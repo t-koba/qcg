@@ -20,7 +20,7 @@ fn validate_request(request: &InvalidateRun) -> Result<(), String> {
 
 /// Do not allow an execution lease (which creates meta/) to resurrect a run.
 /// Called only under the stable maintenance lease by mutations.
-pub(crate) fn require_run_directory(run_dir: &Utf8Path) -> Result<(), ApiError> {
+pub fn require_run_directory(run_dir: &Utf8Path) -> Result<(), ApiError> {
     if !crate::run_dirs::is_regular_directory(run_dir).map_err(crate::artifacts::api_internal)?
         || !crate::run_dirs::is_regular_directory(&run_dir.join("meta"))
             .map_err(crate::artifacts::api_internal)?

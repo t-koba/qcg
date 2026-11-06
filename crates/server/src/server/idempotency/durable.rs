@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableIdempotencyRecord {
     pub(crate) key: String,
     pub(crate) digest: String,
@@ -42,10 +42,8 @@ fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
         hex::encode(Sha256::digest(key.as_bytes()))
     ))
 }
-/// Stable protocol namespace: the first SHA-256 byte selects one of 256
-/// persistent gate leaves. Never unlink or rotate these files, even when idle:
-/// another process may have opened the inode. Collisions serialize.
-/// All peers must implement this protocol; upgrades require quiescing old peers.
+/// Permanent 256 execution shards (first SHA-256 byte): never unlink/rotate.
+/// Collisions serialize; upgrades require quiescing old protocol peers.
 pub(crate) struct ExecutionGate {
     file: File,
     runs_dir: Utf8PathBuf,
@@ -77,9 +75,7 @@ impl ExecutionGate {
 }
 impl Drop for ExecutionGate {
     fn drop(&mut self) {
-        // Final Arc drop only: blocking writers retain their own Arc. Unlock
-        // explicitly so a forked child's pre-exec descriptor cannot extend
-        // ownership after the logical owner ends (as with RunStoreLock).
+        // Final Arc drop explicitly unlocks; fork/pre-exec descriptors must not extend ownership.
         if let Err(error) = self.file.unlock() {
             tracing::warn!(%error, "idempotency execution gate unlock failed");
         }
@@ -116,14 +112,10 @@ fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<File, String> {
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     Ok(lock_file)
 }
-/// Shared no-follow open for locks, records and staging. Unix and Windows
-/// pin the immediate parent and open a single leaf relative to its handle.
-/// Ancestors of that parent, including the configured runs-directory boundary,
-/// must remain trusted: this is not a component-by-component anchored walk.
-/// Non-exclusive creation tries O_CREAT|O_EXCL, then opens an existing path
-/// without O_CREAT: merging
-/// these steps causes spurious ENOENT in racing macOS opens. Deletion between
-/// steps retries boundedly; symlinks and persistent churn fail closed.
+/// No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
+/// Ancestors of that parent, including the configured store, must stay trusted.
+/// Create via O_EXCL then open existing: avoids macOS racing-create ENOENT.
+/// Bounded retry on deletion churn; links and persistent churn fail closed.
 fn open_no_follow(
     path: &camino::Utf8Path,
     read: bool,
@@ -395,14 +387,7 @@ fn reap_expired_ready_snapshot(
     let Some(bytes) = ready_bytes else {
         return Ok((None, 0));
     };
-    if bytes.is_empty() {
-        return Err("idempotency record is empty; writer may be in progress".into());
-    }
-    let record: DurableIdempotencyRecord =
-        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
-    if record.key != key {
-        return Err("idempotency record key mismatch".into());
-    }
+    let record = parse_ready(key, bytes)?;
     let generation = record.generation;
     if record.expired_at(now_unix()?, ttl) {
         std::fs::remove_file(idempotency_path(runs_dir, key).as_std_path())
@@ -501,6 +486,7 @@ pub(crate) fn claim_durable_pending(
     let gate = test_gate(runs_dir, key).map_err(ApiHttpError::internal)?;
     claim_durable_pending_gated(&gate, key, digest, reserved_run_id, ttl, _sweep)
 }
+#[cfg(test)]
 pub(crate) fn claim_durable_pending_gated(
     gate: &ExecutionGate,
     key: &str,
@@ -509,8 +495,28 @@ pub(crate) fn claim_durable_pending_gated(
     ttl: std::time::Duration,
     _sweep: &IdempotencySweep,
 ) -> Result<ClaimOutcome, ApiHttpError> {
+    claim_durable_pending_for_target_gated(gate, key, digest, reserved_run_id, ttl, _sweep, false)
+}
+pub(crate) fn claim_durable_pending_for_target_gated(
+    gate: &ExecutionGate,
+    key: &str,
+    digest: &str,
+    reserved_run_id: Option<String>,
+    ttl: std::time::Duration,
+    _sweep: &IdempotencySweep,
+    require_target: bool,
+) -> Result<ClaimOutcome, ApiHttpError> {
     let runs_dir = &gate.runs_dir;
     gate.validate(key).map_err(ApiHttpError::internal)?;
+    // Do not wait for maintenance while holding the key shard. GC snapshots
+    // associations under this lease, then releases metadata before run locks.
+    let _maintenance = service::try_lock_store_maintenance(runs_dir)
+        .map_err(|e| ApiHttpError::internal(e.to_string()))?
+        .ok_or_else(|| {
+            ApiHttpError::service_unavailable(
+                "run store maintenance is busy; retry with the same key",
+            )
+        })?;
     // Temp+rename is atomic but cannot arbitrate owners; hold the shared lock.
     let _lock_held = acquire_idempotency_lock(runs_dir).map_err(ApiHttpError::internal)?;
     // One snapshot orders Ready convergence before any pending mutation.
@@ -571,6 +577,24 @@ pub(crate) fn claim_durable_pending_gated(
     };
     let path = pending_path(runs_dir, key);
     let run_id = adopted.or(reserved_run_id);
+    if require_target {
+        let id = run_id
+            .as_deref()
+            .filter(|id| policy::is_safe_path_component(id))
+            .ok_or_else(|| ApiHttpError::internal("mutation claim lacks target"))?;
+        let run_dir = runs_dir.join(id);
+        service::require_run_directory(&run_dir).map_err(ApiHttpError::from_api)?;
+        let journal = run_dir.join("meta/journal.jsonl");
+        // Revalidate under maintenance: a target deleted after route preflight
+        // must not acquire a dangling Pending association. No run lock needed.
+        open_no_follow(&journal, true, false, false, false).map_err(|e| {
+            ApiHttpError::from_api(if e.kind() == io::ErrorKind::NotFound {
+                api::ApiError::not_found(format!("run `{id}` was not found"))
+            } else {
+                api::ApiError::internal(e.to_string())
+            })
+        })?;
+    }
     let owner = uuid::Uuid::now_v7().to_string();
     // Expired records still floor the generation; absence floors at zero.
     let generation = pending_generation_from_parsed(pending_generation, ready_generation);
@@ -619,7 +643,7 @@ pub(crate) fn claim_durable_pending_gated(
     };
     // Only failed rename leaves a temp. A subsequent directory-sync failure
     // is a persistence error, not evidence of a leftover temp.
-    if let Err(error) = replace_pending(&tmp, &path) {
+    if let Err(error) = rename_verified(&tmp, &path) {
         return Err(ApiHttpError::internal(
             match std::fs::remove_file(tmp.as_std_path()) {
                 Ok(()) => format!("failed to persist idempotency record: {error}"),
@@ -644,17 +668,12 @@ pub(crate) fn claim_durable_pending_gated(
         ))),
     }
 }
-/// Stage with exclusive no-follow creation; until replace_pending the
+/// Stage with exclusive no-follow creation; until rename the
 /// predecessor remains authoritative.
 fn stage_pending(tmp: &camino::Utf8Path, bytes: &[u8]) -> io::Result<()> {
     let mut file = open_no_follow(tmp, false, true, false, true)?;
     file.write_all(bytes)?;
     file.sync_all()
-}
-/// Locked rename intentionally supersedes an expired/absent predecessor;
-/// a crash before rename preserves it.
-fn replace_pending(tmp: &camino::Utf8Path, path: &camino::Utf8Path) -> io::Result<()> {
-    rename_verified(tmp, path)
 }
 mod expiry;
 pub(crate) use expiry::IdempotencySweep;
@@ -813,22 +832,9 @@ pub(crate) fn check_pending_owner_gated(
             ));
         }
     };
-    // Gate-aware classifier: an expired claim whose key/digest/owner/generation
-    // still match remains Current while this gate is held, because no
-    // gate-aware successor could have replaced it. Mismatched expired
-    // identities are still superseded. Unusable fails closed.
+    // A matching identity stays current while gated, even past the pending lease.
     match parse_pending_bytes(key, &bytes) {
-        PendingRead::Valid(current) => {
-            if current.owner == owner
-                && current.generation == generation
-                && current.digest == expected_digest
-            {
-                Ok(OwnerCheck::Current)
-            } else {
-                Ok(OwnerCheck::Superseded)
-            }
-        }
-        PendingRead::Expired(current) => {
+        PendingRead::Valid(current) | PendingRead::Expired(current) => {
             if current.owner == owner
                 && current.generation == generation
                 && current.digest == expected_digest
@@ -851,7 +857,7 @@ enum PendingRead {
     Unusable(String),
 }
 /// Bound record reads: oversize content is foreign damage, never usable state.
-const MAX_IDEMPOTENCY_FILE_BYTES: u64 = 64 * 1024;
+use service::MAX_IDEMPOTENCY_FILE_BYTES;
 /// Absence is reported explicitly so a file vanishing mid-check (a
 /// concurrent release) keeps its historical meaning instead of failing.
 enum BoundedRead {
@@ -896,6 +902,47 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
         }
     };
     parse_pending_bytes(key, &bytes)
+}
+/// Retire only evidence positively resolved by this Ready. The caller holds
+/// the metadata lock; publication also checks the exact claim owner. Expiry
+/// has no owner in Ready, so it matches the complete recorded operation identity.
+/// Ambiguous evidence is retained regardless of age.
+fn retire_ready_pending(
+    runs_dir: &Utf8PathBuf,
+    ready: &DurableIdempotencyRecord,
+    owner: Option<&str>,
+) -> Result<(), String> {
+    let path = pending_path(runs_dir, &ready.key);
+    let bytes = match read_bounded_idempotency_file(&path) {
+        // Retry the directory sync if a prior retirement unlinked Pending
+        // but failed to sync, before expiry is allowed to remove Ready.
+        BoundedRead::Absent => {
+            return sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string());
+        }
+        BoundedRead::Present(bytes) => bytes,
+        BoundedRead::Unreadable(error) => {
+            tracing::warn!(%error, "unreadable pending retained after Ready resolution");
+            return Ok(());
+        }
+    };
+    let pending: DurablePendingRecord = match serde_json::from_slice(&bytes) {
+        Ok(pending) => pending,
+        Err(error) => {
+            tracing::warn!(%error, "corrupt pending retained after Ready resolution");
+            return Ok(());
+        }
+    };
+    if pending.key != ready.key
+        || pending.digest != ready.digest
+        || pending.run_id.as_deref() != Some(ready.run_id.as_str())
+        || pending.generation != ready.generation
+        || owner.is_some_and(|owner| pending.owner != owner)
+    {
+        tracing::warn!("mismatched pending retained after Ready resolution");
+        return Ok(());
+    }
+    std::fs::remove_file(&path).map_err(|error| error.to_string())?;
+    sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())
 }
 /// Read-only digest lookup used before package preflight: an exact retry of a
 /// live pending start must join its owner even if the source package changed.
@@ -960,26 +1007,36 @@ fn load_durable_ready_at(
     ttl: std::time::Duration,
     now: impl FnOnce() -> Result<u64, String>,
 ) -> Result<Option<DurableIdempotencyRecord>, String> {
+    let Some(record) = read_ready(runs_dir, key)? else {
+        return Ok(None);
+    };
+    Ok((!record.expired_at(now()?, ttl)).then_some(record))
+}
+pub(super) fn read_ready(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+) -> Result<Option<DurableIdempotencyRecord>, String> {
     let path = idempotency_path(runs_dir, key);
     let bytes = match read_bounded_idempotency_file(&path) {
         BoundedRead::Present(bytes) => bytes,
         BoundedRead::Absent => return Ok(None),
         BoundedRead::Unreadable(error) => return Err(error),
     };
+    parse_ready(key, &bytes).map(Some)
+}
+fn parse_ready(key: &str, bytes: &[u8]) -> Result<DurableIdempotencyRecord, String> {
     if bytes.is_empty() {
         // An empty published record is unusable, never assumed absent.
         return Err("idempotency record is empty; writer may be in progress".into());
     }
     let record: DurableIdempotencyRecord =
-        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
     if record.key != key {
         return Err("idempotency record key mismatch".into());
     }
-    if record.expired_at(now()?, ttl) {
-        return Ok(None);
-    }
-    Ok(Some(record))
+    Ok(record)
 }
+
 #[derive(Debug)]
 pub(crate) enum WaitOutcome {
     Ready(DurableIdempotencyRecord),
@@ -1228,6 +1285,12 @@ pub(crate) fn store_durable_ready_gated(
         match &pending_read {
             PendingRead::Valid(pending) | PendingRead::Expired(pending) => {
                 check_live_ownership(pending)?;
+                if existing.run_id == run_id
+                    && existing.generation == generation
+                    && let Err(error) = retire_ready_pending(runs_dir, &existing, Some(owner))
+                {
+                    tracing::warn!(%error, "Ready committed; pending retirement incomplete");
+                }
                 return Ok(existing);
             }
             PendingRead::Absent => {
@@ -1283,8 +1346,10 @@ pub(crate) fn store_durable_ready_gated(
                 .unwrap(),
         );
         {
-            // Shared no-follow open so a planted symlink at the temp name
-            // fails closed on every platform (E02).
+            // No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
+            // Ancestors of that parent, including the configured store, must stay trusted.
+            // Create via O_EXCL then open existing: avoids macOS racing-create ENOENT.
+            // Bounded retry on deletion churn; links and persistent churn fail closed.
             let open_result = open_no_follow(&tmp, false, true, false, true);
             match open_result {
                 Ok(mut file) => {
@@ -1312,6 +1377,11 @@ pub(crate) fn store_durable_ready_gated(
     // execution under power loss is accepted in docs/operations.md.
     if let Err(error) = sync_dir(&idempotency_dir(runs_dir)) {
         tracing::warn!(%error, "idempotency ready directory sync failed; file sync already durable");
+    }
+    // Ready is committed: retirement failure must not turn success into a
+    // retryable mutation. Exact Ready expiry can retry leftover retirement.
+    if let Err(error) = retire_ready_pending(runs_dir, &record, Some(owner)) {
+        tracing::warn!(%error, "Ready committed; pending retirement incomplete");
     }
     Ok(record)
 }
@@ -1366,8 +1436,10 @@ pub(crate) fn write_orphan_record(
     }
     let tmp = path.with_extension(format!("tmp-{}", uuid::Uuid::now_v7()));
     {
-        // Shared no-follow open so a planted symlink at the temp name fails
-        // closed on every platform (E02).
+        // No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
+        // Ancestors of that parent, including the configured store, must stay trusted.
+        // Create via O_EXCL then open existing: avoids macOS racing-create ENOENT.
+        // Bounded retry on deletion churn; links and persistent churn fail closed.
         let mut file =
             open_no_follow(&tmp, false, true, false, true).map_err(|error| error.to_string())?;
         file.write_all(&bytes).map_err(|error| error.to_string())?;
@@ -2078,6 +2150,73 @@ mod tests {
     }
 
     #[test]
+    fn ready_publication_and_exact_convergence_retire_pending() {
+        let runs = temp_runs_dir("ready-retirement");
+        let _guard = TempGuard(runs.clone());
+        let (owner, generation) = claim_owner(&runs, "key", "digest", "run");
+        let pending = pending_path(&runs, "key");
+        let original = std::fs::read(&pending).unwrap();
+        store_ready(&runs, "key", "digest", "run", &owner, generation).unwrap();
+        assert!(!pending.exists());
+        let ready = std::fs::read(idempotency_path(&runs, "key")).unwrap();
+        // Simulate interruption after Ready publication but before retirement.
+        std::fs::write(&pending, original).unwrap();
+        store_ready(&runs, "key", "digest", "run", &owner, generation).unwrap();
+        assert!(!pending.exists());
+        assert_eq!(
+            std::fs::read(idempotency_path(&runs, "key")).unwrap(),
+            ready
+        );
+    }
+
+    #[test]
+    fn ready_convergence_preserves_nonmatching_pending_evidence() {
+        let runs = temp_runs_dir("ready-retirement-mismatch");
+        let _guard = TempGuard(runs.clone());
+        let (owner, generation) = claim_owner(&runs, "key", "digest", "run");
+        let path = pending_path(&runs, "key");
+        let original: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        store_ready(&runs, "key", "digest", "run", &owner, generation).unwrap();
+        let ready = std::fs::read(idempotency_path(&runs, "key")).unwrap();
+        for field in ["key", "digest", "run_id", "owner", "generation", "corrupt"] {
+            let mut pending = serde_json::to_value(&original).unwrap();
+            pending[field] = if field == "generation" {
+                serde_json::json!(generation + 1)
+            } else {
+                serde_json::json!("different")
+            };
+            let bytes = if field == "corrupt" {
+                b"{torn".to_vec()
+            } else {
+                serde_json::to_vec(&pending).unwrap()
+            };
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(store_ready(&runs, "key", "digest", "run", &owner, generation).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{field}");
+            assert_eq!(
+                std::fs::read(idempotency_path(&runs, "key")).unwrap(),
+                ready
+            );
+        }
+        // A claim matching the caller but not the existing Ready may converge
+        // under the existing protocol, but cannot retire unresolved evidence.
+        for (run, next_generation) in [("other-run", generation), ("run", generation + 1)] {
+            let mut pending = original.clone();
+            pending.run_id = Some(run.into());
+            pending.generation = next_generation;
+            let bytes = serde_json::to_vec(&pending).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            store_ready(&runs, "key", "digest", run, &owner, next_generation).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(idempotency_path(&runs, "key")).unwrap(),
+                ready
+            );
+        }
+    }
+
+    #[test]
     fn ready_present_unusable_pending_is_refused_not_converged() {
         // E02: the Ready-present Absent-vs-Unusable asymmetry is intentional:
         // Absent (no information) converges onto the committed run, while
@@ -2461,6 +2600,7 @@ mod tests {
         let runs_dir = temp_runs_dir("converge-value");
         let key = "key-converge";
         let owner = claim_owner(&runs_dir, key, "digest", "run-A");
+        let reservation = std::fs::read(pending_path(&runs_dir, key)).unwrap();
         let first = store_ready(&runs_dir, key, "digest", "run-A", &owner.0, owner.1)
             .expect("first commit should succeed");
         assert_eq!(first, "run-A");
@@ -2473,6 +2613,9 @@ mod tests {
                 outcome_name(&other)
             ),
         }
+        // Restore a leftover reservation to exercise fail-closed convergence
+        // after an interrupted retirement.
+        std::fs::write(pending_path(&runs_dir, key), reservation).unwrap();
         // A stale owner committing a different run id for the same digest
         // is refused instead of converging: the reservation (run-A) does
         // not match the request (run-B), so ownership fails closed (E02).
@@ -2650,7 +2793,7 @@ mod tests {
         assert_eq!(survivor.run_id.as_deref(), Some("run-A"));
         assert_eq!(survivor.generation, 1);
         // Replacement converges onto the same run with the next generation.
-        replace_pending(&tmp, &pending).expect("replacement should succeed");
+        rename_verified(&tmp, &pending).expect("replacement should succeed");
         let published: DurablePendingRecord = serde_json::from_slice(
             &std::fs::read(pending.as_std_path()).expect("successor should exist"),
         )
@@ -2668,9 +2811,9 @@ mod tests {
     fn superseded_commit_converges_or_fails_without_overwriting() {
         // B02/E02: a committer whose claim was superseded by an expiry
         // adoption must not replace the newer owner's outcome. Before any
-        // Ready exists it fails; once the successor commits, the stale owner
-        // is still refused (fail-closed) instead of converging: convergence
-        // with a reservation requires current ownership.
+        // Ready exists it fails; after the successor commits it converges
+        // without Pending, but any leftover reservation still requires current
+        // ownership (fail-closed).
         let runs_dir = temp_runs_dir("superseded-commit");
         let key = "key-1";
         let (stale_owner, gen1) = claim_owner(&runs_dir, key, "digest", "run-1");
@@ -2692,9 +2835,20 @@ mod tests {
             matches!(error, StoreReadyError::Storage(_)),
             "supersession must type as an explicit storage failure, got: {error}"
         );
+        let reservation = std::fs::read(pending_path(&runs_dir, key)).unwrap();
         let committed = store_ready(&runs_dir, key, "digest", "run-1", &new_owner, gen2)
             .expect("current generation should commit");
         assert_eq!(committed, "run-1");
+        let ready = std::fs::read(idempotency_path(&runs_dir, key)).unwrap();
+        assert_eq!(
+            store_ready(&runs_dir, key, "digest", "run-1", &stale_owner, gen1).unwrap(),
+            "run-1"
+        );
+        assert_eq!(
+            std::fs::read(idempotency_path(&runs_dir, key)).unwrap(),
+            ready
+        );
+        std::fs::write(pending_path(&runs_dir, key), reservation).unwrap();
         let error = store_ready(&runs_dir, key, "digest", "run-1", &stale_owner, gen1)
             .expect_err("stale commit must be refused even after the successor committed");
         assert!(

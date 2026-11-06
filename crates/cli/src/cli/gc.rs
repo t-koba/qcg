@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use camino::Utf8Path;
 
 /// Manual retention sweep behind `qcg runs gc`.
@@ -20,17 +20,6 @@ pub(crate) fn gc_runs(
     if !runs_dir.exists() {
         return Ok(());
     }
-    // A destructive pass holds the store maintenance lock so two sweeps
-    // never collect the same run. A dry run removes nothing, so it needs no
-    // lock.
-    let _maintenance = if delete {
-        Some(
-            service::try_lock_store_maintenance(runs_dir)?
-                .context("run store maintenance is busy; retry")?,
-        )
-    } else {
-        None
-    };
     let selected = service::gc_run_directories(
         runs_dir,
         policy.keep,
@@ -63,17 +52,12 @@ pub(crate) fn auto_gc_runs(runs_dir: &Utf8Path, policy: &policy::RetentionPolicy
     }
     // A busy store means another holder is already maintaining it, so the
     // automatic sweep skips rather than doing the same work twice.
-    let _maintenance = match service::try_lock_store_maintenance(runs_dir)? {
+    let maintenance = match service::try_lock_store_maintenance(runs_dir)? {
         Some(lock) => lock,
         None => return Ok(()),
     };
-    let removed = service::gc_run_directories(
-        runs_dir,
-        policy.keep,
-        policy.keep_failed,
-        true,
-        policy.max_scan_entries,
-    )?;
+    let removed =
+        maintenance.gc_run_directories(policy.keep, policy.keep_failed, policy.max_scan_entries)?;
     if !removed.is_empty() {
         eprintln!(
             "retention: removed {} run(s) from {runs_dir}",
@@ -88,6 +72,28 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use service::run_meta_dir;
+
+    #[test]
+    fn busy_maintenance_refuses_manual_and_skips_automatic_then_retries() {
+        if env_process::isolated() {
+            return;
+        }
+        // SAFETY: this test owns its isolated process environment.
+        unsafe {
+            std::env::set_var("AUTO_GC", "true");
+        }
+        let (root, runs) = temp_runs_dir("busy");
+        write_run(&runs.join("terminal"), "success", &stamp(1), None);
+        let lease = service::try_lock_store_maintenance(&runs).unwrap().unwrap();
+        assert!(gc_runs(&runs, &policy(0, 0), None, None, true).is_err());
+        gc_runs(&runs, &policy(0, 0), None, None, false).unwrap();
+        auto_gc_runs(&runs, &policy(0, 0)).unwrap();
+        assert!(runs.join("terminal").is_dir());
+        drop(lease);
+        auto_gc_runs(&runs, &policy(0, 0)).unwrap();
+        assert!(!runs.join("terminal").exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     fn write_run(run_dir: &Utf8Path, status: &str, started_at: &str, retention_days: Option<u32>) {
         std::fs::create_dir_all(run_meta_dir(run_dir)).expect("meta dir should be created");

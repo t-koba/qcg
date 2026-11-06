@@ -1,6 +1,7 @@
 use super::*;
 use crate::server::artifact_response::ArtifactResponseBudget;
 use axum::response::Response;
+use sha2::{Digest, Sha256};
 
 const CAP: u64 = 1024 * 1024;
 
@@ -662,4 +663,91 @@ async fn ready_mutation_snapshots() {
             assert_eq!(mutation.journal(&state), journals[i]);
         }
     }
+}
+
+#[test]
+fn ready_records_pin_gc_and_explicit_delete_across_restart() {
+    run_with_bounded_stack(ready_retention);
+}
+
+async fn ready_retention() {
+    let (_guard, generators, state, source) = setup().await;
+    let runs = state.runs_dir.clone();
+    let response = post(&state, &source, false, Some("retained-start"))
+        .await
+        .unwrap();
+    let id = run_id(&response.headers()[header::LOCATION]);
+    drop(response);
+    wait_for_terminal(&state.service, &id).await;
+    // A second key maps to the same run (terminal cancel is a settled no-op).
+    let mut headers = HeaderMap::new();
+    headers.insert(IDEMPOTENCY_HEADER, "retained-cancel".parse().unwrap());
+    drop(
+        cancel_run(State(state.clone()), headers.clone(), Path(id.clone()))
+            .await
+            .unwrap(),
+    );
+    let journal = std::fs::read(runs.join(&id).join("meta/journal.jsonl")).unwrap();
+    state.service.mark_shutting_down();
+    drop(state);
+    let state = open_state(&generators, &runs).await;
+    let paths: Vec<_> = ["retained-start", "retained-cancel"]
+        .iter()
+        .map(|key| {
+            runs.join("idempotency").join(format!(
+                "{}.json",
+                hex::encode(Sha256::digest(key.as_bytes()))
+            ))
+        })
+        .collect();
+    // Replayed actual handlers preserve journal and original run identity.
+    let replay = post(&state, &source, false, Some("retained-start"))
+        .await
+        .unwrap();
+    assert_eq!(run_id(&replay.headers()[header::LOCATION]), id);
+    drop(replay);
+    drop(
+        cancel_run(State(state.clone()), headers.clone(), Path(id.clone()))
+            .await
+            .unwrap(),
+    );
+    for path in &paths {
+        let _maintenance = service::try_lock_store_maintenance(&runs).unwrap().unwrap();
+        let deleted = _maintenance.gc_run_directories(0, 0, 100).unwrap();
+        assert!(!deleted.contains(&runs.join(&id)));
+        drop(_maintenance);
+        let error = crate::delete_run(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.problem.status, 409);
+        // Controlled physical expiry seam: deleting one key must not unpin the other.
+        std::fs::remove_file(path).unwrap();
+    }
+    assert_eq!(
+        std::fs::read(runs.join(&id).join("meta/journal.jsonl")).unwrap(),
+        journal
+    );
+    // A corrupt canonical association stops all destructive work, not just
+    // deletion of a guessed target. No partial snapshot may authorize GC.
+    std::fs::write(&paths[0], b"{torn").unwrap();
+    {
+        let _maintenance = service::try_lock_store_maintenance(&runs).unwrap().unwrap();
+        assert!(_maintenance.gc_run_directories(0, 0, 100).is_err());
+        assert!(runs.join(&id).is_dir());
+    }
+    assert_eq!(
+        crate::delete_run(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap_err()
+            .problem
+            .status,
+        409
+    );
+    std::fs::remove_file(&paths[0]).unwrap();
+    assert_eq!(
+        crate::delete_run(State(state.clone()), Path(id.clone()))
+            .await
+            .unwrap(),
+        StatusCode::NO_CONTENT
+    );
 }

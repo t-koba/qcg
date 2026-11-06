@@ -63,22 +63,48 @@ impl LocalService {
             .map_err(|detail| ApiError::Conflict { detail })
     }
 
+    /// Exclude run deletion during idempotency validation and bounded snapshot
+    /// materialization. The caller must validate its mapping *after* acquiring
+    /// this guard. Does not change public, unguarded read semantics.
+    pub async fn lock_idempotency_snapshot(
+        &self,
+        id: &str,
+    ) -> Result<crate::run_dirs::RunAdmissionLock, ApiError> {
+        if !policy::is_safe_path_component(id) || crate::run_dirs::is_store_coordination_name(id) {
+            return Err(ApiError::invalid("invalid idempotency run id"));
+        }
+        crate::run_dirs::lock_run_admission(&self.inner.runs_dir.join(id), &self.inner.shutdown)
+            .await
+            .map_err(api_internal)?
+            .ok_or_else(|| ApiError::internal("service shutting down"))
+    }
+
     /// Delete a terminal run or discard an inactive direct CLI journal.
     /// Live owners are rejected. Missing runs are an error.
     /// A repeated delete after success reports not-found; list first when
     /// retrying unattended cleanup.
     pub async fn delete_run(&self, id: &str) -> Result<(), ApiError> {
-        // Deletion during the shutdown drain could remove a directory that
-        // shutdown settlement is still writing; refuse it like every other
-        // mutating operation (E05).
+        // Deletion is refused during shutdown settlement.
         self.ensure_running()?;
-        // Stable store lock precedes handoff and execution locks; re-check
-        // disk even when the local map still contains a run deleted by a peer.
+        // Maintenance precedes all run leases; disk state outranks local memory.
         let _maintenance = crate::run_dirs::try_lock_store_maintenance(&self.inner.runs_dir)
             .map_err(api_internal)?
             .ok_or_else(|| ApiError::Conflict {
                 detail: "run store maintenance is busy; retry".into(),
             })?;
+        let directory = self.inner.runs_dir.clone();
+        let cap = self.inner.deployment_policy.max_directory_scan_entries;
+        let retained = self
+            .blocking_work(move || crate::idempotency_refs::retained_runs(&directory, cap))
+            .await
+            .map_err(|e| ApiError::Conflict {
+                detail: e.to_string(),
+            })?;
+        if retained.contains(id) {
+            return Err(ApiError::Conflict {
+                detail: format!("run `{id}` is retained by idempotency records"),
+            });
+        }
         let run_dir = self.run_dir_for(id).await?;
         let _admission = crate::run_dirs::try_lock_run_admission(&run_dir)
             .map_err(api_internal)?
@@ -91,14 +117,7 @@ impl LocalService {
                 detail: format!("run `{id}` is being requeued; retry deletion"),
             })?;
         crate::invalidation::require_run_directory(&run_dir)?;
-        // A peer may own execution while this process sees no local task:
-        // verify the execution lease and pending cancel mailbox in addition
-        // to local terminal state (A02). Deletion before the owner ACKs the
-        // stop would orphan a live writer.
-        // This pre-check is advisory: deletion proceeds only for terminal
-        // runs (checked below under the execution lease), and a cancel
-        // arriving for an already-terminal run is a settled no-op, so a
-        // publish racing this check loses no effect (E03).
+        // Probe mailbox before execution ownership; terminal cancel is a settled no-op.
         if crate::run_dirs::has_pending_cancel_control(&run_dir) {
             return Err(ApiError::Conflict {
                 detail: format!(
@@ -106,8 +125,7 @@ impl LocalService {
                 ),
             });
         }
-        // Hold the execution lease until the directory is gone so no owner
-        // can start appending between the check and the removal (TOCTOU).
+        // Hold execution ownership through removal to exclude peer writers.
         let _execution_lease =
             crate::run_dirs::try_lock_run_execution(&run_dir).map_err(api_internal)?;
         if _execution_lease.is_none() {
@@ -117,9 +135,7 @@ impl LocalService {
                 ),
             });
         }
-        // Re-check under the execution lease: a shutdown that started after
-        // the outer gate must not let the drain race a directory removal
-        // (E05).
+        // Re-check shutdown under execution ownership.
         self.ensure_running()?;
         crate::invalidation::require_run_directory(&run_dir)?;
         let live_task = self
@@ -129,10 +145,7 @@ impl LocalService {
             .await
             .get(id)
             .is_some_and(|record| crate::types::task_slot_is_live(&record.task));
-        // Host-cgroup reconciliation under the execution lease before the
-        // `Started` deletion gate. Uses the persisted binding even when the
-        // current delegation was removed (a changed nonempty parent is refused); failures preserve the
-        // journal and refuse deletion rather than targeting another cgroup.
+        // Reconcile persisted cgroup identity before the Started gate; ambiguity preserves the journal.
         {
             let config = engine::host_cgroup::host_cgroup_config_from_env().map_err(|error| {
                 ApiError::Conflict {

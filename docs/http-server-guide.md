@@ -95,7 +95,7 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/mcp/oauth/callback`
 - `GET, POST /api/runs`
 - `GET /api/runs/{id}`
-- `DELETE /api/runs/{id}` (terminal runs only; active runs need cancel first)
+- `DELETE /api/runs/{id}` (terminal, unpinned runs only; active runs need cancel first)
 - `POST /api/runs/{id}/invalidation` (durably succeeded runs only)
 - `PUT /api/runs/{id}/questions/{qid}`
 - `PUT /api/runs/{id}/confirmations/{cid}`
@@ -178,8 +178,12 @@ run directories. This byte-addressed namespace is a shared protocol, not a
 per-host tuning setting; colliding keys serialize. Gate files are permanent
 coordination state: never unlink, replace, or rotate them, including when idle.
 A waiter or blocked writer may already hold an open handle to the same inode.
-Lock order is gate then the short-lived `.idempotency.lock`; no process waits
-for a gate while holding the metadata lock. Request cancellation stops gate
+Claim publication tries the store `.maintenance.lock` after the gate and before
+`.idempotency.lock`; busy maintenance returns retryable `503` without waiting
+under the key shard. Existing mutation targets are rechecked under maintenance
+before Pending publication: the run directory, metadata directory and journal
+must be real directories/a regular file, not symlinks. No process waits for a gate or run admission while
+holding the metadata lock. Request cancellation stops gate
 polling; a service blocking writer already in flight retains shared ownership
 until it exits. Process death releases the OS lock, not the Pending evidence.
 Contention uses the existing peer wait policy (30 seconds, polling every
@@ -240,7 +244,34 @@ and after each `IDEMPOTENCY_SWEEP_INTERVAL_SECS` delay (default 60), even with n
 requests. Each pass retires at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` due expiry obligations (default 256), under
 the shared idempotency lock. A backlog adds successive pass delays; errors or a
 stopped service can extend cleanup lag. Expired mappings do not replay during
-that lag. Shutdown requests cancellation and joins the resident task. Checks
+that lag. A physically present canonical Ready record still pins its run until
+record removal; this can delay run GC beyond logical TTL but never renews replay.
+Unresolved Pending pins its associated run regardless of age. Pending is resolved
+only by a canonical Ready with the exact key, digest, run ID and generation;
+then Ready alone pins. Multiple keys pin independently. GC skips pinned runs,
+and explicit DELETE returns `409` while any retained association pins the run.
+
+Before deletion, maintenance takes a complete canonical-record snapshot under
+`.idempotency.lock`, releasing that metadata lock before run admission/handoff/
+execution locks or removal. The scan counts all top-level idempotency-directory
+entries against `MAX_DIRECTORY_SCAN_ENTRIES`, caps each record at the existing
+64 KiB durable-read bound, validates filename/key identity and uses no-follow
+reads. It does not traverse `.expiry` or `.temps` and writes no reverse index or
+pin markers. An absent idempotency directory means no associations; malformed,
+unknown or unreadable associations, or an incomplete scan, refuse destructive
+GC and DELETE rather than guessing which runs are safe. Resolve the underlying
+evidence under quiescence; never remove ambiguous Pending solely by age.
+
+Replay takes run admission before its final canonical Ready identity/TTL check
+and holds it through bounded snapshot materialization. Changed/expired mappings
+return to normal claiming, not stale replay. If an observed Ready is still
+within TTL but its canonical file is missing, replay fails with a storage error;
+absence is not permission to execute again. Only actual expiry or a different
+current canonical record permits leaving that observed replay behind. Initial keyed responses hold the
+result run's admission from before Ready publication through snapshot reads, so
+physical record expiry cannot strand a response between commit and reading.
+These guards do not change ordinary public read semantics or add mixed-version
+fencing or a power-loss guarantee. Shutdown requests cancellation and joins the resident task. Checks
 between lock polls, discovery entries, migration attempts, radix steps and temp
 entries are cooperative; filesystem calls already in progress are not
 interruptible. If shutdown grace expires, aborting the async resident can detach
@@ -266,9 +297,15 @@ bounded at twice the entry budget, and radix traversal/pruning at 256 steps per
 budget slot (the u64 index has sixteen hex levels). Cursors resume across passes.
 Empty index paths, including those left by a failed publication, are pruned by
 that cursor once due; failed removal/sync retains its position for retry without
-a separate tree scan. Pending claims (even expired ones) and unexpired Ready
-remain untouched. Do not mix pre-index writers with index-aware servers in one
-store.
+a separate tree scan. A successful Ready publication (or exact same-Ready
+convergence) best-effort retires only the Pending claim matching its key, digest,
+run ID, owner and generation; retirement failure does not undo the committed
+Ready. Before removing an exact scheduled Ready that is due, maintenance also
+removes and directory-syncs a Pending matching its key, digest, run ID and
+generation. This resolves leftover claims, not ambiguous effects: mismatched,
+corrupt or unreadable Pending evidence remains, regardless of age. Pending is
+never deleted solely because it expired; unexpired Ready remains untouched.
+Do not mix pre-index writers with index-aware servers in one store.
 
 Exact generated staging temps live separately and have an independent budget
 of at most `IDEMPOTENCY_SWEEP_MAX_ENTRIES` yielded temp entries per pass; Ready

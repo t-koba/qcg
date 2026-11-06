@@ -944,6 +944,15 @@ async fn interaction_process_crash_with_lease(
     if denial_prefix.is_some() {
         lease.as_ref().unwrap().unlock().unwrap();
     }
+    if !hold_execution_lease {
+        let _maintenance = service::try_lock_store_maintenance(runs).unwrap().unwrap();
+        let deleted = _maintenance.gc_run_directories(0, 0, 100).unwrap();
+        assert!(
+            !deleted.contains(&run_dir),
+            "accepted Pending pins the terminal journal before restart"
+        );
+        assert!(run_dir.join("meta/journal.jsonl").is_file());
+    }
     let aged_pending = fs::read(pending(runs)).unwrap();
     let state = Arc::new(crate::test_state(
         shared_service(runs),
@@ -1462,6 +1471,418 @@ async fn creation_process_crash_at(scope: &str, accepted: bool) {
                 *source_journal.as_ref().unwrap(),
                 "fork retry leaves the source journal intact"
             );
+        }
+    }
+}
+
+// One path-scoped barrier; other concurrently running fixtures are untouched.
+type SnapshotBarrier = (
+    Utf8PathBuf,
+    Arc<tokio::sync::Notify>,
+    Arc<tokio::sync::Notify>,
+);
+static SNAPSHOT_BARRIER: std::sync::Mutex<Option<SnapshotBarrier>> = std::sync::Mutex::new(None);
+pub(super) async fn snapshot_barrier(runs: &Utf8PathBuf) {
+    let notifications = SNAPSHOT_BARRIER
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(path, ..)| path == runs)
+        .map(|(_, reached, resume)| (reached.clone(), resume.clone()));
+    if let Some((reached, resume)) = notifications {
+        reached.notify_one();
+        resume.notified().await;
+    }
+}
+
+#[tokio::test]
+async fn initial_and_replay_snapshot_admission_survive_physical_ready_expiry() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-snapshot-retention-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    let state = Arc::new(crate::test_state(
+        shared_service(runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let mut headers = HeaderMap::new();
+    for replay in [false, true] {
+        let key = format!("{KEY}-{replay}");
+        headers.insert(policy::IDEMPOTENCY_HEADER, key.parse().unwrap());
+        let id = state
+            .service
+            .start_run(api::StartRun {
+                generator_id: "hello-template".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !state
+                .service
+                .snapshot(id.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let ready = runs.join("idempotency").join(format!(
+            "{}.json",
+            hex::encode(Sha256::digest(key.as_bytes()))
+        ));
+        if replay {
+            drop(
+                crate::server::run_detail::cancel_run(
+                    axum::extract::State(state.clone()),
+                    headers.clone(),
+                    axum::extract::Path(id.clone()),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let resume = Arc::new(tokio::sync::Notify::new());
+        *SNAPSHOT_BARRIER.lock().unwrap() = Some((runs.clone(), reached.clone(), resume.clone()));
+        let request = {
+            let state = state.clone();
+            let headers = headers.clone();
+            let id = id.clone();
+            tokio::spawn(async move {
+                crate::server::run_detail::cancel_run(
+                    axum::extract::State(state),
+                    headers,
+                    axum::extract::Path(id),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), reached.notified())
+            .await
+            .unwrap();
+        assert!(
+            ready.is_file(),
+            "Ready must be committed before snapshot materialization"
+        );
+        // Controlled expiry-worker seam, under its actual metadata lock.
+        let metadata = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(runs.join("idempotency/.idempotency.lock"))
+            .unwrap();
+        metadata.lock().unwrap();
+        fs::remove_file(&ready).unwrap();
+        metadata.unlock().unwrap();
+        {
+            let _maintenance = service::try_lock_store_maintenance(runs).unwrap().unwrap();
+            let deleted = _maintenance.gc_run_directories(0, 0, 100).unwrap();
+            assert!(
+                !deleted.contains(&runs.join(&id)),
+                "snapshot must hold admission beyond Ready retirement"
+            );
+        }
+        resume.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        drop(response);
+        *SNAPSHOT_BARRIER.lock().unwrap() = None;
+        let _maintenance = service::try_lock_store_maintenance(runs).unwrap().unwrap();
+        assert!(
+            _maintenance
+                .gc_run_directories(0, 0, 100)
+                .unwrap()
+                .contains(&runs.join(&id))
+        );
+    }
+}
+
+#[tokio::test]
+async fn stale_ready_is_revalidated_after_admission_wait() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-stale-retention-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    let state = Arc::new(crate::test_state(
+        shared_service(runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let id = state
+        .service
+        .start_run(api::StartRun {
+            generator_id: "hello-template".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let admission = state.service.lock_idempotency_snapshot(&id).await.unwrap();
+    // No canonical Ready exists: a stale cached/observed identity cannot serve.
+    let record = durable::DurableIdempotencyRecord {
+        key: KEY.into(),
+        digest: "d".into(),
+        run_id: id,
+        generation: 1,
+        created_at_unix: durable::now_unix().unwrap(),
+        publication_id: None,
+    };
+    let request = {
+        let state = state.clone();
+        tokio::spawn(async move { replay_ready(&state, record, false, "d").await })
+    };
+    tokio::task::yield_now().await;
+    assert!(!request.is_finished());
+    drop(admission);
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), request)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err()
+            .problem
+            .status
+            == 500
+    );
+}
+
+#[tokio::test]
+async fn mutation_claim_fails_fast_during_maintenance_and_rechecks_deleted_target() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-target-retention-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    fs::create_dir_all(runs.join("target/meta")).unwrap();
+    fs::write(runs.join("target/meta/journal.jsonl"), b"journal").unwrap();
+    let gate = ExecutionGate::try_acquire(runs, KEY).unwrap().unwrap();
+    let maintenance = service::try_lock_store_maintenance(runs).unwrap().unwrap();
+    // Holding metadata too proves the busy path never waits on it under the shard.
+    let metadata = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(runs.join("idempotency/.idempotency.lock"))
+        .unwrap();
+    metadata.lock().unwrap();
+    let claim = || {
+        durable::claim_durable_pending_for_target_gated(
+            &gate,
+            KEY,
+            "d",
+            Some("target".into()),
+            policy::IDEMPOTENCY_TTL,
+            &Default::default(),
+            true,
+        )
+    };
+    assert_eq!(claim().unwrap_err().problem.status, 503);
+    assert!(!pending(runs).exists());
+    fs::remove_dir_all(runs.join("target")).unwrap();
+    metadata.unlock().unwrap();
+    drop(maintenance);
+    assert_eq!(claim().unwrap_err().problem.status, 404);
+    assert!(
+        !pending(runs).exists(),
+        "deleted target cannot receive dangling Pending"
+    );
+}
+
+#[tokio::test]
+async fn ready_replay_distinguishes_loss_expiry_and_canonical_replacement() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-ready-loss-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    let state = Arc::new(crate::test_state(
+        shared_service(runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let record = durable::DurableIdempotencyRecord {
+        key: KEY.into(),
+        digest: request_digest("cancel_run", "target", b"", None),
+        run_id: "target".into(),
+        generation: 1,
+        created_at_unix: durable::now_unix().unwrap(),
+        publication_id: Some("publication".into()),
+    };
+    let mut headers = HeaderMap::new();
+    headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+    state
+        .idempotency
+        .lock()
+        .await
+        .insert(KEY.into(), IdempotencyEntry::ready(record.clone()));
+    let called = std::sync::atomic::AtomicBool::new(false);
+    let error = with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "cancel_run",
+        target: "target",
+        body: b"",
+        digest_context: None,
+        created: false,
+        reserved_run_id: Some("target".into()),
+        execute: |_| async {
+            called.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok("target".into())
+        },
+    })
+    .await
+    .unwrap_err();
+    assert_eq!(error.problem.status, 500);
+    assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(state.idempotency.lock().await.contains_key(KEY));
+    assert!(!pending(runs).exists());
+    let mut expired = record.clone();
+    expired.created_at_unix = 0;
+    assert!(
+        replay_ready(&state, expired.clone(), false, "anything")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let ready = runs.join("idempotency").join(format!(
+        "{}.json",
+        hex::encode(Sha256::digest(KEY.as_bytes()))
+    ));
+    fs::create_dir_all(ready.parent().unwrap()).unwrap();
+    // An actually different canonical publication permits re-admission, even
+    // when the replacement is already expired under this peer's frozen TTL.
+    expired.publication_id = Some("replacement".into());
+    fs::write(&ready, serde_json::to_vec(&expired).unwrap()).unwrap();
+    assert!(
+        replay_ready(&state, record.clone(), false, "anything")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        replay_ready(&state, expired.clone(), false, "anything")
+            .await
+            .unwrap()
+            .is_none()
+    );
+    fs::write(&ready, serde_json::to_vec(&record).unwrap()).unwrap();
+    assert_eq!(
+        replay_ready(&state, record, false, "different")
+            .await
+            .unwrap_err()
+            .problem
+            .status,
+        409
+    );
+    assert!(
+        replay_ready(&state, expired, false, "anything")
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn start_lookup_checks_live_memory_pending_digest_before_disk() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-pending-lookup-{}", uuid::Uuid::now_v7())),
+    );
+    let state = Arc::new(crate::test_state(
+        shared_service(&fixture.0),
+        fixture.0.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let digest = request_digest("start_run", "", b"same", None);
+    let mut headers = HeaderMap::new();
+    headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+    let (completed, _) = tokio::sync::watch::channel(false);
+    state.idempotency.lock().await.insert(
+        KEY.into(),
+        IdempotencyEntry::Pending {
+            digest,
+            owner_id: uuid::Uuid::now_v7(),
+            created_at: Instant::now(),
+            completed,
+        },
+    );
+    for body in [b"same".as_slice(), b"different".as_slice()] {
+        let call = IdempotentCall {
+            state: &state,
+            headers: &headers,
+            scope: "start_run",
+            target: "",
+            body,
+            digest_context: None,
+            created: true,
+            reserved_run_id: None,
+            execute: |_| async { panic!("lookup never executes") },
+        };
+        let result = lookup_start_idempotency(&call).await;
+        if body == b"same" {
+            assert!(matches!(result, Ok(StartIdempotencyLookup::Pending)));
+        } else {
+            assert_eq!(result.err().unwrap().problem.status, 409);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn mutation_claim_rejects_linked_and_non_directory_parents_before_publication() {
+    use std::os::unix::fs::symlink;
+    for component in ["target", "target/meta", "target/meta/journal.jsonl"] {
+        for linked in [false, true] {
+            let fixture = Fixture(
+                Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                    .unwrap()
+                    .join(format!("qcg-target-path-{}", uuid::Uuid::now_v7())),
+            );
+            let runs = &fixture.0;
+            fs::create_dir_all(runs.join("target/meta")).unwrap();
+            fs::write(runs.join("target/meta/journal.jsonl"), b"journal").unwrap();
+            let path = runs.join(component);
+            let original = runs.join("original");
+            fs::rename(&path, &original).unwrap();
+            if linked {
+                symlink(&original, &path).unwrap();
+            } else if component.ends_with("jsonl") {
+                fs::create_dir(&path).unwrap();
+            } else {
+                fs::write(&path, b"not a directory").unwrap();
+            }
+            let gate = ExecutionGate::try_acquire(runs, KEY).unwrap().unwrap();
+            let result = durable::claim_durable_pending_for_target_gated(
+                &gate,
+                KEY,
+                "d",
+                Some("target".into()),
+                policy::IDEMPOTENCY_TTL,
+                &Default::default(),
+                true,
+            );
+            assert!(result.is_err(), "{component}, linked={linked}");
+            assert!(!pending(runs).exists());
         }
     }
 }

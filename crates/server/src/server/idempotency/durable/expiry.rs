@@ -367,6 +367,10 @@ fn reap(runs: &Utf8PathBuf, work: &Utf8PathBuf, now: u64, ttl: Duration) -> Resu
                 if !current.expired_at(now, ttl) {
                     return Err("expiry work is not due".into());
                 }
+                // Retire exact resolved evidence and sync it before Ready.
+                // Ambiguous Pending survives; failed removal/sync retries
+                // with the Ready still present under this metadata lock.
+                retire_ready_pending(runs, &current, None)?;
                 fs::remove_file(&ready).map_err(|e| e.to_string())?;
             }
         }
@@ -456,6 +460,95 @@ mod tests {
                 }
             })
             .collect()
+    }
+
+    #[test]
+    fn exact_due_ready_retires_only_resolved_pending() {
+        let runs = runs();
+        let _lock = acquire_idempotency_lock(&runs).unwrap();
+        for field in [
+            "exact",
+            "key",
+            "digest",
+            "run_id",
+            "generation",
+            "corrupt",
+            "unreadable",
+        ] {
+            let path = ready(&runs, field, 1, true);
+            let work = index_files(&idempotency_dir(&runs).join(".expiry"))
+                .pop()
+                .unwrap();
+            let pending = pending_path(&runs, field);
+            let mut record = serde_json::json!({
+                "key": field, "digest": "digest", "run_id": "run",
+                "owner": "owner", "generation": 1, "created_at_unix": 1
+            });
+            if !["exact", "corrupt", "unreadable"].contains(&field) {
+                record[field] = if field == "generation" {
+                    serde_json::json!(2)
+                } else {
+                    serde_json::json!("different")
+                };
+            }
+            let bytes = if field == "corrupt" {
+                b"{torn".to_vec()
+            } else {
+                serde_json::to_vec(&record).unwrap()
+            };
+            if field == "unreadable" {
+                fs::create_dir(&pending).unwrap();
+            } else {
+                fs::write(&pending, &bytes).unwrap();
+            }
+            reap(&runs, &work, 100, Duration::from_secs(10)).unwrap();
+            assert!(!path.exists());
+            assert!(!work.exists());
+            match field {
+                "exact" => assert!(!pending.exists()),
+                "unreadable" => assert!(pending.is_dir()),
+                _ => assert_eq!(fs::read(&pending).unwrap(), bytes, "{field}"),
+            }
+        }
+        drop(_lock);
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
+    fn pending_retirement_requires_exact_present_due_ready() {
+        let runs = runs();
+        let _lock = acquire_idempotency_lock(&runs).unwrap();
+        let ready = ready(&runs, "key", 1, true);
+        let work = index_files(&idempotency_dir(&runs).join(".expiry"))
+            .pop()
+            .unwrap();
+        let pending = pending_path(&runs, "key");
+        let bytes = br#"{"key":"key","digest":"digest","run_id":"run","owner":"owner","generation":1,"created_at_unix":1}"#;
+        fs::write(&pending, bytes).unwrap();
+        let ttl = Duration::from_secs(10);
+        assert!(reap(&runs, &work, 10, ttl).is_err());
+        assert!(ready.exists());
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        // A stale schedule must not resolve Pending against a new publication,
+        // even when every operation field and timestamp is identical.
+        let mut successor: DurableIdempotencyRecord =
+            serde_json::from_slice(&fs::read(&ready).unwrap()).unwrap();
+        successor.publication_id = Some(uuid::Uuid::now_v7().to_string());
+        fs::write(&ready, serde_json::to_vec(&successor).unwrap()).unwrap();
+        reap(&runs, &work, 100, ttl).unwrap();
+        assert!(ready.exists());
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        // Without the Ready itself, the index alone cannot resolve Pending.
+        let scheduled = fs::read(&ready).unwrap();
+        register(&runs, &scheduled).unwrap();
+        let work = index_files(&idempotency_dir(&runs).join(".expiry"))
+            .pop()
+            .unwrap();
+        fs::remove_file(&ready).unwrap();
+        reap(&runs, &work, 100, ttl).unwrap();
+        assert_eq!(fs::read(&pending).unwrap(), bytes);
+        drop(_lock);
+        fs::remove_dir_all(runs).unwrap();
     }
 
     #[test]

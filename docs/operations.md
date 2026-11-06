@@ -270,15 +270,50 @@ newest nonfailed terminal runs (success, canceled, or interrupted); failed
 runs do not consume that budget and are governed only by the separate
 `keep_failed` budget (default 10). An explicit `--keep`/`--keep-failed`
 overrides the resolved count for that sweep. With defaults, a sweep may retain
-up to 50 nonfailed terminal runs plus 10 failed runs.
+up to 50 unpinned nonfailed terminal runs plus 10 unpinned failed runs, in
+addition to any runs protected by idempotency or live coordination leases.
 
 Expiry comes from the run's journal: when the contract declared a retention
 window, the run recorded it when it started, and a sweep expires that run on
-the recorded window — a run past its window is collected even when the count
+the recorded window — an unpinned, inactive run past its window is collected even when the count
 budget would keep it, while a run inside its window is still governed by the
 count budgets. Without a declared window only the count budgets apply. A
 sweep never consults today's contract, because it cannot reconstruct the
 policy the run originally ran under.
+
+Destructive GC acquires store maintenance internally. Callers already holding
+maintenance use that lease's store-bound sweep method, which does not reacquire
+it; service background cleanup and automatic CLI cleanup retain their existing
+skip-on-contention behavior. Dry-run sweeps do not require maintenance.
+
+Idempotency associations take precedence over those run count/age budgets.
+A physically present canonical `<runs-dir>/idempotency/<sha256>.json` Ready pins
+its run, including after logical replay TTL, until the existing record-expiry
+writer removes it. This lag does not extend replay. Unresolved
+`<sha256>.pending.json` pins regardless of age; only an exact Ready match on
+key, digest, run ID and generation resolves Pending, leaving Ready as the pin.
+Each key pins independently. Pinned runs do not consume terminal keep slots;
+GC skips them and explicit service/HTTP deletion refuses with `409`.
+
+While holding `.maintenance.lock`, deletion reads a complete canonical ref
+snapshot under `.idempotency.lock`, then releases the metadata lock before
+probing run admission, handoff and execution or removing any directories.
+Pending publication tries maintenance before metadata, returning retryable
+`503` if maintenance is busy; existing mutation targets are revalidated there.
+Replay holds run admission across the final Ready identity/TTL validation and
+bounded snapshot reads; an initial keyed response takes that guard before
+Ready publication. There is no persistent pin/index state. All shared-store
+writers must honor this order: stop/join old peers and in-flight writers before
+upgrade; mixed-version fencing and power-loss safety are not provided.
+
+The canonical scan independently counts all top-level idempotency entries
+against the configured directory scan cap and uses the existing 64 KiB
+per-record read bound. It validates filename/key identity and refuses links,
+malformed/unknown/unreadable associations and incomplete scans. It never recurses
+into `.expiry` or `.temps`. An absent idempotency directory means no refs;
+ambiguous evidence stops destructive GC and explicit deletion for the store,
+not merely the suspected run. Repair/reconcile under quiescence; never age-delete
+Pending to clear a retention failure.
 
 The store scan is bounded by `MAX_DIRECTORY_SCAN_ENTRIES` (default `100000`);
 a store with more entries refuses the sweep instead of scanning without
@@ -730,8 +765,12 @@ Admission records and run coordination locks are different mechanisms.
   targets, within the locked, trusted runs-dir boundary (also on Windows).
   Ordinary record opens remain no-follow and reject reparse points.
   Regular generated temps need verified age of at least 60 seconds, and exact
-  staging symlinks are unlinked without following them. Pending claims (even
-  expired), unexpired Ready, and corrupt/ambiguous records remain safe. Errors
+  staging symlinks are unlinked without following them. Pending is retired only
+  against an exact resolving Ready: publication/convergence additionally matches
+  the claim owner; due indexed expiry matches key, digest, run ID and generation
+  and removes/syncs that Pending before Ready. Publication retirement is
+  best-effort and never undoes committed Ready. Pending age alone never permits
+  deletion; ambiguous Pending and unexpired Ready remain untouched. Errors
   are warned with retryable evidence retained; corrupt discovery/index records
   require operator repair. Shutdown requests cancellation and joins the async
   resident; cancellation is cooperative between work items, not within blocking

@@ -15,19 +15,42 @@ pub(crate) fn run_identity_event<'a>(
         .ok_or_else(|| ServiceError::Invalid(format!("run `{run_dir}` has no run identity event")))
 }
 
-/// Selects the terminal runs a retention sweep collects.
-///
-/// Successful, canceled, and interrupted runs consume `keep`; failed runs
-/// consume only the separate `keep_failed` post-mortem budget, mirroring
-/// `runs gc`. A run past its journal-recorded retention window is always
-/// selected regardless of the counts. Unreadable or malformed candidates
-/// are logged and left untouched without stopping the sweep.
-///
-/// The returned directories are the selected runs, and their meaning depends
-/// on the mode: in delete mode they are the directories removed successfully,
-/// in dry-run mode they are the candidates the sweep would remove. A removal
-/// that fails is an error, never a reported removal.
+/// Select terminal runs by journal retention, then independent failed/other keep
+/// counts. Canonical idempotency references pin runs before selection; incomplete
+/// reference scans fail before deletion. Unreadable run candidates are skipped.
+/// Destructive calls acquire maintenance; existing holders use the lease method.
+/// Returns successfully removed directories, or candidates in dry-run mode.
 pub fn gc_run_directories(
+    runs_dir: &Utf8Path,
+    keep: usize,
+    keep_failed: usize,
+    delete: bool,
+    max_scan_entries: usize,
+) -> Result<Vec<Utf8PathBuf>, ServiceError> {
+    if delete {
+        if !runs_dir.try_exists()? {
+            return Ok(Vec::new());
+        }
+        return crate::try_lock_store_maintenance(runs_dir)?
+            .ok_or_else(|| ServiceError::Invalid("run store maintenance is busy; retry".into()))?
+            .gc_run_directories(keep, keep_failed, max_scan_entries);
+    }
+    sweep(runs_dir, keep, keep_failed, false, max_scan_entries)
+}
+
+impl crate::StoreMaintenanceLock {
+    /// Destructive sweep under this lease's store, without reacquiring it.
+    pub fn gc_run_directories(
+        &self,
+        keep: usize,
+        keep_failed: usize,
+        max_scan_entries: usize,
+    ) -> Result<Vec<Utf8PathBuf>, ServiceError> {
+        sweep(&self.1, keep, keep_failed, true, max_scan_entries)
+    }
+}
+
+fn sweep(
     runs_dir: &Utf8Path,
     keep: usize,
     keep_failed: usize,
@@ -39,6 +62,7 @@ pub fn gc_run_directories(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error.into()),
     };
+    let retained = crate::idempotency_refs::retained_runs(runs_dir, max_scan_entries)?;
     let now = chrono::Utc::now();
     let mut candidates = Vec::new();
     let mut scanned = 0_usize;
@@ -111,11 +135,11 @@ pub fn gc_run_directories(
     let mut kept_non_failed = 0_usize;
     let mut kept_failed = 0_usize;
     for (started_at, path) in candidates {
-        // A temporary interrupt terminal is not collectible until the entire
-        // preemption handoff ends, including the gap between execution leases.
-        // Probe admission, handoff, and execution ownership before charging a
-        // keep slot. Admission fences same-ID recreation; busy/changed runs
-        // must not evict older, genuinely terminal runs from the budget.
+        if path.file_name().is_some_and(|id| retained.contains(id)) {
+            continue;
+        }
+        // Probe admission/handoff/execution before charging keep slots.
+        // This excludes preemption gaps and same-ID recreation; never wait under maintenance.
         let protection = (|| {
             let Some(admission) = crate::run_dirs::try_lock_run_admission(&path)? else {
                 return Ok(None);
@@ -454,5 +478,30 @@ mod tests {
         );
         assert_eq!(deleted, vec![runs.join("valid")]);
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    #[test]
+    fn destructive_entry_points_require_maintenance_without_relocking() {
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-gc-lease-{}", uuid::Uuid::now_v7()));
+        let lease = crate::try_lock_store_maintenance(&runs).unwrap().unwrap();
+        assert!(super::gc_run_directories(&runs, 0, 0, true, 100).is_err());
+        assert!(
+            super::gc_run_directories(&runs, 0, 0, false, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(lease.gc_run_directories(0, 0, 100).unwrap().is_empty());
+        drop(lease);
+        assert!(
+            super::gc_run_directories(&runs, 0, 0, true, 100)
+                .unwrap()
+                .is_empty()
+        );
+        std::fs::remove_dir_all(runs).unwrap();
     }
 }

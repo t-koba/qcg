@@ -239,55 +239,41 @@ impl Drop for RunStoreLock {
 }
 
 pub(crate) fn lock_runs_directory(runs_dir: &Utf8Path) -> Result<RunStoreLock, ServiceError> {
-    std::fs::create_dir_all(runs_dir)?;
-    let lock_path = runs_dir.join(".service.lock");
-    let file = open_lock_file(&lock_path)?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(ServiceError::Invalid(format!(
-                "runs directory `{runs_dir}` is already owned by another qcg service"
-            )));
-        }
-        Err(std::fs::TryLockError::Error(error)) => return Err(ServiceError::Io(error)),
-    }
-    Ok(RunStoreLock(file))
+    lock_store(runs_dir, false)
 }
 
-/// Shared peers coexist; Exclusive mode waits until all release the same
-/// `.service.lock`, keeping the store modes mutually exclusive (E12c).
+/// Shared peers coexist on the same stable service-lock inode.
 pub(crate) fn lock_runs_directory_shared(
     runs_dir: &Utf8Path,
 ) -> Result<RunStoreLock, ServiceError> {
+    lock_store(runs_dir, true)
+}
+
+fn lock_store(runs_dir: &Utf8Path, shared: bool) -> Result<RunStoreLock, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
-    let lock_path = runs_dir.join(".service.lock");
-    let file = open_lock_file(&lock_path)?;
-    match file.try_lock_shared() {
+    let file = open_lock_file(&runs_dir.join(".service.lock"))?;
+    let result = if shared {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    };
+    match result {
         Ok(()) => Ok(RunStoreLock(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Err(ServiceError::Invalid(format!(
-            "runs directory `{runs_dir}` is exclusively owned by another qcg service"
-        ))),
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let ownership = if shared { "exclusively" } else { "already" };
+            Err(ServiceError::Invalid(format!(
+                "runs directory `{runs_dir}` is {ownership} owned by another qcg service"
+            )))
+        }
         Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
     }
 }
 
-/// Serializes admission (fresh prepare, incomplete-journal wipe, or
-/// adoption decision) for one run directory across processes. Two
-/// admissions for the same reserved run id must not race: the loser would
-/// otherwise wipe a live prepare or append a second `run_queued` event
-/// (E03).
-///
-/// The lock lives next to the run directory, never inside it: admission may
-/// wipe the run directory, and unlinking a locked file would let a later
-/// admission lock a fresh inode while this one still holds the old (E03).
-/// G03: coordination uses a fixed set of sharded lock files shared by many
-/// run ids (one file per shard, not per run), so lifetime admissions never
-/// accumulate entries in the runs directory. Same-run admissions map to the
-/// same shard and still exclude each other; distinct ids sharing a shard
-/// wait cancellably (see [`lock_run_admission`]). Legacy per-run `.admission-<digest>.lock` files from
-/// earlier releases are never created here and are ignored by every store
-/// scan (see [`is_store_coordination_name`]).
-pub(crate) struct RunAdmissionLock(File);
+/// Cross-process prepare/adopt serialization. Fixed FNV shards outside deletable
+/// run directories prevent stale-inode races and per-run lock accumulation.
+/// Collisions wait cancellably; admission checks identity only after acquisition.
+/// Legacy per-run lock files are ignored by scans and never created here.
+pub struct RunAdmissionLock(File);
 
 impl Drop for RunAdmissionLock {
     fn drop(&mut self) {
@@ -353,11 +339,9 @@ pub(crate) fn try_lock_run_admission(
     Ok(try_lock_run_shard(run_dir, ".admission-shards")?.map(RunAdmissionLock))
 }
 
-/// Retention/preemption rendezvous, outside the deletable run directory.
-/// Separate from admission: a long boundary drain must not stall admissions
-/// sharing a shard. Fixed shards bound store entries; they are never unlinked.
-/// Lock order is handoff then execution; GC probes admission first, then
-/// handoff and execution, never waiting on any lease.
+/// Permanent, bounded handoff shards outside deletable run directories.
+/// Separate from admission so long drains do not block it; order is handoff then
+/// execution (GC probes admission first), without waiting under maintenance.
 pub(crate) struct RunHandoffLock(File);
 
 impl Drop for RunHandoffLock {
@@ -376,17 +360,37 @@ pub(crate) async fn lock_run_handoff(
     run_dir: &Utf8Path,
     shutdown: &CancellationToken,
 ) -> Result<Option<RunHandoffLock>, ServiceError> {
+    wait_for_run_lock(run_dir, shutdown, try_lock_run_handoff, true).await
+}
+
+/// Admission probes once even after shutdown; handoff/execution stop before probing.
+/// A successful acquisition always transfers settlement responsibility to the caller.
+async fn wait_for_run_lock<T>(
+    run_dir: &Utf8Path,
+    shutdown: &CancellationToken,
+    probe: impl Fn(&Utf8Path) -> Result<Option<T>, ServiceError>,
+    stop_before_probe: bool,
+) -> Result<Option<T>, ServiceError> {
     loop {
-        if shutdown.is_cancelled() {
+        if stop_before_probe && shutdown.is_cancelled() {
             return Ok(None);
         }
-        if let Some(lock) = try_lock_run_handoff(run_dir)? {
+        if let Some(lock) = probe(run_dir)? {
             return Ok(Some(lock));
         }
         tokio::select! {
+            biased;
             _ = shutdown.cancelled() => return Ok(None),
             _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
         }
+    }
+}
+
+fn try_lock_file(file: File) -> Result<Option<File>, ServiceError> {
+    match file.try_lock() {
+        Ok(()) => Ok(Some(file)),
+        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
+        Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
     }
 }
 
@@ -402,45 +406,19 @@ fn try_lock_run_shard(run_dir: &Utf8Path, directory: &str) -> Result<Option<File
         .ok_or_else(|| ServiceError::Invalid(format!("run directory `{run_dir}` has no name")))?;
     let shard = run_coordination_shard_index(run_id);
     let file = open_lock_file(&shards_dir.join(format!("shard-{shard:02x}.lock")))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
-    }
+    try_lock_file(file)
 }
 
-/// H01: cancellable admission-shard acquisition.
-///
-/// A `None` from [`try_lock_run_admission`] is physical shard contention,
-/// not a same-run conflict: distinct run ids share 64 shards, so a busy
-/// shard must be waited on, not reported as "this run is already in
-/// progress". The caller distinguishes the semantic duplicate only after
-/// acquiring the shard, via the adoption/identity checks. The wait is
-/// async and shutdown-cancellable: `None` is returned when `shutdown` fires
-/// first, and the caller must refuse without starting any work (H01-03).
-/// Lock files are never unlinked and no blocking mutex is held across the
-/// wait, so cross-process holders still release on crash.
+/// Wait cancellably for the admission shard; contention is not a same-run conflict.
+/// Shutdown returns None without admitting work. Never unlink shard files.
 pub(crate) async fn lock_run_admission(
     run_dir: &Utf8Path,
     shutdown: &tokio_util::sync::CancellationToken,
 ) -> Result<Option<RunAdmissionLock>, ServiceError> {
-    loop {
-        match try_lock_run_admission(run_dir)? {
-            Some(lock) => return Ok(Some(lock)),
-            None => {
-                tokio::select! {
-                    _ = shutdown.cancelled() => return Ok(None),
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-                }
-            }
-        }
-    }
+    wait_for_run_lock(run_dir, shutdown, try_lock_run_admission, false).await
 }
 
-/// Execution ownership ends when the guard drops, not when the last copy
-/// of its file descriptor closes. A concurrent command spawn can inherit
-/// the descriptor across fork until exec closes it; relying on File's close
-/// alone can therefore leave a finished task's lease locked at requeue.
+/// Explicit unlock ends ownership despite fork/pre-exec descriptor inheritance.
 pub(crate) struct RunExecutionLock(File);
 
 impl Drop for RunExecutionLock {
@@ -449,31 +427,12 @@ impl Drop for RunExecutionLock {
     }
 }
 
-/// Waits for execution ownership when a caller must complete a durable
-/// handoff. Unlike ordinary probes, a transient competing lease must not
-/// abandon a yielded run in the in-memory Running state. Shutdown cancels
-/// the wait so preemption handoff work cannot pin the service's store lock.
+/// Complete durable handoff despite transient competition; shutdown cancels waiting.
 pub(crate) async fn lock_run_execution(
     run_dir: &Utf8Path,
     shutdown: &CancellationToken,
 ) -> Result<Option<RunExecutionLock>, ServiceError> {
-    loop {
-        if shutdown.is_cancelled() {
-            return Ok(None);
-        }
-        if let Some(lock) = try_lock_run_execution(run_dir)? {
-            // Acquisition transfers settlement responsibility to this
-            // caller. Do not drop a held lease merely because shutdown raced
-            // the successful lock attempt; the caller must settle or hand it
-            // off while ownership is still unambiguous.
-            return Ok(Some(lock));
-        }
-        tokio::select! {
-            biased;
-            _ = shutdown.cancelled() => return Ok(None),
-            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
-        }
-    }
+    wait_for_run_lock(run_dir, shutdown, try_lock_run_execution, true).await
 }
 
 pub(crate) fn try_lock_run_execution(
@@ -490,20 +449,11 @@ pub(crate) fn try_lock_existing_run_execution(
     run_dir: &Utf8Path,
 ) -> Result<Option<RunExecutionLock>, ServiceError> {
     let file = open_lock_file(&run_meta_dir(run_dir).join("execution.lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(RunExecutionLock(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
-    }
+    Ok(try_lock_file(file)?.map(RunExecutionLock))
 }
 
-/// Records which service process currently owns run execution in the
-/// execution-lease file itself, so shared-store peers can observe owner
-/// hand-offs without a separate channel (E12). The lease (flock) stays the
-/// authority: the claim is an advisory convergence hint read by
-/// `refresh_shared_runs`, which adopts it into memory on owner change. The
-/// claim is bounded and validated on read; malformed content reads as no
-/// claim, never as a foreign owner.
+/// Persist an advisory owner hint inside the lease file for shared-peer refresh.
+/// The file lock, not this bounded hint, remains authoritative.
 pub(crate) fn claim_run_execution_owner(
     lock: &RunExecutionLock,
     owner_id: &str,
@@ -518,11 +468,7 @@ pub(crate) fn claim_run_execution_owner(
     Ok(())
 }
 
-/// Reads the advisory execution-owner claim left by the current lease
-/// holder, if any. Returns `None` when the file is missing, unreadable,
-/// empty, or malformed: an unscannable claim is no evidence about
-/// ownership, so callers keep their current owner instead of guessing
-/// (E12). Never follows a symlink (E01).
+/// Read a bounded advisory owner hint; missing, linked or malformed means unknown.
 pub(crate) fn read_run_execution_owner(run_dir: &Utf8Path) -> Option<String> {
     let path = run_meta_dir(run_dir).join("execution.lock");
     let meta = std::fs::symlink_metadata(&path).ok()?;
@@ -554,7 +500,7 @@ pub(crate) fn read_run_execution_owner(run_dir: &Utf8Path) -> Option<String> {
 
 /// Store-wide maintenance ownership. Explicitly unlock on drop because a
 /// concurrent fork may temporarily retain the descriptor until exec.
-pub struct StoreMaintenanceLock(File);
+pub struct StoreMaintenanceLock(File, pub(crate) Utf8PathBuf);
 
 impl Drop for StoreMaintenanceLock {
     fn drop(&mut self) {
@@ -568,11 +514,7 @@ pub fn try_lock_store_maintenance(
 ) -> Result<Option<StoreMaintenanceLock>, ServiceError> {
     std::fs::create_dir_all(runs_dir)?;
     let file = open_lock_file(&runs_dir.join(".maintenance.lock"))?;
-    match file.try_lock() {
-        Ok(()) => Ok(Some(StoreMaintenanceLock(file))),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(error)) => Err(ServiceError::Io(error)),
-    }
+    Ok(try_lock_file(file)?.map(|file| StoreMaintenanceLock(file, runs_dir.to_owned())))
 }
 
 pub(crate) fn prepare_api_run_directory(run_dir: &Utf8Path) -> Result<(), ServiceError> {
@@ -781,7 +723,7 @@ fn populate_checkpoint_fork(
         // and blob store are attacker-influenced, so path-based
         // symlink_metadata-then-open would TOCTOU through a swapped symlink
         // (E06).
-        verify_source_digest_nofollow(&source_blob, &digest, &path)?;
+        verified_source(&source_blob, &digest, &path)?;
         // Atomic copy via temp + rename with post-copy verification. The
         // bytes come from the verified handle, never a second path open.
         // The repeated hashes below (tmp, destination, blob store) are
@@ -834,7 +776,7 @@ fn populate_checkpoint_fork(
         if regular_file_exists(&target_blob)? {
             // An existing blob is never trusted blindly: verify it like the
             // freshly copied ones so a corrupted store cannot seed a fork.
-            verify_source_digest_nofollow(&target_blob, digest, path)?;
+            verified_source(&target_blob, digest, path)?;
             continue;
         }
         let source_blob = source_meta.join("checkpoint-blobs").join(digest);
@@ -843,7 +785,7 @@ fn populate_checkpoint_fork(
                 "checkpoint blob `{digest}` for `{path}` is missing; refusing the fork"
             )));
         }
-        verify_source_digest_nofollow(&source_blob, digest, path)?;
+        verified_source(&source_blob, digest, path)?;
         // Stage through a temp plus rename, never directly at the final
         // path: a crash mid-copy must leave no partial blob that later
         // verifies as fixed corruption (E03/E06).
@@ -1004,58 +946,32 @@ fn regular_file_exists(path: &Utf8Path) -> Result<bool, ServiceError> {
     }
 }
 
-/// Opens a checkpoint source without following symlinks and validates the
-/// open handle itself is a regular file. Path-based `symlink_metadata`
-/// checks alone TOCTOU through a symlink swapped between the check and the
-/// open/hash/copy, so the O_NOFOLLOW handle is authoritative on Unix (E06).
-#[cfg(unix)]
+/// No-follow checkpoint source; validate the opened handle as well as the path.
+/// Non-Unix retains a pre-open symlink probe, not a race-safe guarantee.
 fn open_regular_file_nofollow(path: &Utf8Path) -> Result<std::fs::File, ServiceError> {
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                ServiceError::Invalid(format!("checkpoint path `{path}` is missing"))
-            } else {
-                ServiceError::Io(error)
-            }
-        })?;
-    let metadata = file.metadata().map_err(ServiceError::Io)?;
-    if !metadata.is_file() {
+    let map_error = |error: std::io::Error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            ServiceError::Invalid(format!("checkpoint path `{path}` is missing"))
+        } else {
+            ServiceError::Io(error)
+        }
+    };
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .map_err(map_error)?
+        .file_type()
+        .is_symlink()
+    {
         return Err(ServiceError::Invalid(format!(
-            "checkpoint path `{path}` is not a regular file"
+            "checkpoint path `{path}` is a symbolic link"
         )));
     }
-    Ok(file)
-}
-
-/// Non-Unix open: no O_NOFOLLOW, so the pre-open symlink probe plus the
-/// handle type check is the whole defense. Symlinked sources are refused
-/// before the handle is used (E06). Residual boundary: a swap between the
-/// probe and the open remains by platform necessity; deployments with
-/// untrusted concurrent writers must use Unix (E06).
-#[cfg(not(unix))]
-fn open_regular_file_nofollow(path: &Utf8Path) -> Result<std::fs::File, ServiceError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ServiceError::Invalid(format!(
-                "checkpoint path `{path}` is a symbolic link"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) => {
-            if error.kind() == std::io::ErrorKind::NotFound {
-                return Err(ServiceError::Invalid(format!(
-                    "checkpoint path `{path}` is missing"
-                )));
-            }
-            return Err(ServiceError::Io(error));
-        }
-    }
-    let file = std::fs::File::open(path).map_err(ServiceError::Io)?;
-    let metadata = file.metadata().map_err(ServiceError::Io)?;
-    if !metadata.is_file() {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW);
+    let file = options.open(path).map_err(map_error)?;
+    if !file.metadata()?.is_file() {
         return Err(ServiceError::Invalid(format!(
             "checkpoint path `{path}` is not a regular file"
         )));
@@ -1083,11 +999,11 @@ fn hash_opened_file(file: &mut std::fs::File) -> Result<String, ServiceError> {
 /// Verifies a checkpoint source digest through its O_NOFOLLOW handle. The
 /// digest comparison happens on handle-read bytes, never a second path
 /// open that could follow a swapped link (E06).
-fn verify_source_digest_nofollow(
+fn verified_source(
     source: &Utf8Path,
     expected_digest: &str,
     path_label: &Utf8Path,
-) -> Result<(), ServiceError> {
+) -> Result<File, ServiceError> {
     let mut handle = open_regular_file_nofollow(source)?;
     let actual = hash_opened_file(&mut handle)?;
     if actual != expected_digest {
@@ -1095,15 +1011,10 @@ fn verify_source_digest_nofollow(
             "checkpoint blob `{expected_digest}` for `{path_label}` failed integrity verification"
         )));
     }
-    Ok(())
+    Ok(handle)
 }
 
-/// Copies verified source bytes from the O_NOFOLLOW handle to a fresh temp
-/// path. Reading from the handle (not a second path open) keeps the copy
-/// bound to the verified bytes (E06). Staging uses `sync_all` (content plus
-/// metadata), the same durability bar as cancel temps and the fork journal:
-/// checkpoint blobs are executable inputs, so a power loss must not leave a
-/// staged temp whose content never reached the disk.
+/// Copy from a verified no-follow handle into an exclusive, synced temp file.
 fn copy_source_handle_to_tmp(
     source: &Utf8Path,
     tmp: &Utf8Path,
@@ -1111,13 +1022,7 @@ fn copy_source_handle_to_tmp(
     path_label: &Utf8Path,
 ) -> Result<(), ServiceError> {
     use std::io::Seek as _;
-    let mut handle = open_regular_file_nofollow(source)?;
-    let actual = hash_opened_file(&mut handle)?;
-    if actual != expected_digest {
-        return Err(ServiceError::Invalid(format!(
-            "checkpoint blob `{expected_digest}` for `{path_label}` failed integrity verification"
-        )));
-    }
+    let mut handle = verified_source(source, expected_digest, path_label)?;
     handle.rewind().map_err(ServiceError::Io)?;
     let mut tmp_file = std::fs::OpenOptions::new()
         .write(true)
@@ -1130,39 +1035,20 @@ fn copy_source_handle_to_tmp(
     Ok(())
 }
 
-/// Reuses an already-verified blob for a repeated digest without touching
-/// the source again: the target blob store is the verified copy, so the
-/// second path projects from it and only the fresh workspace file is
-/// hashed (E06). Staging uses `sync_all` like `copy_source_handle_to_tmp`:
-/// workspace inputs share the same durability bar as cancel temps (E06).
+/// Project a verified target-store blob through the same synced staging path.
+/// Verify both copy and committed destination, without reopening the original source.
 fn copy_verified_blob_to_workspace(
     verified_blob: &Utf8Path,
     destination: &Utf8Path,
     path_label: &Utf8Path,
     expected_digest: &str,
 ) -> Result<(), ServiceError> {
-    use std::io::Seek as _;
-    let mut handle = open_regular_file_nofollow(verified_blob)?;
-    let actual = hash_opened_file(&mut handle)?;
-    if actual != expected_digest {
-        return Err(ServiceError::Invalid(format!(
-            "checkpoint blob `{expected_digest}` for `{path_label}` failed integrity verification"
-        )));
-    }
-    handle.rewind().map_err(ServiceError::Io)?;
     let tmp = destination.with_file_name(format!(
         ".{}.part-{}",
         destination.file_name().unwrap_or("blob"),
         uuid::Uuid::now_v7().as_simple()
     ));
-    let mut tmp_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
-        .map_err(ServiceError::Io)?;
-    std::io::copy(&mut handle, &mut tmp_file).map_err(ServiceError::Io)?;
-    tmp_file.sync_all().map_err(ServiceError::Io)?;
-    drop(tmp_file);
+    copy_source_handle_to_tmp(verified_blob, &tmp, expected_digest, path_label)?;
     if files::hash_file_sha256(&tmp, None).map(|(hex, _)| hex)? != expected_digest {
         let _ = std::fs::remove_file(&tmp);
         return Err(ServiceError::Invalid(format!(
@@ -1185,29 +1071,10 @@ pub(crate) fn journal_is_empty(path: &Utf8Path) -> std::io::Result<bool> {
     Ok(std::fs::metadata(path)?.len() == 0)
 }
 
-/// Decides whether a reserved run id binds to an existing run directory
-/// left by a crashed idempotency owner. Adoption requires the journal to
-/// fold to the same run id AND to hold that run's own `run_queued` event:
-/// only a completed admission is resumed. A partial attempt (crash
-/// mid-prepare, before `run_queued`) is wiped for a deterministic redo.
-/// A fork's copied checkpoint journal carries the source's `run_queued`
-/// (rewritten to the fork id) before its own admission event, so a
-/// `run_queued` only counts when sequenced after every `run_forked` event:
-/// otherwise a partial fork would be mistaken for a completed admission.
-/// Identity chain: directory name = reserved run id = pending claim run id,
-/// and the claim only issues one run id per key and digest, so wiping here
-/// can never destroy foreign data. Anything else fails closed.
-/// Removes an incomplete run directory while preserving its cancel
-/// mailbox. A cancel that landed before any journal existed (racing a
-/// fresh start, or a retry after a crash between preparation and
-/// admission) is still a live request: wiping it with the partial
-/// directory would lose the cancellation, so `meta/control` survives and
-/// drains into the fresh run (E03).
-/// Sidecar disposition: only `meta/control` is kept. `meta/idempotency.json`
-/// and `checkpoint-blobs` are removed because an incomplete directory has
-/// no completed admission and no completed execution, so no valid orphan
-/// pointer or pinned blob can exist yet; anything present is partial
-/// damage from the crashed attempt (E03).
+/// Wipe an incomplete admission under its admission lease, keeping meta/control.
+/// Cancel publication can race preparation, so never remove the whole directory.
+/// Partial idempotency sidecars/blobs carry no completed admission and are removed;
+/// host-cgroup evidence instead refuses the wipe until exclusively reconciled.
 fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
     use crate::summaries::run_meta_dir;
     let binding = engine::host_cgroup::binding_path(&run_meta_dir(run_dir));
@@ -1221,11 +1088,7 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
         }
     }
     let keep = run_meta_dir(run_dir).join("control");
-    // Pin the keep path without following symlinks (E01): `read_dir`
-    // follows a symlinked control directory while publish pins O_NOFOLLOW,
-    // so the wipe must lstat the keep path and refuse a symlinked mailbox
-    // instead of deleting through it. `exists()` would follow the link and
-    // misread a swapped mailbox as absent.
+    // Refuse linked mailboxes, including swaps; never follow them during wiping.
     match std::fs::symlink_metadata(&keep) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(ServiceError::Invalid(format!(
@@ -1236,24 +1099,9 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(ServiceError::Io(error)),
     }
-    // Never use a whole-directory remove here: a cancel published between
-    // the existence probe and the removal would already have been
-    // acknowledged, and deleting it would lose a successful request (E01).
-    // Enumerated deletion only removes entries observed at scan time, so a
-    // concurrently published mailbox survives and drains later.
-    // Callers hold the per-run admission lock and re-validate the journal
-    // immediately before calling: no concurrent admission can complete a
-    // journal while the wipe runs, so the wipe never deletes a live
-    // admission (E03).
-    // Deletes every entry under `dir` except `keep` itself; directories
-    // containing `keep` are entered instead of removed, so the mailbox
-    // survives while every partial artifact is removed. `symlink_metadata`
-    // never reports a link as a dir, so links are removed as links and
-    // never followed (E03).
+    // Enumerated no-follow deletion preserves concurrent mailbox publication.
+    // Recurse only into real ancestors of keep; remove links as links.
     fn wipe_except(dir: &Utf8Path, keep: &Utf8Path) -> Result<(), ServiceError> {
-        // Every scan uses `symlink_metadata` (never `metadata`/`exists`):
-        // symlinks are removed as links and never followed, matching the
-        // publish O_NOFOLLOW pin (E01).
         let entries = match std::fs::read_dir(dir) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -1265,9 +1113,7 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
                 ServiceError::Invalid(format!("run path is not UTF-8: {}", path.display()))
             })?;
             if path == keep {
-                // Re-lstat the keep path without following: a symlink
-                // swapped in after the outer check must fail closed instead
-                // of being preserved as a foreign mailbox (E01).
+                // Revalidate against swaps since the outer probe.
                 match std::fs::symlink_metadata(&path) {
                     Ok(meta) if meta.file_type().is_symlink() => {
                         return Err(ServiceError::Invalid(format!(
@@ -1279,10 +1125,7 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
                     Err(error) => return Err(ServiceError::Io(error)),
                 }
             }
-            // Inspection failures fail the wipe instead of guessing
-            // file-vs-dir: removing a directory as a file (or vice versa)
-            // would either fail confusingly or miss content (E03). A
-            // vanished entry races a concurrent cleanup; skip it.
+            // Vanished entries are races; other inspection failures must surface.
             let is_real_dir = match std::fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata.is_dir(),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1299,23 +1142,15 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
         Ok(())
     }
     wipe_except(run_dir, &keep)?;
-    // When no mailbox exists the wipe must leave no trace for a
-    // deterministic redo: remove newly-emptied directories, ignoring
-    // races where a concurrent publisher repopulated them (E01/E03).
-    // `remove_dir` only removes empty directories, so a concurrently
-    // published mailbox survives. The probe uses `symlink_metadata`
-    // (no-follow): `exists()` would follow a swapped link and misread a
-    // symlinked mailbox as absent (E01).
+    // Remove only empty directories; concurrent mailbox publication survives.
+    // No-follow probing must not mistake a linked mailbox for absence.
     let keep_missing = match std::fs::symlink_metadata(&keep) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
         Ok(_) => false,
         Err(error) => return Err(ServiceError::Io(error)),
     };
     if keep_missing {
-        // Best-effort: a concurrent publisher repopulating the directory
-        // or a mid-wipe failure only leaves an empty directory behind for
-        // the next admission to adopt-or-wipe again. Removal failures warn
-        // instead of failing the wipe (E01/E03).
+        // Cleanup failure leaves an adoptable directory; warn without losing the mailbox.
         let meta = run_meta_dir(run_dir);
         if let Err(error) = std::fs::remove_dir(meta.as_std_path()) {
             tracing::warn!(dir = %meta, %error, "incomplete wipe left an empty meta directory");
@@ -1327,10 +1162,7 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
     Ok(())
 }
 
-/// Adoption plus the single journal snapshot the admission reuses for its
-/// seed, queue instant, and state fold, so start and fork admissions read
-/// the journal once instead of scanning per field (E03). The fold is done
-/// here, so seed derivation must not fold the same events again.
+/// Reusable admission snapshot: events, seed/queue inputs and one state fold.
 pub(crate) struct AdoptSnapshot {
     pub(crate) adopted: bool,
     pub(crate) events: Vec<Value>,
@@ -1351,6 +1183,9 @@ impl AdoptSnapshot {
     }
 }
 
+/// Adopt only the reserved identity with its own run_queued after all run_forked
+/// events. Copied fork history is not completed admission. Partial preparation
+/// is wiped with its cancel mailbox preserved; foreign identities fail closed.
 pub(crate) fn try_adopt_run_dir_with_snapshot(
     run_dir: &Utf8Path,
     run_id: &str,
@@ -1374,8 +1209,7 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     let metadata_dir = run_meta_dir(run_dir);
     match std::fs::symlink_metadata(&metadata_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // No metadata directory after a crash between preparation and
-            // admission: wipe everything but the cancel mailbox (E03).
+            // Incomplete preparation: preserve the cancel mailbox.
             wipe_incomplete_run_dir(run_dir)?;
             return Ok(AdoptSnapshot::empty());
         }
@@ -1388,15 +1222,10 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
         Err(error) => return Err(ServiceError::Io(error)),
     }
     let journal_path = metadata_dir.join("journal.jsonl");
-    // The leaf is checked with `symlink_metadata` before its contents are read.
-    // One metadata stat serves the whole empty-journal probe (E03): every
-    // caller holds the per-run admission lock, so no concurrent admission
-    // can complete this journal while the probe runs.
+    // No-follow metadata suffices under admission ownership.
     match std::fs::symlink_metadata(&journal_path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // No journal with a possibly dirty workspace from a crash
-            // between directory preparation and admission: wipe everything
-            // but the cancel mailbox (E03).
+            // Incomplete preparation: preserve the cancel mailbox.
             wipe_incomplete_run_dir(run_dir)?;
             return Ok(AdoptSnapshot::empty());
         }
@@ -1406,16 +1235,14 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
             )));
         }
         Ok(metadata) if metadata.len() == 0 => {
-            // An empty journal with workspace remnants is the same partial
-            // state: wipe the directory but not the mailbox (E03).
+            // Empty preparation: preserve the cancel mailbox.
             wipe_incomplete_run_dir(run_dir)?;
             return Ok(AdoptSnapshot::empty());
         }
         Ok(_) => {}
         Err(error) => return Err(ServiceError::Io(error)),
     }
-    // One journal read serves both the state fold and the admission-event
-    // scan below: adoption never pays a scan per check (E03).
+    // Reuse one read for folding and admission identity.
     let events = read_events_from_meta(&run_meta_dir(run_dir))?;
     let state =
         RunState::fold_values(&events).map_err(|error| ServiceError::Invalid(error.to_string()))?;
@@ -1432,11 +1259,7 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
             )));
         }
     }
-    // A fork checkpoint copy carries the source's `run_queued` (with the
-    // fork id stamped on) ahead of a `run_forked` marker: only a
-    // `run_queued` sequenced after every `run_forked` event is the fork's
-    // own admission. A journal without any `run_forked` accepts any
-    // matching `run_queued`.
+    // Only an admission after the last fork marker completes this run.
     let last_fork_seq = events
         .iter()
         .filter(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
@@ -1453,13 +1276,7 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
             })
     });
     if !initialized {
-        // A partial fork or a journal without this run's own admission
-        // is wiped directly with no second read (E03): every caller holds
-        // the per-run admission lock, which serializes prepare/wipe/adopt
-        // for one run id, so no concurrent admission can complete a journal
-        // for this directory while this probe runs. Execution appends
-        // (non-admission writers) never create `run_queued`, so they cannot
-        // flip this verdict either (E03).
+        // Under admission ownership, non-admission writers cannot change this verdict.
         wipe_incomplete_run_dir(run_dir)?;
         return Ok(AdoptSnapshot::empty());
     }

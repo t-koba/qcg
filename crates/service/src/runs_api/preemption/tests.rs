@@ -100,15 +100,10 @@ days = 0
         .unwrap()
         .unwrap();
     assert!(
-        crate::summaries::gc_run_directories(
-            &service.inner.runs_dir,
-            0,
-            0,
-            true,
-            policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES
-        )
-        .unwrap()
-        .is_empty()
+        maintenance
+            .gc_run_directories(0, 0, policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES)
+            .unwrap()
+            .is_empty()
     );
     drop(maintenance);
     assert!(run_dir.is_dir());
@@ -182,14 +177,9 @@ async fn gc_first_preemption_cannot_recreate_deleted_metadata() {
     let maintenance = crate::run_dirs::try_lock_store_maintenance(&service.inner.runs_dir)
         .unwrap()
         .unwrap();
-    let deleted = crate::summaries::gc_run_directories(
-        &service.inner.runs_dir,
-        0,
-        0,
-        true,
-        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
-    )
-    .unwrap();
+    let deleted = maintenance
+        .gc_run_directories(0, 0, policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES)
+        .unwrap();
     drop(maintenance);
     assert_eq!(deleted, vec![run_dir.clone()]);
     assert!(!run_dir.exists());

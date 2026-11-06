@@ -8,7 +8,7 @@ use crate::run_dirs::{
     write_run_event,
 };
 use crate::summaries::{
-    fold_run_state, gc_run_directories, has_remote_cancel_request, read_merged_events_from_meta,
+    fold_run_state, has_remote_cancel_request, read_merged_events_from_meta,
     read_optional_output_manifest, refresh_runs, rehydrate_runs, run_meta_dir, run_workspace_dir,
 };
 use crate::types::{
@@ -1095,10 +1095,7 @@ impl LocalService {
             .map_err(|error| ServiceError::Invalid(error.to_string()))
     }
 
-    /// Retention sweep. Lease contention (another process owns the sweep)
-    /// is a normal skip. Every other lease or sweep failure propagates as
-    /// Err so the GC task retries boundedly and then ends visibly instead
-    /// of looping silently as Ok (E05).
+    /// Skip busy maintenance; propagate other failures for bounded GC retry.
     pub(crate) async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
         let directory = self.inner.runs_dir.clone();
         let policy = self.inner.deployment_policy;
@@ -1107,11 +1104,9 @@ impl LocalService {
                 let Some(lock) = try_lock_store_maintenance(&directory)? else {
                     return Ok(None);
                 };
-                let deleted = gc_run_directories(
-                    &directory,
+                let deleted = lock.gc_run_directories(
                     policy.gc_keep,
                     policy.gc_keep_failed,
-                    true,
                     policy.max_directory_scan_entries,
                 )?;
                 Ok(Some((lock, deleted)))
@@ -1127,8 +1122,8 @@ impl LocalService {
             // A directory deleted by this protected GC pass was terminal on
             // disk under both leases even if the local task-completion path
             // has not yet converged its in-memory status.
-            if (deleted.contains(&record.run_dir) && !is_regular_directory(&record.run_dir)?)
-                || (record.state.is_terminal() && !is_regular_directory(&record.run_dir)?)
+            if (deleted.contains(&record.run_dir) || record.state.is_terminal())
+                && !is_regular_directory(&record.run_dir)?
             {
                 removed.push(id.clone());
             }
