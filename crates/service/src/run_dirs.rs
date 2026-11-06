@@ -1551,15 +1551,8 @@ pub(crate) fn control_dir(run_dir: &Utf8Path) -> Utf8PathBuf {
 /// A live publisher's temp is fresh, so the scanner side never touches it.
 const CANCEL_TMP_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// Opens the cancel control directory and pins it with
-/// `O_DIRECTORY | O_NOFOLLOW` (Unix) so every later staging operation is
-/// bound to the same directory inode: a symlink swapped in after
-/// `create_dir_all` cannot redirect temp creation or publication (E01). The
-/// handle must stay alive across staging and publication; temps are created
-/// with `openat` relative to it and the publish rename runs between two
-/// names in the same directory fd. Opening with `O_DIRECTORY | O_NOFOLLOW`
-/// already refuses non-directories and symlinks atomically: no
-/// check-then-use window remains.
+/// Pin the mailbox inode with O_DIRECTORY | O_NOFOLLOW; staging and Linux
+/// publication use directory-relative names to resist pathname swaps.
 #[cfg(unix)]
 fn open_control_dir_pinned(dir: &Utf8Path) -> Result<File, ServiceError> {
     std::fs::create_dir_all(dir)?;
@@ -1570,11 +1563,7 @@ fn open_control_dir_pinned(dir: &Utf8Path) -> Result<File, ServiceError> {
         .map_err(ServiceError::Io)
 }
 
-/// Creates one cancel staging temp relative to a pinned control-directory
-/// fd (openat semantics): no staging pathname is resolved, so a directory
-/// swap after the pin cannot redirect the create (E01). The temp is
-/// owner-only (0600) from creation, so no umask window exposes it. `EEXIST`
-/// surfaces as `AlreadyExists` for the collision retry below.
+/// Create an owner-only, no-follow temp relative to the pin; EEXIST retries.
 #[cfg(unix)]
 fn create_cancel_temp_at(dir_fd: &File, name: &str) -> Result<File, ServiceError> {
     let owned = std::ffi::CString::new(name)
@@ -1595,10 +1584,7 @@ fn create_cancel_temp_at(dir_fd: &File, name: &str) -> Result<File, ServiceError
     Ok(unsafe { File::from_raw_fd(raw) })
 }
 
-/// Removes one cancel staging temp relative to a pinned control-directory
-/// fd, so cleanup cannot stray after a directory swap (E01). Returns the
-/// unlink result so callers warn on failure like the non-Unix path: silent
-/// cleanup would hide a leaked temp that later blocks a fresh publish (E01).
+/// Unlink relative to the pin; callers surface cleanup failures.
 #[cfg(unix)]
 fn remove_cancel_temp_at(dir_fd: &File, name: &str) -> std::io::Result<()> {
     let Ok(owned) = std::ffi::CString::new(name) else {
@@ -1620,35 +1606,33 @@ pub(crate) fn request_remote_cancel(
     run_id: &str,
     requester: &str,
 ) -> Result<String, ServiceError> {
+    let operation_id = uuid::Uuid::now_v7().to_string();
+    request_remote_cancel_with_id(run_dir, run_id, requester, &operation_id)?;
+    Ok(operation_id)
+}
+
+/// Returns whether this call published new evidence. Attribution and timestamp
+/// belong to the first publisher; a retry only checks the logical identity.
+pub(crate) fn request_remote_cancel_with_id(
+    run_dir: &Utf8Path,
+    run_id: &str,
+    requester: &str,
+    operation_id: &str,
+) -> Result<bool, ServiceError> {
+    if !uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id) {
+        return Err(ServiceError::Invalid(
+            "invalid cancel operation identity".into(),
+        ));
+    }
     let dir = control_dir(run_dir);
-    // Regression guards for the three cancel-mailbox windows (E01), all
-    // closed in the current pin structure:
-    // - control-dir check-then-temp-open: closed by fd-pinning below.
-    //   `open_control_dir_pinned` (O_DIRECTORY|O_NOFOLLOW) anchors temp
-    //   creation (`openat`) and publication (`renameat2`/`link`), so no
-    //   staging pathname is resolved after the pin and a directory swap
-    //   cannot redirect the create or publish.
-    // - unsynced temp utime: closed by the synced mtime refresh
-    //   below (`set_modified` + `sync_all` before the write, and the write
-    //   itself ends with `sync_all`). A crash between refresh and publish
-    //   cannot leave a fresh-looking temp whose content never reached disk.
-    // - lock-release-before-rename: closed by holding the stage
-    //   lock across publication (the `&file` borrow in the publish call).
-    //   The reaper only touches stale AND unlocked temps, so releasing
-    //   before the rename would open a fresh/stale-flip window; holding
-    //   through the rename pins the published inode only briefly.
-    // Pin the control directory before any staging path is used (Unix): the
-    // fd below anchors temp creation (openat) and publication (renameat2),
-    // closing the create_dir_all/symlink_metadata-check/temp-open TOCTOU
-    // (E01).
+    // Pin before staging: Unix opens, publication, and retry reads stay
+    // relative to this inode even if the pathname is swapped.
     #[cfg(unix)]
     let control_fd = open_control_dir_pinned(&dir)?;
     #[cfg(not(unix))]
     {
         std::fs::create_dir_all(&dir)?;
-        // The control directory itself must not be a symlink:
-        // `create_dir_all` follows links, so verify after creation and
-        // refuse to publish through a swapped path (E01).
+        // create_dir_all follows links: refuse a symlinked mailbox.
         match std::fs::symlink_metadata(&dir) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 return Err(ServiceError::Invalid(format!(
@@ -1658,27 +1642,20 @@ pub(crate) fn request_remote_cancel(
             Ok(_) => {}
             Err(error) => return Err(ServiceError::Io(error)),
         }
-        // Non-Unix has no O_DIRECTORY|O_NOFOLLOW: the open below plus an
-        // immediate re-metadata check is the whole defense, and a residual
-        // pathname window remains between creation and publication.
-        // Deployments that allow untrusted concurrent writers to the control
-        // directory are unsupported on non-Unix and must use Unix (E01).
+        // Non-Unix pathname races remain: untrusted concurrent writers are
+        // unsupported; use Unix for pinned-directory publication and cleanup.
     }
-    // Single sweep lives on the drain path (`list_pending_cancel_controls`);
-    // sweeping here as well would double-scan every publish (E01).
-    // A leftover temp with a fresh uuid is impossible without a planted
-    // name collision, so on collision retry with a fresh id instead of
-    // overwriting foreign bytes (E01).
+    // Sweeping stays on the drain path. Temp collisions retry fresh names,
+    // never change the stable operation identity or overwrite foreign bytes.
     let mut attempts = 0;
-    let (operation_id, temporary, path, mut file) = loop {
+    let (temporary, path, mut file) = loop {
         if attempts >= 3 {
             return Err(ServiceError::Invalid(
                 "cancel staging collided repeatedly; refusing to overwrite".into(),
             ));
         }
         attempts += 1;
-        let operation_id = uuid::Uuid::now_v7().to_string();
-        let temporary = dir.join(format!(".cancel-{operation_id}.tmp"));
+        let temporary = dir.join(format!(".cancel-{}.tmp", uuid::Uuid::now_v7()));
         let open_result = {
             #[cfg(unix)]
             {
@@ -1694,10 +1671,7 @@ pub(crate) fn request_remote_cancel(
                     .write(true)
                     .create_new(true)
                     .open(&temporary);
-                // Re-validate immediately: without O_NOFOLLOW a symlink
-                // planted in the create/open window would have been followed.
-                // Fail closed on any link; a residual pathname race remains
-                // (documented above).
+                // Recheck after open; non-Unix retains a pathname race.
                 match file {
                     Ok(file) => match std::fs::symlink_metadata(&temporary) {
                         Ok(meta) if meta.file_type().is_symlink() => {
@@ -1719,9 +1693,7 @@ pub(crate) fn request_remote_cancel(
         match open_result {
             Ok(file) => {
                 let path = dir.join(format!("cancel-{operation_id}.json"));
-                // `temporary` is reused from above: recomputing the join
-                // would risk divergence, so move the same value (E01).
-                break (operation_id, temporary, path, file);
+                break (temporary, path, file);
             }
             Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 tracing::warn!(path = %temporary, "cancel staging collision; retrying with a fresh id");
@@ -1738,17 +1710,10 @@ pub(crate) fn request_remote_cancel(
         "ts": chrono::Utc::now().to_rfc3339(),
     });
     let bytes = serde_json::to_vec(&payload)?;
-    // Stage the complete record in a name the scanner ignores, sync it,
-    // then publish by rename. A reader can only observe a complete cancel
-    // request or no request at all, never a torn one that a scanner would
-    // misread as corruption and delete (E01). The temp is exclusively
-    // locked for the whole stage so a reaper can tell a live publisher
-    // from an abandoned temp without trusting mtimes alone (E01).
+    // Readers ignore staging names. Hold the exclusive stage lock through
+    // sync and publication so the stale/unlocked-temp reaper cannot race us.
     let cleanup_unpublished = |temporary: &Utf8Path| {
-        // Warn on both platforms: a leaked staging temp blocks no future
-        // publish (fresh UUIDs) but hides a partially written request that
-        // the reaper must still handle, so silence on either path would
-        // diverge cleanup visibility (E01).
+        // Leaked staging is reclaimable, but cleanup errors must be visible.
         #[cfg(unix)]
         {
             if let Some(name) = temporary.file_name()
@@ -1772,14 +1737,8 @@ pub(crate) fn request_remote_cancel(
         cleanup_unpublished(&temporary);
         return Err(ServiceError::Io(error));
     }
-    // Refresh the temp mtime while holding the exclusive lock so a reaper
-    // cannot mistake a live publisher for a stale temp even under clock
-    // skew: the age gate only applies to unlocked temps (E01). A refresh
-    // failure means the premise is gone, so fail the publish instead of
-    // continuing with a temp that looks abandoned. The refreshed mtime is
-    // synced before publication: a crash between refresh and publish must
-    // not leave a fresh-looking temp whose content never reached the disk,
-    // and the write below syncs content plus metadata together (E01).
+    // Refresh and sync mtime under the lock before writing: a crash must
+    // not leave fresh-looking staging whose content was never synced.
     if let Err(error) = file
         .set_modified(std::time::SystemTime::now())
         .and_then(|()| file.sync_all())
@@ -1793,53 +1752,117 @@ pub(crate) fn request_remote_cancel(
             return Err(ServiceError::Io(error));
         }
     }
-    // The stage lock stays held across publication below (the `&file` borrow
-    // in the publish call): the reaper only touches stale AND unlocked
-    // temps, and this temp is seconds old, so holding the lock through the
-    // rename only pins the published inode briefly until this function
-    // returns. Releasing before the rename instead would open a
-    // fresh/stale-flip window where the age gate could reap a temp that is
-    // about to be published (E01).
-    // Publish with no-overwrite semantics: the operation id is a fresh
-    // UUIDv7, so an existing destination means a planted file or a UUID
-    // collision. Overwriting it would destroy a previous request (E01).
+    // Never overwrite accepted evidence. Publication removes the staging temp
+    // on failure; an existing destination is reusable only after a pinned,
+    // bounded, no-follow read proves the same logical operation.
     #[cfg(target_os = "linux")]
-    publish_cancel_control(&control_fd, &temporary, &path, &file)?;
+    let published = publish_cancel_control(&control_fd, &temporary, &path, &file);
     #[cfg(not(target_os = "linux"))]
-    publish_cancel_control(&dir, &temporary, &path, &file)?;
-    // The rename is the publication: a later dir-sync failure only affects
-    // power-loss durability (outside the Q2 process-crash boundary; the
-    // staged payload itself was already synced with sync_all before the
-    // rename), so it warns instead of reporting Err. Reporting Err here
-    // would make the caller retry with a fresh operation id and journal a
-    // duplicate cancel for one published request. Callers of this function
-    // (remote-cancel admission) cannot turn a post-publish sync failure
-    // into a refusal without risking exactly that duplication, hence
-    // warn-only by necessity, not by optimism (E01).
-    // Q2 boundary: if power loss drops the directory entry, the next boot
-    // observes the request as absent and a client retry re-publishes under
-    // a fresh operation id; duplicate journaling is prevented by the
-    // cancel-drain idempotence, not by this sync. Process-crash (SIGKILL)
-    // durability is unaffected because the payload sync precedes publish.
+    let published = publish_cancel_control(&dir, &temporary, &path, &file);
+    match published {
+        Ok(()) => {}
+        Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !matching_cancel_control(
+                #[cfg(not(unix))]
+                &dir,
+                #[cfg(unix)]
+                &control_fd,
+                run_id,
+                operation_id,
+            )? {
+                return Err(ServiceError::Invalid(
+                    "cancel control vanished during retry".into(),
+                ));
+            }
+            return Ok(false);
+        }
+        Err(error) => return Err(error),
+    }
+    // A directory-sync error affects power-loss durability, not the process-
+    // crash boundary: publication has happened and cannot become a refusal.
     if let Err(error) = sync_dir_entry(&dir) {
         tracing::warn!(path = %path, %error, "cancel control published but directory sync failed");
     }
-    Ok(operation_id)
+    Ok(true)
 }
 
-/// Atomically publishes a staged cancel temp under no-overwrite
-/// semantics. The staged payload was already synced with `sync_all` before
-/// this rename, and the caller syncs the directory entry after: both the
-/// payload and the publication use `sync_all` durability (E01). The
-/// publisher's stage lock (`_stage_lock`) is borrowed across the rename so
-/// the reaper cannot observe an unlocked-but-unpublished temp (E01).
-/// On Linux this is a single `renameat2(RENAME_NOREPLACE)` relative to the
-/// pinned control-directory fd; on other platforms it is a portable
-/// `link(2)` + `unlink(temp)` dance with identical no-overwrite semantics
-/// (E01): `link` fails with `EEXIST` when the destination exists and never
-/// overwrites, so no probe-then-rename plant window remains.
-/// Failures remove the temp; an existing destination is a refusal, never
-/// an overwrite (E01).
+/// Bounded identity check shared by retry and consumption. Unix pins the
+/// directory; non-Unix requires trusted writers (pathname swap races remain).
+fn matching_cancel_control(
+    #[cfg(not(unix))] dir: &Utf8Path,
+    #[cfg(unix)] control_fd: &File,
+    run_id: &str,
+    operation_id: &str,
+) -> Result<bool, ServiceError> {
+    if operation_id.is_empty() || operation_id.contains(['/', '\\', '\0']) {
+        return Err(ServiceError::Invalid(
+            "invalid cancel operation identity".into(),
+        ));
+    }
+    let name = format!("cancel-{operation_id}.json");
+    #[cfg(unix)]
+    let existing = {
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: pinned directory and generated single-leaf name.
+        let fd = unsafe {
+            libc::openat(
+                control_fd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(ServiceError::Io(error));
+        }
+        // SAFETY: fd is a newly opened owned descriptor.
+        unsafe { File::from_raw_fd(fd) }
+    };
+    #[cfg(not(unix))]
+    let existing = {
+        let path = dir.join(name);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(ServiceError::Io(error)),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err(ServiceError::Invalid("invalid cancel control file".into()));
+        }
+        let file = File::open(&path)?;
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(ServiceError::Invalid("cancel control is a symlink".into()));
+        }
+        file
+    };
+    use std::io::Read as _;
+    let metadata = existing.metadata()?;
+    if !metadata.is_file() || metadata.len() > 64 * 1024 {
+        return Err(ServiceError::Invalid(
+            "invalid existing cancel control".into(),
+        ));
+    }
+    let mut bytes = Vec::new();
+    existing.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    let control: Value = serde_json::from_slice(&bytes)?;
+    if bytes.len() > 64 * 1024
+        || control["op"] != "cancel"
+        || control["run_id"] != run_id
+        || control["operation_id"] != operation_id
+    {
+        return Err(ServiceError::Invalid(
+            "cancel control identity mismatch".into(),
+        ));
+    }
+    Ok(true)
+}
+
+/// No-overwrite publication holds the stage lock across rename/link. Payload
+/// sync precedes publication; directory sync follows. Failures remove the temp;
+/// AlreadyExists requires identity validation, never overwrite.
 #[cfg(target_os = "linux")]
 fn publish_cancel_control(
     dir_fd: &File,
@@ -1848,9 +1871,7 @@ fn publish_cancel_control(
     _stage_lock: &File,
 ) -> Result<(), ServiceError> {
     {
-        // Both names are dir-relative: an absolute tmp would bypass the
-        // dir_fd and reintroduce a pathname race. Fail closed on missing
-        // file names instead of defaulting.
+        // Only leaf names may be resolved relative to the pinned fd.
         let Some(tmp_name) = temporary.file_name() else {
             let _ = remove_cancel_temp_at(dir_fd, "");
             return Err(ServiceError::Invalid(
@@ -1883,9 +1904,7 @@ fn publish_cancel_control(
             if error.kind() == std::io::ErrorKind::AlreadyExists
                 || error.raw_os_error() == Some(libc::EEXIST)
             {
-                return Err(ServiceError::Invalid(
-                    "cancel control already exists; refusing to overwrite".into(),
-                ));
+                return Err(ServiceError::Io(std::io::ErrorKind::AlreadyExists.into()));
             }
             return Err(ServiceError::Io(error));
         }
@@ -1900,19 +1919,7 @@ fn publish_cancel_control(
     _stage_lock: &File,
 ) -> Result<(), ServiceError> {
     {
-        // `_dir` is unused on this path (the link below is path-based but
-        // atomic); keep the parameter so both platforms share one helper
-        // signature.
-        // Portable NOREPLACE via link(2): creating a second hard link at
-        // the destination fails atomically when it exists, so publication
-        // never overwrites a planted file or a colliding UUID. The temp is
-        // then unlinked, leaving the published control as the sole link.
-        // Same-filesystem is guaranteed (same control directory), so
-        // cross-device fallback is unreachable; any such error fails
-        // closed instead of overwriting via rename (E01).
-        // Refuse a symlinked staging temp before linking: without
-        // O_NOFOLLOW a link planted in the create/open window would have
-        // been followed at open time. Fail closed on any link (E01).
+        // Portable no-overwrite publication: link then unlink the staging name.
         match std::fs::symlink_metadata(temporary) {
             Ok(meta) if meta.file_type().is_symlink() => {
                 let _ = std::fs::remove_file(temporary);
@@ -1926,18 +1933,13 @@ fn publish_cancel_control(
                 return Err(ServiceError::Io(error));
             }
         }
-        // Refuse a symlinked destination probe before the link so the
-        // error names the plant; the link itself remains authoritative
-        // (it fails with EEXIST on any existing destination including a
-        // symlink, never following it to overwrite the target) (E01).
+        // Probe for diagnostics; the no-overwrite link remains authoritative.
         match std::fs::symlink_metadata(path) {
             Ok(_) => {
                 if let Err(cleanup) = std::fs::remove_file(temporary) {
                     tracing::warn!(path = %temporary, %cleanup, "failed to clean cancel staging after overwrite refusal");
                 }
-                return Err(ServiceError::Invalid(
-                    "cancel control already exists; refusing to overwrite".into(),
-                ));
+                return Err(ServiceError::Io(std::io::ErrorKind::AlreadyExists.into()));
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
@@ -1949,11 +1951,7 @@ fn publish_cancel_control(
         }
         match std::fs::hard_link(temporary, path) {
             Ok(()) => {
-                // Publication is the link; unlink the staging name. A
-                // failure here leaves two links to the same published
-                // bytes: the destination is already durable, so warn and
-                // reclaim best-effort without reporting failure (which
-                // would invite a duplicate publish) (E01).
+                // Already published: failed staging cleanup must not refuse it.
                 if let Err(cleanup) = std::fs::remove_file(temporary) {
                     tracing::warn!(path = %temporary, %cleanup, "published cancel control but failed to unlink staging temp");
                 }
@@ -1963,9 +1961,7 @@ fn publish_cancel_control(
                 if let Err(cleanup) = std::fs::remove_file(temporary) {
                     tracing::warn!(path = %temporary, %cleanup, "failed to clean cancel staging after overwrite refusal");
                 }
-                Err(ServiceError::Invalid(
-                    "cancel control already exists; refusing to overwrite".into(),
-                ))
+                Err(ServiceError::Io(std::io::ErrorKind::AlreadyExists.into()))
             }
             Err(error) => {
                 if let Err(cleanup) = std::fs::remove_file(temporary) {
@@ -1977,22 +1973,10 @@ fn publish_cancel_control(
     }
 }
 
-/// Flush a directory entry so a published rename survives a crash.
-/// Unix opens the directory itself (`O_DIRECTORY | O_NOFOLLOW`) so a swapped
-/// path cannot redirect the sync. Cancel payloads and idempotency claim,
-/// Ready, and orphan stages all use `sync_all` (content plus metadata such
-/// as the freshly refreshed mtime must persist together), followed by a
-/// directory sync with the same crash visibility. Windows cannot open a
-/// directory and NTFS
-/// journals the rename itself; the non-Unix implementation is therefore a
-/// no-op success, so identical renames have weaker power-loss durability on
-/// non-Unix by platform necessity (Q2). Non-Unix mailbox reads stay
-/// best-effort: concurrent symlink swaps are refused by the pre/post
-/// `symlink_metadata` probes, but a pathname window remains; deployments
-/// that allow untrusted concurrent writers to the control directory are
-/// unsupported and must use Unix (E01).
-/// Shared with the idempotency store so the platform branch
-/// lives in exactly one place (E01).
+/// Flush a directory entry after publication. Unix pins O_DIRECTORY |
+/// O_NOFOLLOW; non-Unix is a no-op (weaker power-loss durability). Non-Unix
+/// mailbox operations require trusted writers because pathname races remain.
+/// Shared with idempotency storage to keep platform behavior in one place.
 #[cfg(unix)]
 pub fn sync_dir_entry(dir: &Utf8Path) -> std::io::Result<()> {
     std::fs::OpenOptions::new()
@@ -2008,16 +1992,9 @@ pub fn sync_dir_entry(_dir: &Utf8Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Best-effort reaping of abandoned publish temps. A temp is removed only
-/// when it is both older than [`CANCEL_TMP_TTL`] and proven not live: the
-/// age gate reaps crashed publishers, while the lock probe protects a live
-/// publisher from clock skew or admin time steps that would otherwise make
-/// its fresh temp look stale (E01).
-/// The mtime probe uses `symlink_metadata` so a symlinked temp never
-/// follows outside the control directory; symlinked temps are removed as
-/// links only and never opened (E01).
-/// Shared predicate with the drain-path inline reap below so the two never
-/// diverge (E01).
+/// Reap temps only when stale AND proven idle: the age check handles crashed
+/// publishers and the lock probe protects live ones even under clock skew.
+/// Symlink metadata avoids following links; the drain shares this predicate.
 fn cancel_temp_is_stale(meta: &std::fs::Metadata, now: std::time::SystemTime) -> bool {
     match meta.modified() {
         Ok(modified) => now
@@ -2193,13 +2170,8 @@ pub(crate) fn list_pending_cancel_controls(
     run_dir: &Utf8Path,
 ) -> Result<Vec<(String, Value)>, ServiceError> {
     let dir = control_dir(run_dir);
-    // Single directory scan serves both the stale-temp reap and the pending
-    // list: a second read_dir per drain is redundant I/O (E01). Temps are
-    // reaped inline; controls are collected below.
-    // The control directory itself is lstat-checked (no-follow) before the
-    // scan: `read_dir` would follow a symlinked control dir while publish
-    // pins O_NOFOLLOW, so a swapped mailbox fails the scan instead of
-    // redirecting reads outside (E01).
+    // One scan reaps abandoned staging temps and lists controls. Refuse a
+    // symlinked directory, matching no-follow publication/consumption.
     match std::fs::symlink_metadata(&dir) {
         Ok(meta) if meta.file_type().is_symlink() => {
             tracing::warn!(dir = %dir, "cancel control directory is a symlink; failing scan");
@@ -2215,10 +2187,7 @@ pub(crate) fn list_pending_cancel_controls(
         }
     }
     let mut pending = Vec::new();
-    // A control is only honored for the run directory that holds it: the
-    // expected run id is the directory name, resolved once. An
-    // undeterminable directory fails the scan instead of matching every
-    // control against an empty fallback (E01).
+    // Bind controls to the containing run directory, never an empty fallback.
     let Some(expected_run_id) = run_dir.file_name() else {
         return Err(ServiceError::Invalid(format!(
             "run directory `{run_dir}` has no file name; refusing cancel scan"
@@ -2244,13 +2213,8 @@ pub(crate) fn list_pending_cancel_controls(
             }
         };
         let path = entry.path();
-        // Never follow a symlink here: a planted link would redirect the
-        // read outside the control directory (E01). A vanished file races
-        // with a concurrent drain; skip it instead of failing the whole
-        // mailbox, while any other inspection failure fails the scan so a
-        // partially observed mailbox is never mistaken for clean (E01).
-        // Every scan uses `symlink_metadata` (no-follow), matching the
-        // publish O_NOFOLLOW pin: symlinks are never followed (E01).
+        // Inspect without following links; disappearance is a racing drain,
+        // while other inspection errors fail the entire scan closed.
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -2259,14 +2223,8 @@ pub(crate) fn list_pending_cancel_controls(
                 return Err(ServiceError::Io(error));
             }
         };
-        // Temp check runs before the UTF-8 gate through the ONE shared core:
-        // on Unix the byte-exact predicate classifies non-UTF8 temps exactly
-        // like UTF-8 ones, so a live publisher's non-UTF8 temp keeps its
-        // age/lock protection instead of being deleted as foreign damage
-        // (E01). All removals below converge through the shared cores
-        // (`reap_cancel_temp_entry` for temps, `reap_foreign_control_entry`
-        // for foreign shapes): no direct `remove_file` bypasses the
-        // symlink/age/lock discipline (E01).
+        // Classify temps byte-exactly before UTF-8 conversion. All scan cleanup
+        // uses the shared reapers and their symlink/age/lock discipline.
         if is_cancel_temp_name(entry.file_name().as_os_str()) {
             // Inline stale-temp reap through the ONE shared core also used
             // by the standalone sweep, without a second directory scan
@@ -2441,28 +2399,58 @@ pub(crate) fn list_pending_cancel_controls(
     Ok(pending)
 }
 
-/// Removes a drained cancel control. Returns true when the link is gone
-/// (removed or already absent). A removal failure returns false so the
-/// caller can surface a phantom control instead of silently assuming the
-/// mailbox is clean (E01/E05). The file stays for the next drain, which
-/// re-checks under the journal lock and converges without duplicating.
-/// A directory-sync failure after a successful removal still returns true:
-/// the link is gone for the process-crash boundary and only power-loss
-/// durability is affected (Q2).
+/// Removes only matching evidence; malformed or unrelated controls stay put.
+/// Unix reads and unlinks use one no-follow directory pin. Service publishers
+/// never overwrite controls, so racing drains/retries are idempotent. Success
+/// covers process crashes, not power-loss durability after sync failure.
 pub(crate) fn consume_cancel_control(run_dir: &Utf8Path, operation_id: &str) -> bool {
     let dir = control_dir(run_dir);
-    let path = dir.join(format!("cancel-{operation_id}.json"));
-    if let Err(error) = std::fs::remove_file(&path) {
-        if error.kind() != std::io::ErrorKind::NotFound {
-            tracing::warn!(path = %path, %error, "failed to consume cancel control; it stays for the next drain");
-            return false;
+    let result = (|| -> Result<(), ServiceError> {
+        #[cfg(unix)]
+        let control_fd = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&dir)?;
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(&dir)?.file_type().is_symlink() {
+            return Err(ServiceError::Invalid(
+                "cancel control directory is a symlink".into(),
+            ));
         }
-        return true;
+        let run_id = run_dir
+            .file_name()
+            .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?;
+        if !matching_cancel_control(
+            #[cfg(not(unix))]
+            &dir,
+            #[cfg(unix)]
+            &control_fd,
+            run_id,
+            operation_id,
+        )? {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        remove_cancel_temp_at(&control_fd, &format!("cancel-{operation_id}.json"))?;
+        #[cfg(not(unix))]
+        std::fs::remove_file(dir.join(format!("cancel-{operation_id}.json")))?;
+        #[cfg(unix)]
+        let sync = control_fd.sync_all();
+        #[cfg(not(unix))]
+        let sync = sync_dir_entry(&dir);
+        if let Err(error) = sync {
+            tracing::warn!(path = %dir, %error, "consumed cancel control but directory sync failed");
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => true,
+        Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            tracing::warn!(path = %dir, %error, "cancel control retained: consumption failed");
+            false
+        }
     }
-    if let Err(error) = sync_dir_entry(&dir) {
-        tracing::warn!(path = %path, %error, "consumed cancel control but directory sync failed");
-    }
-    true
 }
 
 pub(crate) fn has_pending_cancel_control(run_dir: &Utf8Path) -> bool {
@@ -2826,6 +2814,45 @@ mod tests {
     }
 
     #[test]
+    fn stable_cancel_mailbox_reuses_exact_identity_and_refuses_damage() {
+        let root = temp_root("stable-cancel");
+        let _guard = TempGuard(root.clone());
+        let run_dir = root.join("run-1");
+        let operation = uuid::Uuid::now_v7().to_string();
+        let path = control_dir(&run_dir).join(format!("cancel-{operation}.json"));
+        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "original", &operation).unwrap());
+        let original = std::fs::read(&path).unwrap();
+        assert!(!request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).unwrap());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        for field in ["op", "run_id", "operation_id"] {
+            let mut damaged: Value = serde_json::from_slice(&original).unwrap();
+            damaged[field] = "mismatch".into();
+            let bytes = serde_json::to_vec(&damaged).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::write(&path, b"{").unwrap();
+        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"{");
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            let target = root.join("target");
+            std::fs::write(&target, &original).unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+            assert_eq!(std::fs::read(&target).unwrap(), original);
+        }
+        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", "../bad").is_err());
+        assert_eq!(
+            std::fs::read_dir(control_dir(&run_dir)).unwrap().count(),
+            1,
+            "fresh staging temps must not leak on refusal or reuse"
+        );
+    }
+
+    #[test]
     fn unconfirmed_cancel_temps_are_not_scanned_or_reaped() {
         // E01: a publisher stopped before the rename leaves only a temp
         // that the scanner must ignore instead of treating as corruption.
@@ -3101,8 +3128,8 @@ mod tests {
         let error = publish_cancel_control(&dir, &temporary, &planted, &stage)
             .expect_err("publish over an existing control must fail");
         assert!(
-            error.to_string().contains("refusing to overwrite"),
-            "refusal must say so: {error}"
+            matches!(error, ServiceError::Io(ref io) if io.kind() == std::io::ErrorKind::AlreadyExists),
+            "publication must report a typed collision for identity validation: {error}"
         );
         assert_eq!(
             std::fs::read(planted.as_std_path()).expect("plant should still read"),

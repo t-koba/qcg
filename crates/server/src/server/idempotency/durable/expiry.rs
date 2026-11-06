@@ -709,6 +709,7 @@ mod tests {
         for created in [1, live_created] {
             let key = format!("pending-{created}");
             let record = DurablePendingRecord {
+                operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 key: key.clone(),
                 digest: "digest".into(),
                 run_id: Some("reserved".into()),

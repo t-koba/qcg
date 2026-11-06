@@ -479,6 +479,9 @@ struct DurablePendingRecord {
     digest: String,
     /// Adoption retains the reserved run across the execution/Ready crash gap.
     run_id: Option<String>,
+    /// Missing only in legacy claims, which cannot be adopted after expiry.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    operation_id: Option<String>,
     owner: String,
     created_at_unix: u64,
     /// Required generation; a superseded committer cannot replace a successor.
@@ -532,6 +535,7 @@ pub(crate) fn claim_durable_pending_gated(
     // until atomic replacement, retaining its run association across a crash
     // during adoption. Its generation still floors the successor.
     let mut adopted: Option<String> = None;
+    let mut operation_id = uuid::Uuid::now_v7().to_string();
     let pending_generation: u64 = match match snapshot.pending.as_deref() {
         Some(bytes) => parse_pending_bytes(key, bytes),
         None => PendingRead::Absent,
@@ -543,8 +547,17 @@ pub(crate) fn claim_durable_pending_gated(
             return Ok(ClaimOutcome::Peer);
         }
         PendingRead::Expired(record) => {
+            let accepted_id = record.operation_id.as_deref().ok_or_else(|| {
+                ApiHttpError::internal("expired legacy idempotency claim has no operation identity; quiescence and reconciliation required")
+            })?;
+            if !uuid::Uuid::parse_str(accepted_id).is_ok_and(|id| id.to_string() == accepted_id) {
+                return Err(ApiHttpError::internal(
+                    "invalid idempotency operation identity",
+                ));
+            }
             let generation = record.generation;
             if record.digest == digest {
+                operation_id = accepted_id.to_string();
                 adopted = record.run_id.clone();
             }
             generation
@@ -565,6 +578,7 @@ pub(crate) fn claim_durable_pending_gated(
         key: key.to_string(),
         digest: digest.to_string(),
         run_id: run_id.clone(),
+        operation_id: Some(operation_id.clone()),
         owner: owner.clone(),
         created_at_unix: now_unix().map_err(ApiHttpError::internal)?,
         generation,
@@ -619,6 +633,7 @@ pub(crate) fn claim_durable_pending_gated(
         Ok(()) => {
             // The locked predecessor is expired/absent; live claims returned Peer.
             Ok(ClaimOutcome::Owner {
+                operation_id,
                 run_id,
                 owner,
                 generation,
@@ -694,6 +709,7 @@ fn clean_temp(entry: std::fs::DirEntry, now: u64) -> Result<(), String> {
 #[derive(Debug)]
 pub(crate) enum ClaimOutcome {
     Owner {
+        operation_id: String,
         run_id: Option<String>,
         owner: String,
         generation: u64,
@@ -1795,6 +1811,7 @@ mod tests {
             Ok(OwnerCheck::Absent)
         ));
         let claim = |owner: &str, generation: u64| DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
             run_id: None,
@@ -1863,6 +1880,7 @@ mod tests {
             .expect("idempotency dir should be created");
         // Foreign-key file: key field differs from the lookup key.
         let foreign = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: "other".into(),
             digest: "d".into(),
             run_id: None,
@@ -1888,6 +1906,7 @@ mod tests {
         // `check_pending_owner` call acquires the same key's gate, so the
         // exact holder cannot have been replaced between aging and recheck.
         let expired = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
             run_id: Some("run-A".into()),
@@ -2104,6 +2123,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let foreign = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: "other".into(),
             digest: "d".into(),
             run_id: None,
@@ -2140,6 +2160,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let claim = |owner: &str, generation: u64| DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
             run_id: None,
@@ -2510,6 +2531,33 @@ mod tests {
     }
 
     #[test]
+    fn expired_legacy_or_invalid_operation_identity_is_retained_not_adopted() {
+        let runs_dir = temp_runs_dir("legacy-operation-id");
+        let key = "legacy";
+        claim_pending(&runs_dir, key, "digest", "run-1").unwrap();
+        expire_pending_claim(&runs_dir, key);
+        let path = pending_path(&runs_dir, key);
+        let mut record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        for invalid in [
+            None,
+            Some(serde_json::json!(null)),
+            Some(serde_json::json!("not-an-id")),
+            Some(serde_json::json!(7)),
+        ] {
+            record.as_object_mut().unwrap().remove("operation_id");
+            if let Some(invalid) = invalid {
+                record["operation_id"] = invalid;
+            }
+            let bytes = serde_json::to_vec(&record).unwrap();
+            std::fs::write(&path, &bytes).unwrap();
+            assert!(claim_pending(&runs_dir, key, "digest", "run-2").is_err());
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+        std::fs::remove_dir_all(&runs_dir).unwrap();
+    }
+
+    #[test]
     fn generations_increase_across_expiry_chains() {
         // B02: adoption of an expired claim advances the generation, so a
         // superseded owner can never present a current one.
@@ -2522,14 +2570,26 @@ mod tests {
             other => panic!("expected owner, got {}", outcome_name(&other)),
         };
         assert_eq!(gen1, 1, "fresh chain starts at generation 1");
+        let original: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(pending_path(&runs_dir, key)).unwrap()).unwrap();
+        let operation_id = original.operation_id.unwrap();
+        assert!(uuid::Uuid::parse_str(&operation_id).is_ok());
         // Age the claim past its TTL without touching anything else.
         expire_pending_claim(&runs_dir, key);
         let second =
             claim_pending(&runs_dir, key, "digest", "run-9").expect("adoption claim should win");
         match second {
             ClaimOutcome::Owner {
-                run_id, generation, ..
+                run_id,
+                generation,
+                operation_id: adopted_id,
+                ..
             } => {
+                assert_eq!(adopted_id, operation_id);
+                let adopted: DurablePendingRecord =
+                    serde_json::from_slice(&std::fs::read(pending_path(&runs_dir, key)).unwrap())
+                        .unwrap();
+                assert_eq!(adopted.operation_id.as_ref(), Some(&operation_id));
                 assert_eq!(
                     run_id.as_deref(),
                     Some("run-1"),
@@ -2553,6 +2613,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let predecessor = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
             run_id: Some("run-A".into()),
@@ -2567,6 +2628,7 @@ mod tests {
         )
         .expect("predecessor claim should be written");
         let successor = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
             run_id: Some("run-A".into()),
@@ -2705,6 +2767,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let reservationless = DurablePendingRecord {
+            operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
             run_id: None,

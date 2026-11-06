@@ -158,7 +158,8 @@ pub(crate) async fn answer_run(
         // The target id rides in the pending claim for uniformity (E02).
         // Reject on mismatch instead of ignoring it: executing a different
         // run than reserved could never commit.
-        execute: |reserved| async {
+        execute: |context| async {
+            let reserved = context.reserved_run_id;
             match reserved {
                 Some(reserved) if reserved == id => state
                     .service
@@ -193,7 +194,8 @@ pub(crate) async fn confirm_run(
         created: false,
         reserved_run_id: Some(id.clone()),
         // Reservation check mirrors `answer_run` (E02).
-        execute: |reserved| async {
+        execute: |context| async {
+            let reserved = context.reserved_run_id;
             match reserved {
                 Some(reserved) if reserved == id => state
                     .service
@@ -223,11 +225,19 @@ pub(crate) async fn cancel_run(
         created: false,
         reserved_run_id: Some(id.clone()),
         // Reservation check mirrors `answer_run` (E02).
-        execute: |reserved| async {
+        execute: |context| async {
+            let reserved = context.reserved_run_id;
             match reserved {
-                Some(reserved) if reserved == id => {
-                    state.service.cancel(id.clone()).await.map(|()| id.clone())
+                Some(reserved) if reserved == id => match context.operation_id {
+                    Some(operation_id) => {
+                        state
+                            .service
+                            .cancel_with_operation_id(id.clone(), operation_id)
+                            .await
+                    }
+                    None => state.service.cancel(id.clone()).await,
                 }
+                .map(|()| id.clone()),
                 _ => Err(api::ApiError::Internal {
                     detail: "idempotency reservation does not match the target run".into(),
                 }),

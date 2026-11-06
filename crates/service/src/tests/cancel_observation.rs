@@ -432,3 +432,252 @@ async fn pre_execution_observation_semantic_corruption_remains_retryable() {
         }
     }
 }
+
+#[tokio::test]
+async fn cancel_shutdown_refusal_withdraws_only_new_mailbox() {
+    for previously_accepted in [false, true] {
+        let (_guard, service, id, directory) = waiting_run().await;
+        let operation = uuid::Uuid::now_v7().to_string();
+        let mailbox =
+            crate::run_dirs::control_dir(&directory).join(format!("cancel-{operation}.json"));
+        let original = if previously_accepted {
+            assert!(
+                crate::run_dirs::request_remote_cancel_with_id(
+                    &directory,
+                    &id,
+                    "first-request",
+                    &operation
+                )
+                .unwrap()
+            );
+            Some(std::fs::read(&mailbox).unwrap())
+        } else {
+            None
+        };
+        // A read guard permits run_dir_for but queues the final acceptance
+        // write lock. No run task remains to compete for that lock.
+        let read_guard = service.inner.runs.read().await;
+        let cancel_service = service.clone();
+        let cancel_id = id.clone();
+        let cancel = tokio::spawn(async move {
+            cancel_service
+                .cancel_with_operation_id(cancel_id, operation)
+                .await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while service.inner.runs.try_read().is_ok() {
+            assert!(
+                !cancel.is_finished(),
+                "cancel must queue behind the read guard"
+            );
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::task::yield_now().await;
+        }
+        assert!(mailbox.exists());
+        service.mark_shutting_down();
+        drop(read_guard);
+        assert!(matches!(
+            cancel.await.unwrap(),
+            Err(api::ApiError::Unavailable { .. })
+        ));
+        if let Some(original) = original {
+            assert_eq!(
+                std::fs::read(&mailbox).unwrap(),
+                original,
+                "refusal cannot withdraw a previous acceptance"
+            );
+        } else {
+            assert!(
+                !mailbox.exists(),
+                "refused new acceptance must not leave a phantom"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancel_retry_consumes_journaled_before_unlink_across_recovery() {
+    for mode in [
+        "retry-first",
+        "recover-first",
+        "terminal",
+        "shutdown-terminal",
+    ] {
+        let (_guard, service, id, directory) = waiting_run().await;
+        let operation = uuid::Uuid::now_v7().to_string();
+        crate::run_dirs::request_remote_cancel_with_id(
+            &directory,
+            &id,
+            "first-request",
+            &operation,
+        )
+        .unwrap();
+        let mailbox =
+            crate::run_dirs::control_dir(&directory).join(format!("cancel-{operation}.json"));
+        // Construct exactly the process-crash boundary: journal append has
+        // completed but the consumer has not unlinked the published control.
+        // This is a deterministic disk-state test, not a power-loss/SIGKILL test.
+        {
+            let _lease = crate::run_dirs::try_lock_run_execution(&directory)
+                .unwrap()
+                .expect("parked writer has exited");
+            let record = service.inner.runs.read().await[&id].clone();
+            crate::run_dirs::write_run_event(
+                &record,
+                "user_cancel_requested",
+                serde_json::json!({"run_id": id, "operation_id": operation,
+                    "requester": "first-request"}),
+            )
+            .unwrap();
+            if mode.ends_with("terminal") {
+                crate::run_dirs::write_run_event(
+                    &record,
+                    "run_canceled",
+                    serde_json::json!({"run_id": id, "reason": model::FailureDetail::new(model::FailureCode::Canceled, "cancellation requested")}),
+                )
+                .unwrap();
+            }
+        }
+        assert!(mailbox.exists());
+        assert!(
+            fold_run_state(&directory)
+                .unwrap()
+                .cancel_operations
+                .contains(&operation)
+        );
+        let runs = directory.parent().unwrap().to_owned();
+        drop(service);
+        wait_for_store_lock_release(runs.clone()).await;
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let recovered = test_service(vec![generators], runs);
+        if mode == "recover-first" {
+            recovered.resume_recovered_runs().await;
+            wait_for_snapshot(&recovered, &id, RunStatus::Canceled).await;
+            join_run_task(&recovered, &id).await;
+        }
+        if mode == "shutdown-terminal" {
+            recovered.mark_shutting_down();
+        }
+        for _ in 0..2 {
+            recovered
+                .cancel_with_operation_id(id.clone(), operation.clone())
+                .await
+                .unwrap();
+            assert!(
+                !mailbox.exists(),
+                "retry must consume journaled evidence: {mode}"
+            );
+        }
+        if mode == "retry-first" {
+            recovered.resume_recovered_runs().await;
+            wait_for_snapshot(&recovered, &id, RunStatus::Canceled).await;
+            join_run_task(&recovered, &id).await;
+        }
+        let events = read_events_from_meta(&run_meta_dir(&directory)).unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["t"] == "user_cancel_requested"
+                    && event["operation_id"] == operation)
+                .count(),
+            1,
+            "{mode}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["t"] == "run_canceled")
+                .count(),
+            1
+        );
+        if mode != "shutdown-terminal" {
+            recovered
+                .delete_run(&id)
+                .await
+                .expect("consumed mailbox cannot pin deletion");
+        }
+    }
+}
+
+#[tokio::test]
+async fn terminal_cancel_retry_preserves_invalid_and_unrelated_evidence() {
+    let (_guard, service, id, directory) = waiting_run().await;
+    service.cancel(id.clone()).await.unwrap();
+    let operation = uuid::Uuid::now_v7().to_string();
+    let unrelated = crate::run_dirs::request_remote_cancel(&directory, &id, "unrelated").unwrap();
+    let controls = crate::run_dirs::control_dir(&directory);
+    let mailbox = controls.join(format!("cancel-{operation}.json"));
+    let journal = std::fs::read(run_meta_dir(&directory).join("journal.jsonl")).unwrap();
+    for bytes in [
+        b"not json".to_vec(),
+        serde_json::to_vec(&serde_json::json!({"op": "cancel", "run_id": "other",
+            "operation_id": operation}))
+        .unwrap(),
+        serde_json::to_vec(&serde_json::json!({"op": "cancel", "run_id": id,
+            "operation_id": unrelated}))
+        .unwrap(),
+        serde_json::to_vec(&serde_json::json!({"op": "other", "run_id": id,
+            "operation_id": operation}))
+        .unwrap(),
+    ] {
+        std::fs::write(&mailbox, &bytes).unwrap();
+        assert!(
+            service
+                .cancel_with_operation_id(id.clone(), operation.clone())
+                .await
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&mailbox).unwrap(), bytes);
+    }
+    std::fs::remove_file(&mailbox).unwrap();
+    #[cfg(unix)]
+    {
+        let outside = directory.join("outside.json");
+        let bytes = serde_json::to_vec(&serde_json::json!({"op": "cancel", "run_id": id,
+            "operation_id": operation}))
+        .unwrap();
+        std::fs::write(&outside, &bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, &mailbox).unwrap();
+        assert!(
+            service
+                .cancel_with_operation_id(id.clone(), operation.clone())
+                .await
+                .is_err()
+        );
+        assert!(
+            std::fs::symlink_metadata(&mailbox)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read(&outside).unwrap(), bytes);
+        std::fs::remove_file(&mailbox).unwrap();
+        let moved = directory.join("moved-control");
+        std::fs::rename(&controls, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &controls).unwrap();
+        assert!(
+            service
+                .cancel_with_operation_id(id.clone(), unrelated.clone())
+                .await
+                .is_err()
+        );
+        assert!(moved.join(format!("cancel-{unrelated}.json")).exists());
+        std::fs::remove_file(&controls).unwrap();
+        std::fs::rename(&moved, &controls).unwrap();
+    }
+    service
+        .cancel_with_operation_id(id.clone(), operation)
+        .await
+        .unwrap();
+    assert!(controls.join(format!("cancel-{unrelated}.json")).exists());
+    service
+        .cancel_with_operation_id(id, unrelated.clone())
+        .await
+        .unwrap();
+    assert!(!controls.join(format!("cancel-{unrelated}.json")).exists());
+    assert_eq!(
+        std::fs::read(run_meta_dir(&directory).join("journal.jsonl")).unwrap(),
+        journal
+    );
+}

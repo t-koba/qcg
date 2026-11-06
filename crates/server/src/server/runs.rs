@@ -136,7 +136,8 @@ pub(crate) async fn start_run(
         // The reservation rides in the pending claim and the commit proves
         // `request run_id == reserved run_id` (E02). A missing reservation
         // fails closed instead of minting an unclaimed run.
-        execute: move |reserved| async move {
+        execute: move |context| async move {
+            let reserved = context.reserved_run_id;
             let Some(reserved) = reserved else {
                 return Err(api::ApiError::Internal {
                     detail: "idempotency reservation is missing; commit refused".into(),
@@ -253,7 +254,8 @@ pub(crate) async fn fork_run(
         reserved_run_id: Some(reserved),
         // Reservation check mirrors `start_run` (E02): a missing
         // reservation fails closed instead of forking unclaimed.
-        execute: |reserved| async move {
+        execute: |context| async move {
+            let reserved = context.reserved_run_id;
             let Some(reserved) = reserved else {
                 return Err(api::ApiError::Internal {
                     detail: "idempotency reservation is missing; commit refused".into(),

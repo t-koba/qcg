@@ -135,6 +135,53 @@ async fn gate_process() {
         None,
         tokio_util::sync::CancellationToken::new(),
     ));
+    if mode.starts_with("cancel-") {
+        let id = fs::read_to_string(runs.join("cancel-target")).unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+        if mode == "cancel-crash" {
+            with_idempotency(IdempotentCall {
+                state: &state,
+                headers: &headers,
+                scope: "cancel",
+                target: &id,
+                body: &[],
+                digest_context: None,
+                created: false,
+                reserved_run_id: Some(id.clone()),
+                execute: |context| {
+                    let id = &id;
+                    let state = &state;
+                    let runs = &runs;
+                    async move {
+                        assert_eq!(context.reserved_run_id.as_ref(), Some(id));
+                        let operation_id = context.operation_id.unwrap();
+                        let accepted = state
+                            .service
+                            .cancel_with_operation_id(id.clone(), operation_id.clone())
+                            .await;
+                        assert!(matches!(accepted, Err(api::ApiError::Conflict { .. })));
+
+                        fs::write(runs.join("cancel-operation"), operation_id).unwrap();
+                        barrier(runs, "cancel-accepted").await;
+                        Ok(id.clone())
+                    }
+                },
+            })
+            .await
+            .unwrap();
+            panic!("parent must kill request before Ready");
+        }
+        let response = crate::server::run_detail::cancel_run(
+            axum::extract::State(state),
+            headers,
+            axum::extract::Path(id),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        return;
+    }
     let reserved = state
         .service
         .reserve_start_run_id("hello-template")
@@ -158,7 +205,8 @@ async fn gate_process() {
         digest_context: None,
         created: true,
         reserved_run_id: Some(reserved),
-        execute: |reserved| async {
+        execute: |context| async {
+            let reserved = context.reserved_run_id;
             assert_ne!(
                 mode, "retry",
                 "same-key successor must replay, never execute"
@@ -312,4 +360,190 @@ async fn live_conflict_is_reported_without_waiting_for_the_gate() {
         assert!(futures_util::poll!(&mut wait).is_pending());
     }
     drop(gate);
+}
+
+#[tokio::test]
+async fn cancel_process_crash_before_ready_reuses_mailbox_identity() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-cancel-crash-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let owner = service::LocalService::with_generator_roots_policy_and_store_mode(
+        vec![generators],
+        runs.clone(),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        service::RunStoreMode::SharedFilesystem,
+        service::ServiceDeploymentPolicy::default(),
+    )
+    .unwrap();
+    let id = owner
+        .start_run(api::StartRun {
+            generator_id: "ask-user".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while owner.snapshot(id.clone()).await.unwrap().state != api::RunStatus::Waiting {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let run_dir = owner.run_dir_for(&id).await.unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("meta/execution.lock"))
+        .unwrap();
+    loop {
+        match lease.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+            Err(error) => panic!("lease failed: {error:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
+    fs::write(runs.join("cancel-target"), &id).unwrap();
+    // This single-threaded runtime stays blocked at the process barriers, so
+    // the owner cannot drain the mailbox before we inspect and kill the request.
+    let mut request = spawn(runs, "cancel-crash");
+    wait_file(runs, "cancel-accepted");
+    let operation = fs::read_to_string(runs.join("cancel-operation")).unwrap();
+    let claim: serde_json::Value =
+        serde_json::from_slice(&fs::read(pending(runs)).unwrap()).unwrap();
+    assert_eq!(claim["operation_id"], operation);
+    let mailbox = run_dir
+        .join("meta/control")
+        .join(format!("cancel-{operation}.json"));
+    let original = fs::read(&mailbox).unwrap();
+    request.0.kill().unwrap();
+    request.0.wait().unwrap();
+    assert_eq!(fs::read(&mailbox).unwrap(), original);
+    age_claim(runs);
+    drop(lease);
+    let mut retry = spawn(runs, "cancel-retry");
+    assert!(retry.success());
+    assert!(
+        !mailbox.exists(),
+        "successful settlement consumes the accepted mailbox"
+    );
+    assert!(!pending(runs).exists());
+    assert!(
+        durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_some()
+    );
+    owner
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await
+        .unwrap();
+    owner
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await
+        .unwrap();
+    let journal = fs::read_to_string(run_dir.join("meta/journal.jsonl")).unwrap();
+    let accepted: Vec<serde_json::Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .filter(|event: &serde_json::Value| event["t"] == "user_cancel_requested")
+        .collect();
+    assert_eq!(
+        accepted.len(),
+        1,
+        "one logical cancel must journal once: {journal}"
+    );
+    assert_eq!(accepted[0]["operation_id"], operation);
+    assert!(
+        !mailbox.exists(),
+        "terminal retry must not leave phantom control"
+    );
+}
+
+#[tokio::test]
+async fn direct_and_unkeyed_cancel_keep_fresh_operation_ids() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-cancel-fresh-{}", uuid::Uuid::now_v7())),
+    );
+    let service = crate::test_service(
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators"),
+        fixture.0.clone(),
+        None,
+    )
+    .unwrap();
+    let state = Arc::new(crate::test_state(
+        service,
+        fixture.0.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let id = state
+        .service
+        .start_run(api::StartRun {
+            generator_id: "ask-user".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.service.snapshot(id.clone()).await.unwrap().state != api::RunStatus::Waiting {
+        assert!(Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let run_dir = state.service.run_dir_for(&id).await.unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("meta/execution.lock"))
+        .unwrap();
+    loop {
+        match lease.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+            Err(error) => panic!("lease failed: {error:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
+    for _ in 0..2 {
+        assert!(matches!(
+            state.service.cancel(id.clone()).await,
+            Err(api::ApiError::Conflict { .. })
+        ));
+        let error = crate::server::run_detail::cancel_run(
+            axum::extract::State(state.clone()),
+            HeaderMap::new(),
+            axum::extract::Path(id.clone()),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.problem.status, 409);
+    }
+    let controls: Vec<serde_json::Value> = fs::read_dir(run_dir.join("meta/control"))
+        .unwrap()
+        .map(|entry| serde_json::from_slice(&fs::read(entry.unwrap().path()).unwrap()).unwrap())
+        .collect();
+    let ids: std::collections::BTreeSet<_> = controls
+        .iter()
+        .map(|control| control["operation_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        ids.len(),
+        4,
+        "direct and unkeyed calls must each use fresh IDs"
+    );
+    assert!(ids.iter().all(|id| uuid::Uuid::parse_str(id).is_ok()));
+    assert!(state.idempotency.lock().await.is_empty());
+    drop(lease);
+    state.service.cancel(id.clone()).await.unwrap();
+    state.service.cancel(id.clone()).await.unwrap();
+    assert_eq!(
+        fs::read_dir(run_dir.join("meta/control")).unwrap().count(),
+        0
+    );
 }

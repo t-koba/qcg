@@ -65,11 +65,15 @@ pub(crate) fn idempotency_key(headers: &HeaderMap) -> Result<Option<String>, Api
         .transpose()
 }
 
-/// Inputs for [`with_idempotency`], bundled so the admission signature
-/// stays reviewable as options grow.
+/// Private HTTP executor inputs; service receives no HTTP claim policy.
+pub(crate) struct ExecutorContext {
+    pub(crate) reserved_run_id: Option<String>,
+    pub(crate) operation_id: Option<String>,
+}
+
 pub(crate) struct IdempotentCall<'a, F, Fut>
 where
-    F: FnOnce(Option<String>) -> Fut,
+    F: FnOnce(ExecutorContext) -> Fut,
     Fut: std::future::Future<Output = Result<String, ApiError>>,
 {
     pub(crate) state: &'a Arc<AppState>,
@@ -133,7 +137,7 @@ pub(crate) async fn lookup_start_idempotency<F, Fut>(
     call: &IdempotentCall<'_, F, Fut>,
 ) -> Result<StartIdempotencyLookup, ApiHttpError>
 where
-    F: FnOnce(Option<String>) -> Fut,
+    F: FnOnce(ExecutorContext) -> Fut,
     Fut: std::future::Future<Output = Result<String, ApiError>>,
 {
     let Some(key) = idempotency_key(call.headers)? else {
@@ -235,7 +239,7 @@ pub(crate) async fn with_idempotency<F, Fut>(
     call: IdempotentCall<'_, F, Fut>,
 ) -> Result<Response, ApiHttpError>
 where
-    F: FnOnce(Option<String>) -> Fut,
+    F: FnOnce(ExecutorContext) -> Fut,
     Fut: std::future::Future<Output = Result<String, ApiError>>,
 {
     let IdempotentCall {
@@ -255,29 +259,24 @@ where
         // handler has already reserved its run id; the executor must receive
         // it so the run is created under that reservation instead of failing
         // closed. Answer/confirm/cancel executors check it against their target.
-        let run_id = execute(reserved_run_id.clone())
-            .await
-            .map_err(ApiHttpError::from_api)?;
+        let run_id = execute(ExecutorContext {
+            reserved_run_id: reserved_run_id.clone(),
+            operation_id: None,
+        })
+        .await
+        .map_err(ApiHttpError::from_api)?;
         return snapshot_response(state, run_id, created).await;
     };
-    // Frozen boot policy: every prune, capacity, TTL, and expiry decision
-    // below uses the values resolved once at boot and stored in AppState.
-    // The environment is never re-read here, so tuning applies at the next
-    // boot and one request can never mix two standards or drift from boot
-    // validation (E04).
+    // Use only boot-frozen policy, never per-request environment reads.
     let policy_ttl = state.idempotency_ttl;
     let policy_max_entries = state.idempotency_max_entries;
-    // An orphaned run id observed while waiting rides across claim-loop
-    // iterations: the claim may be replaced or reaped before the loop
-    // re-reads it, so carrying the id preserves the run association. The
-    // durable claim owner rides along too, so every release below only
-    // ever removes our own claim file. `claim_owner`/`claim_generation`
-    // are overwritten on every Owner arm before any read, so no reset is
-    // needed when looping on Superseded (E02).
+    // Carry waiter run association across retries. Owner/generation and the
+    // acceptance ID always come from the latest gated durable Owner outcome.
     let mut carried_adopted: Option<String> = None;
     let mut execution_gate = None;
     let mut claim_owner: Option<String> = None;
     let mut claim_generation: Option<u64> = None;
+    let mut operation_id = None;
     let (owner_id, adopted_run_id, mut pending_guard) = 'admit: loop {
         let (owner_id, adopted_run_id, mut pending_guard) = loop {
             let (wait, owner_id, adopted_run_id) = {
@@ -328,22 +327,8 @@ where
                             }
                             return replay_ready(state, durable, created).await;
                         }
-                        // Cross-process reservation before becoming in-memory
-                        // owner: peers with the same key converge to one run.
-                        // An adopted run id from an expired claim binds the retry
-                        // to the orphaned run instead of creating a second one.
-                        // A carried id from the waiter path fills in when the
-                        // claim file is already gone; a live claim reaped here
-                        // takes precedence. When no Ready record exists, a
-                        // run-side orphan sidecar (written after execution)
-                        // recovers the original run after Ready loss: the retry
-                        // adopts its journal instead of starting a fresh run
-                        // (E03). A sidecar with a different digest conflicts
-                        // instead of aliasing another request.
-                        // Blocking work runs off the async runtime (E02).
-                        // Scoped to run-creating requests only: answer,
-                        // confirm, and cancel target an existing run and
-                        // never need a full store scan per admission (E02).
+                        // Only run creation needs orphan-sidecar discovery.
+                        // Mutations bind to their target without a store scan.
                         if carried_adopted.is_none() && matches!(scope, "start_run" | "fork_run") {
                             let runs_dir = state.runs_dir.clone();
                             let key = idempotency_key.clone();
@@ -399,10 +384,12 @@ where
                                 }
                             }
                             ClaimOutcome::Owner {
+                                operation_id: accepted_id,
                                 run_id,
                                 owner,
                                 generation,
                             } => {
+                                operation_id = Some(accepted_id);
                                 claim_owner = Some(owner);
                                 claim_generation = Some(generation);
                                 run_id
@@ -415,10 +402,8 @@ where
                                 return Err(idempotency_conflict());
                             }
                         };
-                        // Re-examine the map under a fresh lock: a peer may have
-                        // registered while disk was read or the claim published.
-                        // Our durable claim is released on every diverge path so
-                        // it never wedges the key (E02).
+                        // Disk work raced local registration: recheck before
+                        // inserting, releasing our durable claim on divergence.
                         let mut idempotency = state.idempotency.lock().await;
                         // Clone only the fields needed after the lock drops:
                         // the entry holds an unclonable watch sender.
@@ -455,14 +440,8 @@ where
                         };
                         match reexamined {
                             Reexamined::Ready { digest, run_id } => {
-                                // A peer committed while we claimed: our durable
-                                // claim never executed anything, so release it
-                                // and converge without executing (E02). A
-                                // release failure fails fast with 503 instead
-                                // of warning and parking peers until TTL: a
-                                // corrupt or unreadable claim must surface
-                                // immediately (E02). This path always returns,
-                                // so no identity reset is needed.
+                                // We have not executed: release our exact claim
+                                // and replay. Release failures must surface as 503.
                                 let release = claim_owner.clone().zip(claim_generation);
                                 drop(idempotency);
                                 if let Some((owner, generation)) = release {
@@ -610,46 +589,45 @@ where
     // The admit loop only breaks with a rechecked-current claim, which
     // always carries an identity. A missing identity means the invariant
     // broke: fail closed instead of releasing with empty defaults.
-    let (claim_owner, claim_generation) = match (claim_owner, claim_generation) {
-        (Some(owner), Some(generation)) => (owner, generation),
-        _ => {
-            return Err(ApiHttpError::internal(
-                "idempotency admission completed without a claim identity",
-            ));
-        }
-    };
+    let (claim_owner, claim_generation, operation_id) =
+        match (claim_owner, claim_generation, operation_id) {
+            (Some(owner), Some(generation), Some(operation_id)) => {
+                (owner, generation, operation_id)
+            }
+            _ => {
+                return Err(ApiHttpError::internal(
+                    "idempotency admission completed without a claim identity",
+                ));
+            }
+        };
     let gate = Arc::clone(
         execution_gate
             .as_ref()
             .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
     );
-    let run_id = match service::with_acceptance_guard(gate.clone(), execute(adopted_run_id)).await {
+    let run_id = match service::with_acceptance_guard(
+        gate.clone(),
+        execute(ExecutorContext {
+            reserved_run_id: adopted_run_id,
+            operation_id: Some(operation_id),
+        }),
+    )
+    .await
+    {
         Ok(run_id) => run_id,
         Err(error) => {
-            // Ambiguous acceptance: the service error alone does not prove
-            // the operation had no effects. `service.cancel` publishes its
-            // durable mailbox before returning Conflict/error, so releasing
-            // the durable claim here would let a retry execute as a fresh
-            // owner over an already-accepted operation. Preserve the durable
-            // claim for its 60s lease/adoption window on every execution
-            // error; only the process-local waiter entry is withdrawn and
-            // woken so peers retry through the durable Peer path instead of
-            // wedging on memory. Route-specific acceptance reconciliation is
-            // still required (see the partial-fence docs); this conservative
-            // retention may hold a key even when no effect occurred.
+            // Errors do not prove absence of effects: cancel may already have
+            // published a mailbox. Retain the durable claim and its acceptance
+            // ID; withdraw only memory waiters. Other route reconciliation is
+            // still incomplete, so this can hold even an effect-free failure.
             PendingIdempotencyGuard::withdraw(Arc::clone(state), idempotency_key.clone(), owner_id)
                 .await;
             pending_guard.disarm();
             return Err(ApiHttpError::from_api(error));
         }
     };
-    // Reverse mapping for Ready-loss recovery (E03): after execution, record
-    // the key association inside the run directory itself so a retry after
-    // Ready loss adopts the original run from its journal instead of
-    // starting a fresh one. Only run-creating scopes need it; answer,
-    // confirm, and cancel target an existing run. Best-effort: a missing
-    // sidecar only loses the recovery path while the Ready record remains
-    // primary. Blocking work runs off the async runtime (E02).
+    // Best-effort run-side reverse mapping recovers start/fork after Ready
+    // loss. Mutation targets need no orphan scan or sidecar; Ready is primary.
     if matches!(scope, "start_run" | "fork_run")
         && let Err(error) = write_orphan_record_async(
             gate.clone(),
@@ -1151,7 +1129,8 @@ mod tests {
                     digest_context: None,
                     created: true,
                     reserved_run_id: None,
-                    execute: |adopted| async {
+                    execute: |context| async {
+                        let adopted = context.reserved_run_id;
                         assert_eq!(adopted.as_ref(), Some(&reserved));
                         state.service.start_run_with_id(request, adopted).await
                     },
@@ -1380,7 +1359,8 @@ mod tests {
                 digest_context: None,
                 created: true,
                 reserved_run_id: Some(reserved),
-                execute: |adopted| async move {
+                execute: |context| async move {
+                    let adopted = context.reserved_run_id;
                     let Some(adopted) = adopted else {
                         return Err(api::ApiError::Internal {
                             detail: "idempotency reservation is missing; commit refused".into(),
@@ -1455,7 +1435,8 @@ mod tests {
             digest_context: None,
             created: false,
             reserved_run_id: Some(target.to_string()),
-            execute: |reserved| async move {
+            execute: |context| async move {
+                let reserved = context.reserved_run_id;
                 assert_eq!(
                     reserved.as_deref(),
                     Some(target),
@@ -1603,7 +1584,8 @@ mod tests {
             digest_context: None,
             created: true,
             reserved_run_id: Some(reserved),
-            execute: |adopted| async move {
+            execute: |context| async move {
+                let adopted = context.reserved_run_id;
                 let Some(adopted) = adopted else {
                     return Err(api::ApiError::Internal {
                         detail: "idempotency reservation is missing; commit refused".into(),
@@ -1715,4 +1697,5 @@ mod tests {
 }
 
 #[cfg(test)]
+#[path = "tests/execution_gate.rs"]
 mod execution_gate_tests;

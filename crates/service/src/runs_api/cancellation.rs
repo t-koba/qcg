@@ -3,66 +3,77 @@ use super::*;
 
 impl LocalService {
     pub async fn cancel(&self, id: String) -> Result<(), ApiError> {
-        // A cancel accepted during the shutdown drain would race the
-        // interruption settlement and journal a competing terminal event;
-        // refuse it like every other mutating operation (E05). Terminal
-        // runs stay idempotent under shutdown: re-cancelling a settled run
-        // reports success without journaling (E05).
+        self.cancel_with_operation_id(id, uuid::Uuid::now_v7().to_string())
+            .await
+    }
+
+    /// Retry one logical cancellation across request-process crashes. The caller
+    /// must retain the opaque ID; no HTTP key or claim policy enters the service.
+    pub async fn cancel_with_operation_id(
+        &self,
+        id: String,
+        operation_id: String,
+    ) -> Result<(), ApiError> {
+        // Shutdown refuses new cancels, but terminal retries remain no-ops.
         if self.is_shutting_down()
             && let Ok(run_dir) = self.run_dir_for(&id).await
             && self.authoritative_state(&run_dir).await?.terminal.is_some()
         {
+            if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
+                return Err(api_internal(
+                    "cancel retry could not consume matching control",
+                ));
+            }
             return Ok(());
         }
         self.ensure_running()?;
-        // Durable cross-process cancel mailbox first so a peer owner observes
-        // the request even when this process tracks no local task (A02).
-        // Control-file creation is fail-closed: I/O errors are reported
-        // instead of silently dropping the cancel request (A01).
+        // Publish before local signaling so even an untracked peer owner
+        // observes acceptance; mailbox I/O failures must never drop a cancel.
         let run_dir = self.run_dir_for(&id).await?;
-        let cancel_operation =
-            crate::run_dirs::request_remote_cancel(&run_dir, &id, &self.inner.owner_id)
-                .map_err(api_internal)?;
+        let state = self.authoritative_state(&run_dir).await?;
+        if state.terminal.is_some() || state.cancel_operations.contains(&operation_id) {
+            if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
+                return Err(api_internal(
+                    "cancel retry could not consume matching control",
+                ));
+            }
+            return Ok(());
+        }
+        let newly_published = crate::run_dirs::request_remote_cancel_with_id(
+            &run_dir,
+            &id,
+            &self.inner.owner_id,
+            &operation_id,
+        )
+        .map_err(api_internal)?;
         let (task, settled) = {
             let mut runs = self.inner.runs.write().await;
             let Some(record) = runs.get_mut(&id) else {
-                // No local record, but the durable mailbox already carries
-                // the cancel to the owning peer (A02). Report success so a
-                // non-tracking peer can still stop a shared run, even under
-                // shutdown: no local journal race exists here (E05).
+                // The peer owner's mailbox is sufficient acceptance here.
                 return Ok(());
             };
             if record.state.is_terminal() {
-                // The mailbox file just created above would otherwise linger
-                // with no engine left to drain it, pinning has_pending true
-                // and blocking deletion (E03). Withdraw it: the run already
-                // settled, so there is nothing to cancel. Terminal cancels
-                // stay idempotent even under shutdown (E05).
-                if !crate::run_dirs::consume_cancel_control(&run_dir, &cancel_operation) {
+                // Settlement raced publication. Consume even reused evidence:
+                // no engine remains to drain it and it must not pin deletion.
+                if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
                     tracing::warn!(run_id = %id, "terminal cancel left a phantom cancel control");
                 }
                 return Ok(());
             }
-            // Re-check under the runs lock: a shutdown that started between
-            // the outer gate and here must not journal a competing cancel
-            // against the interruption settlement (E05). The just-written
-            // mailbox file is withdrawn so no phantom cancel outlives the
-            // refusal (E04).
+            // Recheck shutdown under the runs lock. Withdraw only evidence
+            // published by this call, never a prior accepted retry's mailbox.
             if self.is_shutting_down() {
-                if !crate::run_dirs::consume_cancel_control(&run_dir, &cancel_operation) {
+                if newly_published
+                    && !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id)
+                {
                     tracing::warn!(run_id = %id, "shutdown refusal left a phantom cancel control");
                 }
                 return Err(ApiError::Unavailable {
                     detail: "server is shutting down".into(),
                 });
             }
-            // A live engine task is the journal writer even while parked in
-            // Waiting/Confirming, and it holds the execution lease for the
-            // whole run. Rendezvous with it instead of racing its lease:
-            // probing the lease here would report a locally owned run as
-            // executing elsewhere whenever cancel lands before an answer.
-            // Liveness uses the shared slot predicate: a parked finished
-            // handle no longer owns execution (E12).
+            // Rendezvous with the live writer, even while Waiting/Confirming;
+            // probing its execution lease would conflict with our own task.
             let engine_is_active = crate::types::task_slot_is_live(&record.task);
             record.cancellation.cancel();
             // Acceptance, not settlement: the mailbox carries the request
@@ -75,9 +86,7 @@ impl LocalService {
                 let settled = record.clone();
                 (None, Some(settled))
             } else {
-                // Single-writer rule: never append while the engine task is
-                // live. The owner task drains the mailbox and settles the
-                // journal after exiting (A01).
+                // The live task alone journals and settles after exit.
                 let task = record.take_task_slot();
                 (task, None)
             }

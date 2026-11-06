@@ -199,20 +199,36 @@ retry rejoins as a peer instead of executing fresh. Retention is not proof
 that replay is safe, and may hold a key even when no effect occurred.
 Route-specific acceptance reconciliation is still required.
 
-This is a partial fence, not crash-after-acceptance reconciliation. If a process
-dies after accepting start/fork, answer/confirmation, or cancel but before
-Ready, the gate does not establish whether repeating that operation is safe.
-Ambiguous Pending evidence is not reaped; existing recovery and indeterminate
-operation refusals still apply. A 60-second Pending lease expiring while its
-gate is held does not authorize a successor to replace it, but after the gate
-is released the next holder still adopts the expired run id without proving
-that repeating the operation is safe for that route. Do not treat a released
-OS lock as proof that
-an operation had no effects. Before upgrading a shared store, stop and join
-**all** old peers and their in-flight writers; upgrade every writer before
-resuming. Record formats and Ready TTL remain unchanged, but old binaries do
-not honor execution gates: mixed-version writers are unsupported and cannot
-be made safe by these locks. Keep runs-directory ancestry trusted and unchanged.
+New durable Pending claims include an opaque operation ID before execution.
+A same-key, same-digest adoption retains that ID as well as the reserved run ID.
+For **cancel only**, HTTP passes the ID to the service's cancellation acceptance:
+a process crash after mailbox publication but before Ready retries the same
+logical cancel, rather than generating another random mailbox operation.
+An existing mailbox with the same operation/run identity is reused without
+replacing its original attribution or timestamp; corrupt or mismatched evidence
+fails closed. An already-journaled operation ID is the same acceptance, and the
+journal-locked drain deduplicates concurrent deliveries. Journaled and terminal
+retries consume a still-published matching mailbox without adding another event
+or publishing a phantom control; malformed or unrelated evidence is retained. Shutdown refusal can withdraw only a mailbox
+newly published by that call, not evidence accepted by an earlier request.
+Direct service and unkeyed HTTP cancels still generate fresh IDs.
+
+This is a **partial process-crash recovery step**, not a power-loss durability
+guarantee or general crash-after-acceptance reconciliation. Start/fork and
+answer/confirmation crash windows remain unresolved. Ambiguous Pending evidence
+is not reaped or retired by age; existing recovery and indeterminate-operation
+refusals still apply. An expired lease does not authorize takeover while its
+gate is held, and a released OS lock is not proof that an operation had no effects.
+
+Legacy Pending JSON without an operation ID remains readable for live-peer
+waiting, but **expired adoption fails closed and retains the evidence** rather
+than inventing an identity. Stop and join **all** old peers and their in-flight
+writers before upgrading a shared store, and upgrade every writer before
+resuming. Reconcile legacy Pending operations and their associated runs under
+quiescence before manually resolving their records; do not simply delete them
+or manufacture IDs to unblock retries. Mixed-version writers are unsupported:
+old binaries neither preserve these IDs nor honor execution gates. Ready format
+and TTL are unchanged. Keep runs-directory ancestry trusted and unchanged.
 
 Ready expires when the wall clock reaches its persisted creation second plus
 `IDEMPOTENCY_TTL_SECS` (the cutoff is inclusive). Replay never renews it.
