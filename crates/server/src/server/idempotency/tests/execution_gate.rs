@@ -75,6 +75,50 @@ fn age_claim(runs: &Utf8PathBuf) -> Vec<u8> {
     original
 }
 
+fn shared_service(runs: &Utf8PathBuf) -> service::LocalService {
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .to_owned();
+    service::LocalService::with_generator_roots_policy_and_store_mode(
+        vec![workspace.join("fixtures/generators")],
+        runs.clone(),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        service::RunStoreMode::SharedFilesystem,
+        service::ServiceDeploymentPolicy::default(),
+    )
+    .unwrap()
+}
+
+fn answer_payload() -> api::AnswerPayload {
+    api::AnswerPayload {
+        values: std::collections::BTreeMap::from([(
+            "answer".into(),
+            serde_json::json!("detailed"),
+        )]),
+    }
+}
+fn confirm_decision() -> api::ConfirmDecision {
+    api::ConfirmDecision {
+        decision: api::ConfirmationDecision::Approve,
+    }
+}
+fn interaction_body(scope: &str, interaction: &str) -> Vec<u8> {
+    // Match run_detail's digest: interaction id, NUL, then the typed JSON body.
+    let mut body = interaction.as_bytes().to_vec();
+    body.push(0);
+    body.extend(if scope == "answer" {
+        serde_json::to_vec(&answer_payload()).unwrap()
+    } else {
+        serde_json::to_vec(&confirm_decision()).unwrap()
+    });
+    body
+}
+
 #[tokio::test]
 async fn gate_process() {
     let Ok(root) = std::env::var("QCG_GATE_TEST_RUNS") else {
@@ -113,28 +157,56 @@ async fn gate_process() {
         assert_eq!(fs::read(pending(&runs)).unwrap(), before);
         return;
     }
-    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .to_owned();
-    let service = service::LocalService::with_generator_roots_policy_and_store_mode(
-        vec![workspace.join("fixtures/generators")],
-        runs.clone(),
-        None,
-        policy::DEFAULT_MAX_ACTIVE_RUNS,
-        policy::DEFAULT_MAX_TRACKED_RUNS,
-        service::RunStoreMode::SharedFilesystem,
-        service::ServiceDeploymentPolicy::default(),
-    )
-    .unwrap();
+    let service = shared_service(&runs);
     let state = Arc::new(crate::test_state(
         service,
         runs.clone(),
         None,
         tokio_util::sync::CancellationToken::new(),
     ));
+    if let Some(scope @ ("answer" | "confirm")) = mode.strip_suffix("-crash") {
+        let (id, interaction): (String, String) =
+            serde_json::from_slice(&fs::read(runs.join("interaction-target")).unwrap()).unwrap();
+        let body = interaction_body(scope, &interaction);
+        let mut headers = HeaderMap::new();
+        headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+        with_idempotency(IdempotentCall {
+            state: &state,
+            headers: &headers,
+            scope,
+            target: &id,
+            body: &body,
+            digest_context: None,
+            created: false,
+            reserved_run_id: Some(id.clone()),
+            execute: |context| {
+                let id = &id;
+                let state = &state;
+                let runs = &runs;
+                async move {
+                    assert_eq!(context.reserved_run_id.as_ref(), Some(id));
+                    if scope == "answer" {
+                        state
+                            .service
+                            .answer(id.clone(), interaction, answer_payload())
+                            .await?;
+                    } else {
+                        state
+                            .service
+                            .confirm(id.clone(), interaction, confirm_decision())
+                            .await?;
+                    }
+                    // The journal append has completed, but Ready cannot be stored
+                    // until this closure returns. The parent holds execution.lock.
+                    barrier(runs, "interaction-accepted").await;
+                    Ok(id.clone())
+                }
+            },
+        })
+        .await
+        .unwrap();
+        panic!("parent must kill request before Ready");
+    }
     if mode.starts_with("cancel-") {
         let id = fs::read_to_string(runs.join("cancel-target")).unwrap();
         let mut headers = HeaderMap::new();
@@ -546,4 +618,182 @@ async fn direct_and_unkeyed_cancel_keep_fresh_operation_ids() {
         fs::read_dir(run_dir.join("meta/control")).unwrap().count(),
         0
     );
+}
+
+#[tokio::test]
+async fn answer_process_crash_after_acceptance_retries_to_ready() {
+    interaction_process_crash("answer").await;
+}
+
+#[tokio::test]
+async fn confirm_process_crash_after_acceptance_retries_to_ready() {
+    interaction_process_crash("confirm").await;
+}
+
+// Process termination on the shared filesystem only, not a power-loss test.
+async fn interaction_process_crash(scope: &str) {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("qcg-{scope}-crash-{}", uuid::Uuid::now_v7())),
+    );
+    let runs = &fixture.0;
+    let owner = shared_service(runs);
+    let id = owner
+        .start_run(api::StartRun {
+            generator_id: if scope == "answer" {
+                "ask-user"
+            } else {
+                "side-effect-confirm"
+            }
+            .into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let interaction = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = owner.snapshot(id.clone()).await.unwrap();
+            if scope == "answer" && snapshot.state == api::RunStatus::Waiting {
+                break snapshot.question.unwrap().id;
+            }
+            if scope == "confirm" && snapshot.state == api::RunStatus::Confirming {
+                break snapshot.confirm.unwrap().id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let run_dir = owner.run_dir_for(&id).await.unwrap();
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("meta/execution.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match lease.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+            Err(error) => panic!("lease failed: {error:?}"),
+        }
+        assert!(Instant::now() < deadline, "execution lease timed out");
+    }
+    drop(owner);
+    fs::write(
+        runs.join("interaction-target"),
+        serde_json::to_vec(&(&id, &interaction)).unwrap(),
+    )
+    .unwrap();
+    let accepted_events = || {
+        fs::read_to_string(run_dir.join("meta/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| {
+                event["t"]
+                    == if scope == "answer" {
+                        "user_answered"
+                    } else {
+                        "user_confirmed"
+                    }
+            })
+            .collect::<Vec<_>>()
+    };
+    let mut request = spawn(runs, &format!("{scope}-crash"));
+    wait_file(runs, "interaction-accepted");
+    let original = fs::read(pending(runs)).unwrap();
+    let claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    assert_eq!(claim["run_id"], id);
+    assert_eq!(
+        claim["digest"],
+        request_digest(scope, &id, &interaction_body(scope, &interaction), None)
+    );
+    assert!(
+        durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    let accepted = accepted_events();
+    assert_eq!(accepted.len(), 1);
+    if scope == "answer" {
+        assert_eq!(accepted[0]["question_id"], interaction);
+        assert_eq!(
+            accepted[0]["values"],
+            serde_json::json!(answer_payload().values)
+        );
+    } else {
+        assert_eq!(accepted[0]["confirmation_id"], interaction);
+        assert_eq!(accepted[0]["approved"], true);
+    }
+    request.0.kill().unwrap();
+    request.0.wait().unwrap();
+    assert_eq!(
+        fs::read(pending(runs)).unwrap(),
+        original,
+        "process death must preserve Pending"
+    );
+    assert_eq!(accepted_events(), accepted);
+    assert!(
+        durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    // Controlled lease-expiry seam from the stable-key claim tests: only
+    // created_at changes, not the digest, target, owner or reserved run.
+    age_claim(runs);
+    let state = Arc::new(crate::test_state(
+        shared_service(runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let mut headers = HeaderMap::new();
+    headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
+    let response = tokio::time::timeout(Duration::from_secs(5), async {
+        let path = axum::extract::Path((id.clone(), interaction.clone()));
+        if scope == "answer" {
+            crate::server::run_detail::answer_run(
+                axum::extract::State(state.clone()),
+                headers,
+                path,
+                axum::Json(answer_payload()),
+            )
+            .await
+        } else {
+            crate::server::run_detail::confirm_run(
+                axum::extract::State(state.clone()),
+                headers,
+                path,
+                axum::Json(confirm_decision()),
+            )
+            .await
+        }
+    })
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    let snapshot: api::RunSnapshot = serde_json::from_slice(
+        &axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(snapshot.run_id, id);
+    assert!(!pending(runs).exists());
+    let ready = durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.run_id, id);
+    assert_eq!(ready.digest, claim["digest"].as_str().unwrap());
+    assert_eq!(
+        accepted_events(),
+        accepted,
+        "retry must preserve the single original acceptance"
+    );
+    // Do not launch the approved command when releasing the test-owned lease.
+    state.service.mark_shutting_down();
+    drop(lease);
 }
