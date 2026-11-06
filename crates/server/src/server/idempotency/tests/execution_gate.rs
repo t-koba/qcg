@@ -164,7 +164,10 @@ async fn gate_process() {
         None,
         tokio_util::sync::CancellationToken::new(),
     ));
-    if let Some(scope @ ("start_run" | "fork_run")) = mode.strip_suffix("-pre-admission") {
+    if let Some(scope @ ("start_run" | "fork_run")) = mode
+        .strip_suffix("-pre-admission")
+        .or_else(|| mode.strip_suffix("-post-acceptance"))
+    {
         let body = fs::read(runs.join("creation-request")).unwrap();
         let target = fs::read_to_string(runs.join("creation-target")).unwrap();
         let package = fs::read_to_string(runs.join("creation-package")).unwrap();
@@ -191,10 +194,12 @@ async fn gate_process() {
             execute: |context| async {
                 assert_eq!(context.reserved_run_id.as_ref(), Some(&reserved));
                 assert!(!runs.join(&reserved).exists());
-                // The gate and Pending reservation exist, but neither service
-                // admission API has been called. The parent kills us here.
-                barrier(&runs, "creation-before-admission").await;
-                if scope == "start_run" {
+                if mode.ends_with("-pre-admission") {
+                    // The gate and Pending reservation exist, but neither service
+                    // admission API has been called. The parent kills us here.
+                    barrier(&runs, "creation-before-admission").await;
+                }
+                let id = if scope == "start_run" {
                     state
                         .service
                         .start_run_with_package_identity(
@@ -212,12 +217,20 @@ async fn gate_process() {
                             context.reserved_run_id,
                         )
                         .await
+                }?;
+                assert_eq!(id, reserved);
+                if mode.ends_with("-post-acceptance") {
+                    assert!(runs.join(&reserved).exists());
+                    // Service admission returned the reserved run, but this
+                    // closure has not returned, so Ready cannot be published.
+                    barrier(&runs, "creation-after-acceptance").await;
                 }
+                Ok(id)
             },
         })
         .await
         .unwrap();
-        panic!("parent must kill request before service admission");
+        panic!("parent must kill request at the creation barrier");
     }
     if let Some(scope @ ("answer" | "confirm")) = mode.strip_suffix("-crash") {
         let (id, interaction): (String, String) =
@@ -876,15 +889,32 @@ async fn fork_process_crash_before_admission_retries_reserved_run_to_ready() {
     creation_process_crash("fork_run").await;
 }
 
-// Process termination on the shared filesystem only, not power-loss durability.
+#[tokio::test]
+async fn start_process_crash_after_acceptance_adopts_reserved_run_to_ready() {
+    creation_process_crash_at("start_run", true).await;
+}
+
+#[tokio::test]
+async fn fork_process_crash_after_acceptance_adopts_reserved_run_to_ready() {
+    creation_process_crash_at("fork_run", true).await;
+}
+
+// Process termination on the shared filesystem only, not power-loss durability
+// or evidence for general Pending retirement.
 async fn creation_process_crash(scope: &str) {
+    creation_process_crash_at(scope, false).await;
+}
+
+async fn creation_process_crash_at(scope: &str, accepted: bool) {
+    let phase = if accepted {
+        "post-acceptance"
+    } else {
+        "pre-admission"
+    };
     let fixture = Fixture(
         Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .unwrap()
-            .join(format!(
-                "qcg-{scope}-pre-admission-{}",
-                uuid::Uuid::now_v7()
-            )),
+            .join(format!("qcg-{scope}-{phase}-{}", uuid::Uuid::now_v7())),
     );
     let runs = &fixture.0;
     let owner = shared_service(runs);
@@ -953,8 +983,17 @@ async fn creation_process_crash(scope: &str) {
     fs::write(runs.join("creation-request"), &body).unwrap();
     fs::write(runs.join("creation-target"), &target).unwrap();
     fs::write(runs.join("creation-package"), &package).unwrap();
-    let mut child = spawn(runs, &format!("{scope}-pre-admission"));
-    wait_file(runs, "creation-before-admission");
+    let source_journal = (scope == "fork_run")
+        .then(|| fs::read(runs.join(&target).join("meta/journal.jsonl")).unwrap());
+    let mut child = spawn(runs, &format!("{scope}-{phase}"));
+    wait_file(
+        runs,
+        if accepted {
+            "creation-after-acceptance"
+        } else {
+            "creation-before-admission"
+        },
+    );
     let original = fs::read(pending(runs)).unwrap();
     let claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
     let reserved = claim["run_id"].as_str().unwrap().to_owned();
@@ -965,10 +1004,46 @@ async fn creation_process_crash(scope: &str) {
         (scope == "start_run").then_some(package.as_bytes()),
     );
     assert_eq!(claim["digest"], digest);
-    assert!(
-        !runs.join(&reserved).exists(),
-        "reserved run is not admitted"
-    );
+    let admissions = || {
+        let journal = fs::read_to_string(runs.join(&reserved).join("meta/journal.jsonl")).unwrap();
+        let events: Vec<serde_json::Value> = journal
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // A fork copies source history. Count only its own admission, after
+        // the fork marker, not the source's queued/started events.
+        let first = if scope == "fork_run" {
+            events
+                .iter()
+                .rposition(|event| event["t"] == "run_forked")
+                .unwrap()
+                + 1
+        } else {
+            0
+        };
+        events
+            .into_iter()
+            .skip(first)
+            .filter(|event| event["t"] == "run_queued")
+            .collect::<Vec<_>>()
+    };
+    let original_admissions = accepted.then(|| {
+        let events = admissions();
+        assert_eq!(
+            events.len(),
+            1,
+            "service durably admitted the reserved run once"
+        );
+        events
+    });
+    if accepted {
+        assert!(runs.join(&reserved).exists(), "reserved run was admitted");
+    } else {
+        assert!(
+            !runs.join(&reserved).exists(),
+            "reserved run is not admitted"
+        );
+    }
     assert!(
         durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
             .unwrap()
@@ -992,7 +1067,14 @@ async fn creation_process_crash(scope: &str) {
         aged,
         "death retains Pending evidence"
     );
-    assert!(!runs.join(&reserved).exists());
+    if accepted {
+        assert!(
+            runs.join(&reserved).exists(),
+            "death retains the admitted run"
+        );
+    } else {
+        assert!(!runs.join(&reserved).exists());
+    }
     assert!(
         durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
             .unwrap()
@@ -1005,9 +1087,23 @@ async fn creation_process_crash(scope: &str) {
         tokio_util::sync::CancellationToken::new(),
     ));
     let before = state.service.list_run_items().await.unwrap();
-    assert_eq!(before.len(), usize::from(scope == "fork_run"));
-    if scope == "fork_run" {
-        assert_eq!(before[0].run_id, target);
+    if accepted {
+        assert_eq!(before.len(), 1 + usize::from(scope == "fork_run"));
+        assert_eq!(
+            before.iter().filter(|item| item.run_id == reserved).count(),
+            1
+        );
+        if scope == "fork_run" {
+            assert_eq!(
+                before.iter().filter(|item| item.run_id == target).count(),
+                1
+            );
+        }
+    } else {
+        assert_eq!(before.len(), usize::from(scope == "fork_run"));
+        if scope == "fork_run" {
+            assert_eq!(before[0].run_id, target);
+        }
     }
     assert_eq!(
         fs::read(pending(runs)).unwrap(),
@@ -1078,13 +1174,31 @@ async fn creation_process_crash(scope: &str) {
         assert_eq!(mappings[0]["key"], KEY);
         assert_eq!(mappings[0]["run_id"], reserved);
         let after = state.service.list_run_items().await.unwrap();
-        assert_eq!(after.len(), before.len() + 1, "exactly one new admission");
+        if accepted {
+            assert_eq!(
+                after.len(),
+                before.len(),
+                "retry must adopt, not admit a new run"
+            );
+            assert_eq!(
+                admissions(),
+                *original_admissions.as_ref().unwrap(),
+                "retry must preserve the single original admission"
+            );
+        } else {
+            assert_eq!(after.len(), before.len() + 1, "exactly one new admission");
+        }
         assert_eq!(
             after.iter().filter(|item| item.run_id == reserved).count(),
             1
         );
         if scope == "fork_run" {
             assert_eq!(after.iter().filter(|item| item.run_id == target).count(), 1);
+            assert_eq!(
+                fs::read(runs.join(&target).join("meta/journal.jsonl")).unwrap(),
+                *source_journal.as_ref().unwrap(),
+                "fork retry leaves the source journal intact"
+            );
         }
     }
 }
