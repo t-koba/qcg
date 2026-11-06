@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-/// Four default-sized (16 MiB) single-artifact response snapshots.
+/// Four default-sized (16 MiB) artifact and JSON run-view response bodies.
 pub(crate) const DEFAULT_MAX_ARTIFACT_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]
@@ -55,11 +55,29 @@ impl ArtifactResponseBudget {
     }
 }
 
-/// Owned by the response stream, including while its body is unpolled.
+/// Owned by response bytes or stream, including while its body is unpolled.
 #[derive(Debug)]
 pub(crate) struct Reservation {
     budget: Arc<ArtifactResponseBudget>,
     bytes: u64,
+}
+
+impl Reservation {
+    pub(crate) fn into_body(self, bytes: Vec<u8>) -> axum::body::Body {
+        struct ReservedBytes {
+            bytes: Vec<u8>,
+            _reservation: Reservation,
+        }
+        impl AsRef<[u8]> for ReservedBytes {
+            fn as_ref(&self) -> &[u8] {
+                &self.bytes
+            }
+        }
+        axum::body::Body::from(axum::body::Bytes::from_owner(ReservedBytes {
+            bytes,
+            _reservation: self,
+        }))
+    }
 }
 
 impl Drop for Reservation {
@@ -68,9 +86,117 @@ impl Drop for Reservation {
     }
 }
 
+/// Count first without retaining JSON, then reserve the exact serialized size.
+/// The value is an immutable run view: both passes serialize the same shape.
+pub(crate) fn serialize_json(
+    value: &impl serde::Serialize,
+    limit: u64,
+    budget: &Arc<ArtifactResponseBudget>,
+) -> Result<(Vec<u8>, Reservation), ApiHttpError> {
+    struct Counter(u64);
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("JSON size overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value).map_err(ApiHttpError::internal)?;
+    if counter.0 > limit {
+        return Err(ApiHttpError::from_api(api::ApiError::TooLarge {
+            actual_bytes: counter.0 as usize,
+            limit_bytes: limit as usize,
+        }));
+    }
+    let reservation = budget.reserve(counter.0)?;
+    let body = serde_json::to_vec(value).map_err(ApiHttpError::internal)?;
+    Ok((body, reservation))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn json_reserves_exact_bytes_before_buffering_and_releases_on_errors() {
+        struct Value<'a> {
+            budget: &'a Arc<ArtifactResponseBudget>,
+            calls: std::cell::Cell<usize>,
+            fail_on: usize,
+        }
+        impl serde::Serialize for Value<'_> {
+            fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let pass = self.calls.get();
+                self.calls.set(pass + 1);
+                // Four bytes for the JSON string "ok"; no buffer exists on pass zero.
+                assert_eq!(
+                    self.budget.used.load(Ordering::Relaxed),
+                    if pass == 0 { 0 } else { 4 }
+                );
+                if pass == self.fail_on {
+                    return Err(serde::ser::Error::custom("injected serialization failure"));
+                }
+                serializer.serialize_str("ok")
+            }
+        }
+        let budget = ArtifactResponseBudget::new(Some(4)).unwrap();
+        for fail_on in [0, 1, usize::MAX] {
+            let value = Value {
+                budget: &budget,
+                calls: std::cell::Cell::new(0),
+                fail_on,
+            };
+            let result = serialize_json(&value, 4, &budget);
+            if fail_on == usize::MAX {
+                let (body, reservation) = result.unwrap();
+                assert_eq!(body, br#""ok""#);
+                assert_eq!(reservation.bytes, body.len() as u64);
+                drop(reservation);
+            } else {
+                assert_eq!(result.unwrap_err().problem.status, 500);
+            }
+            assert_eq!(budget.used.load(Ordering::Relaxed), 0);
+        }
+        let value = serde_json::json!({"escaped": "\n\"é"});
+        let expected = serde_json::to_vec(&value).unwrap();
+        let budget = ArtifactResponseBudget::new(Some(expected.len() as u64)).unwrap();
+        assert_eq!(
+            serialize_json(&value, expected.len() as u64 - 1, &budget)
+                .unwrap_err()
+                .problem
+                .status,
+            413
+        );
+        let (body, reservation) = serialize_json(&value, expected.len() as u64, &budget).unwrap();
+        assert_eq!(body, expected);
+        assert_eq!(reservation.bytes, expected.len() as u64);
+        drop(reservation);
+        let occupied = budget.reserve(1).unwrap();
+        assert_eq!(
+            serialize_json(&value, u64::MAX, &budget)
+                .unwrap_err()
+                .problem
+                .status,
+            503
+        );
+        assert_eq!(budget.used.load(Ordering::Relaxed), 1);
+        drop(occupied);
+        let too_small = ArtifactResponseBudget::new(Some(expected.len() as u64 - 1)).unwrap();
+        assert_eq!(
+            serialize_json(&value, u64::MAX, &too_small)
+                .unwrap_err()
+                .problem
+                .status,
+            413
+        );
+        assert_eq!(too_small.used.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn concurrent_reservations_cannot_overadmit() {

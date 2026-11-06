@@ -27,7 +27,7 @@ pub struct ServerConfig {
     pub max_request_bytes: Option<usize>,
     /// Dedicated-route default (16 MiB); bundle/generic service stay explicit-only.
     pub max_artifact_bytes: Option<u64>,
-    /// Aggregate single-artifact response snapshots; omitted uses 64 MiB.
+    /// Aggregate artifact and JSON run-view response bytes; omitted uses 64 MiB.
     pub max_artifact_response_bytes: Option<u64>,
     /// Dedicated-route default (1,000 entries); bundle/generic stay explicit-only.
     pub max_artifact_entries: Option<usize>,

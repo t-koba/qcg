@@ -2,7 +2,7 @@
 use super::*;
 impl LocalService {
     pub async fn artifacts(&self, id: String) -> Result<OutputManifest, ApiError> {
-        Ok(self.bounded_manifest(&id, None).await?.0)
+        Ok(self.artifact_manifest_with_limits(&id, None).await?.0)
     }
     pub async fn read_artifact(
         &self,
@@ -11,7 +11,7 @@ impl LocalService {
     ) -> Result<(OutputArtifact, Utf8PathBuf), ApiError> {
         self.read_artifact_inner(id, path, None).await
     }
-    async fn bounded_manifest(
+    pub async fn artifact_manifest_with_limits(
         &self,
         id: &str,
         limits: Option<&crate::package::ArtifactZipLimits>,
@@ -28,12 +28,7 @@ impl LocalService {
         let path = run_meta_dir(&run_dir).join("outputs.json");
         let file = std::fs::File::open(&path).map_err(api_internal)?;
         let staged = file.metadata().map_err(api_internal)?.len();
-        if staged > capped as u64 {
-            return Err(ApiError::TooLarge {
-                actual_bytes: staged as usize,
-                limit_bytes: capped,
-            });
-        }
+        check_json_size(staged, capped as u64)?;
         let raw = files::read_bounded(&path, Some(capped)).map_err(api_internal)?;
         let manifest: OutputManifest = serde_json::from_slice(&raw).map_err(api_internal)?;
         if manifest.artifacts.len() > eff.max_entries.unwrap() {
@@ -50,26 +45,25 @@ impl LocalService {
         id: String,
         limits: &crate::package::ArtifactZipLimits,
     ) -> Result<Vec<u8>, ApiError> {
-        let (manifest, _) = self.bounded_manifest(&id, Some(limits)).await?;
-        let limit = usize::try_from(limits.effective().max_bytes.unwrap()).map_err(api_internal)?;
-        let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit as u64));
-        serde_json::to_writer(&mut body, &manifest).map_err(api_internal)?;
-        if body.exceeded {
-            return Err(ApiError::TooLarge {
-                actual_bytes: body.written as usize,
-                limit_bytes: limit,
-            });
-        }
-        Ok(body.inner)
+        let (manifest, _) = self
+            .artifact_manifest_with_limits(&id, Some(limits))
+            .await?;
+        bounded_json(&manifest, limits)
     }
     pub async fn snapshot_json(
         &self,
         id: String,
         limits: &crate::package::ArtifactZipLimits,
     ) -> Result<Vec<u8>, ApiError> {
+        bounded_json(&self.snapshot_with_limits(id, limits).await?, limits)
+    }
+    pub async fn snapshot_with_limits(
+        &self,
+        id: String,
+        limits: &crate::package::ArtifactZipLimits,
+    ) -> Result<RunSnapshot, ApiError> {
         let eff = limits.effective();
         let limit = usize::try_from(eff.max_bytes.unwrap()).map_err(api_internal)?;
-        let entries = eff.max_entries.unwrap();
         let memory = self.inner.runs.read().await.get(&id).cloned();
         let run_dir = match &memory {
             Some(r) => r.run_dir.clone(),
@@ -87,12 +81,7 @@ impl LocalService {
                     Err(e) => return Err(api_internal(e)),
                     Ok(f) => {
                         let staged = f.metadata().map_err(api_internal)?.len();
-                        if staged > limit as u64 {
-                            return Err(ApiError::TooLarge {
-                                actual_bytes: staged as usize,
-                                limit_bytes: limit,
-                            });
-                        }
+                        check_json_size(staged, limit as u64)?;
                         let raw = files::read_bounded(&path, Some(limit)).map_err(api_internal)?;
                         let m: OutputManifest =
                             serde_json::from_slice(&raw).map_err(api_internal)?;
@@ -102,7 +91,7 @@ impl LocalService {
             }
         };
         if let Some(m) = &artifacts {
-            if m.artifacts.len() > entries {
+            if m.artifacts.len() > eff.max_entries.unwrap() {
                 return Err(ApiError::invalid_field(
                     "artifacts",
                     "artifact count exceeds limit",
@@ -112,27 +101,17 @@ impl LocalService {
         }
         #[cfg(test)]
         crate::tests::terminal_manifest::after_first_read(&run_dir);
-        let snapshot = self
-            .assemble_snapshot_from_read(
-                id,
-                memory,
-                &run_dir,
-                SnapshotRead {
-                    events: &view.events,
-                    state: &view.state,
-                },
-                artifacts,
-            )
-            .await?;
-        let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit as u64));
-        serde_json::to_writer(&mut body, &snapshot).map_err(api_internal)?;
-        if body.exceeded {
-            return Err(ApiError::TooLarge {
-                actual_bytes: body.written as usize,
-                limit_bytes: limit,
-            });
-        }
-        Ok(body.inner)
+        self.assemble_snapshot_from_read(
+            id,
+            memory,
+            &run_dir,
+            SnapshotRead {
+                events: &view.events,
+                state: &view.state,
+            },
+            artifacts,
+        )
+        .await
     }
     pub async fn read_artifact_with_limits(
         &self,
@@ -148,7 +127,7 @@ impl LocalService {
         path: String,
         limits: Option<&crate::package::ArtifactZipLimits>,
     ) -> Result<(OutputArtifact, Utf8PathBuf), ApiError> {
-        let (manifest, run_dir) = self.bounded_manifest(&id, limits).await?;
+        let (manifest, run_dir) = self.artifact_manifest_with_limits(&id, limits).await?;
         let artifact = manifest
             .artifacts
             .into_iter()
@@ -227,4 +206,25 @@ impl LocalService {
             audit_limit,
         })
     }
+}
+
+fn bounded_json(
+    value: &impl serde::Serialize,
+    limits: &crate::package::ArtifactZipLimits,
+) -> Result<Vec<u8>, ApiError> {
+    let limit = limits.effective().max_bytes.unwrap();
+    let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit));
+    serde_json::to_writer(&mut body, value).map_err(api_internal)?;
+    check_json_size(body.written, limit)?;
+    Ok(body.inner)
+}
+
+fn check_json_size(actual: u64, limit: u64) -> Result<(), ApiError> {
+    if actual > limit {
+        return Err(ApiError::TooLarge {
+            actual_bytes: actual as usize,
+            limit_bytes: limit as usize,
+        });
+    }
+    Ok(())
 }

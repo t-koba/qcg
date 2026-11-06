@@ -364,8 +364,9 @@ The complete file is verified before delivering a successful range response.
 snapshot responses share a server-only provisional profile of 16 MiB and 1,000 entries.
 These are provisional product-policy defaults, not customer-calibrated values, a p95
 target, or a peak-RSS guarantee. Each route enforces its per-request ceiling.
-Single-artifact downloads additionally share the response-snapshot budget below;
-other routes have no shared response-memory budget.
+The two JSON run-view routes and single-artifact downloads additionally share
+the response-byte budget below; other routes have no shared response-memory
+budget.
 Direct CLI export (`qcg runs export`) uses the unbounded default and never applies
 the provisional profile; only HTTP applies `artifact_limits.effective()`.
 
@@ -376,21 +377,32 @@ provisional default for these snapshot and dedicated artifact routes only,
 never unlimited.
 
 `--max-artifact-response-bytes` (`MAX_ARTIFACT_RESPONSE_BYTES`, default
-`67108864`, 64 MiB) bounds the aggregate response-owned verified snapshots for
-concurrent `GET /api/runs/{id}/artifacts/{path...}` responses. The default admits
-four current default-sized 16 MiB bodies. The positive byte limit is frozen at
-server boot; zero refuses startup. Each non-304 response reserves the full
-manifest artifact size before snapshot allocation or body reads, including for
-a range, and retains that reservation until its response body is dropped.
-Verification/allocation errors and body drops release the reservation. One
-artifact larger than the budget returns `413`; temporary aggregate exhaustion
-returns `503`, both before reading its body. Conditional `304` responses still
-verify the file but retain no snapshot and do not use this budget.
+`67108864`, 64 MiB) bounds aggregate response-owned bytes for concurrent
+`GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`, and
+`GET /api/runs/{id}/artifacts/{path...}` responses. The default admits four
+current default-sized 16 MiB bodies. The positive byte limit is frozen at
+server boot; zero refuses startup.
 
-This bounds only these response-owned snapshot bytes, not total RSS, allocator
-or streaming overhead, metadata, or any other endpoint (including artifact
-lists, zip, bundles, and run snapshots). Raising per-artifact limits does not
-raise this budget; configure it independently to admit larger downloads.
+The two JSON run-view routes count their serialized bytes without retaining a
+body, enforce the per-response limit, and reserve the exact size before
+buffering JSON. Small responses use only their actual serialized size, not the
+per-response maximum. The exact-body ETag and `If-None-Match` behavior are
+unchanged; `304` releases the temporary serialization reservation immediately.
+Single-artifact responses reserve the full manifest artifact size before
+snapshot allocation or body reads, including for a range. Conditional
+single-artifact `304` responses still verify the file but retain no snapshot
+and do not use this budget.
+
+Reservations stay with the response bytes/body until dropped; serialization,
+verification, allocation and conditional-response errors release them. One
+body larger than the budget returns `413`; temporary aggregate exhaustion
+returns `503`, before response buffering (or single-artifact body reads).
+These limits do not change the existing per-response byte and entry limits.
+
+This bounds only the covered response-owned bytes, not total RSS, allocator
+or streaming overhead, metadata, or other endpoints (including zip, bundles,
+run-list, and start/fork responses). Raising per-artifact limits does not raise
+this budget; configure it independently to admit larger responses.
 
 Enforcement order: raw `outputs.json` bytes are capped before deserialization
 using the opened file's metadata for the exact stable size (a concurrent

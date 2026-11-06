@@ -22,12 +22,12 @@ pub(crate) async fn run_snapshot(
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
     // Bounded snapshot body shares the dedicated 16 MiB/1,000 profile; over-limit fails 413 before ETag/304.
-    let body = state
+    let snapshot = state
         .service
-        .snapshot_json(id, &state.artifact_limits)
+        .snapshot_with_limits(id, &state.artifact_limits)
         .await
         .map_err(ApiHttpError::from_api)?;
-    conditional_response(&headers, body, "application/json")
+    reserved_json_response(&state, &headers, &snapshot)
 }
 pub(crate) async fn invalidate_run(
     State(state): State<Arc<AppState>>,
@@ -503,16 +503,31 @@ pub(crate) async fn run_artifacts(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
-    let body = state
+    let (manifest, _) = state
         .service
-        .artifacts_json(id.clone(), &state.artifact_limits)
+        .artifact_manifest_with_limits(&id, Some(&state.artifact_limits))
         .await
         .map_err(ApiHttpError::from_api)?;
-    // The validator is the exact body digest: the artifact set can change
-    // (files appear or are invalidated) without the run's own sequence
-    // moving, so a seq-only ETag would return a stale 304 (E16). Single
-    // entry point computes the digest once from the served bytes.
-    conditional_response(&headers, body, "application/json")
+    reserved_json_response(&state, &headers, &manifest)
+}
+fn reserved_json_response(
+    state: &AppState,
+    headers: &HeaderMap,
+    value: &impl serde::Serialize,
+) -> Result<Response, ApiHttpError> {
+    let (body, reservation) = super::artifact_response::serialize_json(
+        value,
+        state.artifact_limits.effective().max_bytes.unwrap(),
+        &state.artifact_response_budget,
+    )?;
+    // The validator names the exact bytes, not a run sequence or manifest file.
+    let served = body_etag(&body);
+    conditional_response_with_etag(
+        headers,
+        reservation.into_body(body),
+        "application/json",
+        &served,
+    )
 }
 /// The exact-body ETag shared by every conditional JSON endpoint, so a
 /// digest change can never diverge between snapshot and artifact paths
@@ -613,7 +628,7 @@ pub(crate) fn conditional_response(
 /// response. `served` must be `body_etag(&body)`.
 fn conditional_response_with_etag(
     headers: &HeaderMap,
-    body: Vec<u8>,
+    body: impl Into<Body>,
     content_type: &'static str,
     served: &str,
 ) -> Result<Response, ApiHttpError> {
@@ -631,7 +646,7 @@ fn conditional_response_with_etag(
         .header(header::CONTENT_TYPE, content_type)
         .header(header::ETAG, served)
         .header(header::CACHE_CONTROL, "no-store")
-        .body(Body::from(body))
+        .body(body.into())
         .map_err(ApiHttpError::internal)
 }
 /// Exact-body validator response shared by conditional reads and mutation
@@ -1961,6 +1976,191 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&runs);
     }
+    #[tokio::test]
+    async fn buffered_run_views_share_budget_until_response_bytes_drop() {
+        use super::super::artifact_response::ArtifactResponseBudget;
+        use std::collections::{BTreeMap, BTreeSet};
+        async fn view(
+            state: Arc<AppState>,
+            snapshot: bool,
+            headers: HeaderMap,
+        ) -> Result<Response, ApiHttpError> {
+            if snapshot {
+                run_snapshot(State(state), Path("budget-run".into()), headers).await
+            } else {
+                run_artifacts(State(state), Path("budget-run".into()), headers).await
+            }
+        }
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("json-budget-{}", uuid::Uuid::now_v7()));
+        let workspace = camino::Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let service =
+            crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None).unwrap();
+        let run_dir = runs.join("budget-run");
+        std::fs::create_dir_all(run_dir.join("meta")).unwrap();
+        std::fs::create_dir_all(run_dir.join("workspace")).unwrap();
+        let started = serde_json::json!({"t": "run_started", "seq": 1, "run_id": "budget-run",
+            "trace_id": "ab".repeat(16), "span_id": "cd01", "ts": "2026-01-01T00:00:00Z",
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test", "inputs": {},
+            "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": "wall_clock"});
+        std::fs::write(run_dir.join("meta/journal.jsonl"), format!("{started}\n")).unwrap();
+        std::fs::write(run_dir.join("workspace/a.bin"), b"data").unwrap();
+        let artifact = artifact_for(b"data");
+        std::fs::write(
+            run_dir.join("meta/outputs.json"),
+            serde_json::to_vec(&model::OutputManifest {
+                artifacts: vec![model::OutputArtifact {
+                    path: "a.bin".into(),
+                    ..artifact
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        let mut state = Arc::new(AppState {
+            service,
+            runs_dir: runs.clone(),
+            oauth_origin: None,
+            oauth_allowed_origins: BTreeSet::new(),
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_ttl: policy::IDEMPOTENCY_TTL,
+            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            idempotency_sweep: Default::default(),
+            api_token_digest: None,
+            artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget: ArtifactResponseBudget::new(None).unwrap(),
+            asset_limit: None,
+            max_request_bytes: None,
+            metrics_policy: crate::server::MetricsPolicy::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        });
+        for snapshot in [false, true] {
+            let expected = if snapshot {
+                state
+                    .service
+                    .snapshot_json("budget-run".into(), &state.artifact_limits)
+                    .await
+                    .unwrap()
+            } else {
+                state
+                    .service
+                    .artifacts_json("budget-run".into(), &state.artifact_limits)
+                    .await
+                    .unwrap()
+            };
+            let bytes = expected.len() as u64;
+            let cap = bytes * 2 + 4;
+            Arc::get_mut(&mut state).unwrap().artifact_response_budget =
+                ArtifactResponseBudget::new(Some(cap)).unwrap();
+            let artifact = read_artifact(
+                State(state.clone()),
+                Path(("budget-run".into(), "a.bin".into())),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap();
+            let (first, second) = tokio::join!(
+                view(state.clone(), snapshot, HeaderMap::new()),
+                view(state.clone(), snapshot, HeaderMap::new())
+            );
+            let first = first.unwrap();
+            let second = second.unwrap();
+            assert_eq!(
+                view(state.clone(), snapshot, HeaderMap::new())
+                    .await
+                    .unwrap_err()
+                    .problem
+                    .status,
+                503
+            );
+            assert_eq!(first.headers()[header::ETAG], body_etag(&expected));
+            assert_eq!(first.headers()[header::CONTENT_TYPE], "application/json");
+            assert_eq!(first.headers()[header::CACHE_CONTROL], "no-store");
+            drop(first);
+            drop(
+                view(state.clone(), snapshot, HeaderMap::new())
+                    .await
+                    .unwrap(),
+            );
+            drop(second);
+            drop(artifact);
+            drop(state.artifact_response_budget.reserve(cap).unwrap());
+            Arc::get_mut(&mut state).unwrap().artifact_response_budget =
+                ArtifactResponseBudget::new(Some(bytes)).unwrap();
+            let response = view(state.clone(), snapshot, HeaderMap::new())
+                .await
+                .unwrap();
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            assert_eq!(&body[..], expected);
+            assert_eq!(
+                state
+                    .artifact_response_budget
+                    .reserve(1)
+                    .unwrap_err()
+                    .problem
+                    .status,
+                503
+            );
+            drop(body);
+            drop(state.artifact_response_budget.reserve(bytes).unwrap());
+            let mut headers = HeaderMap::new();
+            headers.insert(header::IF_NONE_MATCH, body_etag(&expected).parse().unwrap());
+            let response = view(state.clone(), snapshot, headers.clone())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
+            assert_eq!(response.headers()[header::ETAG], body_etag(&expected));
+            drop(state.artifact_response_budget.reserve(bytes).unwrap());
+            assert!(
+                axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            headers.insert(header::IF_NONE_MATCH, "malformed".parse().unwrap());
+            assert_eq!(
+                view(state.clone(), snapshot, headers)
+                    .await
+                    .unwrap_err()
+                    .problem
+                    .status,
+                400
+            );
+            drop(state.artifact_response_budget.reserve(bytes).unwrap());
+            let missing = run_snapshot(
+                State(state.clone()),
+                Path("missing".into()),
+                HeaderMap::new(),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(missing.problem.status, 404);
+            drop(state.artifact_response_budget.reserve(bytes).unwrap());
+            Arc::get_mut(&mut state).unwrap().artifact_response_budget =
+                ArtifactResponseBudget::new(Some(bytes - 1)).unwrap();
+            assert_eq!(
+                view(state.clone(), snapshot, HeaderMap::new())
+                    .await
+                    .unwrap_err()
+                    .problem
+                    .status,
+                413
+            );
+            drop(state.artifact_response_budget.reserve(bytes - 1).unwrap());
+        }
+        std::fs::remove_dir_all(runs).unwrap();
+    }
+
     #[tokio::test]
     async fn dedicated_list_and_single_bounds_reject_before_conditionals() {
         use axum::extract::{Path, State};

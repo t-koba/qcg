@@ -235,7 +235,7 @@ pub(crate) enum Command {
         /// Explicit max only. Omitted means no mechanistic limit.
         #[arg(long = "max-artifact-bytes", env = "MAX_ARTIFACT_BYTES")]
         max_artifact_bytes: Option<u64>,
-        /// Aggregate single-artifact response snapshots (default 64 MiB); must be positive.
+        /// Aggregate artifact and JSON run-view response bytes (default 64 MiB); must be positive.
         #[arg(
             long = "max-artifact-response-bytes",
             env = "MAX_ARTIFACT_RESPONSE_BYTES"

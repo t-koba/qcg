@@ -500,17 +500,24 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   start/fork snapshots plus `artifacts`, single `artifacts/{path}`, and
   `artifacts.zip`). Unset means the provisional shared default (16 MiB,
   1,000 entries) for those routes only, never unlimited. Larger explicit
-  values are honored as per-artifact limits; a single-artifact response must
-  also fit `MAX_ARTIFACT_RESPONSE_BYTES` (raise that budget separately when
-  needed). Other routes (`bundle`, run-list) are not covered; producer
+  values are honored as per-response limits; run-view JSON and single-artifact
+  responses must also fit `MAX_ARTIFACT_RESPONSE_BYTES` (raise that budget
+  separately when needed). Other routes (`bundle`, run-list) are not covered; producer
   `output_*` limits and direct CLI behavior are unchanged.
 - `MAX_ARTIFACT_RESPONSE_BYTES` (default `67108864`, 64 MiB;
-  `--max-artifact-response-bytes`): aggregate verified single-artifact response
-  snapshot bytes for `qcg serve`, frozen at boot and required to be positive.
-  The default admits four 16 MiB bodies. A response reserves its full artifact
-  size (also for ranges) until body drop; errors release it. A body over budget
-  returns `413`; temporary exhaustion returns `503`, before body reads. `304`
-  responses verify without retaining a snapshot and are not charged. This is
-  not a total-RSS bound and does not cover other endpoints or their buffers.
+  `--max-artifact-response-bytes`): aggregate response-owned bytes for
+  `GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`, and single-artifact
+  `GET /api/runs/{id}/artifacts/{path...}` responses in `qcg serve`. Frozen at
+  boot and required to be positive. The default admits four 16 MiB bodies.
+  JSON views count and reserve their exact serialized size before buffering;
+  single-artifact responses reserve the full artifact size (also for ranges)
+  before body reads. Reservations remain with response bytes/body until drop;
+  errors release them. A body over budget returns `413`; temporary exhaustion
+  returns `503` before buffering/reads. JSON `304` responses release their
+  temporary reservation; single-artifact `304` responses verify without
+  retaining a snapshot and are not charged. Per-response limits are unchanged.
+  This is not a total-RSS bound and does not cover metadata, allocator or
+  streaming overhead, or other endpoints (including zip, bundles, run-list,
+  and start/fork responses).
 - `MAX_ASSET_BYTES` (default `16777216`, 16 MiB): maximum bytes for one served
   generator package asset. Omitted means the hard default, never unlimited.
