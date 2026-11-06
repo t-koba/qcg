@@ -76,7 +76,9 @@ impl IdempotencyEntry {
 /// Entries are judged by the frozen boot `ttl` and `max_entries` passed by
 /// the caller, never by a live environment read, so requests cannot drift
 /// from boot validation (E04). TTL expiry removes both Pending and Ready;
-/// capacity pressure evicts only Ready: evicting a Pending would orphan live
+/// This is memory bookkeeping, never authority to replace a durable owner:
+/// claim/release/commit still require that key's cross-process execution gate.
+/// Capacity pressure evicts only Ready: evicting a Pending would orphan live
 /// waiters, and Pending count is already bounded by concurrent requests with
 /// a TTL backstop (E04).
 pub(crate) fn prune_idempotency(

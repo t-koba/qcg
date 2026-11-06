@@ -162,9 +162,57 @@ cache/admission map; Pending entries are protected from capacity eviction and
 can temporarily exceed this budget. There is no absolute durable record count
 cap. A retained key with identical request content replays the
 original result. Identical pending requests in the same process wait for the
-owner and replay its result; a pending request owned by another process may
-return `503 Service Unavailable`. Reusing a still-bound key with changed
-content returns `409 Conflict`.
+owner and replay its result if the owner completes successfully; owner
+cancellation or error wakes them to retry through durable admission instead.
+A pending request owned by another process may return `503 Service Unavailable`.
+Reusing a still-bound key with changed content normally returns `409 Conflict`.
+Busy-gate contention can instead time out with `503`, even when a different
+digest would otherwise conflict: expired claims and shard collisions need
+not expose a live conflicting claim before the gate is acquired.
+
+Keyed durable ownership and service acceptance share a cross-process execution
+gate, held from claim validation through execution and Ready publication.
+The SHA-256 hash of the key selects a stable gate by its first byte: at most
+256 `.execution-XX.lock` files in the idempotency directory, outside deletable
+run directories. This byte-addressed namespace is a shared protocol, not a
+per-host tuning setting; colliding keys serialize. Gate files are permanent
+coordination state: never unlink, replace, or rotate them, including when idle.
+A waiter or blocked writer may already hold an open handle to the same inode.
+Lock order is gate then the short-lived `.idempotency.lock`; no process waits
+for a gate while holding the metadata lock. Request cancellation stops gate
+polling; a service blocking writer already in flight retains shared ownership
+until it exits. Process death releases the OS lock, not the Pending evidence.
+Contention uses the existing peer wait policy (30 seconds, polling every
+100 milliseconds); Pending's existing 60-second lease is unchanged. These
+fixed protocol defaults are not new environment settings. Lease expiry alone
+cannot supersede an owner that still holds its execution gate.
+
+A service execution that returns an error preserves its Pending claim: the
+error alone does not prove the operation had no effects. `cancel` publishes
+its durable mailbox before returning `409` or another error, so releasing the
+claim on error would let a retry execute as a fresh owner over an
+already-accepted operation. Only the process-local waiter entry is withdrawn
+and woken; the durable claim preserves evidence only for its existing
+60-second lease/adoption window, measured from claim publication, not a fresh
+quarantine starting at the error. While that lease remains live, a same-key
+retry rejoins as a peer instead of executing fresh. Retention is not proof
+that replay is safe, and may hold a key even when no effect occurred.
+Route-specific acceptance reconciliation is still required.
+
+This is a partial fence, not crash-after-acceptance reconciliation. If a process
+dies after accepting start/fork, answer/confirmation, or cancel but before
+Ready, the gate does not establish whether repeating that operation is safe.
+Ambiguous Pending evidence is not reaped; existing recovery and indeterminate
+operation refusals still apply. A 60-second Pending lease expiring while its
+gate is held does not authorize a successor to replace it, but after the gate
+is released the next holder still adopts the expired run id without proving
+that repeating the operation is safe for that route. Do not treat a released
+OS lock as proof that
+an operation had no effects. Before upgrading a shared store, stop and join
+**all** old peers and their in-flight writers; upgrade every writer before
+resuming. Record formats and Ready TTL remain unchanged, but old binaries do
+not honor execution gates: mixed-version writers are unsupported and cannot
+be made safe by these locks. Keep runs-directory ancestry trusted and unchanged.
 
 Ready expires when the wall clock reaches its persisted creation second plus
 `IDEMPOTENCY_TTL_SECS` (the cutoff is inclusive). Replay never renews it.

@@ -13,10 +13,11 @@ pub(crate) use config::{
     prune_idempotency,
 };
 pub(crate) use durable::{
-    ClaimOutcome, OwnerCheck, StoreReadyError, WaitOutcome, check_pending_owner,
-    claim_durable_pending, find_orphan_run, load_durable_ready_result, release_durable_pending,
-    store_durable_ready, wait_for_peer_ready, write_orphan_record,
+    ClaimOutcome, ExecutionGate, OwnerCheck, StoreReadyError, WaitOutcome, find_orphan_run,
+    load_durable_ready_result, wait_for_peer_ready, write_orphan_record,
 };
+#[cfg(test)]
+pub(crate) use durable::{check_pending_owner, claim_durable_pending, release_durable_pending};
 pub(crate) use guard::PendingIdempotencyGuard;
 
 use anyhow::Result;
@@ -80,6 +81,7 @@ where
     /// digests remain byte-for-byte unchanged when this is `None`.
     pub(crate) digest_context: Option<&'a [u8]>,
     pub(crate) created: bool,
+    /// Start/fork reservation, or mutation target checked against any adopted id.
     pub(crate) reserved_run_id: Option<String>,
     pub(crate) execute: F,
 }
@@ -227,8 +229,8 @@ where
 /// start/fork requests the handler reserves the run id before the claim so
 /// a crash between run creation and Ready commit retries into the SAME run
 /// instead of orphaning one run and creating another. Answer, confirm, and
-/// cancel pass their target id; the reservation is ignored by their
-/// executors but recorded in the pending claim for uniformity.
+/// cancel bind the claim to their target id and check the adopted id against
+/// that target before executing; they do not ignore the reservation.
 pub(crate) async fn with_idempotency<F, Fut>(
     call: IdempotentCall<'_, F, Fut>,
 ) -> Result<Response, ApiHttpError>
@@ -252,7 +254,7 @@ where
         // Unkeyed requests skip the claim/commit protocol, but a run-creating
         // handler has already reserved its run id; the executor must receive
         // it so the run is created under that reservation instead of failing
-        // closed. Answer/confirm/cancel executors ignore the value.
+        // closed. Answer/confirm/cancel executors check it against their target.
         let run_id = execute(reserved_run_id.clone())
             .await
             .map_err(ApiHttpError::from_api)?;
@@ -273,10 +275,11 @@ where
     // are overwritten on every Owner arm before any read, so no reset is
     // needed when looping on Superseded (E02).
     let mut carried_adopted: Option<String> = None;
+    let mut execution_gate = None;
     let mut claim_owner: Option<String> = None;
     let mut claim_generation: Option<u64> = None;
-    let (owner_id, adopted_run_id) = 'admit: loop {
-        let (owner_id, adopted_run_id) = loop {
+    let (owner_id, adopted_run_id, mut pending_guard) = 'admit: loop {
+        let (owner_id, adopted_run_id, mut pending_guard) = loop {
             let (wait, owner_id, adopted_run_id) = {
                 let mut idempotency = state.idempotency.lock().await;
                 prune_idempotency(
@@ -353,12 +356,18 @@ where
                                 carried_adopted = Some(orphan_run_id);
                             }
                         }
-                        let runs_dir = state.runs_dir.clone();
                         let key = idempotency_key.clone();
                         let digest = request_digest.clone();
                         let reserved = carried_adopted.clone().or(reserved_run_id.clone());
+                        let gate = acquire_execution_gate(
+                            state.runs_dir.clone(),
+                            idempotency_key.clone(),
+                            request_digest.clone(),
+                        )
+                        .await?;
+                        execution_gate = Some(Arc::clone(&gate));
                         let adopted = match claim_durable_pending_async(
-                            runs_dir,
+                            gate,
                             key,
                             digest,
                             reserved,
@@ -368,6 +377,7 @@ where
                         .await?
                         {
                             ClaimOutcome::Peer => {
+                                execution_gate.take();
                                 match wait_for_peer_ready(
                                     &state.runs_dir,
                                     &idempotency_key,
@@ -457,7 +467,9 @@ where
                                 drop(idempotency);
                                 if let Some((owner, generation)) = release {
                                     release_durable_pending_or_503(
-                                        state.runs_dir.clone(),
+                                        Arc::clone(execution_gate.as_ref().ok_or_else(|| {
+                                            ApiHttpError::internal("missing execution gate")
+                                        })?),
                                         idempotency_key.clone(),
                                         owner,
                                         generation,
@@ -477,7 +489,9 @@ where
                                     // (E02): a corrupt claim must not degrade
                                     // to warn plus wait-until-TTL.
                                     release_durable_pending_or_503(
-                                        state.runs_dir.clone(),
+                                        Arc::clone(execution_gate.as_ref().ok_or_else(|| {
+                                            ApiHttpError::internal("missing execution gate")
+                                        })?),
                                         idempotency_key.clone(),
                                         owner,
                                         generation,
@@ -491,6 +505,7 @@ where
                                 // completion instead of executing twice. The
                                 // next Owner arm overwrites the claim identity
                                 // before any read, so no reset is needed here.
+                                execution_gate.take();
                                 (Some(waiter), None, None)
                             }
                             Reexamined::Absent => {
@@ -516,14 +531,21 @@ where
                                         completed,
                                     },
                                 );
-                                (None, Some(owner_id), adopted)
+                                // Arm memory cleanup under the registration lock, before
+                                // any fallible await (including the owner recheck).
+                                let guard = PendingIdempotencyGuard::new(
+                                    Arc::clone(state),
+                                    idempotency_key.clone(),
+                                    owner_id,
+                                );
+                                (None, Some((owner_id, guard)), adopted)
                             }
                         }
                     }
                 }
             };
-            if let Some(owner_id) = owner_id {
-                break (owner_id, adopted_run_id);
+            if let Some((owner_id, guard)) = owner_id {
+                break (owner_id, adopted_run_id, guard);
             }
             if let Some(mut completed) = wait {
                 if !*completed.borrow() {
@@ -549,17 +571,14 @@ where
                 ));
             }
         };
-        // Pre-execution ownership recheck: a descheduled owner whose claim
-        // expired and was adopted while it slept must not start executing its
-        // stale reservation — that run could never commit and would linger as
-        // an orphan (E02). A successor that acted between the recheck and the
-        // execution below is a millisecond-scale residual; the commit-time
-        // ownership check and the orphan settlement below still converge it.
-        // That residual may let this stale owner briefly start its engine;
-        // such surplus execution never commits and is canceled by the orphan
-        // settlement below (E02).
+        // Claim, validation and service acceptance share the same gate.
+        // Expiry observations cannot authorize replacement while it is held.
         match check_pending_owner_async(
-            state.runs_dir.clone(),
+            Arc::clone(
+                execution_gate
+                    .as_ref()
+                    .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
+            ),
             idempotency_key.clone(),
             owner,
             generation,
@@ -567,27 +586,23 @@ where
         )
         .await?
         {
-            OwnerCheck::Current => break 'admit (owner_id, adopted_run_id),
+            OwnerCheck::Current => break 'admit (owner_id, adopted_run_id, pending_guard),
             OwnerCheck::Superseded | OwnerCheck::Absent => {
                 // Withdraw our in-memory Pending entry (waking any same-key
-                // waiter via sender drop) and re-enter the claim loop with the
+                // waiter) and re-enter the claim loop with the
                 // adopted id riding along. Never execute a superseded
                 // reservation.
-                {
-                    let mut idempotency = state.idempotency.lock().await;
-                    if matches!(
-                        idempotency.get(&idempotency_key),
-                        Some(IdempotencyEntry::Pending {
-                            owner_id: current,
-                            ..
-                        }) if *current == owner_id
-                    ) {
-                        idempotency.remove(&idempotency_key);
-                    }
-                }
+                PendingIdempotencyGuard::withdraw(
+                    Arc::clone(state),
+                    idempotency_key.clone(),
+                    owner_id,
+                )
+                .await;
+                pending_guard.disarm();
                 carried_adopted = carried_adopted.or(adopted_run_id);
                 // No identity reset needed: the next Owner arm overwrites
                 // both before any read.
+                execution_gate.take();
                 continue 'admit;
             }
         }
@@ -603,43 +618,28 @@ where
             ));
         }
     };
-    let mut pending_guard =
-        PendingIdempotencyGuard::new(Arc::clone(state), idempotency_key.clone(), owner_id);
-    let run_id = match execute(adopted_run_id).await {
+    let gate = Arc::clone(
+        execution_gate
+            .as_ref()
+            .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
+    );
+    let run_id = match service::with_acceptance_guard(gate.clone(), execute(adopted_run_id)).await {
         Ok(run_id) => run_id,
         Err(error) => {
-            let completed = {
-                let mut idempotency = state.idempotency.lock().await;
-                if matches!(
-                    idempotency.get(&idempotency_key),
-                    Some(IdempotencyEntry::Pending {
-                        owner_id: current,
-                        ..
-                    }) if *current == owner_id
-                ) {
-                    match idempotency.remove(&idempotency_key) {
-                        Some(IdempotencyEntry::Pending { completed, .. }) => Some(completed),
-                        _ => None,
-                    }
-                } else {
-                    None
-                }
-            };
+            // Ambiguous acceptance: the service error alone does not prove
+            // the operation had no effects. `service.cancel` publishes its
+            // durable mailbox before returning Conflict/error, so releasing
+            // the durable claim here would let a retry execute as a fresh
+            // owner over an already-accepted operation. Preserve the durable
+            // claim for its 60s lease/adoption window on every execution
+            // error; only the process-local waiter entry is withdrawn and
+            // woken so peers retry through the durable Peer path instead of
+            // wedging on memory. Route-specific acceptance reconciliation is
+            // still required (see the partial-fence docs); this conservative
+            // retention may hold a key even when no effect occurred.
+            PendingIdempotencyGuard::withdraw(Arc::clone(state), idempotency_key.clone(), owner_id)
+                .await;
             pending_guard.disarm();
-            // Release the cross-process claim so a retry can become owner.
-            // A release failure fails fast with 503 (E02), overriding the
-            // execution error: a corrupt claim must surface immediately.
-            // Blocking work runs off the async runtime (E02).
-            release_durable_pending_or_503(
-                state.runs_dir.clone(),
-                idempotency_key.clone(),
-                claim_owner.clone(),
-                claim_generation,
-            )
-            .await?;
-            if let Some(completed) = completed {
-                let _ = completed.send(true);
-            }
             return Err(ApiHttpError::from_api(error));
         }
     };
@@ -652,6 +652,7 @@ where
     // primary. Blocking work runs off the async runtime (E02).
     if matches!(scope, "start_run" | "fork_run")
         && let Err(error) = write_orphan_record_async(
+            gate.clone(),
             state.runs_dir.clone(),
             run_id.clone(),
             idempotency_key.clone(),
@@ -673,15 +674,16 @@ where
     // silently; a finished run makes cancel a no-op. A cancel failure is
     // propagated as an error instead of warn-only: an unsettled orphan must
     // surface (E02).
-    let settle_orphan = |run_id: String| async move {
-        state
-            .service
-            .cancel(run_id.clone())
-            .await
-            .map_err(ApiHttpError::from_api)
+    let settle_orphan = |run_id: String| {
+        let gate = gate.clone();
+        async move {
+            service::with_acceptance_guard(gate, state.service.cancel(run_id))
+                .await
+                .map_err(ApiHttpError::from_api)
+        }
     };
     let committed = match store_durable_ready_async(
-        state.runs_dir.clone(),
+        gate.clone(),
         idempotency_key.clone(),
         request_digest.clone(),
         run_id.clone(),
@@ -703,7 +705,11 @@ where
         Err(error) => {
             if matches!(error, StoreReadyError::DigestConflict) {
                 release_durable_pending_or_503(
-                    state.runs_dir.clone(),
+                    Arc::clone(
+                        execution_gate
+                            .as_ref()
+                            .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
+                    ),
                     idempotency_key.clone(),
                     claim_owner.clone(),
                     claim_generation,
@@ -721,11 +727,9 @@ where
             // instead of warn-only so an unsettled orphan surfaces (E02).
             // Without a committed Ready the run is kept for TTL adoption
             // (see below), never canceled here.
-            // Re-verification is under the durable lock at commit time; a
-            // successor stealing between the pre-execution recheck and the
-            // end of execution cannot be narrowed further (execution is
-            // long), so this orphan settlement is the airtight backstop:
-            // every stale execution converges or cancels, never leaks (E02).
+            // Gate-aware peers cannot supersede this execution. Keep the
+            // defensive settlement for damaged/external state; it is not
+            // proof of crash-after-acceptance reconciliation.
             if let Ok(Some(committed)) = load_durable_ready_async(
                 state.runs_dir.clone(),
                 idempotency_key.clone(),
@@ -745,7 +749,7 @@ where
                 // still-wedged claim surfaces as 503 on the next retry via
                 // the normal claim path, so nothing is silently wedged.
                 let _ = release_durable_pending_async(
-                    state.runs_dir.clone(),
+                    gate.clone(),
                     idempotency_key.clone(),
                     claim_owner.clone(),
                     claim_generation,
@@ -807,7 +811,11 @@ where
         completed
     };
     release_durable_pending_or_503(
-        state.runs_dir.clone(),
+        Arc::clone(
+            execution_gate
+                .as_ref()
+                .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
+        ),
         idempotency_key.clone(),
         claim_owner.clone(),
         claim_generation,
@@ -817,6 +825,8 @@ where
     if let Some(completed) = completed {
         let _ = completed.send(true);
     }
+    drop(gate);
+    drop(execution_gate);
     snapshot_response(state, committed_run_id, created).await
 }
 
@@ -846,12 +856,12 @@ pub(crate) fn idempotency_conflict() -> ApiHttpError {
 /// real damage: parking the request until TTL would wedge retries silently,
 /// so the failure surfaces immediately for operator action (E02).
 async fn release_durable_pending_or_503(
-    runs_dir: camino::Utf8PathBuf,
+    gate: Arc<ExecutionGate>,
     key: String,
     owner: String,
     generation: u64,
 ) -> Result<(), ApiHttpError> {
-    if let Err(error) = release_durable_pending_async(runs_dir, key, owner, generation).await {
+    if let Err(error) = release_durable_pending_async(gate, key, owner, generation).await {
         tracing::warn!(%error, "idempotency claim release failed; failing fast");
         return Err(ApiHttpError::service_unavailable(
             "idempotent request is still in progress elsewhere; retry with the same key",
@@ -860,11 +870,49 @@ async fn release_durable_pending_or_503(
     Ok(())
 }
 
+/// Dropping this future stops retries; no blocking lock wait survives it.
+async fn acquire_execution_gate(
+    runs_dir: camino::Utf8PathBuf,
+    key: String,
+    digest: String,
+) -> Result<Arc<ExecutionGate>, ApiHttpError> {
+    let deadline = tokio::time::Instant::now() + durable::PEER_WAIT;
+    loop {
+        let dir = runs_dir.clone();
+        let key = key.clone();
+        let expected = digest.clone();
+        if let Some(gate) = tokio::task::spawn_blocking(move || {
+            let gate = ExecutionGate::try_acquire(&dir, &key).map_err(ApiHttpError::internal)?;
+            // Observation can reject a live conflicting request, never grant
+            // ownership. Expired/absent claims still require acquiring the gate.
+            if gate.is_none()
+                && durable::load_durable_pending_digest_result(&dir, &key)
+                    .map_err(ApiHttpError::internal)?
+                    .is_some_and(|stored| stored != expected)
+            {
+                return Err(idempotency_conflict());
+            }
+            Ok(gate)
+        })
+        .await
+        .map_err(|e| ApiHttpError::internal(e.to_string()))??
+        {
+            return Ok(Arc::new(gate));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiHttpError::service_unavailable(
+                "idempotent request is still in progress elsewhere; retry with the same key",
+            ));
+        }
+        tokio::time::sleep(durable::PEER_POLL).await;
+    }
+}
+
 /// Blocking filesystem claim offloaded from the async runtime: the
 /// cross-process file lock blocks the OS thread, so it must never run on a
 /// Tokio worker (E02).
 async fn claim_durable_pending_async(
-    runs_dir: camino::Utf8PathBuf,
+    gate: Arc<ExecutionGate>,
     key: String,
     digest: String,
     reserved_run_id: Option<String>,
@@ -872,7 +920,7 @@ async fn claim_durable_pending_async(
     sweep: Arc<durable::IdempotencySweep>,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     tokio::task::spawn_blocking(move || {
-        claim_durable_pending(&runs_dir, &key, &digest, reserved_run_id, ttl, &sweep)
+        durable::claim_durable_pending_gated(&gate, &key, &digest, reserved_run_id, ttl, &sweep)
     })
     .await
     .map_err(|error| ApiHttpError::internal(format!("idempotency claim task failed: {error}")))?
@@ -908,7 +956,7 @@ async fn load_durable_pending_digest_async(
 
 /// Blocking Ready commit offloaded from the async runtime (E02).
 async fn store_durable_ready_async(
-    runs_dir: camino::Utf8PathBuf,
+    gate: Arc<ExecutionGate>,
     key: String,
     digest: String,
     run_id: String,
@@ -917,7 +965,7 @@ async fn store_durable_ready_async(
     ttl: std::time::Duration,
 ) -> Result<durable::DurableIdempotencyRecord, durable::StoreReadyError> {
     tokio::task::spawn_blocking(move || {
-        store_durable_ready(&runs_dir, &key, &digest, &run_id, &owner, generation, ttl)
+        durable::store_durable_ready_gated(&gate, &key, &digest, &run_id, &owner, generation, ttl)
     })
     .await
     .map_err(|error| {
@@ -927,13 +975,13 @@ async fn store_durable_ready_async(
 
 /// Blocking claim release offloaded from the async runtime (E02).
 async fn release_durable_pending_async(
-    runs_dir: camino::Utf8PathBuf,
+    gate: Arc<ExecutionGate>,
     key: String,
     owner: String,
     generation: u64,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
-        release_durable_pending(&runs_dir, &key, &owner, generation)
+        durable::release_durable_pending_gated(&gate, &key, &owner, generation)
     })
     .await
     .map_err(|error| format!("idempotency release task failed: {error}"))?
@@ -942,14 +990,16 @@ async fn release_durable_pending_async(
 /// Blocking pre-execution ownership recheck offloaded from the async
 /// runtime (E02).
 async fn check_pending_owner_async(
-    runs_dir: camino::Utf8PathBuf,
+    gate: Arc<ExecutionGate>,
     key: String,
     owner: String,
     generation: u64,
     expected_digest: String,
 ) -> Result<OwnerCheck, ApiHttpError> {
+    #[cfg(test)]
+    tests::owner_recheck_boundary().await;
     tokio::task::spawn_blocking(move || {
-        check_pending_owner(&runs_dir, &key, &owner, generation, &expected_digest)
+        durable::check_pending_owner_gated(&gate, &key, &owner, generation, &expected_digest)
     })
     .await
     .map_err(|error| ApiHttpError::internal(format!("idempotency recheck task failed: {error}")))?
@@ -958,14 +1008,18 @@ async fn check_pending_owner_async(
 
 /// Blocking orphan sidecar write offloaded from the async runtime (E02).
 async fn write_orphan_record_async(
+    gate: Arc<ExecutionGate>,
     runs_dir: camino::Utf8PathBuf,
     run_id: String,
     key: String,
     digest: String,
 ) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || write_orphan_record(&runs_dir, &run_id, &key, &digest))
-        .await
-        .map_err(|error| format!("idempotency orphan write task failed: {error}"))?
+    tokio::task::spawn_blocking(move || {
+        let _gate = gate;
+        write_orphan_record(&runs_dir, &run_id, &key, &digest)
+    })
+    .await
+    .map_err(|error| format!("idempotency orphan write task failed: {error}"))?
 }
 
 /// Blocking orphan scan offloaded from the async runtime (E02). A damaged
@@ -988,6 +1042,167 @@ async fn find_orphan_run_async(
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+
+    // Task-local one-shot boundary: no global hook or wall-clock scheduling race.
+    tokio::task_local! {
+        static OWNER_RECHECK: std::cell::RefCell<Option<(
+            tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>,
+        )>>;
+    }
+
+    pub(super) async fn owner_recheck_boundary() {
+        let hook = OWNER_RECHECK
+            .try_with(|hook| hook.borrow_mut().take())
+            .ok()
+            .flatten();
+        if let Some((reached, resume)) = hook {
+            let _ = reached.send(());
+            let _ = resume.await;
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_recheck_abort_and_error_wake_memory_waiters_and_allow_retry() {
+        use std::time::Duration;
+        for mode in ["abort", "error"] {
+            let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                .unwrap()
+                .join(format!("mod-recheck-{mode}-{}", uuid::Uuid::now_v7()));
+            let _temp_guard = ModTempGuard(runs.clone());
+            let state = mod_test_state(&runs);
+            let reserved = state
+                .service
+                .reserve_start_run_id("hello-template")
+                .unwrap();
+            let key = "recheck-boundary";
+            let mut headers = HeaderMap::new();
+            headers.insert(policy::IDEMPOTENCY_HEADER, key.parse().unwrap());
+            let (reached, at_boundary) = tokio::sync::oneshot::channel();
+            let (resume, wait) = tokio::sync::oneshot::channel();
+            let owner_state = state.clone();
+            let owner_headers = headers.clone();
+            let owner_reserved = reserved.clone();
+            let owner = tokio::spawn(OWNER_RECHECK.scope(
+                std::cell::RefCell::new(Some((reached, wait))),
+                async move {
+                    with_idempotency(IdempotentCall {
+                        state: &owner_state,
+                        headers: &owner_headers,
+                        scope: "start_run",
+                        target: "",
+                        body: b"recheck",
+                        digest_context: None,
+                        created: true,
+                        reserved_run_id: Some(owner_reserved),
+                        execute: |_| async { panic!("failed owner must not execute") },
+                    })
+                    .await
+                },
+            ));
+            tokio::time::timeout(Duration::from_secs(5), at_boundary)
+                .await
+                .unwrap()
+                .unwrap();
+            let mut completed = match state.idempotency.lock().await.get(key).unwrap() {
+                IdempotencyEntry::Pending { completed, .. } => completed.subscribe(),
+                _ => panic!("owner must be Pending before recheck"),
+            };
+            let path = runs.join("idempotency").join(format!(
+                "{}.pending.json",
+                hex::encode(Sha256::digest(key.as_bytes()))
+            ));
+            let original = std::fs::read(&path).unwrap();
+            if mode == "abort" {
+                owner.abort();
+                assert!(owner.await.unwrap_err().is_cancelled());
+                assert_eq!(std::fs::read(&path).unwrap(), original);
+            } else {
+                // Real recheck error, not a mocked outcome. Restore the exact
+                // evidence afterward so retry exercises the normal claim path.
+                std::fs::write(&path, b"not-json").unwrap();
+                resume.send(()).unwrap();
+                assert_eq!(owner.await.unwrap().unwrap_err().problem.status, 500);
+                std::fs::write(&path, &original).unwrap();
+            }
+            tokio::time::timeout(Duration::from_secs(5), completed.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(*completed.borrow());
+            assert!(!state.idempotency.lock().await.contains_key(key));
+            // Controlled lease-expiry seam: do not wait 60s, and do not
+            // change product retention. Memory cleanup must not wait Ready TTL.
+            let mut claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            claim["created_at_unix"] = 1.into();
+            std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+            let request = api::StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::from([("name".into(), serde_json::json!("recheck"))]),
+                ..Default::default()
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                with_idempotency(IdempotentCall {
+                    state: &state,
+                    headers: &headers,
+                    scope: "start_run",
+                    target: "",
+                    body: b"recheck",
+                    digest_context: None,
+                    created: true,
+                    reserved_run_id: None,
+                    execute: |adopted| async {
+                        assert_eq!(adopted.as_ref(), Some(&reserved));
+                        state.service.start_run_with_id(request, adopted).await
+                    },
+                }),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert_eq!(result.status(), axum::http::StatusCode::CREATED);
+            assert_eq!(
+                durable::load_durable_ready_result(&runs, key, policy::IDEMPOTENCY_TTL)
+                    .unwrap()
+                    .unwrap()
+                    .run_id,
+                reserved
+            );
+            assert!(!path.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn withdrawn_memory_owner_cannot_remove_successor() {
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mod-successor-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = ModTempGuard(runs.clone());
+        let state = mod_test_state(&runs);
+        let key = "successor".to_owned();
+        let old_owner = uuid::Uuid::now_v7();
+        let successor = uuid::Uuid::now_v7();
+        let (completed, mut waiter) = tokio::sync::watch::channel(false);
+        state.idempotency.lock().await.insert(
+            key.clone(),
+            IdempotencyEntry::Pending {
+                digest: "digest".into(),
+                owner_id: successor,
+                created_at: Instant::now(),
+                completed,
+            },
+        );
+        // Await the exact cleanup used by Drop, with a superseded identity;
+        // no scheduler timing is needed to prove the successor survives it.
+        PendingIdempotencyGuard::withdraw(state.clone(), key.clone(), old_owner).await;
+        assert!(matches!(state.idempotency.lock().await.get(&key),
+            Some(IdempotencyEntry::Pending { owner_id, .. }) if *owner_id == successor));
+        assert!(!waiter.has_changed().unwrap());
+        PendingIdempotencyGuard::withdraw(state.clone(), key.clone(), successor).await;
+        waiter.changed().await.unwrap();
+        assert!(*waiter.borrow());
+        assert!(!state.idempotency.lock().await.contains_key(&key));
+    }
 
     /// Removes the temp runs dir on drop so a failed assertion cannot leak
     /// test directories.
@@ -1205,12 +1420,132 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_error_preserves_durable_claim_for_ambiguous_acceptance() {
+        // Observed ambiguous acceptance: `service.cancel` publishes its
+        // durable mailbox before returning Conflict/error. The `with_idempotency`
+        // execution error must therefore preserve the durable Pending claim;
+        // only the process-local waiter entry is withdrawn and woken. A
+        // same-key retry must rejoin as Peer, never immediately execute as a
+        // fresh owner. Real service and tempdir storage, no mocks.
+        use axum::http::{HeaderMap, HeaderValue};
+
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!("mod-ambiguous-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = ModTempGuard(runs.clone());
+        let state = mod_test_state(&runs);
+        let key = "ambiguous-acceptance";
+        let scope = "cancel";
+        let target = "run-1";
+        let body = b"cancel-payload";
+        let digest = request_digest(scope, target, body, None);
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            policy::IDEMPOTENCY_HEADER,
+            HeaderValue::from_str(key).expect("key should be a valid header"),
+        );
+        let side_effect = runs.join("mailbox-side-effect");
+        let side_effect_for_execute = side_effect.clone();
+        let error = with_idempotency(IdempotentCall {
+            state: &state,
+            headers: &headers,
+            scope,
+            target,
+            body,
+            digest_context: None,
+            created: false,
+            reserved_run_id: Some(target.to_string()),
+            execute: |reserved| async move {
+                assert_eq!(
+                    reserved.as_deref(),
+                    Some(target),
+                    "reservation must ride into execution"
+                );
+                // Simulate the accepted cancel mailbox before the error.
+                std::fs::write(&side_effect_for_execute, b"mailbox").map_err(|error| {
+                    api::ApiError::Internal {
+                        detail: format!("test setup failed: {error}"),
+                    }
+                })?;
+                Err(api::ApiError::Conflict {
+                    detail: "run `run-1` is executing elsewhere; cancel was signaled".into(),
+                })
+            },
+        })
+        .await
+        .expect_err("ambiguous execution error must surface");
+        assert_eq!(
+            error.problem.status,
+            axum::http::StatusCode::CONFLICT.as_u16(),
+            "ambiguous cancel error must surface as 409, got: {error:?}"
+        );
+        assert!(
+            side_effect.is_file(),
+            "the accepted side effect must exist before the error is assessed"
+        );
+        // Durable evidence remains under the same identity.
+        assert_eq!(
+            durable::load_durable_pending_digest_result(&runs, key)
+                .expect("pending digest should read"),
+            Some(digest.clone()),
+            "the durable claim digest must survive the execution error"
+        );
+        let pending_path = runs.join("idempotency").join(format!(
+            "{}.pending.json",
+            hex::encode(Sha256::digest(key.as_bytes()))
+        ));
+        let before = std::fs::read(pending_path.as_std_path())
+            .expect("pending claim file must survive the execution error");
+        assert!(
+            !state.idempotency.lock().await.contains_key(key),
+            "the process-local waiter entry must be withdrawn on execution error"
+        );
+        // Same-key same-digest work cannot immediately execute as a fresh
+        // owner: it rejoins as Peer. A different digest still conflicts.
+        assert!(
+            matches!(
+                claim_durable_pending(
+                    &runs,
+                    key,
+                    &digest,
+                    Some("run-fresh".into()),
+                    policy::IDEMPOTENCY_TTL,
+                    &state.idempotency_sweep,
+                )
+                .expect("reclaim should not fail"),
+                ClaimOutcome::Peer
+            ),
+            "preserved claim must force a same-digest retry into Peer, never Owner"
+        );
+        assert!(
+            matches!(
+                claim_durable_pending(
+                    &runs,
+                    key,
+                    "different-digest",
+                    Some("run-fresh".into()),
+                    policy::IDEMPOTENCY_TTL,
+                    &state.idempotency_sweep,
+                )
+                .expect("conflict check should not fail"),
+                ClaimOutcome::Conflict
+            ),
+            "preserved claim must still conflict a different digest"
+        );
+        assert_eq!(
+            std::fs::read(pending_path.as_std_path()).expect("pending should still read"),
+            before,
+            "a failed fresh claim must not replace the preserved evidence"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_commit_with_ready_present_cancels_surplus_through_with_idempotency() {
-        // E02: the recheck-then-execute window cannot be narrowed further
-        // (execution is long), so the orphan backstop must be airtight: a
-        // stale-owner commit refusal with a committed same-digest Ready
-        // cancels the surplus execution through `with_idempotency` instead
-        // of leaking it. Real service, real tempdir storage, no mocks.
+        // Defensive behavior under externally damaged state: gate-aware peers
+        // cannot supersede a live execution, so this test deliberately bypasses
+        // the protocol to plant Ready plus a corrupt Pending. The refusal must
+        // still settle a surplus run. This is not a supported peer takeover.
+        // Real service and tempdir storage, no mocks.
         use api::StartRun;
         use axum::http::{HeaderMap, HeaderValue};
         use serde_json::json;
@@ -1378,3 +1713,6 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod execution_gate_tests;

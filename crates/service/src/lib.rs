@@ -13,6 +13,7 @@ mod invalidation;
 mod lifecycle;
 mod queue;
 mod read_store;
+pub use read_store::with_acceptance_guard;
 mod run_dirs;
 mod run_refs;
 mod runs_api;

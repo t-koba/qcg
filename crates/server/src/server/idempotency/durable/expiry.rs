@@ -459,6 +459,52 @@ mod tests {
     }
 
     #[test]
+    fn maintenance_never_unlinks_held_or_idle_execution_gates() {
+        let runs = runs();
+        let key = "gate-retention";
+        let held = ExecutionGate::try_acquire(&runs, key).unwrap().unwrap();
+        let path = idempotency_dir(&runs).join(format!(
+            ".execution-{:02x}.lock",
+            Sha256::digest(key.as_bytes())[0]
+        ));
+        let opened = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let sweep = IdempotencySweep::default();
+        sweep
+            .pass_at(
+                &runs,
+                Duration::from_secs(1),
+                || Ok(u64::MAX),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert!(ExecutionGate::try_acquire(&runs, key).unwrap().is_none());
+        assert!(matches!(
+            opened.try_lock(),
+            Err(fs::TryLockError::WouldBlock)
+        ));
+        drop(held);
+        sweep
+            .pass_at(
+                &runs,
+                Duration::from_secs(1),
+                || Ok(u64::MAX),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        opened.try_lock().unwrap();
+        assert!(
+            ExecutionGate::try_acquire(&runs, key).unwrap().is_none(),
+            "fresh opens must still share the idle inode"
+        );
+        drop(opened);
+        fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[test]
     fn bounded_idle_passes_migrate_once_and_recover_after_restart() {
         let runs = runs();
         let ttl = Duration::from_secs(10);

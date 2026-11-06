@@ -1,4 +1,16 @@
 //! Rebuildable read views. Execution, approvals and integrity checks read originals.
+tokio::task_local! {
+    static ACCEPTANCE_GUARD: std::sync::Arc<dyn Send + Sync>;
+}
+/// Retain a caller-owned acceptance guard through service work, including
+/// blocking writers that keep running after cancellation of the calling future.
+pub async fn with_acceptance_guard<T>(
+    guard: std::sync::Arc<dyn Send + Sync>,
+    work: impl std::future::Future<Output = T>,
+) -> T {
+    ACCEPTANCE_GUARD.scope(guard, work).await
+}
+
 use crate::summaries::{run_identity_event, status_from_journal, status_name_from_state};
 use crate::{LocalService, ServiceError, run_meta_dir};
 use api::{ApiError, RunEvent};
@@ -430,7 +442,9 @@ impl LocalService {
             .acquire_owned()
             .await
             .map_err(|e| ServiceError::Invalid(e.to_string()))?;
+        let guard = ACCEPTANCE_GUARD.try_with(Clone::clone).ok();
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             let _permit = permit;
             read()
         })
@@ -457,6 +471,47 @@ impl LocalService {
 mod tests {
     use super::*;
     use std::sync::atomic::Ordering;
+    #[tokio::test]
+    async fn cancelled_acceptance_retains_guard_until_blocking_writer_exits() {
+        struct Guard(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                let _ = self.0.take().unwrap().send(());
+            }
+        }
+        let root = crate::tests::support::TempGuard(crate::tests::support::temp_run_dir(
+            "acceptance-guard",
+        ));
+        let service = crate::tests::support::test_service(vec![], root.0.clone());
+        let (dropped, mut observed_drop) = tokio::sync::oneshot::channel();
+        let (entered, observed_entry) = tokio::sync::oneshot::channel();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let task = tokio::spawn(with_acceptance_guard(
+            Arc::new(Guard(Some(dropped))),
+            async move {
+                service
+                    .blocking_work(move || {
+                        entered.send(()).unwrap();
+                        blocked.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            },
+        ));
+        observed_entry.await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(matches!(
+            observed_drop.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), observed_drop)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
     fn journal() -> (Utf8PathBuf, engine::JournalWriter) {
         let directory = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .unwrap()
