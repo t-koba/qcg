@@ -10,6 +10,26 @@ impl LocalService {
     ) -> Result<(), ApiError> {
         self.ensure_running()?;
         let answer = json!(payload.values);
+        // Recovery omits terminal runs from memory. An idempotent retry may
+        // still need to publish Ready after the exact answer already finished.
+        let tracked = self.inner.runs.read().await.contains_key(&id);
+        if !tracked && policy::is_safe_path_component(&id) {
+            let run_dir = self.run_dir_for(&id).await?;
+            let state = self.authoritative_state(&run_dir).await?;
+            if state.terminal.is_some() {
+                return match state.answers.get(&question_id) {
+                    Some(existing) if existing == &answer => Ok(()),
+                    Some(_) => Err(ApiError::Conflict {
+                        detail: format!(
+                            "question `{question_id}` was already answered with different values"
+                        ),
+                    }),
+                    None => Err(ApiError::invalid(format!(
+                        "run `{id}` is not waiting for user input"
+                    ))),
+                };
+            }
+        }
         // Memory fast paths first; durable acceptance is decided atomically
         // under the journal lock below, so racing peers serialize and exactly
         // one conflicting acceptance wins (A02). Durable acceptance precedes
@@ -192,14 +212,28 @@ impl LocalService {
     ) -> Result<(), ApiError> {
         self.ensure_running()?;
         let approved = decision.decision == ConfirmationDecision::Approve;
-        // Terminal runs are intentionally absent from the memory map after
-        // recovery. Durable identical denials still reconcile/replay before
-        // Ready publication, including a failed earlier settlement append.
-        if !approved {
+        let tracked = self.inner.runs.read().await.contains_key(&id);
+        if !approved || (!tracked && policy::is_safe_path_component(&id)) {
             let run_dir = self.run_dir_for(&id).await?;
             let state = self.authoritative_state(&run_dir).await?;
-            if state.confirmations.get(&confirmation_id) == Some(&false) {
-                return self.reconcile_denial(&id, &run_dir, &confirmation_id).await;
+            match state.confirmations.get(&confirmation_id) {
+                Some(existing) if *existing != approved => {
+                    return Err(ApiError::Conflict {
+                        detail: format!(
+                            "confirmation `{confirmation_id}` already has a different decision"
+                        ),
+                    });
+                }
+                Some(false) => {
+                    return self.reconcile_denial(&id, &run_dir, &confirmation_id).await;
+                }
+                Some(true) if !tracked && state.terminal.is_some() => return Ok(()),
+                _ if !tracked && state.terminal.is_some() => {
+                    return Err(ApiError::invalid(format!(
+                        "run `{id}` is not waiting for side-effect confirmation"
+                    )));
+                }
+                _ => {}
             }
         }
         // Validate, persist, and mutate under one write lock so concurrent

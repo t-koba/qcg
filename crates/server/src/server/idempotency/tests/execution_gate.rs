@@ -774,7 +774,25 @@ async fn denied_confirmation_prefix_process_crash_retries_to_ready() {
     }
 }
 
+#[tokio::test]
+async fn terminal_answer_process_crash_before_ready_retries_to_ready() {
+    interaction_process_crash_with_lease("answer", None, false).await;
+}
+
+#[tokio::test]
+async fn terminal_approved_confirmation_process_crash_before_ready_retries_to_ready() {
+    interaction_process_crash_with_lease("confirm", None, false).await;
+}
+
 async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
+    interaction_process_crash_with_lease(scope, denial_prefix, true).await;
+}
+
+async fn interaction_process_crash_with_lease(
+    scope: &str,
+    denial_prefix: Option<usize>,
+    hold_execution_lease: bool,
+) {
     let fixture = Fixture(
         Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .unwrap()
@@ -809,20 +827,25 @@ async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
     .await
     .unwrap();
     let run_dir = owner.run_dir_for(&id).await.unwrap();
-    let lease = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(run_dir.join("meta/execution.lock"))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    loop {
-        match lease.try_lock() {
-            Ok(()) => break,
-            Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
-            Err(error) => panic!("lease failed: {error:?}"),
+    let lease = if hold_execution_lease {
+        let lease = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(run_dir.join("meta/execution.lock"))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            match lease.try_lock() {
+                Ok(()) => break,
+                Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+                Err(error) => panic!("lease failed: {error:?}"),
+            }
+            assert!(Instant::now() < deadline, "execution lease timed out");
         }
-        assert!(Instant::now() < deadline, "execution lease timed out");
-    }
+        Some(lease)
+    } else {
+        None
+    };
     drop(owner);
     fs::write(
         runs.join("interaction-target"),
@@ -879,6 +902,29 @@ async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
         assert_eq!(accepted[0]["confirmation_id"], interaction);
         assert_eq!(accepted[0]["approved"], denial_prefix.is_none());
     }
+    if !hold_execution_lease {
+        let journal = run_dir.join("meta/journal.jsonl");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if engine::RunState::fold_journal(&journal)
+                    .unwrap()
+                    .terminal
+                    .is_some()
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accepted operation must finish before the request process is killed");
+        assert!(
+            durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+                .unwrap()
+                .is_none(),
+            "terminal run must still have no Ready while the request is blocked"
+        );
+    }
     request.0.kill().unwrap();
     request.0.wait().unwrap();
     assert_eq!(
@@ -896,7 +942,7 @@ async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
     // created_at changes, not the digest, target, owner or reserved run.
     age_claim(runs);
     if denial_prefix.is_some() {
-        lease.unlock().unwrap();
+        lease.as_ref().unwrap().unlock().unwrap();
     }
     let aged_pending = fs::read(pending(runs)).unwrap();
     let state = Arc::new(crate::test_state(
@@ -1008,6 +1054,77 @@ async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
             .unwrap();
         state.service.resume_recovered_runs().await;
         assert_eq!(fs::read(&path).unwrap(), settled);
+    } else if !hold_execution_lease {
+        assert_eq!(snapshot.state, api::RunStatus::Succeeded);
+        if scope == "confirm" {
+            assert!(run_dir.join("workspace/after.txt").exists());
+            let events = engine::read_journal_values(
+                &run_dir.join("meta/journal.jsonl"),
+                engine::JournalLimits::default(),
+            )
+            .unwrap()
+            .events;
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["t"] == "operation_started")
+                    .count(),
+                1,
+                "terminal replay must not duplicate operation execution"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["t"] == "operation_finished")
+                    .count(),
+                1
+            );
+        }
+        let journal = run_dir.join("meta/journal.jsonl");
+        let settled = fs::read(&journal).unwrap();
+        let conflict = if scope == "answer" {
+            state
+                .service
+                .answer(
+                    id.clone(),
+                    interaction.clone(),
+                    api::AnswerPayload {
+                        values: std::collections::BTreeMap::from([(
+                            "answer".into(),
+                            serde_json::json!("different"),
+                        )]),
+                    },
+                )
+                .await
+        } else {
+            state
+                .service
+                .confirm(id.clone(), interaction.clone(), confirm_decision(true))
+                .await
+        };
+        assert!(matches!(conflict, Err(api::ApiError::Conflict { .. })));
+        assert_eq!(fs::read(&journal).unwrap(), settled);
+        let missing = if scope == "answer" {
+            state
+                .service
+                .answer(
+                    id.clone(),
+                    format!("{interaction}-missing"),
+                    answer_payload(),
+                )
+                .await
+        } else {
+            state
+                .service
+                .confirm(
+                    id.clone(),
+                    format!("{interaction}-missing"),
+                    confirm_decision(false),
+                )
+                .await
+        };
+        assert!(matches!(missing, Err(api::ApiError::Invalid { .. })));
+        assert_eq!(fs::read(&journal).unwrap(), settled);
     }
     assert!(!pending(runs).exists());
     let ready = durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
