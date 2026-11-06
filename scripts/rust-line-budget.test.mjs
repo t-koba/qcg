@@ -11,7 +11,7 @@ function write(root, path, text) {
   writeFileSync(file, text);
 }
 
-test("test paths and inline test-only cfg modules split physical lines", () => {
+test("test paths and test-only cfg items split physical lines", () => {
   assert.equal(isTestPath("crates/demo/src/tests/mod.rs"), true);
   assert.equal(isTestPath("crates/demo/src/test_support.rs"), true);
   assert.equal(isTestPath("crates/demo/src/lib.rs"), false);
@@ -25,6 +25,12 @@ test("test paths and inline test-only cfg modules split physical lines", () => {
   assert.deepEqual(splitSrcFile("#[cfg(all(unix, test))]\nmod tests {\n}\n", "crates/demo/src/lib.rs"), { product: 0, test: 3 });
   assert.deepEqual(splitSrcFile("#[cfg(all(not(test), unix))]\nmod production {\n}\n", "crates/demo/src/lib.rs"), { product: 3, test: 0 });
   assert.deepEqual(splitSrcFile("#[cfg(test)]\nfn helper() {}\n", "crates/demo/src/lib.rs"), { product: 2, test: 0 });
+  const hooks = [
+    "fn run() {", '    #[cfg(any(test, feature = "test-hooks"))]', "    let hook = task_local()", "        .try_with(Clone::clone)", "        .flatten();",
+    '    #[cfg(any(test, feature = "test-hooks"))]', "    if let Some(hook) = hook {", "        hook();", "    }", "}", "",
+  ].join("\n");
+  assert.deepEqual(splitSrcFile(hooks, "crates/demo/src/lib.rs"), { product: 2, test: 8 });
+  assert.deepEqual(splitSrcFile('#[cfg(any(test, feature = "test-hooks"))]\nmod hooks {\n}\n', "crates/demo/src/lib.rs"), { product: 0, test: 3 });
 });
 
 test("recursive budget counts test locations uncapped and caps only product", () => {

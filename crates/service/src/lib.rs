@@ -28,12 +28,13 @@ pub use run_dirs::*;
 pub use summaries::*;
 pub use types::*;
 
-#[cfg(test)]
-pub(crate) mod denial_settlement_test_hooks {
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+pub mod denial_settlement_test_hooks {
     use std::sync::Arc;
 
     tokio::task_local! {
-        pub(crate) static BEFORE_SETTLE: Option<Arc<dyn Fn() + Send + Sync>>;
+        pub static BEFORE_SETTLE: Option<Arc<dyn Fn() + Send + Sync>>;
     }
 }
 

@@ -938,6 +938,176 @@ async fn aborted_interaction_request_after_acceptance(scope: &str) {
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn aborted_denial_request_keeps_pending_and_gate_until_settlement_finishes() {
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "qcg-denial-settlement-abort-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let _fixture = Fixture(runs.clone());
+    let state = Arc::new(crate::test_state(
+        shared_service(&runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let id = state
+        .service
+        .start_run(api::StartRun {
+            generator_id: "side-effect-confirm".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let interaction = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = state.service.snapshot(id.clone()).await.unwrap();
+            if snapshot.state == api::RunStatus::Confirming {
+                break snapshot.confirm.unwrap().id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let key = "denial-settlement-abort";
+    let mut headers = HeaderMap::new();
+    headers.insert(policy::IDEMPOTENCY_HEADER, key.parse().unwrap());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (release, blocked) = std::sync::mpsc::channel();
+    let blocked = Arc::new(std::sync::Mutex::new(blocked));
+    let hook = {
+        let entered = entered.clone();
+        Arc::new(move || {
+            entered.notify_one();
+            blocked.lock().unwrap().recv().unwrap();
+        })
+    };
+    let settlement_entered = entered.notified();
+    let owner_state = state.clone();
+    let owner_headers = headers.clone();
+    let owner_id = id.clone();
+    let owner_interaction = interaction.clone();
+    let request = tokio::spawn(service::denial_settlement_test_hooks::BEFORE_SETTLE.scope(
+        Some(hook),
+        async move {
+            crate::server::confirm_run(
+                axum::extract::State(owner_state),
+                owner_headers,
+                axum::extract::Path((owner_id, owner_interaction)),
+                axum::Json(confirm_decision(true)),
+            )
+            .await
+        },
+    ));
+    settlement_entered.await;
+
+    let pending_path = pending_for(&runs, key);
+    let pending = fs::read(&pending_path).expect("accepted denial must retain Pending");
+    assert!(
+        durable::load_durable_ready_result(&runs, key, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    let run_dir = state.service.run_dir_for(&id).await.unwrap();
+    let accepted = fs::read_to_string(run_dir.join("meta/journal.jsonl")).unwrap();
+    let events: Vec<serde_json::Value> = accepted
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "user_confirmed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["decision"] == "denied_by_user")
+            .count(),
+        0
+    );
+
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    assert_eq!(fs::read(&pending_path).unwrap(), pending);
+    assert!(
+        durable::load_durable_ready_result(&runs, key, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        ExecutionGate::try_acquire(&runs, key).unwrap().is_none(),
+        "the detached settlement writer must retain the keyed gate"
+    );
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(gate) = ExecutionGate::try_acquire(&runs, key).unwrap() {
+                drop(gate);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("settlement completion must release the keyed gate");
+    age_claim_for(&runs, key);
+
+    let response = tokio::time::timeout(
+        Duration::from_secs(5),
+        crate::server::confirm_run(
+            axum::extract::State(state.clone()),
+            headers,
+            axum::extract::Path((id.clone(), interaction)),
+            axum::Json(confirm_decision(true)),
+        ),
+    )
+    .await
+    .expect("same-key retry should settle promptly after the detached writer exits")
+    .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(
+        durable::load_durable_ready_result(&runs, key, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .unwrap()
+            .run_id,
+        id
+    );
+    let events: Vec<serde_json::Value> = fs::read_to_string(run_dir.join("meta/journal.jsonl"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "user_confirmed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["decision"] == "denied_by_user")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "run_finished" && event["status"] == "failed")
+            .count(),
+        1
+    );
+    assert!(!run_dir.join("workspace/after.txt").exists());
+}
+
 #[tokio::test]
 async fn answer_process_crash_after_acceptance_retries_to_ready() {
     interaction_process_crash("answer", None).await;

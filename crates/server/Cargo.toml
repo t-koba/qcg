@@ -38,6 +38,7 @@ tower-http = { workspace = true, optional = true }
 
 [dev-dependencies]
 engine = { path = "../engine" }
+service = { path = "../service", features = ["test-hooks"] }
 tokio = { workspace = true, features = ["test-util"] }
 tower.workspace = true
 

@@ -416,7 +416,7 @@ impl LocalService {
             .unwrap_or((None, None, None));
         let directory = run_dir.to_owned();
         let confirmation = confirmation_id.to_owned();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let before_settle = crate::denial_settlement_test_hooks::BEFORE_SETTLE
             .try_with(Clone::clone)
             .ok()
@@ -432,7 +432,7 @@ impl LocalService {
             record.artifacts = None;
         }
         self.blocking_work(move || {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             if let Some(before_settle) = before_settle {
                 before_settle();
             }

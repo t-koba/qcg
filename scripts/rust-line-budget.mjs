@@ -1,4 +1,4 @@
-// Test paths/files and inline test-only cfg modules are uncapped; other src lines are product.
+// Test paths/files and test-only cfg items are uncapped; other src lines are product.
 import { readdirSync, readFileSync, statSync } from "node:fs";
 import { dirname, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -24,19 +24,38 @@ function braceDelta(s, q) {
   }
   return n;
 }
+function isTestOnlyCfg(line) {
+  return /^\s*#\[cfg\((?:test|all\((?:[^()]*,\s*)?test(?:\s*,[^()]*)?\)|any\(test,\s*feature\s*=\s*"test-hooks"\))\)\]\s*$/.test(line);
+}
 export function splitSrcFile(s, path) {
   const physical = lines(s), a = s.split("\n");
   if (isTestPath(path)) return { product: 0, test: physical };
   let test = 0;
   for (let i = 0; i < a.length; i++) {
-    if (!/^\s*#\[cfg\((?:test|all\((?:[^()]*,\s*)?test(?:\s*,[^()]*)?\))\)\]\s*$/.test(a[i])) continue;
+    if (!isTestOnlyCfg(a[i])) continue;
     let m = i + 1;
     while (m < a.length && (!a[m].trim() || /^\s*(?:#\s*\[|\/\/|\/\*|\*)/.test(a[m]))) m++;
-    if (!/^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\b/.test(a[m] || "")) continue;
-    let start = m;
-    if (!a[m].includes("{")) { if (a[m].trim().endsWith(";") || !a[m + 1]?.trim().startsWith("{")) continue; start++; }
-    const q = { block: 0, raw: null, quote: "" }; let depth = 0;
-    for (let end = start; end < a.length; end++) if ((depth += braceDelta(a[end], q)) === 0) { test += end - i + 1; i = end; break; }
+    const module = /^(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\b/.test(a[m] || "");
+    if (module) {
+      let start = m;
+      if (!a[m].includes("{")) { if (a[m].trim().endsWith(";") || !a[m + 1]?.trim().startsWith("{")) continue; start++; }
+      const q = { block: 0, raw: null, quote: "" }; let depth = 0;
+      for (let end = start; end < a.length; end++) if ((depth += braceDelta(a[end], q)) === 0) { test += end - i + 1; i = end; break; }
+      continue;
+    }
+    const isLet = /^let\b/.test(a[m]?.trim() || ""), isIf = /^if\b/.test(a[m]?.trim() || "");
+    if (!isLet && !isIf) continue;
+    const q = { block: 0, raw: null, quote: "" }; let depth = 0, opened = false;
+    for (let end = m; end < a.length; end++) {
+      const delta = braceDelta(a[end], q);
+      depth += delta;
+      opened ||= delta > 0;
+      if ((isLet && depth === 0 && a[end].includes(";")) || (isIf && opened && depth === 0)) {
+        test += end - i + 1;
+        i = end;
+        break;
+      }
+    }
   }
   return { product: physical - test, test };
 }
