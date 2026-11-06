@@ -196,12 +196,15 @@ error alone does not prove the operation had no effects. `cancel` publishes
 its durable mailbox before returning `409` or another error, so releasing the
 claim on error would let a retry execute as a fresh owner over an
 already-accepted operation. Only the process-local waiter entry is withdrawn
-and woken; the durable claim preserves evidence only for its existing
-60-second lease/adoption window, measured from claim publication, not a fresh
-quarantine starting at the error. While that lease remains live, a same-key
-retry rejoins as a peer instead of executing fresh. Retention is not proof
-that replay is safe, and may hold a key even when no effect occurred.
-Route-specific acceptance reconciliation is still required.
+and woken; the durable Pending may remain unresolved after its existing
+60-second lease. The timestamp controls when a same-digest retry may adopt,
+measured from claim publication rather than from a new quarantine after the
+error; it does not authorize replacing Pending with a different digest. A
+different-digest request continues to conflict while that evidence remains,
+regardless of age. While the lease is
+live, a same-key retry rejoins as a peer instead of executing fresh. Retention
+is not proof that replay is safe, and may hold a key even when no effect
+occurred. Route-specific acceptance reconciliation is still required.
 
 New durable Pending claims include an opaque operation ID before execution.
 A same-key, same-digest adoption retains that ID as well as the reserved run ID.

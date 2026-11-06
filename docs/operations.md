@@ -292,6 +292,8 @@ its run, including after logical replay TTL, until the existing record-expiry
 writer removes it. This lag does not extend replay. Unresolved
 `<sha256>.pending.json` pins regardless of age; only an exact Ready match on
 key, digest, run ID and generation resolves Pending, leaving Ready as the pin.
+An expired unresolved Pending conflicts with a different digest; its timestamp
+permits same-digest adoption but never replacement by age.
 Request-triggered expiry and the resident sweep retire that exact Pending and
 attempt to sync its removal before unlinking Ready; a Pending unlink or
 directory-sync error keeps Ready for retry. Ambiguous Pending remains unresolved

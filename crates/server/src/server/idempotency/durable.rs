@@ -365,8 +365,7 @@ fn read_key_files_snapshot(runs_dir: &Utf8PathBuf, key: &str) -> Result<KeyFiles
         pending: snapshot_of(pending_path(runs_dir, key))?,
     })
 }
-/// Test-only helper sharing the production snapshot reap path: removes an
-/// expired Ready record under the idempotency lock (E02).
+/// Test helper for the production Ready-expiry path.
 #[cfg(test)]
 fn reap_expired_ready_locked(
     runs_dir: &Utf8PathBuf,
@@ -377,8 +376,7 @@ fn reap_expired_ready_locked(
     let mut snapshot = read_key_files_snapshot(runs_dir, key)?;
     reap_expired_ready_snapshot(runs_dir, key, &mut snapshot, ttl).map(|_| ())
 }
-/// Expiry returns the generation floor (absent: zero), preventing an older
-/// owner from restarting the chain. Retired Pending bytes leave the snapshot.
+/// Return the generation floor and update the snapshot when expiry removes files.
 fn reap_expired_ready_snapshot(
     runs_dir: &Utf8PathBuf,
     key: &str,
@@ -391,8 +389,7 @@ fn reap_expired_ready_snapshot(
     let record = parse_ready(key, bytes)?;
     let generation = record.generation;
     if record.expired_at(now_unix()?, ttl) {
-        // Resolve the exact crash-left Pending first. If retirement or its
-        // directory sync fails, keep Ready as the durable resolution proof.
+        // I/O or sync errors abort expiry; ambiguous Pending stays unresolved.
         if retire_ready_pending(runs_dir, &record, None)? {
             snapshot.pending = None;
         }
@@ -463,7 +460,7 @@ fn acquire_maintenance_lock(
         }
     }
 }
-/// Pending lasts 60s (30s waiter reports live as 503, adopts expired); Ready uses frozen TTL.
+/// Pending's 60s lease permits same-digest adoption; age never permits a different digest to replace it.
 const PENDING_TTL_SECS: u64 = 60;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurablePendingRecord {
@@ -479,8 +476,7 @@ struct DurablePendingRecord {
     /// Required generation; a superseded committer cannot replace a successor.
     generation: u64,
 }
-/// Claim before execution. Live equal-digest peers wait; other digests
-/// conflict. Expired equal-digest claims adopt the predecessor's run id.
+/// Expired equal digests adopt the reserved run; foreign digests always conflict.
 #[cfg(test)]
 pub(crate) fn claim_durable_pending(
     runs_dir: &Utf8PathBuf,
@@ -544,9 +540,8 @@ pub(crate) fn claim_durable_pending_for_target_gated(
         }
         return Ok(ClaimOutcome::Ready(committed));
     }
-    // A live predecessor is never overwritten. An expired predecessor stays
-    // until atomic replacement, retaining its run association across a crash
-    // during adoption. Its generation still floors the successor.
+    // Expired Pending adopts only for its original digest and run; a foreign
+    // digest conflicts rather than replacing unresolved evidence.
     let mut adopted: Option<String> = None;
     let mut operation_id = uuid::Uuid::now_v7().to_string();
     let pending_generation: u64 = match match snapshot.pending.as_deref() {
@@ -560,6 +555,9 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             return Ok(ClaimOutcome::Peer);
         }
         PendingRead::Expired(record) => {
+            if record.digest != digest {
+                return Ok(ClaimOutcome::Conflict);
+            }
             let accepted_id = record.operation_id.as_deref().ok_or_else(|| {
                 ApiHttpError::internal("expired legacy idempotency claim has no operation identity; quiescence and reconciliation required")
             })?;
@@ -569,10 +567,8 @@ pub(crate) fn claim_durable_pending_for_target_gated(
                 ));
             }
             let generation = record.generation;
-            if record.digest == digest {
-                operation_id = accepted_id.to_string();
-                adopted = record.run_id.clone();
-            }
+            operation_id = accepted_id.to_string();
+            adopted = record.run_id.clone();
             generation
         }
         PendingRead::Absent => 0,
@@ -910,11 +906,11 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
     };
     parse_pending_bytes(key, &bytes)
 }
-/// Retire only evidence positively resolved by this Ready. The caller holds
-/// the metadata lock; publication also checks the exact claim owner. Expiry
-/// has no owner in Ready, so it matches the complete recorded operation identity.
-/// Returns true only after an exact Pending unlink and directory sync; ambiguous
-/// evidence remains untouched regardless of age.
+/// Retire only a Pending resolved by the complete Ready identity; caller holds
+/// the metadata lock, and publication also checks the claim owner.
+/// Expiry has no owner to compare, so it matches key, digest, run and generation.
+/// Return true only after exact unlink and directory sync; ambiguous evidence
+/// remains untouched regardless of age.
 fn retire_ready_pending(
     runs_dir: &Utf8PathBuf,
     ready: &DurableIdempotencyRecord,
@@ -922,8 +918,7 @@ fn retire_ready_pending(
 ) -> Result<bool, String> {
     let path = pending_path(runs_dir, &ready.key);
     let bytes = match read_bounded_idempotency_file(&path) {
-        // Retry the directory sync if a prior retirement unlinked Pending
-        // but failed to sync, before expiry is allowed to remove Ready.
+        // Retry sync when Pending was already unlinked but its sync failed.
         BoundedRead::Absent => {
             sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
             return Ok(false);
@@ -954,8 +949,7 @@ fn retire_ready_pending(
     sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
     Ok(true)
 }
-/// Read-only digest lookup used before package preflight: an exact retry of a
-/// live pending start must join its owner even if the source package changed.
+/// Read live digest before package preflight so exact pending retries can join.
 pub(crate) fn load_durable_pending_digest_result(
     runs_dir: &Utf8PathBuf,
     key: &str,
@@ -1286,10 +1280,8 @@ pub(crate) fn store_durable_ready_gated(
         if existing.digest != digest {
             return Err(StoreReadyError::DigestConflict);
         }
-        // Absent means replay after release; Unusable is positive damage
-        // evidence. A matching claim converges even after its wall-clock
-        // timestamp while this gate is held; mismatched identities are
-        // refused by the ownership check below.
+        // Absent permits replay after release; damaged evidence fails closed.
+        // A matching claim still requires current gate ownership.
         match &pending_read {
             PendingRead::Valid(pending) | PendingRead::Expired(pending) => {
                 check_live_ownership(pending)?;
@@ -2526,6 +2518,39 @@ mod tests {
                 outcome_name(&other)
             ),
         }
+        let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
+    }
+
+    #[test]
+    fn expired_claim_with_different_digest_conflicts_without_overwrite() {
+        // Age does not resolve an accepted Pending operation: a different
+        // request must not replace its run, digest, owner, or operation ID.
+        let runs_dir = temp_runs_dir("expired-foreign-digest");
+        let key = "key-expired-peer";
+        claim_owner(&runs_dir, key, "digest-a", "run-A");
+        let path = pending_path(&runs_dir, key);
+        let mut pending: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(&path).expect("claim should read"))
+                .expect("claim should parse");
+        pending.created_at_unix = 0;
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&pending).expect("claim should serialize"),
+        )
+        .expect("claim should be aged");
+        let aged = std::fs::read(&path).expect("aged claim should read");
+
+        let outcome = claim_pending(&runs_dir, key, "digest-b", "run-B")
+            .expect("expired evidence should remain a claim conflict");
+        assert!(
+            matches!(outcome, ClaimOutcome::Conflict),
+            "different digest must not supersede unresolved Pending, got {outcome:?}"
+        );
+        assert_eq!(
+            std::fs::read(&path).expect("original Pending should remain"),
+            aged,
+            "different-digest retry must preserve exact Pending evidence"
+        );
         let _ = std::fs::remove_dir_all(runs_dir.as_std_path());
     }
 
