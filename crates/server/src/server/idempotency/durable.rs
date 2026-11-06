@@ -373,25 +373,32 @@ fn reap_expired_ready_locked(
     key: &str,
     ttl: std::time::Duration,
 ) -> Result<(), String> {
-    let snapshot = read_key_files_snapshot(runs_dir, key)?;
-    reap_expired_ready_snapshot(runs_dir, key, snapshot.ready.as_deref(), ttl).map(|_| ())
+    let _lock = acquire_idempotency_lock(runs_dir)?;
+    let mut snapshot = read_key_files_snapshot(runs_dir, key)?;
+    reap_expired_ready_snapshot(runs_dir, key, &mut snapshot, ttl).map(|_| ())
 }
-/// Locked snapshot expiry returns its generation floor (absent: zero),
-/// preventing an older owner from restarting the chain. Readers never mutate.
+/// Expiry returns the generation floor (absent: zero), preventing an older
+/// owner from restarting the chain. Retired Pending bytes leave the snapshot.
 fn reap_expired_ready_snapshot(
     runs_dir: &Utf8PathBuf,
     key: &str,
-    ready_bytes: Option<&[u8]>,
+    snapshot: &mut KeyFilesSnapshot,
     ttl: std::time::Duration,
 ) -> Result<(Option<DurableIdempotencyRecord>, u64), String> {
-    let Some(bytes) = ready_bytes else {
+    let Some(bytes) = snapshot.ready.as_deref() else {
         return Ok((None, 0));
     };
     let record = parse_ready(key, bytes)?;
     let generation = record.generation;
     if record.expired_at(now_unix()?, ttl) {
+        // Resolve the exact crash-left Pending first. If retirement or its
+        // directory sync fails, keep Ready as the durable resolution proof.
+        if retire_ready_pending(runs_dir, &record, None)? {
+            snapshot.pending = None;
+        }
         std::fs::remove_file(idempotency_path(runs_dir, key).as_std_path())
             .map_err(|error| error.to_string())?;
+        snapshot.ready = None;
         return Ok((None, generation));
     }
     Ok((Some(record), generation))
@@ -520,11 +527,11 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     // Temp+rename is atomic but cannot arbitrate owners; hold the shared lock.
     let _lock_held = acquire_idempotency_lock(runs_dir).map_err(ApiHttpError::internal)?;
     // One snapshot orders Ready convergence before any pending mutation.
-    let snapshot = read_key_files_snapshot(runs_dir, key).map_err(ApiHttpError::internal)?;
+    let mut snapshot = read_key_files_snapshot(runs_dir, key).map_err(ApiHttpError::internal)?;
     // Parse each file once, retaining the expired Ready generation floor.
     let (committed_opt, ready_generation) =
-        match reap_expired_ready_snapshot(runs_dir, key, snapshot.ready.as_deref(), ttl) {
-            Ok((committed, generation)) => (committed, generation),
+        match reap_expired_ready_snapshot(runs_dir, key, &mut snapshot, ttl) {
+            Ok(result) => result,
             Err(error) => {
                 return Err(ApiHttpError::internal(format!(
                     "failed to load idempotency record: {error}"
@@ -906,30 +913,32 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
 /// Retire only evidence positively resolved by this Ready. The caller holds
 /// the metadata lock; publication also checks the exact claim owner. Expiry
 /// has no owner in Ready, so it matches the complete recorded operation identity.
-/// Ambiguous evidence is retained regardless of age.
+/// Returns true only after an exact Pending unlink and directory sync; ambiguous
+/// evidence remains untouched regardless of age.
 fn retire_ready_pending(
     runs_dir: &Utf8PathBuf,
     ready: &DurableIdempotencyRecord,
     owner: Option<&str>,
-) -> Result<(), String> {
+) -> Result<bool, String> {
     let path = pending_path(runs_dir, &ready.key);
     let bytes = match read_bounded_idempotency_file(&path) {
         // Retry the directory sync if a prior retirement unlinked Pending
         // but failed to sync, before expiry is allowed to remove Ready.
         BoundedRead::Absent => {
-            return sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string());
+            sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
+            return Ok(false);
         }
         BoundedRead::Present(bytes) => bytes,
         BoundedRead::Unreadable(error) => {
             tracing::warn!(%error, "unreadable pending retained after Ready resolution");
-            return Ok(());
+            return Ok(false);
         }
     };
     let pending: DurablePendingRecord = match serde_json::from_slice(&bytes) {
         Ok(pending) => pending,
         Err(error) => {
             tracing::warn!(%error, "corrupt pending retained after Ready resolution");
-            return Ok(());
+            return Ok(false);
         }
     };
     if pending.key != ready.key
@@ -939,10 +948,11 @@ fn retire_ready_pending(
         || owner.is_some_and(|owner| pending.owner != owner)
     {
         tracing::warn!("mismatched pending retained after Ready resolution");
-        return Ok(());
+        return Ok(false);
     }
     std::fs::remove_file(&path).map_err(|error| error.to_string())?;
-    sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())
+    sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
+    Ok(true)
 }
 /// Read-only digest lookup used before package preflight: an exact retry of a
 /// live pending start must join its owner even if the source package changed.
@@ -1237,13 +1247,7 @@ pub(crate) fn store_durable_ready_gated(
     // Temp+rename is atomic but cannot arbitrate owners; hold the shared lock.
     let _lock_held = acquire_idempotency_lock(runs_dir)?;
     // Ready convergence and pending ownership use one locked snapshot.
-    let snapshot = read_key_files_snapshot(runs_dir, key)?;
-    // Parse pending once for both convergence and publication.
-    let pending_read = snapshot
-        .pending
-        .as_deref()
-        .map(|bytes| parse_pending_bytes(key, bytes))
-        .unwrap_or(PendingRead::Absent);
+    let mut snapshot = read_key_files_snapshot(runs_dir, key)?;
     // Gate-aware ownership: the exact holder may commit even after the
     // wall-clock timestamp, because no gate-aware successor could have
     // replaced the claim while this gate is held. Mismatched identities
@@ -1272,9 +1276,13 @@ pub(crate) fn store_durable_ready_gated(
             )),
         }
     };
-    if let (Some(existing), _) =
-        reap_expired_ready_snapshot(runs_dir, key, snapshot.ready.as_deref(), ttl)?
-    {
+    let (existing, _) = reap_expired_ready_snapshot(runs_dir, key, &mut snapshot, ttl)?;
+    let pending_read = snapshot
+        .pending
+        .as_deref()
+        .map(|bytes| parse_pending_bytes(key, bytes))
+        .unwrap_or(PendingRead::Absent);
+    if let Some(existing) = existing {
         if existing.digest != digest {
             return Err(StoreReadyError::DigestConflict);
         }
@@ -2403,6 +2411,52 @@ mod tests {
             serde_json::from_value::<DurableIdempotencyRecord>(ready_without_generation).is_err(),
             "ready without generation must be corrupt"
         );
+    }
+
+    #[test]
+    fn request_expiry_retires_crash_left_exact_pending_before_new_claim() {
+        let runs_dir = temp_runs_dir("ready-reap-pending");
+        let _guard = TempGuard(runs_dir.clone());
+        let key = "key-expired-pending";
+        let (owner, generation) = claim_owner(&runs_dir, key, "digest", "run-1");
+        let pending = pending_path(&runs_dir, key);
+        let pending_bytes = std::fs::read(&pending).expect("owned Pending should be readable");
+        store_ready(&runs_dir, key, "digest", "run-1", &owner, generation)
+            .expect("owned Ready should publish");
+
+        // Simulate process death after Ready publication but before the
+        // best-effort Pending retirement completes.
+        std::fs::write(&pending, pending_bytes).expect("restore crash-left Pending");
+        let ready_path = idempotency_path(&runs_dir, key);
+        let mut ready: DurableIdempotencyRecord =
+            serde_json::from_slice(&std::fs::read(&ready_path).expect("Ready should be readable"))
+                .expect("Ready should parse");
+        ready.created_at_unix = now_unix()
+            .expect("test clock should be after the Unix epoch")
+            .saturating_sub(policy::IDEMPOTENCY_TTL.as_secs().max(1));
+        std::fs::write(
+            &ready_path,
+            serde_json::to_vec(&ready).expect("Ready should serialize"),
+        )
+        .expect("expired Ready should be written");
+
+        let next = claim_pending(&runs_dir, key, "digest", "run-2")
+            .expect("request-path expiry should allow a new claim after TTL");
+        let (next_owner, next_generation) = match next {
+            ClaimOutcome::Owner {
+                owner, generation, ..
+            } => (owner, generation),
+            other => panic!("resolved expired Pending must not block a new claim: {other:?}"),
+        };
+        assert_ne!(next_owner, owner);
+        assert_eq!(next_generation, generation + 1);
+        assert!(!ready_path.exists(), "expired Ready should be removed");
+        let next_pending: DurablePendingRecord = serde_json::from_slice(
+            &std::fs::read(&pending).expect("new Pending should be present"),
+        )
+        .expect("new Pending should parse");
+        assert_eq!(next_pending.run_id.as_deref(), Some("run-2"));
+        assert_eq!(next_pending.generation, next_generation);
     }
 
     #[test]

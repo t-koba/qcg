@@ -248,8 +248,12 @@ that lag. A physically present canonical Ready record still pins its run until
 record removal; this can delay run GC beyond logical TTL but never renews replay.
 Unresolved Pending pins its associated run regardless of age. Pending is resolved
 only by a canonical Ready with the exact key, digest, run ID and generation;
-then Ready alone pins. Multiple keys pin independently. GC skips pinned runs,
-and explicit DELETE returns `409` while any retained association pins the run.
+then Ready alone pins. Request-triggered expiry and the resident sweep retire an
+exactly matching Pending and attempt to sync its removal before unlinking Ready.
+A Pending unlink or directory-sync error keeps Ready for retry. Ambiguous Pending
+is retained and never resolved by age. Multiple keys pin independently. GC skips
+pinned runs, and explicit DELETE returns `409` while any retained association
+pins the run.
 
 Before deletion, maintenance takes a complete canonical-record snapshot under
 `.idempotency.lock`, releasing that metadata lock before run admission/handoff/
