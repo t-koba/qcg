@@ -4,6 +4,38 @@ use axum::response::Response;
 
 const CAP: u64 = 1024 * 1024;
 
+// Windows test threads reserve about 1 MiB, but these handler-driven tests
+// poll deeper: the ready-post test needs between 1.5 and 2.0 MiB of debug
+// frames on Linux (measured by shrinking the test thread with RUST_MIN_STACK
+// until the same overflow reproduces), and the sibling post/mutation tests
+// overflow a 1 MiB thread the same way. Shrinking the test future alone
+// (about 94 KiB) cannot close that gap, so run these tests on a bounded
+// auxiliary thread with a current-thread Tokio runtime instead of raising
+// the suite-wide stack. Failures resume on the harness thread so assertion
+// messages and locations read exactly as with `#[tokio::test]`.
+const BOUNDED_TEST_STACK: usize = 8 * 1024 * 1024;
+
+fn run_with_bounded_stack<Fut>(make_future: impl FnOnce() -> Fut + Send + 'static)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    match std::thread::Builder::new()
+        .stack_size(BOUNDED_TEST_STACK)
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime should build")
+                .block_on(make_future());
+        }) {
+        Ok(handle) => match handle.join() {
+            Ok(()) => {}
+            Err(payload) => std::panic::resume_unwind(payload),
+        },
+        Err(error) => panic!("test thread should spawn: {error}"),
+    }
+}
+
 async fn open_state(generators: &Utf8PathBuf, runs: &Utf8PathBuf) -> Arc<AppState> {
     // Dropped service workers may briefly retain the exclusive store lock.
     tokio::time::timeout(Duration::from_secs(5), async {
@@ -129,8 +161,12 @@ async fn charged_bytes(
     bytes
 }
 
-#[tokio::test]
-async fn initial_post_snapshots_charge_and_keep_ready_after_exhaustion() {
+#[test]
+fn initial_post_snapshots_charge_and_keep_ready_after_exhaustion() {
+    run_with_bounded_stack(initial_post_snapshots);
+}
+
+async fn initial_post_snapshots() {
     let (_guard, _, state, source) = setup().await;
     for fork in [false, true] {
         // Unkeyed creation must take the same charged path.
@@ -185,20 +221,7 @@ async fn initial_post_snapshots_charge_and_keep_ready_after_exhaustion() {
 
 #[test]
 fn ready_post_snapshots_share_budget_across_routes_and_restart() {
-    // This combined handler/join future exceeds the Windows test-thread stack
-    // in debug builds. Bound extra stack to this test, not the suite or server.
-    std::thread::Builder::new()
-        .stack_size(8 * 1024 * 1024)
-        .spawn(|| {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap()
-                .block_on(ready_post_snapshots());
-        })
-        .unwrap()
-        .join()
-        .unwrap();
+    run_with_bounded_stack(ready_post_snapshots);
 }
 
 async fn ready_post_snapshots() {
@@ -522,8 +545,12 @@ async fn initial_mutation_snapshots_charge_and_preserve_ready_on_rejection() {
     }
 }
 
-#[tokio::test]
-async fn ready_mutation_snapshots_share_budget_across_routes_and_restart() {
+#[test]
+fn ready_mutation_snapshots_share_budget_across_routes_and_restart() {
+    run_with_bounded_stack(ready_mutation_snapshots);
+}
+
+async fn ready_mutation_snapshots() {
     let (guard, generators, mut state, source) = setup().await;
     let mut mutations = Vec::new();
     let mut expected = Vec::new();
