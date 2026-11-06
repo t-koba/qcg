@@ -2,6 +2,48 @@
 use super::*;
 
 impl LocalService {
+    /// None means a denial won: do not signal cancellation, including on shutdown.
+    pub(super) async fn publish_cancel_control(
+        &self,
+        id: &str,
+        run_dir: &Utf8Path,
+        operation_id: &str,
+    ) -> Result<Option<bool>, ApiError> {
+        let limits = match self.inner.runs.read().await.get(id) {
+            Some(record) => engine::JournalLimits::from(&record.contract.manifest.runtime),
+            None => {
+                let state = self.authoritative_state(run_dir).await?;
+                let contract = crate::run_package::load(run_dir, &state).map_err(api_internal)?;
+                engine::JournalLimits::from(&contract.manifest.runtime)
+            }
+        };
+        match crate::run_dirs::request_remote_cancel_with_id(
+            run_dir,
+            id,
+            &self.inner.owner_id,
+            operation_id,
+            limits,
+        ) {
+            Ok(published) => Ok(Some(published)),
+            Err(crate::types::ServiceError::PreconditionFailed(_)) => {
+                let state = engine::RunState::fold_journal_with_limits(
+                    &crate::summaries::run_meta_dir(run_dir).join("journal.jsonl"),
+                    limits,
+                )
+                .map_err(api_internal)?;
+                let confirmation = state
+                    .confirmations
+                    .iter()
+                    .find(|(_, approved)| !**approved)
+                    .ok_or_else(|| api_internal("cancel acceptance precondition changed"))?
+                    .0;
+                self.reconcile_denial(id, run_dir, confirmation).await?;
+                Ok(None)
+            }
+            Err(error) => Err(api_internal(error)),
+        }
+    }
+
     pub async fn cancel(&self, id: String) -> Result<(), ApiError> {
         self.cancel_with_operation_id(id, uuid::Uuid::now_v7().to_string())
             .await
@@ -19,6 +61,12 @@ impl LocalService {
             && let Ok(run_dir) = self.run_dir_for(&id).await
             && self.authoritative_state(&run_dir).await?.terminal.is_some()
         {
+            let state = self.authoritative_state(&run_dir).await?;
+            if let Some((confirmation, _)) =
+                state.confirmations.iter().find(|(_, approved)| !**approved)
+            {
+                return self.reconcile_denial(&id, &run_dir, confirmation).await;
+            }
             if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
                 return Err(api_internal(
                     "cancel retry could not consume matching control",
@@ -27,10 +75,14 @@ impl LocalService {
             return Ok(());
         }
         self.ensure_running()?;
-        // Publish before local signaling so even an untracked peer owner
-        // observes acceptance; mailbox I/O failures must never drop a cancel.
+        // Publish before signaling; untracked peer owners also need acceptance.
         let run_dir = self.run_dir_for(&id).await?;
         let state = self.authoritative_state(&run_dir).await?;
+        if let Some((confirmation, _)) =
+            state.confirmations.iter().find(|(_, approved)| !**approved)
+        {
+            return self.reconcile_denial(&id, &run_dir, confirmation).await;
+        }
         if state.terminal.is_some() || state.cancel_operations.contains(&operation_id) {
             if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
                 return Err(api_internal(
@@ -39,13 +91,12 @@ impl LocalService {
             }
             return Ok(());
         }
-        let newly_published = crate::run_dirs::request_remote_cancel_with_id(
-            &run_dir,
-            &id,
-            &self.inner.owner_id,
-            &operation_id,
-        )
-        .map_err(api_internal)?;
+        let Some(newly_published) = self
+            .publish_cancel_control(&id, &run_dir, &operation_id)
+            .await?
+        else {
+            return Ok(());
+        };
         let (task, settled) = {
             let mut runs = self.inner.runs.write().await;
             let Some(record) = runs.get_mut(&id) else {
@@ -53,15 +104,13 @@ impl LocalService {
                 return Ok(());
             };
             if record.state.is_terminal() {
-                // Settlement raced publication. Consume even reused evidence:
-                // no engine remains to drain it and it must not pin deletion.
+                // Settlement won; no engine remains to consume the mailbox.
                 if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
                     tracing::warn!(run_id = %id, "terminal cancel left a phantom cancel control");
                 }
                 return Ok(());
             }
-            // Recheck shutdown under the runs lock. Withdraw only evidence
-            // published by this call, never a prior accepted retry's mailbox.
+            // Shutdown may withdraw only this call's newly published evidence.
             if self.is_shutting_down() {
                 if newly_published
                     && !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id)
@@ -72,12 +121,10 @@ impl LocalService {
                     detail: "server is shutting down".into(),
                 });
             }
-            // Rendezvous with the live writer, even while Waiting/Confirming;
-            // probing its execution lease would conflict with our own task.
+            // Signal live writers directly: probing their lease would self-conflict.
             let engine_is_active = crate::types::task_slot_is_live(&record.task);
             record.cancellation.cancel();
-            // Acceptance, not settlement: the mailbox carries the request
-            // and only a journaled terminal state reports `Canceled` (A02).
+            // Display acceptance until a journaled terminal outcome exists.
             record.state = RunStatus::CancelRequested;
             record.preempted = false;
             record.clear_prompt();

@@ -681,8 +681,13 @@ command = ["sh", "-c", "sleep 30"]"#,
         .run_dir_for(&running)
         .await
         .expect("B should resolve the run directory");
-    crate::run_dirs::request_remote_cancel(&run_dir_b, &running, "peer-b")
-        .expect("peer cancel should publish");
+    crate::run_dirs::request_remote_cancel(
+        &run_dir_b,
+        &running,
+        "peer-b",
+        engine::JournalLimits::default(),
+    )
+    .expect("peer cancel should publish");
     // A refreshes while its engine task is still live: the cancel token
     // must be prodded and the run must not stay stale Running.
     slow_a

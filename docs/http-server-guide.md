@@ -192,19 +192,27 @@ fixed protocol defaults are not new environment settings. Lease expiry alone
 cannot supersede an owner that still holds its execution gate.
 
 A service execution that returns an error preserves its Pending claim: the
-error alone does not prove the operation had no effects. `cancel` publishes
-its durable mailbox before returning `409` or another error, so releasing the
-claim on error would let a retry execute as a fresh owner over an
+error alone does not prove the operation had no effects. During ordinary
+operation, cancel mailbox publication and acceptance of a denied confirmation
+serialize under the run's journal lock. If the mailbox is published first, the
+denial append is refused and the cancel is drained idempotently. If denial was
+already accepted, cancel publishes no mailbox and reconciles that denial; a
+failed reconciliation preserves the accepted decision and retryable Pending
+evidence. A mailbox from an accepted cancel remains on an error; shutdown may
+withdraw only a newly published mailbox when refusing that request, as noted
+below. An error while reconciling an earlier denial is not an accepted cancel.
+Releasing the claim on error could let a retry execute as a fresh owner over an
 already-accepted operation. Only the process-local waiter entry is withdrawn
-and woken; the durable Pending may remain unresolved after its existing
-60-second lease. The timestamp controls when a same-digest retry may adopt,
-measured from claim publication rather than from a new quarantine after the
-error; it does not authorize replacing Pending with a different digest. A
-different-digest request continues to conflict while that evidence remains,
-regardless of age. While the lease is
-live, a same-key retry rejoins as a peer instead of executing fresh. Retention
-is not proof that replay is safe, and may hold a key even when no effect
-occurred. Route-specific acceptance reconciliation is still required.
+and woken; the
+durable Pending may remain unresolved after its existing 60-second lease. The
+timestamp controls when a same-digest retry may adopt, measured from claim
+publication rather than from a new quarantine after the error; it does not
+authorize replacing Pending with a different digest. A different-digest request
+continues to conflict while that evidence remains, regardless of age. While
+the lease is live, a same-key retry rejoins as a peer instead of executing
+fresh. Retention is not proof that replay is safe, and may hold a key even when
+no effect occurred. Route-specific acceptance reconciliation is still
+required.
 
 New durable Pending claims include an opaque operation ID before execution.
 A same-key, same-digest adoption retains that ID as well as the reserved run ID.
@@ -215,8 +223,10 @@ An existing mailbox with the same operation/run identity is reused without
 replacing its original attribution or timestamp; corrupt or mismatched evidence
 fails closed. An already-journaled operation ID is the same acceptance, and the
 journal-locked drain deduplicates concurrent deliveries. Journaled and terminal
-retries consume a still-published matching mailbox without adding another event
-or publishing a phantom control; malformed or unrelated evidence is retained. Shutdown refusal can withdraw only a mailbox
+cancel retries consume a still-published matching mailbox without adding
+another event or publishing a phantom control. A valid mailbox that conflicts
+with an already-accepted denial is retained and fails closed; malformed or
+unrelated evidence is retained. Shutdown refusal can withdraw only a mailbox
 newly published by that call, not evidence accepted by an earlier request.
 Direct service and unkeyed HTTP cancels still generate fresh IDs.
 

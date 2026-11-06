@@ -107,10 +107,8 @@ impl LocalService {
             let persist = record.clone();
             let check_answer = answer.clone();
             let check_question_id = question_id.clone();
-            // Generation check: observe the durable pending generation just
-            // before the atomic append. ID matching alone cannot tell a
-            // regenerated prompt apart, so the lock-held precondition below
-            // re-verifies this exact generation (A02).
+            // Bind the prompt generation as well as its id; the atomic append
+            // rechecks both so a regenerated prompt cannot reuse acceptance.
             let observed = self.authoritative_state(&persist.run_dir).await?;
             // A stale observation still attempts the atomic write: the
             // lock-held precondition re-verifies, and classification below
@@ -236,12 +234,8 @@ impl LocalService {
                 _ => {}
             }
         }
-        // Validate, persist, and mutate under one write lock so concurrent
-        // decisions cannot both journal conflicting values with last-wins.
-        // Journal I/O is a short local append; engine scheduling and terminal
-        // settlement stay outside the lock. Rejection classification also
-        // stays outside: it takes run-map locks, so awaiting it under the
-        // guard would deadlock the runs map against itself (B01).
+        // Journal acceptance precedes memory changes. Schedule, reconcile and
+        // classify outside the runs lock: these paths acquire it themselves.
         enum AfterLock {
             Deny(Utf8PathBuf),
             Spawn(Box<SpawnRun>),
@@ -249,9 +243,7 @@ impl LocalService {
         }
         let after = {
             let mut runs = self.inner.runs.write().await;
-            // Re-check under the admission lock: a shutdown that started
-            // between the outer check and this block must not accept a
-            // decision it can no longer execute (E05).
+            // Recheck shutdown under the admission lock.
             self.ensure_running()?;
             let record = runs
                 .get_mut(&id)
@@ -282,10 +274,7 @@ impl LocalService {
                 .confirm
                 .clone()
                 .ok_or_else(|| ApiError::invalid(format!("run `{id}` has no confirmation")))?;
-            // Full-id string match is the corruption gate: a malformed or
-            // foreign confirmation id never equals the pending id, so it
-            // fails here as Conflict instead of aliasing another scope
-            // (Q1). No separate corrupt-vs-mismatch branch is needed.
+            // Exact identity rejects malformed or foreign confirmations.
             if confirm.id != confirmation_id {
                 return Err(ApiError::Conflict {
                     detail: format!(
@@ -301,10 +290,7 @@ impl LocalService {
             // regenerated prompt apart, so the lock-held precondition below
             // re-verifies this exact generation (A02).
             let observed = self.authoritative_state(&persist.run_dir).await?;
-            // A stale observation still attempts the atomic write: the
-            // lock-held precondition re-verifies, and classification below
-            // reports the accurate outcome instead of this spot guessing
-            // from possibly old data.
+            // Classify stale observations only after the atomic check rejects.
             let check_pending_seq = match &observed.pending {
                 Some(engine::Interaction::Confirmation { confirm })
                     if confirm.id == confirmation_id =>
@@ -314,6 +300,7 @@ impl LocalService {
                 _ => None,
             };
             let queued_now = chrono::Utc::now();
+            let check_run_dir = persist.run_dir.clone();
             if let Err(error) = crate::run_dirs::write_run_event_if(
                 &persist,
                 "user_confirmed",
@@ -327,6 +314,15 @@ impl LocalService {
                     if state.terminal.is_some() {
                         return Err(JournalError::PreconditionFailed(
                             "run is already terminal".into(),
+                        ));
+                    }
+                    if !approved
+                        && !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
+                            .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
+                            .is_empty()
+                    {
+                        return Err(JournalError::PreconditionFailed(
+                            "a cancel mailbox was accepted".into(),
                         ));
                     }
                     if state.cancel_requested {
@@ -396,7 +392,7 @@ impl LocalService {
         }
     }
 
-    async fn reconcile_denial(
+    pub(crate) async fn reconcile_denial(
         &self,
         id: &str,
         run_dir: &Utf8Path,
@@ -461,10 +457,8 @@ impl LocalService {
         Ok(())
     }
 
-    /// Classifies an atomically rejected answer by re-folding the journal.
-    /// The rejection itself already happened under the journal lock; this
-    /// only decides which error to report, so a classification race cannot
-    /// accept a second winner.
+    /// Re-fold to classify an atomic rejection; this cannot accept another
+    /// winner because acceptance was already decided under the journal lock.
     pub(super) async fn classify_answer_rejection(
         &self,
         id: &str,
@@ -538,9 +532,7 @@ impl LocalService {
         }
         match state.confirmations.get(confirmation_id) {
             Some(existing) if *existing == approved => {
-                // A peer decided identically first. Adopt the durable
-                // decision so this process observes the same acceptance
-                // instead of a stale confirmation prompt.
+                // Adopt the peer's identical durable decision.
                 let mut runs = self.inner.runs.write().await;
                 if let Some(record) = runs.get_mut(id) {
                     record

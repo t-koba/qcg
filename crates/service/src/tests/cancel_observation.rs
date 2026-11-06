@@ -132,7 +132,13 @@ async fn cancel_observation_settlement_errors_keep_accepted_cancel_retryable() {
     for point in ["drain", "fold"] {
         for shutdown in [false, true] {
             let (_guard, service, id, directory) = waiting_run().await;
-            crate::run_dirs::request_remote_cancel(&directory, &id, "test").unwrap();
+            crate::run_dirs::request_remote_cancel(
+                &directory,
+                &id,
+                "test",
+                engine::JournalLimits::default(),
+            )
+            .unwrap();
             service.inner.runs.write().await.get_mut(&id).unwrap().state =
                 RunStatus::CancelRequested;
             fail_once(&directory, point, 0);
@@ -233,7 +239,13 @@ async fn cancel_observation_known_terminal_converges_without_another_terminal() 
     // Even shutdown cannot replace a verified terminal with Interrupted.
     service.mark_shutting_down();
     service.inner.runs.write().await.get_mut(&id).unwrap().state = RunStatus::CancelRequested;
-    crate::run_dirs::request_remote_cancel(&directory, &id, "test").unwrap();
+    crate::run_dirs::request_remote_cancel(
+        &directory,
+        &id,
+        "test",
+        engine::JournalLimits::default(),
+    )
+    .unwrap();
     let _lease = crate::run_dirs::try_lock_run_execution(&directory)
         .unwrap()
         .expect("no engine writer");
@@ -446,7 +458,8 @@ async fn cancel_shutdown_refusal_withdraws_only_new_mailbox() {
                     &directory,
                     &id,
                     "first-request",
-                    &operation
+                    &operation,
+                    engine::JournalLimits::default()
                 )
                 .unwrap()
             );
@@ -510,6 +523,7 @@ async fn cancel_retry_consumes_journaled_before_unlink_across_recovery() {
             &id,
             "first-request",
             &operation,
+            engine::JournalLimits::default(),
         )
         .unwrap();
         let mailbox =
@@ -605,7 +619,13 @@ async fn terminal_cancel_retry_preserves_invalid_and_unrelated_evidence() {
     let (_guard, service, id, directory) = waiting_run().await;
     service.cancel(id.clone()).await.unwrap();
     let operation = uuid::Uuid::now_v7().to_string();
-    let unrelated = crate::run_dirs::request_remote_cancel(&directory, &id, "unrelated").unwrap();
+    let unrelated = crate::run_dirs::request_remote_cancel(
+        &directory,
+        &id,
+        "unrelated",
+        engine::JournalLimits::default(),
+    )
+    .unwrap();
     let controls = crate::run_dirs::control_dir(&directory);
     let mailbox = controls.join(format!("cancel-{operation}.json"));
     let journal = std::fs::read(run_meta_dir(&directory).join("journal.jsonl")).unwrap();

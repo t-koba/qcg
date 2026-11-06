@@ -854,6 +854,13 @@ impl LocalService {
                     "requester": requester,
                 }),
                 |state| {
+                    // Legacy denial + mailbox evidence has no provable order.
+                    // Never consume it as a harmless precondition rejection.
+                    if state.confirmations.values().any(|approved| !approved) {
+                        return Err(engine::JournalError::InvalidEvent(
+                            "denial conflicts with cancel mailbox; evidence retained".into(),
+                        ));
+                    }
                     if state.cancel_operations.contains(&operation_id) {
                         return Err(engine::JournalError::PreconditionFailed(
                             "cancel operation was already journaled".into(),
@@ -2250,6 +2257,7 @@ impl LocalService {
                 %run_id,
                 "cancel drain failed during cancellation settlement; mailbox retained"
             );
+            return;
         }
         let terminal = match self.authoritative_state(&record.run_dir).await {
             Ok(state) => state.terminal,

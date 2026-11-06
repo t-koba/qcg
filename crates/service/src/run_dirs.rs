@@ -114,7 +114,11 @@ pub(crate) fn settle_confirmed_denial(
                 "accepted denial identity or settlement is ambiguous".into(),
             )
         };
-        if state.confirmations.get(confirmation_id) != Some(&false) {
+        if !list_pending_cancel_controls(run_dir)
+            .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
+            .is_empty()
+            || state.confirmations.get(confirmation_id) != Some(&false)
+        {
             return Err(ambiguous());
         }
         // Reconstruct the exact prompt at acceptance, not a current generator
@@ -1489,13 +1493,15 @@ fn remove_cancel_temp_at(dir_fd: &File, name: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn request_remote_cancel(
     run_dir: &Utf8Path,
     run_id: &str,
     requester: &str,
+    limits: JournalLimits,
 ) -> Result<String, ServiceError> {
     let operation_id = uuid::Uuid::now_v7().to_string();
-    request_remote_cancel_with_id(run_dir, run_id, requester, &operation_id)?;
+    request_remote_cancel_with_id(run_dir, run_id, requester, &operation_id, limits)?;
     Ok(operation_id)
 }
 
@@ -1506,6 +1512,7 @@ pub(crate) fn request_remote_cancel_with_id(
     run_id: &str,
     requester: &str,
     operation_id: &str,
+    limits: JournalLimits,
 ) -> Result<bool, ServiceError> {
     if !uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id) {
         return Err(ServiceError::Invalid(
@@ -1643,10 +1650,39 @@ pub(crate) fn request_remote_cancel_with_id(
     // Never overwrite accepted evidence. Publication removes the staging temp
     // on failure; an existing destination is reusable only after a pinned,
     // bounded, no-follow read proves the same logical operation.
-    #[cfg(target_os = "linux")]
-    let published = publish_cancel_control(&control_fd, &temporary, &path, &file);
-    #[cfg(not(target_os = "linux"))]
-    let published = publish_cancel_control(&dir, &temporary, &path, &file);
+    let mut published = None;
+    let path_journal = run_meta_dir(run_dir).join("journal.jsonl");
+    // Stage I/O is outside the journal lock. Only final publication competes
+    // with confirmation acceptance; no timestamps or local task order decide.
+    let checked = JournalWriter::append_events_with(&path_journal, run_id, limits, None, |state| {
+        if state.confirmations.values().any(|approved| !approved) {
+            return Err(JournalError::PreconditionFailed(
+                "accepted denial must be reconciled before cancellation".into(),
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            published = Some(publish_cancel_control(
+                &control_fd,
+                &temporary,
+                &path,
+                &file,
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            published = Some(publish_cancel_control(&dir, &temporary, &path, &file));
+        }
+        Ok(Vec::new())
+    });
+    if let Err(error) = checked {
+        cleanup_unpublished(&temporary);
+        return Err(match error {
+            JournalError::PreconditionFailed(detail) => ServiceError::PreconditionFailed(detail),
+            error => ServiceError::Invalid(error.to_string()),
+        });
+    }
+    let published = published.expect("publication selected under journal lock");
     match published {
         Ok(()) => {}
         Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -2708,20 +2744,56 @@ mod tests {
         let run_dir = root.join("run-1");
         let operation = uuid::Uuid::now_v7().to_string();
         let path = control_dir(&run_dir).join(format!("cancel-{operation}.json"));
-        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "original", &operation).unwrap());
+        assert!(
+            request_remote_cancel_with_id(
+                &run_dir,
+                "run-1",
+                "original",
+                &operation,
+                engine::JournalLimits::default()
+            )
+            .unwrap()
+        );
         let original = std::fs::read(&path).unwrap();
-        assert!(!request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).unwrap());
+        assert!(
+            !request_remote_cancel_with_id(
+                &run_dir,
+                "run-1",
+                "retry",
+                &operation,
+                engine::JournalLimits::default()
+            )
+            .unwrap()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), original);
         for field in ["op", "run_id", "operation_id"] {
             let mut damaged: Value = serde_json::from_slice(&original).unwrap();
             damaged[field] = "mismatch".into();
             let bytes = serde_json::to_vec(&damaged).unwrap();
             std::fs::write(&path, &bytes).unwrap();
-            assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+            assert!(
+                request_remote_cancel_with_id(
+                    &run_dir,
+                    "run-1",
+                    "retry",
+                    &operation,
+                    engine::JournalLimits::default()
+                )
+                .is_err()
+            );
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
         }
         std::fs::write(&path, b"{").unwrap();
-        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+        assert!(
+            request_remote_cancel_with_id(
+                &run_dir,
+                "run-1",
+                "retry",
+                &operation,
+                engine::JournalLimits::default()
+            )
+            .is_err()
+        );
         assert_eq!(std::fs::read(&path).unwrap(), b"{");
         #[cfg(unix)]
         {
@@ -2729,10 +2801,28 @@ mod tests {
             let target = root.join("target");
             std::fs::write(&target, &original).unwrap();
             std::os::unix::fs::symlink(&target, &path).unwrap();
-            assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", &operation).is_err());
+            assert!(
+                request_remote_cancel_with_id(
+                    &run_dir,
+                    "run-1",
+                    "retry",
+                    &operation,
+                    engine::JournalLimits::default()
+                )
+                .is_err()
+            );
             assert_eq!(std::fs::read(&target).unwrap(), original);
         }
-        assert!(request_remote_cancel_with_id(&run_dir, "run-1", "retry", "../bad").is_err());
+        assert!(
+            request_remote_cancel_with_id(
+                &run_dir,
+                "run-1",
+                "retry",
+                "../bad",
+                engine::JournalLimits::default()
+            )
+            .is_err()
+        );
         assert_eq!(
             std::fs::read_dir(control_dir(&run_dir)).unwrap().count(),
             1,
@@ -2771,7 +2861,13 @@ mod tests {
         let root = temp_root("cancel-plant");
         let _temp_guard = TempGuard(root.clone());
         let run_dir = root.join("run-1");
-        let legit = request_remote_cancel(&run_dir, "run-1", "tester").expect("publish");
+        let legit = request_remote_cancel(
+            &run_dir,
+            "run-1",
+            "tester",
+            engine::JournalLimits::default(),
+        )
+        .expect("publish");
         let dir = control_dir(&run_dir);
         std::fs::write(
             dir.join("cancel-evil.json").as_std_path(),
@@ -2962,7 +3058,13 @@ mod tests {
             let run_dir = run_dir.clone();
             let ids = std::sync::Arc::clone(&ids);
             handles.push(std::thread::spawn(move || {
-                let id = request_remote_cancel(&run_dir, "run-1", "tester").expect("publish");
+                let id = request_remote_cancel(
+                    &run_dir,
+                    "run-1",
+                    "tester",
+                    engine::JournalLimits::default(),
+                )
+                .expect("publish");
                 ids.lock().expect("ids lock").push(id);
             }));
         }
@@ -3038,7 +3140,15 @@ mod tests {
         let _temp_guard = TempGuard(root.clone());
         let run_dir = root.join("run-1");
         let ids: Vec<String> = (0..4)
-            .map(|_| request_remote_cancel(&run_dir, "run-1", "tester").expect("publish"))
+            .map(|_| {
+                request_remote_cancel(
+                    &run_dir,
+                    "run-1",
+                    "tester",
+                    engine::JournalLimits::default(),
+                )
+                .expect("publish")
+            })
             .collect();
         let pending = list_pending_cancel_controls(&run_dir).expect("scan should succeed");
         let listed: Vec<String> = pending.iter().map(|(id, _)| id.clone()).collect();
@@ -3076,7 +3186,13 @@ mod tests {
         // Simulate the race: wipe enumerates while a publish lands. The
         // implementation never uses whole-directory removal, so invoking
         // the wipe with a live mailbox must preserve it.
-        let id = request_remote_cancel(&run_dir, "run-1", "tester").expect("publish");
+        let id = request_remote_cancel(
+            &run_dir,
+            "run-1",
+            "tester",
+            engine::JournalLimits::default(),
+        )
+        .expect("publish");
         wipe_incomplete_run_dir(&run_dir).expect("wipe should succeed");
         assert!(
             dir.join(format!("cancel-{id}.json")).exists(),
@@ -3233,7 +3349,13 @@ mod tests {
         let root = temp_root("cancel-resurrect");
         let _temp_guard = TempGuard(root.clone());
         let run_dir = root.join("run-1");
-        let id = request_remote_cancel(&run_dir, "run-1", "tester").expect("publish");
+        let id = request_remote_cancel(
+            &run_dir,
+            "run-1",
+            "tester",
+            engine::JournalLimits::default(),
+        )
+        .expect("publish");
         let dir = control_dir(&run_dir);
         let published = dir.join(format!("cancel-{id}.json"));
         assert!(published.exists(), "publish must exist");

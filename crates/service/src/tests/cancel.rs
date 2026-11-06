@@ -744,8 +744,13 @@ enabled = false"#,
     )
     .expect("peer should initialize");
     let run_dir = peer.run_dir_for(&id).await.expect("run dir should resolve");
-    crate::run_dirs::request_remote_cancel(&run_dir, &id, "peer-test")
-        .expect("mailbox write should succeed");
+    crate::run_dirs::request_remote_cancel(
+        &run_dir,
+        &id,
+        "peer-test",
+        engine::JournalLimits::default(),
+    )
+    .expect("mailbox write should succeed");
     // No terminal outcome exists: nothing settled.
     let folded = crate::summaries::fold_run_state(&run_dir).expect("fold should succeed");
     assert!(
@@ -832,8 +837,13 @@ enabled = false"#,
     let mut ops = Vec::new();
     for _ in 0..3 {
         ops.push(
-            crate::run_dirs::request_remote_cancel(&run_dir, &id, "tester")
-                .expect("publish should succeed"),
+            crate::run_dirs::request_remote_cancel(
+                &run_dir,
+                &id,
+                "tester",
+                engine::JournalLimits::default(),
+            )
+            .expect("publish should succeed"),
         );
     }
     // A requester-less control: malformed, never journaled.
@@ -927,7 +937,13 @@ async fn cancel_racing_shutdown_settles_interrupted() {
         .run_dir_for(&id)
         .await
         .expect("run directory should resolve");
-    crate::run_dirs::request_remote_cancel(&run_dir, &id, "tester").expect("cancel should publish");
+    crate::run_dirs::request_remote_cancel(
+        &run_dir,
+        &id,
+        "tester",
+        engine::JournalLimits::default(),
+    )
+    .expect("cancel should publish");
     service.mark_shutting_down();
     service
         .settle_queued_cancel(&id, &run_dir, "cancellation requested")
@@ -1167,8 +1183,13 @@ enabled = false"#,
     )
     .expect("peer should initialize");
     let run_dir = peer.run_dir_for(&id).await.expect("run dir should resolve");
-    crate::run_dirs::request_remote_cancel(&run_dir, &id, "peer-test")
-        .expect("mailbox write should succeed");
+    crate::run_dirs::request_remote_cancel(
+        &run_dir,
+        &id,
+        "peer-test",
+        engine::JournalLimits::default(),
+    )
+    .expect("mailbox write should succeed");
     peer.refresh_shared_runs()
         .await
         .expect("refresh should succeed");

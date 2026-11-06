@@ -3145,6 +3145,249 @@ enabled = false
 
 #[cfg(unix)]
 #[tokio::test]
+async fn cancel_mailbox_precedes_denial_acceptance() {
+    let service = test_service(
+        vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+        temp_run_dir("cancel-denial-order"),
+    );
+    let id = service
+        .start_run(StartRun {
+            generator_id: "side-effect-confirm".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let prompt = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+        .await
+        .confirm
+        .unwrap();
+    let run_dir = service.run_dir_for(&id).await.unwrap();
+    let operation = uuid::Uuid::now_v7().to_string();
+    let limits = engine::JournalLimits::from(
+        &service.inner.runs.read().await[&id]
+            .contract
+            .manifest
+            .runtime,
+    );
+    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
+        .unwrap();
+    assert!(
+        service
+            .confirm(
+                id.clone(),
+                prompt.id,
+                ConfirmDecision {
+                    decision: ConfirmationDecision::Deny,
+                }
+            )
+            .await
+            .is_err()
+    );
+    service
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    service
+        .cancel_with_operation_id(id.clone(), operation)
+        .await
+        .unwrap();
+    let events = read_journal_string(&service, id).await;
+    let events: Vec<Value> = events
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(!events.iter().any(|event| event["t"] == "user_confirmed"));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "user_cancel_requested")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "run_canceled")
+            .count(),
+        1
+    );
+    assert!(
+        crate::run_dirs::list_pending_cancel_controls(&run_dir)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn accepted_denial_cannot_be_overtaken_by_cancel() {
+    let service = test_service(
+        vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+        temp_run_dir("denial-cancel-order"),
+    );
+    let id = service
+        .start_run(StartRun {
+            generator_id: "side-effect-confirm".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let snapshot = wait_for_snapshot(&service, &id, RunStatus::Confirming).await;
+    let confirm = snapshot.confirm.expect("run should request confirmation");
+    let run_dir = service.run_dir_for(&id).await.unwrap();
+    let package = crate::run_package::package_dir(&run_dir);
+    let parked = run_dir.join("parked-package");
+    std::fs::rename(&package, &parked).unwrap();
+    let denial = service
+        .confirm(
+            id.clone(),
+            confirm.id.clone(),
+            ConfirmDecision {
+                decision: ConfirmationDecision::Deny,
+            },
+        )
+        .await;
+    assert!(
+        denial.is_err(),
+        "package fault interrupts settlement after acceptance"
+    );
+    let accepted = crate::summaries::fold_run_state(&run_dir).unwrap();
+    assert_eq!(accepted.confirmations.get(&confirm.id), Some(&false));
+    assert!(accepted.terminal.is_none());
+    assert!(service.cancel(id.clone()).await.is_err());
+    assert!(
+        !service.inner.runs.read().await[&id]
+            .cancellation
+            .is_cancelled()
+    );
+    assert!(
+        crate::run_dirs::list_pending_cancel_controls(&run_dir)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        crate::summaries::fold_run_state(&run_dir)
+            .unwrap()
+            .terminal
+            .is_none()
+    );
+    std::fs::rename(&parked, &package).unwrap();
+
+    service
+        .cancel(id.clone())
+        .await
+        .expect("cancel after a durable denial should observe the winning decision");
+    let snapshot = wait_for_terminal_snapshot(&service, &id).await;
+    assert_eq!(snapshot.state, RunStatus::Failed);
+    let journal = read_journal_string(&service, id.clone()).await;
+    assert!(
+        !journal.lines().any(|line| {
+            serde_json::from_str::<Value>(line)
+                .is_ok_and(|event| event["t"] == "user_cancel_requested")
+        }),
+        "a later cancel must not cross the accepted denial"
+    );
+    service
+        .confirm(
+            id.clone(),
+            confirm.id,
+            ConfirmDecision {
+                decision: ConfirmationDecision::Deny,
+            },
+        )
+        .await
+        .expect("the same denial retry must complete its original settlement");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn shutdown_preserves_denial_order_and_ambiguous_legacy_evidence() {
+    for legacy_conflict in [false, true] {
+        let service = test_service(
+            vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+            temp_run_dir("shutdown-denial-order"),
+        );
+        let id = service
+            .start_run(StartRun {
+                generator_id: "side-effect-confirm".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let prompt = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+            .await
+            .confirm
+            .unwrap();
+        let run_dir = service.run_dir_for(&id).await.unwrap();
+        let package = crate::run_package::package_dir(&run_dir);
+        let parked = run_dir.join("parked-package");
+        std::fs::rename(&package, &parked).unwrap();
+        assert!(
+            service
+                .confirm(
+                    id.clone(),
+                    prompt.id,
+                    ConfirmDecision {
+                        decision: ConfirmationDecision::Deny,
+                    }
+                )
+                .await
+                .is_err()
+        );
+        std::fs::rename(&parked, &package).unwrap();
+        if legacy_conflict {
+            let operation = uuid::Uuid::now_v7().to_string();
+            let controls = crate::run_dirs::control_dir(&run_dir);
+            std::fs::create_dir_all(&controls).unwrap();
+            let mailbox = controls.join(format!("cancel-{operation}.json"));
+            let bytes = serde_json::to_vec(&json!({
+                "op": "cancel", "run_id": id, "operation_id": operation,
+            }))
+            .unwrap();
+            std::fs::write(&mailbox, &bytes).unwrap();
+            let before = read_journal_string(&service, id.clone()).await;
+            assert!(
+                service
+                    .cancel_with_operation_id(id.clone(), operation)
+                    .await
+                    .is_err()
+            );
+            assert!(service.drain_cancel_controls(&id, &run_dir).await.is_err());
+            assert!(service.shutdown_active_runs().await.is_err());
+            assert_eq!(std::fs::read(&mailbox).unwrap(), bytes);
+            assert_eq!(read_journal_string(&service, id.clone()).await, before);
+            assert!(
+                !service.inner.runs.read().await[&id]
+                    .cancellation
+                    .is_cancelled()
+            );
+        } else {
+            service.shutdown_active_runs().await.unwrap();
+            assert_eq!(
+                service.snapshot(id.clone()).await.unwrap().state,
+                RunStatus::Failed
+            );
+            assert!(
+                !service.inner.runs.read().await[&id]
+                    .cancellation
+                    .is_cancelled()
+            );
+            assert!(
+                crate::run_dirs::list_pending_cancel_controls(&run_dir)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn denied_confirmation_settles_failed_without_executing_side_effect() {
     // Force a settlement failure after durable acceptance without adding a
     // production fault seam: admission uses the already loaded record, while

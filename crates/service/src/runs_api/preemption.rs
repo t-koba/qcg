@@ -212,7 +212,8 @@ impl LocalService {
                 .map_err(api_internal)?
         else {
             tracing::info!(run_id = %id, "preemption requeue stopped during service shutdown");
-            self.settle_shutdown_without_task(id, &staged).await?;
+            self.settle_shutdown_without_task(id, &staged, "service shutdown")
+                .await?;
             return Ok(());
         };
         let mut staged = staged;
@@ -311,7 +312,8 @@ impl LocalService {
             // execution lease and correctly deferred to its owner. Recheck
             // after releasing ownership and let the shutdown path settle the
             // now-durable queue state before any resumed engine is spawned.
-            self.settle_shutdown_without_task(id, &staged).await?;
+            self.settle_shutdown_without_task(id, &staged, "service shutdown")
+                .await?;
             self.inner.queue_notify.notify_waiters();
             return requeue.map(|_| ());
         }
