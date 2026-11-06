@@ -360,13 +360,13 @@ The complete file is verified before delivering a successful range response.
 
 `GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`,
 `GET /api/runs/{id}/artifacts.zip`, `GET /api/runs/{id}/bundle`,
-`GET /api/runs/{id}`, and idempotent `POST /api/runs` / `POST /api/runs/{id}/fork`
+`GET /api/runs/{id}`, and `POST /api/runs` / `POST /api/runs/{id}/fork`
 snapshot responses share a server-only provisional profile of 16 MiB and 1,000 entries.
 These are provisional product-policy defaults, not customer-calibrated values, a p95
 target, or a peak-RSS guarantee. Each route enforces its per-request ceiling.
-The two JSON run-view routes and single-artifact downloads additionally share
-the response-byte budget below; other routes have no shared response-memory
-budget.
+The JSON run-view and start/fork snapshot responses and single-artifact downloads
+additionally share the response-byte budget below; other routes have no shared
+response-memory budget.
 Direct CLI export (`qcg runs export`) uses the unbounded default and never applies
 the provisional profile; only HTTP applies `artifact_limits.effective()`.
 
@@ -378,16 +378,17 @@ never unlimited.
 
 `--max-artifact-response-bytes` (`MAX_ARTIFACT_RESPONSE_BYTES`, default
 `67108864`, 64 MiB) bounds aggregate response-owned bytes for concurrent
-`GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`, and
-`GET /api/runs/{id}/artifacts/{path...}` responses. The default admits four
-current default-sized 16 MiB bodies. The positive byte limit is frozen at
-server boot; zero refuses startup.
+`GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`,
+`GET /api/runs/{id}/artifacts/{path...}`, `POST /api/runs`, and
+`POST /api/runs/{id}/fork` responses, including in-memory and durable idempotency
+replays after restart. The default admits four current default-sized 16 MiB
+bodies. The positive byte limit is frozen at server boot; zero refuses startup.
 
-The two JSON run-view routes count their serialized bytes without retaining a
-body, enforce the per-response limit, and reserve the exact size before
-buffering JSON. Small responses use only their actual serialized size, not the
-per-response maximum. The exact-body ETag and `If-None-Match` behavior are
-unchanged; `304` releases the temporary serialization reservation immediately.
+The JSON run-view and POST snapshot responses count their serialized bytes
+without retaining a body, enforce the per-response limit, and reserve the exact
+size before buffering JSON. Small responses use only their actual serialized
+size, not the per-response maximum. The exact-body ETag and `If-None-Match`
+behavior are unchanged; `304` releases the temporary serialization reservation immediately.
 Single-artifact responses reserve the full manifest artifact size before
 snapshot allocation or body reads, including for a range. Conditional
 single-artifact `304` responses still verify the file but retain no snapshot
@@ -398,11 +399,15 @@ verification, allocation and conditional-response errors release them. One
 body larger than the budget returns `413`; temporary aggregate exhaustion
 returns `503`, before response buffering (or single-artifact body reads).
 These limits do not change the existing per-response byte and entry limits.
+A POST may have committed its run before response admission fails; its error
+retains `Location`. After a temporary `503`, retrying with the same idempotency
+key replays that run once capacity is available, without creating another run.
+For `413`, raise the configured budget if that response must be admitted.
 
 This bounds only the covered response-owned bytes, not total RSS, allocator
 or streaming overhead, metadata, or other endpoints (including zip, bundles,
-run-list, and start/fork responses). Raising per-artifact limits does not raise
-this budget; configure it independently to admit larger responses.
+run-list, and other mutation responses). Raising per-artifact limits does not
+raise this budget; configure it independently to admit larger responses.
 
 Enforcement order: raw `outputs.json` bytes are capped before deserialization
 using the opened file's metadata for the exact stable size (a concurrent

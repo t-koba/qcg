@@ -99,14 +99,34 @@ async fn snapshot_response(
     run_id: String,
     created: bool,
 ) -> Result<Response, ApiHttpError> {
-    let result = match state
-        .service
-        .snapshot_json(run_id.clone(), &state.artifact_limits)
-        .await
-    {
-        Ok(body) => respond_with_snapshot(body, run_id.clone(), created),
-        Err(error) => Err(ApiHttpError::from_api(error)),
-    };
+    let result = async {
+        // Start/fork snapshots share admission on initial success and every
+        // replay. A response failure must not undo the already committed Ready.
+        let (body, reservation) = if created {
+            let snapshot = state
+                .service
+                .snapshot_with_limits(run_id.clone(), &state.artifact_limits)
+                .await
+                .map_err(ApiHttpError::from_api)?;
+            let (body, reservation) = super::artifact_response::serialize_json(
+                &snapshot,
+                state.artifact_limits.effective().max_bytes.unwrap(),
+                &state.artifact_response_budget,
+            )?;
+            (body, Some(reservation))
+        } else {
+            (
+                state
+                    .service
+                    .snapshot_json(run_id.clone(), &state.artifact_limits)
+                    .await
+                    .map_err(ApiHttpError::from_api)?,
+                None,
+            )
+        };
+        respond_with_snapshot(body, reservation, run_id.clone(), created)
+    }
+    .await;
     result.map_err(|mut error| {
         if created {
             error.location = format!("/api/runs/{run_id}").parse().ok();

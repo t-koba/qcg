@@ -5,7 +5,7 @@ use std::sync::{
     atomic::{AtomicU64, Ordering},
 };
 
-/// Four default-sized (16 MiB) artifact and JSON run-view response bodies.
+/// Four default-sized (16 MiB) artifact, run-view, and start/fork snapshot bodies.
 pub(crate) const DEFAULT_MAX_ARTIFACT_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug)]

@@ -506,18 +506,24 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   `output_*` limits and direct CLI behavior are unchanged.
 - `MAX_ARTIFACT_RESPONSE_BYTES` (default `67108864`, 64 MiB;
   `--max-artifact-response-bytes`): aggregate response-owned bytes for
-  `GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`, and single-artifact
-  `GET /api/runs/{id}/artifacts/{path...}` responses in `qcg serve`. Frozen at
+  `GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`, single-artifact
+  `GET /api/runs/{id}/artifacts/{path...}`, and `POST /api/runs` /
+  `POST /api/runs/{id}/fork` snapshots in `qcg serve`, including in-memory and
+  durable idempotency replays after restart. Frozen at
   boot and required to be positive. The default admits four 16 MiB bodies.
-  JSON views count and reserve their exact serialized size before buffering;
+  JSON run-view and POST snapshot responses count and reserve their exact
+  serialized size before buffering;
   single-artifact responses reserve the full artifact size (also for ranges)
   before body reads. Reservations remain with response bytes/body until drop;
   errors release them. A body over budget returns `413`; temporary exhaustion
   returns `503` before buffering/reads. JSON `304` responses release their
   temporary reservation; single-artifact `304` responses verify without
   retaining a snapshot and are not charged. Per-response limits are unchanged.
+  A `503` POST admission failure preserves the committed run and `Location`;
+  retrying the same idempotency key replays it when capacity frees. A `413`
+  means the response exceeds the configured limit; raise that budget to admit it.
   This is not a total-RSS bound and does not cover metadata, allocator or
   streaming overhead, or other endpoints (including zip, bundles, run-list,
-  and start/fork responses).
+  and other mutation responses).
 - `MAX_ASSET_BYTES` (default `16777216`, 16 MiB): maximum bytes for one served
   generator package asset. Omitted means the hard default, never unlimited.

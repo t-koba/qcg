@@ -2869,3 +2869,5 @@ async fn created_snapshot_entry_errors_keep_location_on_start_and_fork_replay() 
     assert_eq!(state.service.list_run_items().await.unwrap().len(), 2);
     let _ = std::fs::remove_dir_all(&runs);
 }
+
+mod snapshot_budget;

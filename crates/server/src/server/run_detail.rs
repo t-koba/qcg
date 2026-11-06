@@ -656,6 +656,7 @@ fn conditional_response_with_etag(
 pub(crate) fn json_response_with_etag(
     status: StatusCode,
     body: Vec<u8>,
+    reservation: Option<super::artifact_response::Reservation>,
     location: Option<String>,
 ) -> Result<Response, ApiHttpError> {
     let etag = body_etag(&body);
@@ -668,7 +669,10 @@ pub(crate) fn json_response_with_etag(
         builder = builder.header(header::LOCATION, location);
     }
     builder
-        .body(Body::from(body))
+        .body(match reservation {
+            Some(reservation) => reservation.into_body(body),
+            None => Body::from(body),
+        })
         .map_err(ApiHttpError::internal)
 }
 /// Single byte ranges; unsupported units/multipart ranges are ignored.

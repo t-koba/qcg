@@ -213,13 +213,20 @@ fn reviewed_package_sha256(headers: &HeaderMap) -> Result<String, ApiHttpError> 
 
 pub(crate) fn respond_with_snapshot(
     body: Vec<u8>,
+    reservation: Option<super::artifact_response::Reservation>,
     run_id: String,
     created: bool,
 ) -> Result<Response, ApiHttpError> {
-    if created {
-        return created_run_response(body, run_id);
-    }
-    json_response_with_etag(StatusCode::OK, body, None)
+    json_response_with_etag(
+        if created {
+            StatusCode::CREATED
+        } else {
+            StatusCode::OK
+        },
+        body,
+        reservation,
+        created.then(|| format!("/api/runs/{run_id}")),
+    )
 }
 pub(crate) async fn fork_run(
     State(state): State<Arc<AppState>>,
@@ -258,15 +265,4 @@ pub(crate) async fn fork_run(
         },
     })
     .await
-}
-
-pub(crate) fn created_run_response(
-    body: Vec<u8>,
-    run_id: String,
-) -> Result<Response, ApiHttpError> {
-    json_response_with_etag(
-        StatusCode::CREATED,
-        body,
-        Some(format!("/api/runs/{run_id}")),
-    )
 }
