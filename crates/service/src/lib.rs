@@ -29,6 +29,15 @@ pub use summaries::*;
 pub use types::*;
 
 #[cfg(test)]
+pub(crate) mod denial_settlement_test_hooks {
+    use std::sync::Arc;
+
+    tokio::task_local! {
+        pub(crate) static BEFORE_SETTLE: Option<Arc<dyn Fn() + Send + Sync>>;
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod retention_gc_test_hooks {
     use std::sync::atomic::{AtomicUsize, Ordering};
 

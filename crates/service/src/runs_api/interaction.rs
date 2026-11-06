@@ -416,6 +416,11 @@ impl LocalService {
             .unwrap_or((None, None, None));
         let directory = run_dir.to_owned();
         let confirmation = confirmation_id.to_owned();
+        #[cfg(test)]
+        let before_settle = crate::denial_settlement_test_hooks::BEFORE_SETTLE
+            .try_with(Clone::clone)
+            .ok()
+            .flatten();
         if let Some(record) = self.inner.runs.write().await.get_mut(id) {
             record
                 .confirmations
@@ -427,6 +432,10 @@ impl LocalService {
             record.artifacts = None;
         }
         self.blocking_work(move || {
+            #[cfg(test)]
+            if let Some(before_settle) = before_settle {
+                before_settle();
+            }
             let limits = match limits {
                 Some(limits) => {
                     if let Some(expected) = package_sha256 {
