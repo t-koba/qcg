@@ -453,10 +453,12 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   [operations](operations.md#container-daemon-operation-policy).
 - `MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
   Unset uses the CPU count; `0` and invalid values refuse boot.
-- `READ_CACHE_MAX_BYTES` (default `67108864`): maximum retained run read-view
-  memory charge. Positive integers only; invalid values refuse boot. Entry
-  count is also bounded by `MAX_TRACKED_RUNS`. This is a rebuildable observation
-  cache; execution and artifact integrity verification still read originals.
+- `READ_CACHE_MAX_BYTES` (default `67108864`): shared maximum retained memory
+  charge for full run read views and compact run-list projections. Positive
+  integers only; invalid values refuse boot. Full-view count is also bounded
+  by `MAX_TRACKED_RUNS`; compact projection count is bounded by its byte charge,
+  not the active-run limit. This is a rebuildable observation cache; execution
+  and artifact integrity verification still read originals.
 - `API_TOKEN_FILE`: path to a file containing the instance bearer token.
   `--api-token` / `API_TOKEN` wins when set; an unreadable or empty file
   refuses boot instead of starting unauthenticated.

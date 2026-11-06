@@ -61,11 +61,25 @@ The fixture contains completed runs, with only one large journal. This measures
 replay and snapshot/list observation, not active LLM execution or live tail
 broadcast throughput. A full replay necessarily reads and transfers history
 for each subscriber; it is not expected to have the same cache behavior as
-snapshot refresh. The server retains at most 10,000 views and explicitly uses
-256 MiB of cache charge for snapshot/SSE and 512 MiB for list census,
-rather than the default 64 MiB budget. Conservative view accounting can exceed
-256 MiB for 10,000 list fixtures; a smaller budget then evicts views and forces
-reconstruction. Cache retention therefore depends on both workload and budget.
+snapshot refresh. The server retains at most 10,000 full views and explicitly
+uses 256 MiB for snapshot/SSE. Historical list measurements used 512 MiB to
+retain full views; conservative accounting could exceed 256 MiB for 10,000
+fixtures. The current list-only benchmark uses the documented 64 MiB default
+and retains compact revision-bound projections instead of full folded states.
+
+An isolated handler diagnostic at source digest
+`7f4f814abdb18076c0659c67d1659a69d49874bb50b673a3f05a16b14a2d3634` (record
+`a7f6a19fdec9501e04548a4ea48dc09f814707712c072c256d0ded97894cb291`) used
+10,001 completed journals and `limit=1`. The cold request took 12,283.372 ms,
+missed 10,001 entries, applied 60,006 events and retained 7,820,890 charged
+bytes. The next requests took 1,164.851 and 1,106.930 ms; each hit all 10,001
+entries, with no eviction, journal-parser bytes read or events applied. The
+instrumented parser read 28,883,104 journal bytes on the cold request. This is
+synthetic host-specific evidence, not production latency; an earlier synthetic
+study measured 15,425.261 ms median at 10,001 runs. Every request still
+enumerates the directory, opens/fingerprints every eligible journal, reads
+invalidation sidecars and filters/sorts all items. This is not O(page), a
+persistent catalog or a bound on total RSS.
 
 The recorded environment and bounds identify the debug
 binary, host, versions, retention configuration and counter definitions.
@@ -79,15 +93,13 @@ Release and slow live-consumer measurements are now recorded below.
 OTLP regression exercises collector failures, partial success, a corrupt run
 beside a healthy run and eight repeated GC/cursor-pruning cycles.
 
-The retained list measurement separately records `warm_rchar_bytes` after the
-initial request and checks it stays below 1 MiB across twenty refreshes. This
-allows request traffic while rejecting a repeated full scan of the smallest
-large journal. Exact zero journal bytes/folds are separately asserted by the
-read-view benchmark's repeated whole census. The HTTP fixtures require 512 MiB
-of conservative cache charge to retain all 10,000 views; this is a benchmark
-configuration, not a change to the 64 MiB product default. An undersized cache
-correctly evicts and reconstructs views, so the performance benefit is bounded
-by the configured retention capacity.
+The list-only HTTP matrix now uses the 64 MiB product default and records
+`warm_rchar_bytes` after the initial request, requiring it to stay below 1 MiB
+across twenty refreshes. This allows request traffic while rejecting repeated
+reads of the 1 MiB target journal. Compact list projections share the cache
+budget with full views; the snapshot/SSE matrix keeps its explicit 256 MiB
+full-view budget. Cache eviction still requires a cold reconstruction, and
+warm listing retains O(number of runs) directory, revision and sidecar checks.
 
 ## Release and slow live consumers
 

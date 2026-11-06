@@ -49,11 +49,16 @@ pub(crate) fn list_items_cached(
     store: &crate::read_store::ReadStore,
 ) -> Result<Vec<api::RunListItem>, ServiceError> {
     let mut summaries = Vec::new();
-    if !runs_dir.exists() {
-        return Ok(summaries);
-    }
+    let entries = match std::fs::read_dir(runs_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            store.prune(runs_dir, &summaries);
+            return Ok(summaries);
+        }
+        Err(error) => return Err(error.into()),
+    };
     let mut scanned = 0;
-    for entry in std::fs::read_dir(runs_dir)? {
+    for entry in entries {
         let entry = entry?;
         if crate::run_dirs::is_coordination_entry(&entry) {
             continue;
@@ -73,24 +78,9 @@ pub(crate) fn list_items_cached(
         if !metadata.is_file() || metadata.len() == 0 {
             continue;
         }
-        let view = store.read(&path)?;
-        let (identity, started) = super::gc::run_identity_event(&path, &view.events)?;
-        summaries.push(api::RunListItem {
-            invalidation: crate::invalidation::read_invalidation(&path)?,
-            run_id: path.file_name().unwrap().to_owned(),
-            state: super::state::status_from_journal(super::runs::status_name_from_state(
-                &view.state,
-            ))?,
-            generator_id: started
-                .generator
-                .split_once('@')
-                .map(|(id, _)| id)
-                .unwrap_or(&started.generator)
-                .to_owned(),
-            started_at: identity.ts.clone(),
-            seq: view.state.last_seq,
-        });
+        summaries.push(store.list_item(&path)?);
     }
+    store.prune(runs_dir, &summaries);
     summaries.sort_by(|a, b| {
         a.started_at
             .cmp(&b.started_at)

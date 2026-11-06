@@ -1224,13 +1224,24 @@ the journal; interrupted external operations with indeterminate outcomes
 refuse automatic replay. Preemption is therefore not a promise that every
 external command or side effect can safely restart.
 
-The observation cache retains at most `MAX_TRACKED_RUNS` entries and
-`READ_CACHE_MAX_BYTES` bytes of conservative memory charge (64 MiB by default).
-For deployments retaining 10,000 runs, the measured synthetic views need about
-240 MiB of charge; the benchmark explicitly sets a 256 MiB budget. A smaller
-budget evicts views and correctly requires rereading them. Capacity accounting
-is incremental and LRU selection uses an index. This budget excludes transient
-request/parser buffers and is not a total process RSS limit.
+The observation cache shares `READ_CACHE_MAX_BYTES` bytes of conservative
+retained-memory charge (64 MiB by default) between full detail views and compact
+run-list projections, with one cached representation per journal. Full views
+also have a `MAX_TRACKED_RUNS` count limit; compact projections are count-bounded
+by their byte charge instead. All entries share incremental accounting and an
+indexed LRU; oversized views are returned without retention. The budget excludes
+transient request/parser buffers and is not a total process RSS limit.
+
+Every list request still enumerates and counts all non-coordination entries under
+`MAX_DIRECTORY_SCAN_ENTRIES`, opens/fingerprints every eligible journal, validates
+changed journals (including off-page runs), and reads invalidation sidecars fresh.
+An unchanged journal can reuse its revision-bound identity/status/time/sequence
+projection without retaining or refolding its full state. Changed compact views
+are rebuilt from the opened journal; parse failures never serve stale results.
+Absent entries are pruned only after a complete successful census, including
+a missing runs root. Cache state is memory-only and rebuilt after restart.
+Filters, sorting and pagination still follow the complete census: this is not
+O(page) work or a persistent catalog. Cache eviction requires a new cold read.
 
 ## Install backup maintenance
 

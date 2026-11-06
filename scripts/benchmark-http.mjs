@@ -14,6 +14,9 @@ const report = resolve(
 );
 const rows = [];
 const listOnly = process.env.QCG_BENCHMARK_MODE === "list";
+// List mode exercises the documented product default; snapshot/SSE retains
+// its explicit full-view workload budget.
+const cacheLimitBytes = (listOnly ? 64 : 256) * 1024 * 1024;
 let server;
 const percentile = (values, p) =>
   [...values].sort((a, b) => a - b)[
@@ -181,7 +184,7 @@ try {
         stdio: ["ignore", "pipe", "pipe"],
         env: {
           ...process.env,
-          READ_CACHE_MAX_BYTES: String((listOnly ? 512 : 256) * 1024 * 1024),
+          READ_CACHE_MAX_BYTES: String(cacheLimitBytes),
           GC_KEEP: "10001",
           GC_KEEP_FAILED: "10001",
           GC_INTERVAL_SECS: "3600",
@@ -235,7 +238,7 @@ try {
             throw new Error(`warm list reread history: ${warmReadBytes} bytes`);
           rows.push({
             runs,
-            cache_limit_bytes: 512 * 1024 * 1024,
+            cache_limit_bytes: cacheLimitBytes,
             journal_mib: mib,
             cold_list_ms: times[0],
             warm_rchar_bytes: warmReadBytes,
