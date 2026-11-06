@@ -293,7 +293,16 @@ async fn gate_process() {
         },
     })
     .await;
-    assert_eq!(result.unwrap().status(), axum::http::StatusCode::CREATED);
+    let response = result.unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::CREATED);
+    if mode == "retry" {
+        let id = fs::read_to_string(runs.join("accepted-run")).unwrap();
+        assert_eq!(
+            response.headers()[axum::http::header::LOCATION],
+            format!("/api/runs/{id}")
+        );
+        assert_eq!(state.service.list_run_items().await.unwrap().len(), 1);
+    }
 }
 
 #[test]
@@ -306,16 +315,20 @@ fn expired_owner_is_fenced_before_and_after_service_acceptance() {
     let runs = &fixture.0;
     let mut owner = spawn(runs, "owner");
     wait_file(runs, "before");
+    // Age only while the owner is paused and before starting concurrent reads.
+    // Rewriting a live claim with fs::write briefly exposes an empty file to
+    // the retry's read-only preflight. The claim stays expired in both phases.
+    age_claim(runs);
+    let aged = fs::read(pending(runs)).unwrap();
     let mut retry = spawn(runs, "retry");
     wait_file(runs, "retry-start");
     for phase in ["before", "accepted"] {
         wait_file(runs, phase);
-        // Age the exact claim past its 60s timestamp while the owner holds
-        // its gate, then resume the call without restoring: the gate-aware
-        // holder must remain current and publish Ready. A gate-aware
-        // successor cannot replace it while the gate is held (see probe).
-        age_claim(runs);
+        // Expiry is not ownership: the gate-aware holder remains current
+        // before and after acceptance, and the same-key retry must wait.
         assert!(spawn(runs, "probe").success());
+        assert_eq!(fs::read(pending(runs)).unwrap(), aged);
+        assert!(retry.0.try_wait().unwrap().is_none());
         fs::write(runs.join(format!("{phase}-go")), b"").unwrap();
     }
     assert!(owner.success());

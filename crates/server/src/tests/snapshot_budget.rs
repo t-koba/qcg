@@ -183,8 +183,25 @@ async fn initial_post_snapshots_charge_and_keep_ready_after_exhaustion() {
     }
 }
 
-#[tokio::test]
-async fn ready_post_snapshots_share_budget_across_routes_and_restart() {
+#[test]
+fn ready_post_snapshots_share_budget_across_routes_and_restart() {
+    // This combined handler/join future exceeds the Windows test-thread stack
+    // in debug builds. Bound extra stack to this test, not the suite or server.
+    std::thread::Builder::new()
+        .stack_size(8 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(ready_post_snapshots());
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+}
+
+async fn ready_post_snapshots() {
     let (guard, generators, mut state, source) = setup().await;
     let mut locations = Vec::new();
     for fork in [false, true] {
