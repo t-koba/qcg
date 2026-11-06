@@ -102,19 +102,23 @@ fn answer_payload() -> api::AnswerPayload {
         )]),
     }
 }
-fn confirm_decision() -> api::ConfirmDecision {
+fn confirm_decision(deny: bool) -> api::ConfirmDecision {
     api::ConfirmDecision {
-        decision: api::ConfirmationDecision::Approve,
+        decision: if deny {
+            api::ConfirmationDecision::Deny
+        } else {
+            api::ConfirmationDecision::Approve
+        },
     }
 }
-fn interaction_body(scope: &str, interaction: &str) -> Vec<u8> {
+fn interaction_body(scope: &str, interaction: &str, deny: bool) -> Vec<u8> {
     // Match run_detail's digest: interaction id, NUL, then the typed JSON body.
     let mut body = interaction.as_bytes().to_vec();
     body.push(0);
     body.extend(if scope == "answer" {
         serde_json::to_vec(&answer_payload()).unwrap()
     } else {
-        serde_json::to_vec(&confirm_decision()).unwrap()
+        serde_json::to_vec(&confirm_decision(deny)).unwrap()
     });
     body
 }
@@ -232,10 +236,17 @@ async fn gate_process() {
         .unwrap();
         panic!("parent must kill request at the creation barrier");
     }
-    if let Some(scope @ ("answer" | "confirm")) = mode.strip_suffix("-crash") {
+    let denial_prefix = mode
+        .strip_prefix("deny-")
+        .and_then(|mode| mode.strip_suffix("-crash"))
+        .map(|prefix| prefix.parse::<usize>().unwrap());
+    if let Some(scope @ ("answer" | "confirm")) = denial_prefix
+        .map(|_| "confirm")
+        .or_else(|| mode.strip_suffix("-crash"))
+    {
         let (id, interaction): (String, String) =
             serde_json::from_slice(&fs::read(runs.join("interaction-target")).unwrap()).unwrap();
-        let body = interaction_body(scope, &interaction);
+        let body = interaction_body(scope, &interaction, denial_prefix.is_some());
         let mut headers = HeaderMap::new();
         headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
         with_idempotency(IdempotentCall {
@@ -258,10 +269,53 @@ async fn gate_process() {
                             .service
                             .answer(id.clone(), interaction, answer_payload())
                             .await?;
+                    } else if let Some(prefix @ 0..=1) = denial_prefix {
+                        // Materialize the exact durable service prefix at a
+                        // deterministic crash boundary, inside a real Pending
+                        // operation/gate. No timing race or power-loss claim.
+                        let path = runs.join(id).join("meta/journal.jsonl");
+                        let observed = engine::RunState::fold_journal(&path).unwrap();
+                        let Some(engine::Interaction::Confirmation { confirm }) =
+                            observed.settled_pending()
+                        else {
+                            panic!("missing prompt")
+                        };
+                        assert_eq!(confirm.id, interaction);
+                        let mut events = vec![(
+                            "user_confirmed",
+                            serde_json::json!({
+                                "confirmation_id": interaction, "approved": false,
+                            }),
+                        )];
+                        if prefix == 1 {
+                            events.push((
+                                "side_effect",
+                                serde_json::json!({
+                                    "kind": confirm.kind, "target": confirm.target,
+                                    "decision": "denied_by_user",
+                                }),
+                            ));
+                        }
+                        engine::JournalWriter::append_events_if(
+                            &path,
+                            id,
+                            events,
+                            engine::JournalLimits::default(),
+                            None,
+                            |state| {
+                                assert_eq!(state.last_seq, observed.last_seq);
+                                Ok(())
+                            },
+                        )
+                        .unwrap();
                     } else {
                         state
                             .service
-                            .confirm(id.clone(), interaction, confirm_decision())
+                            .confirm(
+                                id.clone(),
+                                interaction,
+                                confirm_decision(denial_prefix.is_some()),
+                            )
                             .await?;
                     }
                     // The journal append has completed, but Ready cannot be stored
@@ -703,16 +757,24 @@ async fn direct_and_unkeyed_cancel_keep_fresh_operation_ids() {
 
 #[tokio::test]
 async fn answer_process_crash_after_acceptance_retries_to_ready() {
-    interaction_process_crash("answer").await;
+    interaction_process_crash("answer", None).await;
 }
 
 #[tokio::test]
 async fn confirm_process_crash_after_acceptance_retries_to_ready() {
-    interaction_process_crash("confirm").await;
+    interaction_process_crash("confirm", None).await;
 }
 
 // Process termination on the shared filesystem only, not a power-loss test.
-async fn interaction_process_crash(scope: &str) {
+#[tokio::test]
+async fn denied_confirmation_prefix_process_crash_retries_to_ready() {
+    // false only, false + side_effect, and fully settled before Ready.
+    for prefix in 0..=2 {
+        interaction_process_crash("confirm", Some(prefix)).await;
+    }
+}
+
+async fn interaction_process_crash(scope: &str, denial_prefix: Option<usize>) {
     let fixture = Fixture(
         Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .unwrap()
@@ -782,14 +844,23 @@ async fn interaction_process_crash(scope: &str) {
             })
             .collect::<Vec<_>>()
     };
-    let mut request = spawn(runs, &format!("{scope}-crash"));
+    let mode = denial_prefix.map_or_else(
+        || format!("{scope}-crash"),
+        |prefix| format!("deny-{prefix}-crash"),
+    );
+    let mut request = spawn(runs, &mode);
     wait_file(runs, "interaction-accepted");
     let original = fs::read(pending(runs)).unwrap();
     let claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
     assert_eq!(claim["run_id"], id);
     assert_eq!(
         claim["digest"],
-        request_digest(scope, &id, &interaction_body(scope, &interaction), None)
+        request_digest(
+            scope,
+            &id,
+            &interaction_body(scope, &interaction, denial_prefix.is_some()),
+            None
+        )
     );
     assert!(
         durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
@@ -806,7 +877,7 @@ async fn interaction_process_crash(scope: &str) {
         );
     } else {
         assert_eq!(accepted[0]["confirmation_id"], interaction);
-        assert_eq!(accepted[0]["approved"], true);
+        assert_eq!(accepted[0]["approved"], denial_prefix.is_none());
     }
     request.0.kill().unwrap();
     request.0.wait().unwrap();
@@ -824,12 +895,42 @@ async fn interaction_process_crash(scope: &str) {
     // Controlled lease-expiry seam from the stable-key claim tests: only
     // created_at changes, not the digest, target, owner or reserved run.
     age_claim(runs);
+    if denial_prefix.is_some() {
+        lease.unlock().unwrap();
+    }
+    let aged_pending = fs::read(pending(runs)).unwrap();
     let state = Arc::new(crate::test_state(
         shared_service(runs),
         runs.clone(),
         None,
         tokio_util::sync::CancellationToken::new(),
     ));
+    if denial_prefix.is_some() {
+        state.service.resume_recovered_runs().await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = state.service.snapshot(id.clone()).await.unwrap();
+                if snapshot.state == api::RunStatus::Failed {
+                    assert!(snapshot.confirm.is_none());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("restart recovery must settle denial without a retry");
+
+        assert_eq!(
+            fs::read(pending(runs)).unwrap(),
+            aged_pending,
+            "service recovery must retain Pending until Ready commits"
+        );
+        assert!(
+            durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
+                .unwrap()
+                .is_none()
+        );
+    }
     let mut headers = HeaderMap::new();
     headers.insert(policy::IDEMPOTENCY_HEADER, KEY.parse().unwrap());
     let response = tokio::time::timeout(Duration::from_secs(5), async {
@@ -847,7 +948,7 @@ async fn interaction_process_crash(scope: &str) {
                 axum::extract::State(state.clone()),
                 headers,
                 path,
-                axum::Json(confirm_decision()),
+                axum::Json(confirm_decision(denial_prefix.is_some())),
             )
             .await
         }
@@ -863,6 +964,51 @@ async fn interaction_process_crash(scope: &str) {
     )
     .unwrap();
     assert_eq!(snapshot.run_id, id);
+    if denial_prefix.is_some() {
+        assert_eq!(snapshot.state, api::RunStatus::Failed);
+        assert!(snapshot.confirm.is_none());
+        assert!(!run_dir.join("workspace/after.txt").exists());
+        let path = run_dir.join("meta/journal.jsonl");
+        let settled = fs::read(&path).unwrap();
+        let events = engine::read_journal_values(&path, engine::JournalLimits::default())
+            .unwrap()
+            .events;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["decision"] == "denied_by_user")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["t"] == "run_finished" && e["status"] == "failed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e["t"] == "confirm_request")
+                .count(),
+            1
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| e["decision"] == "approved_by_user" || e["t"] == "command_started")
+        );
+        // In the fully settled prefix case, recovery omitted the terminal
+        // run from its map. Durable replay must still work.
+        state
+            .service
+            .confirm(id.clone(), interaction.clone(), confirm_decision(true))
+            .await
+            .unwrap();
+        state.service.resume_recovered_runs().await;
+        assert_eq!(fs::read(&path).unwrap(), settled);
+    }
     assert!(!pending(runs).exists());
     let ready = durable::load_durable_ready_result(runs, KEY, policy::IDEMPOTENCY_TTL)
         .unwrap()

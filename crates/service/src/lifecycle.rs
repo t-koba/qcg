@@ -1363,6 +1363,23 @@ impl LocalService {
                         return;
                     }
                 };
+                if let Some((confirmation_id, _)) =
+                    state.confirmations.iter().find(|(_, approved)| !**approved)
+                {
+                    let limits = engine::JournalLimits::from(&contract.manifest.runtime);
+                    if let Err(error) = crate::run_dirs::settle_confirmed_denial(
+                        &run_dir,
+                        confirmation_id,
+                        limits,
+                        Some(events.clone()),
+                    ) {
+                        tracing::error!(%run_id, %error, "denial reconciliation refused execution; journal retained");
+                        service.inner.queue_notify.notify_waiters();
+                        return;
+                    }
+                    service.mark_spawn_failed(&run_id).await;
+                    return;
+                }
                 if let Err(error) = state.ensure_no_fail_closed_inflight_operations() {
                     if state.terminal.is_none()
                         && let Err(append_error) = engine::JournalWriter::append_single_event(

@@ -95,22 +95,93 @@ pub(crate) fn write_run_event_if(
     Ok(())
 }
 
-/// Atomic multi-append variant of [`write_run_event_if`] for logically
-/// joint settlements (for example denial bookkeeping plus its terminal
-/// event). No other writer interleaves between the batched events.
-pub(crate) fn write_run_events(
-    record: &RunRecord,
-    events: Vec<(&str, Value)>,
+/// Complete only an unambiguous accepted denial. Selection and both appends
+/// share the journal lock; every surviving prefix is retryable. This is process
+/// crash reconciliation, not a power-loss transaction.
+pub(crate) fn settle_confirmed_denial(
+    run_dir: &Utf8Path,
+    confirmation_id: &str,
+    limits: JournalLimits,
+    event_sender: Option<tokio::sync::broadcast::Sender<api::RunEvent>>,
 ) -> Result<(), ServiceError> {
-    let (run_id, journal_path, limits) = journal_target(record)?;
-    JournalWriter::append_events_if(
-        &journal_path,
-        &run_id,
-        events,
-        limits,
-        Some(record.events.clone()),
-        |_| Ok(()),
-    )
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?;
+    let path = run_meta_dir(run_dir).join("journal.jsonl");
+    JournalWriter::append_events_with(&path, run_id, limits, event_sender, |state| {
+        let ambiguous = || {
+            JournalError::PreconditionFailed(
+                "accepted denial identity or settlement is ambiguous".into(),
+            )
+        };
+        if state.confirmations.get(confirmation_id) != Some(&false) {
+            return Err(ambiguous());
+        }
+        // Reconstruct the exact prompt at acceptance, not a current generator
+        // or an id-only guess. The extra bounded scan is only for denial
+        // settlement; ordinary reads and approvals do not retain this history.
+        let values = engine::read_journal_values(&path, limits)?.events;
+        let mut prefix = RunState::default();
+        let mut accepted = None;
+        for (index, value) in values.iter().enumerate() {
+            if value.get("t").and_then(Value::as_str) == Some("user_confirmed")
+                && value.get("confirmation_id").and_then(Value::as_str) == Some(confirmation_id)
+                && value.get("approved").and_then(Value::as_bool) == Some(false)
+            {
+                let Some(engine::Interaction::Confirmation { confirm }) = prefix.settled_pending()
+                else {
+                    return Err(ambiguous());
+                };
+                if confirm.id != confirmation_id
+                    || prefix.terminal.is_some()
+                    || prefix.cancel_requested
+                    || prefix.confirmations.contains_key(confirmation_id)
+                {
+                    return Err(ambiguous());
+                }
+                accepted = Some((index, confirm.clone()));
+                break;
+            }
+            prefix.apply(value)?;
+        }
+        let (index, confirm) = accepted.ok_or_else(ambiguous)?;
+        let side_effect = json!({
+            "kind": confirm.kind,
+            "target": confirm.target,
+            "decision": "denied_by_user",
+        });
+        let finished = json!({
+            "status": "failed",
+            "metrics": {},
+            "reason": model::FailureDetail::new(
+                model::FailureCode::ExecutionFailed, "side effect denied by user",
+            ),
+        });
+        let settlement = [("side_effect", side_effect), ("run_finished", finished)];
+        let suffix = &values[index + 1..];
+        if suffix.len() > settlement.len() {
+            return Err(ambiguous());
+        }
+        for (value, (kind, payload)) in suffix.iter().zip(&settlement) {
+            if value.get("t").and_then(Value::as_str) != Some(*kind)
+                || !payload
+                    .as_object()
+                    .ok_or_else(ambiguous)?
+                    .iter()
+                    .all(|(key, expected)| value.get(key) == Some(expected))
+                || !value.as_object().ok_or_else(ambiguous)?.keys().all(|key| {
+                    payload.get(key).is_some()
+                        || matches!(
+                            key.as_str(),
+                            "t" | "ts" | "seq" | "run_id" | "trace_id" | "span_id"
+                        )
+                })
+            {
+                return Err(ambiguous());
+            }
+        }
+        Ok(settlement.into_iter().skip(suffix.len()).collect())
+    })
     .map_err(|error| ServiceError::Invalid(error.to_string()))?;
     Ok(())
 }

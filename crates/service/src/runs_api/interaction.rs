@@ -192,6 +192,16 @@ impl LocalService {
     ) -> Result<(), ApiError> {
         self.ensure_running()?;
         let approved = decision.decision == ConfirmationDecision::Approve;
+        // Terminal runs are intentionally absent from the memory map after
+        // recovery. Durable identical denials still reconcile/replay before
+        // Ready publication, including a failed earlier settlement append.
+        if !approved {
+            let run_dir = self.run_dir_for(&id).await?;
+            let state = self.authoritative_state(&run_dir).await?;
+            if state.confirmations.get(&confirmation_id) == Some(&false) {
+                return self.reconcile_denial(&id, &run_dir, &confirmation_id).await;
+            }
+        }
         // Validate, persist, and mutate under one write lock so concurrent
         // decisions cannot both journal conflicting values with last-wins.
         // Journal I/O is a short local append; engine scheduling and terminal
@@ -199,10 +209,7 @@ impl LocalService {
         // stays outside: it takes run-map locks, so awaiting it under the
         // guard would deadlock the runs map against itself (B01).
         enum AfterLock {
-            Deny {
-                denied: Box<RunRecord>,
-                confirm: Box<api::ConfirmSpec>,
-            },
+            Deny(Utf8PathBuf),
             Spawn(Box<SpawnRun>),
             Reject(crate::types::ServiceError),
         }
@@ -217,9 +224,13 @@ impl LocalService {
                 .ok_or_else(|| ApiError::not_found(format!("run `{id}` was not found")))?;
             if let Some(existing) = record.confirmations.get(&confirmation_id) {
                 return if *existing == approved {
-                    // Idempotent replay: the first call already journaled and
-                    // settled or scheduled, so report success without duplicating.
-                    Ok(())
+                    if approved {
+                        Ok(())
+                    } else {
+                        let run_dir = record.run_dir.clone();
+                        drop(runs);
+                        self.reconcile_denial(&id, &run_dir, &confirmation_id).await
+                    }
                 } else {
                     Err(ApiError::Conflict {
                         detail: format!(
@@ -319,12 +330,10 @@ impl LocalService {
                 AfterLock::Reject(error)
             } else if !approved {
                 record.confirmations.insert(confirm.id.clone(), false);
-                record.state = RunStatus::Failed;
-                record.confirm = None;
-                AfterLock::Deny {
-                    denied: Box::new(record.clone()),
-                    confirm: Box::new(confirm),
-                }
+                record.state = RunStatus::Queued;
+                record.clear_prompt();
+                record.artifacts = None;
+                AfterLock::Deny(record.run_dir.clone())
             } else {
                 record.confirmations.insert(confirmation_id.clone(), true);
                 record.state = RunStatus::Queued;
@@ -338,36 +347,8 @@ impl LocalService {
             }
         };
         match after {
-            AfterLock::Deny { denied, confirm } => {
-                // The denial decision already won exclusively via the atomic
-                // user_confirmed check above. Both settlement events append
-                // under one journal-lock hold so no writer interleaves them.
-                crate::run_dirs::write_run_events(
-                    &denied,
-                    vec![
-                        (
-                            "side_effect",
-                            json!({
-                                "kind": confirm.kind,
-                                "target": confirm.target,
-                                "decision": "denied_by_user",
-                            }),
-                        ),
-                        (
-                            "run_finished",
-                            json!({
-                                "status": "failed",
-                                "metrics": {},
-                                "reason": FailureDetail::new(
-                                    FailureCode::ExecutionFailed,
-                                    "side effect denied by user",
-                                ),
-                            }),
-                        ),
-                    ],
-                )
-                .map_err(api_internal)?;
-                Ok(())
+            AfterLock::Deny(run_dir) => {
+                self.reconcile_denial(&id, &run_dir, &confirmation_id).await
             }
             AfterLock::Spawn(request) => {
                 self.clone().spawn_engine_run(*request).await;
@@ -379,6 +360,71 @@ impl LocalService {
                     .await
             }
         }
+    }
+
+    async fn reconcile_denial(
+        &self,
+        id: &str,
+        run_dir: &Utf8Path,
+        confirmation_id: &str,
+    ) -> Result<(), ApiError> {
+        let (sender, limits, package_sha256) = self
+            .inner
+            .runs
+            .read()
+            .await
+            .get(id)
+            .map(|record| {
+                (
+                    Some(record.events.clone()),
+                    Some(engine::JournalLimits::from(
+                        &record.contract.manifest.runtime,
+                    )),
+                    record.package_sha256.clone(),
+                )
+            })
+            .unwrap_or((None, None, None));
+        let directory = run_dir.to_owned();
+        let confirmation = confirmation_id.to_owned();
+        if let Some(record) = self.inner.runs.write().await.get_mut(id) {
+            record
+                .confirmations
+                .insert(confirmation_id.to_string(), false);
+            if !record.state.is_terminal() {
+                record.state = RunStatus::Queued;
+            }
+            record.clear_prompt();
+            record.artifacts = None;
+        }
+        self.blocking_work(move || {
+            let limits = match limits {
+                Some(limits) => {
+                    if let Some(expected) = package_sha256 {
+                        crate::run_package::verify(
+                            &crate::run_package::package_dir(&directory),
+                            &expected,
+                        )?;
+                    }
+                    limits
+                }
+                None => {
+                    let state = crate::summaries::fold_run_state(&directory)?;
+                    let contract = crate::run_package::load(&directory, &state)?;
+                    engine::JournalLimits::from(&contract.manifest.runtime)
+                }
+            };
+            crate::run_dirs::settle_confirmed_denial(&directory, &confirmation, limits, sender)
+        })
+        .await
+        .map_err(api_internal)?;
+        if let Some(record) = self.inner.runs.write().await.get_mut(id)
+            && !record.state.is_terminal()
+        {
+            record.state = RunStatus::Failed;
+            record.clear_prompt();
+            record.artifacts = None;
+        }
+        Ok(())
     }
 
     /// Classifies an atomically rejected answer by re-folding the journal.
@@ -443,6 +489,9 @@ impl LocalService {
         }
         let run_dir = self.run_dir_for(id).await?;
         let state = self.authoritative_state(&run_dir).await?;
+        if !approved && state.confirmations.get(confirmation_id) == Some(&false) {
+            return self.reconcile_denial(id, &run_dir, confirmation_id).await;
+        }
         if state.terminal.is_some() {
             return Err(ApiError::Conflict {
                 detail: format!("run `{id}` is already terminal; confirm was rejected"),
@@ -463,13 +512,6 @@ impl LocalService {
                     record
                         .confirmations
                         .insert(confirmation_id.to_string(), approved);
-                    if !approved {
-                        // A peer denied first: settle locally as failed so a
-                        // stale confirmation prompt never requeues denied work.
-                        record.state = RunStatus::Failed;
-                        record.confirm = None;
-                        record.artifacts = None;
-                    }
                 }
                 Ok(())
             }

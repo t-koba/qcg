@@ -958,15 +958,31 @@ impl JournalWriter {
         event_sender: Option<broadcast::Sender<RunEvent>>,
         check: impl FnOnce(&crate::RunState) -> Result<(), JournalError>,
     ) -> Result<Vec<RunEvent>, JournalError> {
+        if events.is_empty() {
+            return Err(JournalError::InvalidEvent(
+                "journal batch must hold at least one event".into(),
+            ));
+        }
+        Self::append_events_with(journal_path, run_id, limits, event_sender, |state| {
+            check(state)?;
+            Ok(events)
+        })
+    }
+
+    /// Select a reconciliation batch from the fresh state under the journal
+    /// lock. An empty batch is an idempotent no-op. Partial appends remain
+    /// visible to the next reconciliation after an error or process exit.
+    pub fn append_events_with<'a>(
+        journal_path: &Utf8Path,
+        run_id: &str,
+        limits: JournalLimits,
+        event_sender: Option<broadcast::Sender<RunEvent>>,
+        select: impl FnOnce(&crate::RunState) -> Result<Vec<(&'a str, Value)>, JournalError>,
+    ) -> Result<Vec<RunEvent>, JournalError> {
         validate_limits(limits)?;
         if run_id.trim().is_empty() {
             return Err(JournalError::InvalidEvent(
                 "journal run_id must be non-empty".into(),
-            ));
-        }
-        if events.is_empty() {
-            return Err(JournalError::InvalidEvent(
-                "journal batch must hold at least one event".into(),
             ));
         }
         if let Some(parent) = journal_path.parent() {
@@ -974,25 +990,6 @@ impl JournalWriter {
         }
         let _journal_guard = acquire_journal_lock(journal_path)?;
         repair_truncated_tail_locked(journal_path, limits)?;
-        // Normalize every payload before folding so validation failures
-        // reject the whole batch before anything appends.
-        let mut normalized = Vec::with_capacity(events.len());
-        for (kind, mut value) in events {
-            if !value.is_object() {
-                value = json!({ "value": value });
-            }
-            {
-                let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
-                if let Some(payload_run_id) = object.get("run_id").and_then(Value::as_str)
-                    && payload_run_id != run_id
-                {
-                    return Err(JournalError::InvalidEvent(format!(
-                        "journal event run_id mismatch: expected `{run_id}`, found `{payload_run_id}`"
-                    )));
-                }
-            }
-            normalized.push((kind, value));
-        }
         let mut state = crate::RunState::fold_journal_with_limits(journal_path, limits)?;
         if let Some(existing) = state.run_id.as_deref()
             && existing != run_id
@@ -1014,7 +1011,29 @@ impl JournalWriter {
         ) {
             state.audit_seq = state.audit_seq.max(audit_tail);
         }
-        check(&state)?;
+        let events = select(&state)?;
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Normalize every payload before appending so validation failures
+        // reject the whole batch before anything appends.
+        let mut normalized = Vec::with_capacity(events.len());
+        for (kind, mut value) in events {
+            if !value.is_object() {
+                value = json!({ "value": value });
+            }
+            {
+                let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
+                if let Some(payload_run_id) = object.get("run_id").and_then(Value::as_str)
+                    && payload_run_id != run_id
+                {
+                    return Err(JournalError::InvalidEvent(format!(
+                        "journal event run_id mismatch: expected `{run_id}`, found `{payload_run_id}`"
+                    )));
+                }
+            }
+            normalized.push((kind, value));
+        }
         // The batch continues the run unless it seals it: clear a stale
         // clean-shutdown marker before appending so a continued run never
         // carries a shutdown claim into a later torn tail (Sensitive-8).

@@ -3146,12 +3146,9 @@ enabled = false
 #[cfg(unix)]
 #[tokio::test]
 async fn denied_confirmation_settles_failed_without_executing_side_effect() {
-    // Denial is the fail-closed side-effect boundary: the journal must
-    // carry `denied_by_user` plus a terminal `run_finished/failed` record
-    // (with the required metrics object), the snapshot must settle Failed,
-    // and the denied command must never execute. Removing the settlement
-    // writes or the metrics object makes this test fail (confirm errors
-    // with `missing field \`metrics\`` or the snapshot never settles).
+    // Force a settlement failure after durable acceptance without adding a
+    // production fault seam: admission uses the already loaded record, while
+    // reconciliation must verify the pinned package before writing settlement.
     let service = test_service(
         vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
         temp_run_dir("denied-confirmation"),
@@ -3166,16 +3163,43 @@ async fn denied_confirmation_settles_failed_without_executing_side_effect() {
         .expect("run should start");
     let snapshot = wait_for_snapshot(&service, &id, RunStatus::Confirming).await;
     let confirm = snapshot.confirm.expect("run should request confirmation");
-    service
-        .confirm(
-            id.clone(),
-            confirm.id.clone(),
-            ConfirmDecision {
-                decision: ConfirmationDecision::Deny,
-            },
-        )
-        .await
-        .expect("denial should settle the run");
+    let run_dir = service.run_dir_for(&id).await.unwrap();
+    let package = crate::run_package::package_dir(&run_dir);
+    let parked = run_dir.join("parked-package");
+    std::fs::rename(&package, &parked).unwrap();
+    let deny = || ConfirmDecision {
+        decision: ConfirmationDecision::Deny,
+    };
+    assert!(
+        service
+            .confirm(id.clone(), confirm.id.clone(), deny())
+            .await
+            .is_err()
+    );
+    let accepted = crate::summaries::fold_run_state(&run_dir).unwrap();
+    assert_eq!(accepted.confirmations.get(&confirm.id), Some(&false));
+    assert!(
+        accepted.terminal.is_none(),
+        "failure must not fake settlement"
+    );
+    assert_eq!(
+        service.inner.runs.read().await[&id]
+            .confirmations
+            .get(&confirm.id),
+        Some(&false)
+    );
+    assert_eq!(
+        service.snapshot(id.clone()).await.unwrap().state,
+        RunStatus::Queued,
+        "unsettled denial must not look terminal in memory"
+    );
+    std::fs::rename(&parked, &package).unwrap();
+    let (first, second) = tokio::join!(
+        service.confirm(id.clone(), confirm.id.clone(), deny()),
+        service.confirm(id.clone(), confirm.id.clone(), deny()),
+    );
+    first.expect("same-decision retry must complete settlement");
+    second.expect("concurrent identical retry must not duplicate it");
     let snapshot = wait_for_terminal_snapshot(&service, &id).await;
     assert_eq!(snapshot.state, RunStatus::Failed);
     assert!(
@@ -3183,27 +3207,59 @@ async fn denied_confirmation_settles_failed_without_executing_side_effect() {
         "a denied run must not keep its confirmation prompt"
     );
     let journal = read_journal_string(&service, id.clone()).await;
-    assert!(
-        journal
-            .lines()
-            .any(|line| line.contains("\"t\":\"side_effect\"")
-                && line.contains("\"decision\":\"denied_by_user\"")),
-        "denial bookkeeping must journal denied_by_user"
+    let values: Vec<Value> = journal
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        values
+            .iter()
+            .filter(|event| event["t"] == "user_confirmed")
+            .count(),
+        1
+    );
+    assert_eq!(
+        values
+            .iter()
+            .filter(|event| event["decision"] == "denied_by_user")
+            .count(),
+        1
+    );
+    assert_eq!(
+        values
+            .iter()
+            .filter(|event| event["t"] == "run_finished" && event["status"] == "failed")
+            .count(),
+        1
     );
     assert!(
-        journal
-            .lines()
-            .any(|line| line.contains("\"t\":\"run_finished\"")
-                && line.contains("\"status\":\"failed\"")
-                && line.contains("side effect denied by user")),
-        "denial must journal a failed terminal outcome"
+        !values
+            .iter()
+            .any(|event| event["decision"] == "approved_by_user")
     );
+    assert!(!run_dir.join("workspace/after.txt").exists());
+
+    // A mismatched denial detail is evidence, not permission to invent a
+    // successful replay. Preserve the journal byte-for-byte on refusal.
+    let journal_path = run_dir.join("meta/journal.jsonl");
+    let mut corrupt = values;
+    let event = corrupt
+        .iter_mut()
+        .find(|event| event["decision"] == "denied_by_user")
+        .unwrap();
+    event["target"] = "different-target".into();
+    let bytes = corrupt
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&journal_path, &bytes).unwrap();
     assert!(
-        !journal
-            .lines()
-            .any(|line| line.contains("\"decision\":\"approved_by_user\"")),
-        "a denied side effect must never execute"
+        service
+            .confirm(id.clone(), confirm.id.clone(), deny())
+            .await
+            .is_err()
     );
+    assert_eq!(std::fs::read_to_string(journal_path).unwrap(), bytes);
 }
 
 #[cfg(unix)]
