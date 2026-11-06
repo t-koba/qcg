@@ -60,19 +60,26 @@ async fn barrier(runs: &Utf8PathBuf, name: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
-fn pending(runs: &Utf8PathBuf) -> Utf8PathBuf {
+fn pending_for(runs: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
     runs.join("idempotency").join(format!(
         "{}.pending.json",
-        hex::encode(Sha256::digest(KEY.as_bytes()))
+        hex::encode(Sha256::digest(key.as_bytes()))
     ))
 }
-fn age_claim(runs: &Utf8PathBuf) -> Vec<u8> {
+fn pending(runs: &Utf8PathBuf) -> Utf8PathBuf {
+    pending_for(runs, KEY)
+}
+fn age_claim_for(runs: &Utf8PathBuf, key: &str) -> Vec<u8> {
     // Controlled clock seam, never a product mutation: only the timestamp changes.
-    let original = fs::read(pending(runs)).unwrap();
+    let path = pending_for(runs, key);
+    let original = fs::read(&path).unwrap();
     let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
     record["created_at_unix"] = 1.into();
-    fs::write(pending(runs), serde_json::to_vec(&record).unwrap()).unwrap();
+    fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
     original
+}
+fn age_claim(runs: &Utf8PathBuf) -> Vec<u8> {
+    age_claim_for(runs, KEY)
 }
 
 fn shared_service(runs: &Utf8PathBuf) -> service::LocalService {
@@ -752,6 +759,182 @@ async fn direct_and_unkeyed_cancel_keep_fresh_operation_ids() {
     assert_eq!(
         fs::read_dir(run_dir.join("meta/control")).unwrap().count(),
         0
+    );
+}
+
+#[tokio::test]
+async fn aborted_interaction_requests_after_acceptance_retry_to_ready() {
+    for scope in ["answer", "confirm"] {
+        aborted_interaction_request_after_acceptance(scope).await;
+    }
+}
+
+async fn aborted_interaction_request_after_acceptance(scope: &str) {
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("qcg-{scope}-abort-{}", uuid::Uuid::now_v7()));
+    let _fixture = Fixture(runs.clone());
+    let state = Arc::new(crate::test_state(
+        shared_service(&runs),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let id = state
+        .service
+        .start_run(api::StartRun {
+            generator_id: if scope == "answer" {
+                "ask-user"
+            } else {
+                "side-effect-confirm"
+            }
+            .into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let interaction = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = state.service.snapshot(id.clone()).await.unwrap();
+            if scope == "answer" && snapshot.state == api::RunStatus::Waiting {
+                break snapshot.question.unwrap().id;
+            }
+            if scope == "confirm" && snapshot.state == api::RunStatus::Confirming {
+                break snapshot.confirm.unwrap().id;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let key = format!("{scope}-abort-after-acceptance");
+    let mut headers = HeaderMap::new();
+    headers.insert(policy::IDEMPOTENCY_HEADER, key.parse().unwrap());
+    let body = interaction_body(scope, &interaction, scope == "confirm");
+    let (accepted, accepted_rx) = tokio::sync::oneshot::channel();
+    let (_resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+    let owner_state = state.clone();
+    let owner_headers = headers.clone();
+    let owner_id = id.clone();
+    let owner_interaction = interaction.clone();
+    let owner_body = body.clone();
+    let owner_scope = scope.to_owned();
+    let request = tokio::spawn(async move {
+        with_idempotency(IdempotentCall {
+            state: &owner_state,
+            headers: &owner_headers,
+            scope: &owner_scope,
+            target: &owner_id,
+            body: &owner_body,
+            digest_context: None,
+            created: false,
+            reserved_run_id: Some(owner_id.clone()),
+            execute: |context| {
+                let state = &owner_state;
+                let id = &owner_id;
+                let interaction = &owner_interaction;
+                let scope = &owner_scope;
+                async move {
+                    assert_eq!(context.reserved_run_id.as_ref(), Some(id));
+                    if scope == "answer" {
+                        state
+                            .service
+                            .answer(id.clone(), interaction.clone(), answer_payload())
+                            .await?;
+                    } else {
+                        state
+                            .service
+                            .confirm(id.clone(), interaction.clone(), confirm_decision(true))
+                            .await?;
+                    }
+                    accepted.send(()).unwrap();
+                    let _ = resume_rx.await;
+                    Ok(id.clone())
+                }
+            },
+        })
+        .await
+    });
+    accepted_rx.await.unwrap();
+    let pending_path = pending_for(&runs, &key);
+    let original = fs::read(&pending_path).expect("accepted request should retain Pending");
+    assert!(
+        durable::load_durable_ready_result(&runs, &key, policy::IDEMPOTENCY_TTL)
+            .unwrap()
+            .is_none(),
+        "the request is paused before Ready publication"
+    );
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if !state.idempotency.lock().await.contains_key(&key) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("aborted request must withdraw its in-memory waiter");
+    assert_eq!(fs::read(&pending_path).unwrap(), original);
+    let released = ExecutionGate::try_acquire(&runs, &key).unwrap();
+    assert!(released.is_some(), "aborted request must release its gate");
+    drop(released);
+    age_claim_for(&runs, &key);
+
+    let retry = with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope,
+        target: &id,
+        body: &body,
+        digest_context: None,
+        created: false,
+        reserved_run_id: Some(id.clone()),
+        execute: |context| {
+            let state = &state;
+            let id = &id;
+            let interaction = &interaction;
+            async move {
+                assert_eq!(context.reserved_run_id.as_ref(), Some(id));
+                if scope == "answer" {
+                    state
+                        .service
+                        .answer(id.clone(), interaction.clone(), answer_payload())
+                        .await?;
+                } else {
+                    state
+                        .service
+                        .confirm(id.clone(), interaction.clone(), confirm_decision(true))
+                        .await?;
+                }
+                Ok(id.clone())
+            }
+        },
+    })
+    .await
+    .unwrap();
+    assert_eq!(retry.status(), axum::http::StatusCode::OK);
+    let ready = durable::load_durable_ready_result(&runs, &key, policy::IDEMPOTENCY_TTL)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ready.run_id, id);
+    let journal = runs.join(&ready.run_id).join("meta/journal.jsonl");
+    let events = engine::read_journal_values(&journal, engine::JournalLimits::default())
+        .unwrap()
+        .events;
+    let accepted_event = if scope == "answer" {
+        "user_answered"
+    } else {
+        "user_confirmed"
+    };
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == accepted_event)
+            .count(),
+        1,
+        "retry after request cancellation must reuse the accepted interaction"
     );
 }
 
