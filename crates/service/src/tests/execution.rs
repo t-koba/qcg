@@ -3285,6 +3285,272 @@ async fn cancel_mailbox_precedes_confirmation_approval() {
 
 #[cfg(unix)]
 #[tokio::test]
+async fn accepted_approval_is_cancelable_before_side_effect_execution() {
+    let service = test_service(
+        vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
+        temp_run_dir("accepted-approval-cancel"),
+    );
+    let id = service
+        .start_run(StartRun {
+            generator_id: "side-effect-confirm".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let confirm = wait_for_snapshot(&service, &id, RunStatus::Confirming)
+        .await
+        .confirm
+        .expect("run should request confirmation");
+    let run_dir = service.run_dir_for(&id).await.expect("run directory");
+    let execution_lease = crate::run_dirs::try_lock_run_execution(&run_dir)
+        .expect("lease probe should succeed")
+        .expect("test should hold the execution lease");
+    let approving_service = service.clone();
+    let approving_id = id.clone();
+    let confirmation_id = confirm.id.clone();
+    let approval = tokio::spawn(async move {
+        approving_service
+            .confirm(
+                approving_id,
+                confirmation_id,
+                ConfirmDecision {
+                    decision: ConfirmationDecision::Approve,
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let journal = read_journal_string(&service, id.clone()).await;
+            if journal
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| event["t"] == "user_confirmed" && event["approved"] == true)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("approval should be durably accepted while execution is held");
+    let operation = uuid::Uuid::now_v7().to_string();
+    let cancellation = service
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await;
+    assert!(
+        cancellation.is_ok() || matches!(cancellation, Err(api::ApiError::Conflict { .. })),
+        "cancellation should either settle or remain signaled behind the held lease: {cancellation:?}"
+    );
+    approval
+        .await
+        .expect("approval task should join")
+        .expect("approval should be accepted before cancellation");
+    let events: Vec<Value> = read_journal_string(&service, id.clone())
+        .await
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert!(
+        events
+            .iter()
+            .any(|event| { event["t"] == "user_confirmed" && event["approved"] == true })
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["t"] == "side_effect" && event["decision"] == "approved_by_user"
+        }),
+        "published cancellation must stop the approved effect before it executes"
+    );
+    if cancellation.is_err() {
+        assert!(
+            !crate::run_dirs::list_pending_cancel_controls(&run_dir)
+                .expect("pending cancel controls should be readable")
+                .is_empty(),
+            "an unsettled accepted cancellation must retain its mailbox"
+        );
+    }
+    drop(execution_lease);
+    if cancellation.is_err() {
+        service
+            .cancel_with_operation_id(id.clone(), operation)
+            .await
+            .expect("same cancellation should settle after lease release");
+    }
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    let events: Vec<Value> = read_journal_string(&service, id)
+        .await
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "run_canceled")
+            .count(),
+        1
+    );
+    assert!(
+        !events.iter().any(|event| {
+            event["t"] == "side_effect" && event["decision"] == "approved_by_user"
+        })
+    );
+}
+
+#[tokio::test]
+async fn accepted_answer_is_cancelable_before_following_step_runs() {
+    let root = temp_run_dir("accepted-answer-cancel");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&generator).expect("generator directory");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "answer-cancel-order"
+name = "Answer Cancel Order"
+version = "0.1.0"
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[[flow]]
+id = "write_after_answer"
+type = "write"
+[flow.params]
+content = "ran"
+output_file = "post-answer.txt"
+
+[permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false"#,
+    )
+    .expect("generator manifest should be written");
+    let service = test_service(vec![root.clone()], runs);
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let question = wait_for_snapshot(&service, &id, RunStatus::Waiting)
+        .await
+        .question
+        .expect("run should request an answer");
+    let run_dir = service.run_dir_for(&id).await.expect("run directory");
+    let execution_lease = crate::run_dirs::try_lock_run_execution(&run_dir)
+        .expect("lease probe should succeed")
+        .expect("test should hold the execution lease");
+    let answering_service = service.clone();
+    let answering_id = id.clone();
+    let question_id = question.id.clone();
+    let answer = tokio::spawn(async move {
+        answering_service
+            .answer(
+                answering_id,
+                question_id,
+                AnswerPayload {
+                    values: BTreeMap::from([("answer".into(), json!("yes"))]),
+                },
+            )
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let journal = read_journal_string(&service, id.clone()).await;
+            if journal
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|event| event["t"] == "user_answered" && event["question_id"] == question.id)
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("answer should be durably accepted while execution is held");
+    let operation = uuid::Uuid::now_v7().to_string();
+    let cancellation = service
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await;
+    assert!(
+        cancellation.is_ok() || matches!(cancellation, Err(api::ApiError::Conflict { .. })),
+        "cancellation should settle or remain signaled behind the held lease: {cancellation:?}"
+    );
+    answer
+        .await
+        .expect("answer task should join")
+        .expect("answer should be accepted before cancellation");
+    if cancellation.is_err() {
+        assert!(
+            !crate::run_dirs::list_pending_cancel_controls(&run_dir)
+                .expect("pending cancel controls should be readable")
+                .is_empty(),
+            "an unsettled accepted cancellation must retain its mailbox"
+        );
+    }
+    drop(execution_lease);
+    if cancellation.is_err() {
+        service
+            .cancel_with_operation_id(id.clone(), operation)
+            .await
+            .expect("same cancellation should settle after lease release");
+    }
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    assert!(
+        !run_workspace_dir(&run_dir).join("post-answer.txt").exists(),
+        "the following step must not run after the accepted answer is canceled"
+    );
+    let events: Vec<Value> = read_journal_string(&service, id)
+        .await
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let answer_seq = events
+        .iter()
+        .find(|event| event["t"] == "user_answered")
+        .expect("accepted answer event")["seq"]
+        .as_u64()
+        .expect("answer event sequence");
+    let cancel_seq = events
+        .iter()
+        .find(|event| event["t"] == "user_cancel_requested")
+        .expect("accepted cancellation event")["seq"]
+        .as_u64()
+        .expect("cancel event sequence");
+    assert!(answer_seq < cancel_seq);
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "run_canceled")
+            .count(),
+        1
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn accepted_denial_cannot_be_overtaken_by_cancel() {
     let service = test_service(
         vec![Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators")],
