@@ -17,9 +17,9 @@ read cache; the operating system page cache is not cleared. Cold p50/p95 are per
 that cohort, not independent cold-start replications.
 
 The JSON records latency p50/p95 separately for first and subsequent reads,
-actual bytes read (including cache tail witnesses), applied/folded events,
-retained cache charge, census duration, cumulative process CPU, and process
-maximum RSS. RSS is KiB on Linux and bytes on macOS; Windows resource fields
+actual journal bytes read (including complete cached-prefix digest checks on
+append), applied/folded events, retained cache charge, census duration,
+cumulative process CPU, and process maximum RSS. RSS is KiB on Linux and bytes on macOS; Windows resource fields
 are unavailable and represented by zero. Filesystem metadata I/O is not
 included in the byte counter. CPU/RSS are whole-process observations,
 including fixture generation, rather than per-request estimates.
@@ -37,11 +37,14 @@ execution, approval and artifact integrity paths still verify originals.
 Recorded read-view runs are a reproducible sample,
 not a cross-product claim. Raw read-view reports are produced by the command
 above and kept with the release process rather than shipped in the install
-bundle. Cache invalidation detects metadata changes,
-replacement, truncation and changes in the old tail before applying an append.
-It assumes writers follow the journal locking/append protocol; it does not
-prove the integrity of arbitrary historical bytes rewritten outside that
-protocol. Authoritative execution and integrity decisions still read originals.
+bundle. Cache hits are revision-bound. Before reusing a full view across
+same-inode growth on Unix, the cache streams the entire old prefix through
+SHA-256 and resumes only when that digest matches; otherwise it rebuilds from
+byte zero.
+This detects prefix rewrites on changed revisions without relying on a matching
+tail window. The constant-memory integrity check reads the old prefix but avoids
+reparsing and refolding it when unchanged. Other platforms rebuild on change.
+Authoritative execution and integrity decisions still read originals.
 
 The actual HTTP/SSE matrix runs independently:
 

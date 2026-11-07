@@ -112,7 +112,7 @@ impl CachedView {
 #[derive(Debug)]
 struct Entry {
     revision: Revision,
-    tail: Vec<u8>,
+    prefix_digest: Option<[u8; 32]>,
     view: CachedView,
     bytes: usize,
     used: Instant,
@@ -228,7 +228,7 @@ impl ReadStore {
                     entries.full_count -= 1;
                     let entry = entries.views.get_mut(&path).unwrap();
                     entry.bytes = bytes;
-                    entry.tail = Vec::new();
+                    entry.prefix_digest = None;
                     entry.view = CachedView::List(item);
                 }
                 let entry = entries.views.get_mut(&path).unwrap();
@@ -244,25 +244,39 @@ impl ReadStore {
         };
         // Unix identifies replacement by inode. Other platforms rebuild on any
         // change rather than guessing whether a replacement was an append.
+        use sha2::Digest as _;
         let mut view = RunReadView::default();
+        let mut prefix_hash = sha2::Sha256::new();
         if let Some(entry) = prior
             && let CachedView::Full(prior_view) = entry.view
             && cfg!(unix)
             && entry.revision.identity == revision.identity
             && revision.len > entry.revision.len
+            && let Some(expected_digest) = entry.prefix_digest.as_ref()
         {
-            // Truncate-and-requeue can grow past the previous length. Verify
-            // the old tail before treating the change as an append.
-            file.seek(std::io::SeekFrom::Start(
-                entry.revision.len.saturating_sub(entry.tail.len() as u64),
-            ))?;
-            let mut tail = vec![0; entry.tail.len()];
-            file.read_exact(&mut tail)?;
-            #[cfg(test)]
-            self.bytes_read
-                .fetch_add(tail.len() as u64, std::sync::atomic::Ordering::Relaxed);
-            if tail == entry.tail {
+            // File identity and growth do not prove the old prefix is intact.
+            // Verify its complete digest before resuming the fold at the old offset.
+            file.seek(std::io::SeekFrom::Start(0))?;
+            let mut actual_hash = sha2::Sha256::new();
+            let mut remaining = entry.revision.len;
+            let mut buffer = [0u8; 8192];
+            while remaining > 0 {
+                let limit = remaining.min(buffer.len() as u64) as usize;
+                let count = file.read(&mut buffer[..limit])?;
+                if count == 0 {
+                    break;
+                }
+                actual_hash.update(&buffer[..count]);
+                #[cfg(test)]
+                self.bytes_read
+                    .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
+                remaining -= count as u64;
+            }
+            if remaining == 0
+                && actual_hash.clone().finalize().as_slice() == expected_digest.as_slice()
+            {
                 view = Arc::unwrap_or_clone(prior_view);
+                prefix_hash = actual_hash;
             }
         }
         file.seek(std::io::SeekFrom::Start(view.offset))?;
@@ -284,6 +298,7 @@ impl ReadStore {
             if count == 0 {
                 break;
             }
+            prefix_hash.update(&line);
             let has_newline = line.last() == Some(&b'\n');
             let body_len = line.len() - usize::from(has_newline);
             if body_len > limits.max_event_bytes.unwrap_or(usize::MAX) {
@@ -350,14 +365,6 @@ impl ReadStore {
                 view.events.push(event);
             }
         }
-        let mut file = reader.into_inner().into_inner();
-        let tail_len = if list { 0 } else { revision.len.min(4096) };
-        file.seek(std::io::SeekFrom::Start(revision.len - tail_len))?;
-        let mut tail = vec![0; tail_len as usize];
-        file.read_exact(&mut tail)?;
-        #[cfg(test)]
-        self.bytes_read
-            .fetch_add(tail.len() as u64, std::sync::atomic::Ordering::Relaxed);
         // Large views are returned without retention; parser buffers and
         // original journal sizes have separate bounds.
         let state_bytes = serde_json::to_vec(&view.state)?.len();
@@ -382,11 +389,7 @@ impl ReadStore {
         };
         // Both variants share this charge and LRU. Compact entry count is
         // bounded by the byte budget, not the active-run tracking limit.
-        let bytes = payload_bytes
-            + tail.capacity()
-            + 2 * path.as_str().len()
-            + std::mem::size_of::<Entry>()
-            + 256;
+        let bytes = payload_bytes + 2 * path.as_str().len() + std::mem::size_of::<Entry>() + 256;
         if complete && bytes <= self.max_bytes && (list || self.max_entries > 0) {
             let mut entries = self.lock();
             while !entries.views.is_empty()
@@ -404,7 +407,7 @@ impl ReadStore {
                 path,
                 Entry {
                     revision,
-                    tail,
+                    prefix_digest: (!list).then(|| prefix_hash.finalize().into()),
                     view: view.clone(),
                     bytes,
                     used,
@@ -764,7 +767,7 @@ mod tests {
                 .get(&run_meta_dir(&run).join("journal.jsonl"))
                 .unwrap();
             assert!(matches!(entry.view, CachedView::List(_)));
-            assert!(entry.tail.is_empty());
+            assert!(entry.prefix_digest.is_none());
             assert_eq!(cache.bytes, entry.bytes);
             assert_eq!(cache.views.len(), cache.recency.len());
         }
@@ -805,6 +808,49 @@ mod tests {
         assert_eq!(store.applied.load(Ordering::Relaxed), 3);
         std::fs::remove_dir_all(directory).unwrap();
     }
+    #[test]
+    fn append_reuse_does_not_hide_prefix_corruption() {
+        use std::io::Write;
+        let (directory, writer) = journal();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(&vec![b' '; 8192]).unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        let read_store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        let list_store = ReadStore::new(8, policy::DEFAULT_READ_CACHE_BYTES);
+        assert_eq!(read_store.read(&directory).unwrap().state.last_seq, 1);
+        assert_eq!(list_store.read(&directory).unwrap().state.last_seq, 1);
+        assert!(std::fs::metadata(&path).unwrap().len() > 4096);
+
+        {
+            use std::io::{Seek, SeekFrom};
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            file.write_all(b"!").unwrap();
+        }
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b" \n").unwrap();
+        }
+        assert!(engine::read_journal_values(&path, engine::JournalLimits::default()).is_err());
+        assert!(engine::RunState::fold_journal(&path).is_err());
+        assert!(read_store.read(&directory).is_err());
+        assert!(
+            list_store.list_item(&directory).is_err(),
+            "warm append reuse must not hide corruption before the unchanged tail"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
     #[test]
     fn replacement_truncation_corruption_and_entry_eviction() {
         let (directory, writer) = journal();
