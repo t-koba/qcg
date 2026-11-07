@@ -91,6 +91,7 @@ pub(crate) struct AppState {
     /// prune path uses these values, never re-reads the environment, so a
     /// concurrent environment change cannot make one request judge records
     /// by two standards and boot drift is impossible (E04).
+    pub(crate) idempotency_timing: super::idempotency::config::IdempotencyTiming,
     pub(crate) idempotency_ttl: std::time::Duration,
     pub(crate) idempotency_max_entries: usize,
     pub(crate) idempotency_sweep: std::sync::Arc<super::idempotency::durable::IdempotencySweep>,

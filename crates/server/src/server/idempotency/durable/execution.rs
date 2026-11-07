@@ -154,6 +154,7 @@ mod tests {
                 runs.clone(),
                 "key".into(),
                 "digest".into(),
+                super::IdempotencyTiming::DEFAULT,
             );
             tokio::pin!(wait);
             assert!(

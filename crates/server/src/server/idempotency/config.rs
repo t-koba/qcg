@@ -3,10 +3,9 @@
 //! owner cleanup in [`guard`], request orchestration in the parent module.
 
 use super::durable::DurableIdempotencyRecord;
-use anyhow::Result;
 use policy::{IDEMPOTENCY_MAX_ENTRIES, IDEMPOTENCY_TTL};
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Frozen positive-integer deployment settings; unset alone selects the
 /// default. Invalid or non-Unicode values refuse startup, never fall back.
@@ -49,6 +48,40 @@ pub(crate) fn effective_idempotency_sweep_max_entries() -> Result<usize, String>
     )
 }
 
+/// Boot-frozen adoption and peer contention policy, independent of Ready TTL.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IdempotencyTiming {
+    pub pending_lease_secs: u64,
+    pub peer_wait: Duration,
+    pub peer_poll: Duration,
+}
+impl IdempotencyTiming {
+    pub(crate) const DEFAULT: Self = Self {
+        pending_lease_secs: 60,
+        peer_wait: Duration::from_secs(30),
+        peer_poll: Duration::from_millis(100),
+    };
+    pub(crate) fn poll_delay(self, elapsed: Duration) -> Duration {
+        self.peer_poll.min(self.peer_wait.saturating_sub(elapsed))
+    }
+    pub(crate) fn resolve() -> Result<Self, String> {
+        Ok(Self {
+            pending_lease_secs: positive_env(
+                "IDEMPOTENCY_PENDING_LEASE_SECS",
+                Self::DEFAULT.pending_lease_secs,
+            )?,
+            peer_wait: Duration::from_secs(positive_env(
+                "IDEMPOTENCY_PEER_WAIT_SECS",
+                Self::DEFAULT.peer_wait.as_secs(),
+            )?),
+            peer_poll: Duration::from_millis(positive_env(
+                "IDEMPOTENCY_PEER_POLL_MS",
+                Self::DEFAULT.peer_poll.as_millis() as u64,
+            )?),
+        })
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum IdempotencyEntry {
     Pending {
@@ -87,7 +120,7 @@ pub(crate) fn prune_idempotency(
     now_unix: u64,
     ttl: std::time::Duration,
     max_entries: usize,
-) -> Result<(), String> {
+) {
     entries.retain(|_, entry| match entry {
         IdempotencyEntry::Pending { created_at, .. } => now.duration_since(*created_at) < ttl,
         IdempotencyEntry::Ready { record, .. } => !record.expired_at(now_unix, ttl),
@@ -106,7 +139,6 @@ pub(crate) fn prune_idempotency(
         };
         entries.remove(&oldest);
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -114,6 +146,27 @@ mod tests {
     use super::*;
 
     static ENV_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn peer_poll_delay_respects_interval_and_remaining_wait() {
+        let timing = IdempotencyTiming {
+            peer_wait: Duration::from_secs(7),
+            peer_poll: Duration::from_millis(13),
+            ..IdempotencyTiming::DEFAULT
+        };
+        assert_eq!(timing.poll_delay(Duration::ZERO), Duration::from_millis(13));
+        assert_eq!(
+            timing.poll_delay(Duration::from_millis(6999)),
+            Duration::from_millis(1)
+        );
+        assert_eq!(timing.poll_delay(Duration::from_secs(8)), Duration::ZERO);
+        // Accepted u64 durations do not require an overflowing Instant addition.
+        let huge = IdempotencyTiming {
+            peer_wait: Duration::from_secs(u64::MAX),
+            ..timing
+        };
+        assert_eq!(huge.poll_delay(Duration::ZERO), timing.peer_poll);
+    }
 
     #[test]
     fn capacity_still_evicts_the_oldest_cache_insertion_not_pending() {
@@ -153,7 +206,7 @@ mod tests {
                 },
             ),
         ]);
-        prune_idempotency(&mut entries, now, 300, ttl, 3).expect("capacity prune");
+        prune_idempotency(&mut entries, now, 300, ttl, 3);
         assert!(!entries.contains_key("first"));
         assert!(entries.contains_key("second"));
         assert!(entries.contains_key("pending"));
@@ -171,7 +224,7 @@ mod tests {
         // offending variable.
         let _guard = ENV_GUARD.lock().expect("env lock");
         type Setting = (&'static str, fn() -> Result<u64, String>);
-        let settings: [Setting; 4] = [
+        let settings: [Setting; 7] = [
             ("IDEMPOTENCY_TTL_SECS", || {
                 effective_idempotency_ttl().map(|value| value.as_secs())
             }),
@@ -183,6 +236,15 @@ mod tests {
             }),
             ("IDEMPOTENCY_SWEEP_MAX_ENTRIES", || {
                 effective_idempotency_sweep_max_entries().map(|value| value as u64)
+            }),
+            ("IDEMPOTENCY_PENDING_LEASE_SECS", || {
+                IdempotencyTiming::resolve().map(|value| value.pending_lease_secs)
+            }),
+            ("IDEMPOTENCY_PEER_WAIT_SECS", || {
+                IdempotencyTiming::resolve().map(|value| value.peer_wait.as_secs())
+            }),
+            ("IDEMPOTENCY_PEER_POLL_MS", || {
+                IdempotencyTiming::resolve().map(|value| value.peer_poll.as_millis() as u64)
             }),
         ];
         for (variable, resolve) in settings {
@@ -216,6 +278,10 @@ mod tests {
                 std::env::remove_var(variable);
             }
         }
+        assert_eq!(
+            IdempotencyTiming::resolve().unwrap(),
+            IdempotencyTiming::DEFAULT
+        );
         assert_eq!(
             effective_idempotency_sweep_interval().unwrap(),
             policy::IDEMPOTENCY_SWEEP_INTERVAL

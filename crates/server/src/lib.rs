@@ -45,6 +45,7 @@ pub(crate) fn test_state(
         oauth_allowed_origins: std::collections::BTreeSet::new(),
         oauth_callback_url: None,
         idempotency: tokio::sync::Mutex::new(std::collections::BTreeMap::new()),
+        idempotency_timing: crate::server::IdempotencyTiming::DEFAULT,
         idempotency_ttl: policy::IDEMPOTENCY_TTL,
         idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
         idempotency_sweep: Default::default(),

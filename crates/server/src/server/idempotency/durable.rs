@@ -1,5 +1,5 @@
 //! Cross-process Pending/Ready: gated ownership, conservative reads and locked atomic publication.
-use super::idempotency_conflict;
+use super::{config::IdempotencyTiming, idempotency_conflict};
 use crate::server::error::ApiHttpError;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
@@ -36,13 +36,10 @@ fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
 }
 mod execution;
 pub(crate) use execution::ExecutionGate;
-// Reuse existing peer wait policy, not an additional gate timeout.
-pub(super) const PEER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
-pub(super) const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 // Test callers exercise individual metadata operations, not request lifetimes.
 #[cfg(test)]
 fn test_gate(runs_dir: &Utf8PathBuf, key: &str) -> Result<ExecutionGate, String> {
-    let deadline = std::time::Instant::now() + PEER_WAIT;
+    let deadline = std::time::Instant::now() + IdempotencyTiming::DEFAULT.peer_wait;
     loop {
         if let Some(gate) = ExecutionGate::try_acquire(runs_dir, key)? {
             return Ok(gate);
@@ -50,7 +47,7 @@ fn test_gate(runs_dir: &Utf8PathBuf, key: &str) -> Result<ExecutionGate, String>
         if std::time::Instant::now() >= deadline {
             return Err("idempotency gate busy".into());
         }
-        std::thread::sleep(PEER_POLL);
+        std::thread::sleep(IdempotencyTiming::DEFAULT.peer_poll);
     }
 }
 /// Metadata lock makes owner/generation checks and conditional mutations indivisible.
@@ -412,8 +409,8 @@ fn acquire_maintenance_lock(
         }
     }
 }
-/// Pending's 60s lease permits same-digest adoption; age never permits a different digest to replace it.
-const PENDING_TTL_SECS: u64 = 60;
+// Staging-file cleanup grace is independent of Pending adoption.
+const TEMP_GRACE_SECS: u64 = 60;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurablePendingRecord {
     key: String,
@@ -450,7 +447,15 @@ pub(crate) fn claim_durable_pending_gated(
     ttl: std::time::Duration,
     _sweep: &IdempotencySweep,
 ) -> Result<ClaimOutcome, ApiHttpError> {
-    claim_durable_pending_for_target_gated(gate, key, digest, reserved_run_id, ttl, _sweep, false)
+    claim_durable_pending_for_target_gated(
+        gate,
+        key,
+        digest,
+        reserved_run_id,
+        ttl,
+        IdempotencyTiming::DEFAULT,
+        false,
+    )
 }
 pub(crate) fn claim_durable_pending_for_target_gated(
     gate: &ExecutionGate,
@@ -458,7 +463,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     digest: &str,
     reserved_run_id: Option<String>,
     ttl: std::time::Duration,
-    _sweep: &IdempotencySweep,
+    timing: IdempotencyTiming,
     require_target: bool,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     let runs_dir = &gate.runs_dir;
@@ -494,7 +499,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     let mut adopted: Option<String> = None;
     let mut operation_id = uuid::Uuid::now_v7().to_string();
     let pending_generation: u64 = match match snapshot.pending.as_deref() {
-        Some(bytes) => parse_pending_bytes(key, bytes),
+        Some(bytes) => parse_pending_bytes(key, bytes, timing.pending_lease_secs),
         None => PendingRead::Absent,
     } {
         PendingRead::Valid(record) => {
@@ -662,7 +667,7 @@ fn clean_temp(entry: std::fs::DirEntry, now: u64) -> Result<(), String> {
                 .duration_since(UNIX_EPOCH)
                 .map_err(|e| e.to_string())?
                 .as_secs();
-            if now.saturating_sub(modified) < PENDING_TTL_SECS {
+            if now.saturating_sub(modified) < TEMP_GRACE_SECS {
                 return Ok(());
             }
         }
@@ -776,7 +781,7 @@ pub(crate) fn check_pending_owner_gated(
         }
     };
     // A matching identity stays current while gated, even past the pending lease.
-    match parse_pending_bytes(key, &bytes) {
+    match parse_pending_bytes(key, &bytes, u64::MAX) {
         PendingRead::Valid(current) | PendingRead::Expired(current) => {
             if current.owner == owner
                 && current.generation == generation
@@ -831,7 +836,7 @@ fn read_bounded_idempotency_file(path: &camino::Utf8Path) -> BoundedRead {
     }
     BoundedRead::Present(bytes)
 }
-fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
+fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str, lease_secs: u64) -> PendingRead {
     let path = pending_path(runs_dir, key);
     let bytes = match read_bounded_idempotency_file(&path) {
         BoundedRead::Present(bytes) => bytes,
@@ -842,7 +847,7 @@ fn read_durable_pending(runs_dir: &Utf8PathBuf, key: &str) -> PendingRead {
             ));
         }
     };
-    parse_pending_bytes(key, &bytes)
+    parse_pending_bytes(key, &bytes, lease_secs)
 }
 /// Retire only a Pending resolved by the complete Ready identity; caller holds
 /// the metadata lock, and publication also checks the claim owner.
@@ -891,15 +896,16 @@ fn retire_ready_pending(
 pub(crate) fn load_durable_pending_digest_result(
     runs_dir: &Utf8PathBuf,
     key: &str,
+    lease_secs: u64,
 ) -> Result<Option<String>, String> {
-    match read_durable_pending(runs_dir, key) {
+    match read_durable_pending(runs_dir, key, lease_secs) {
         PendingRead::Valid(record) => Ok(Some(record.digest)),
         PendingRead::Expired(_) | PendingRead::Absent => Ok(None),
         PendingRead::Unusable(detail) => Err(detail),
     }
 }
 /// Shared pending classifier for claim snapshots and waiter observations.
-fn parse_pending_bytes(key: &str, bytes: &[u8]) -> PendingRead {
+fn parse_pending_bytes(key: &str, bytes: &[u8], lease_secs: u64) -> PendingRead {
     let record: DurablePendingRecord = match serde_json::from_slice(bytes) {
         Ok(record) => record,
         // Atomic publishers cannot tear reads; corruption must never become Absent.
@@ -917,12 +923,11 @@ fn parse_pending_bytes(key: &str, bytes: &[u8]) -> PendingRead {
         ));
     }
     // Read-only: preserve the claim another caller may be about to adopt.
-    let Ok(now) = now_unix() else {
-        return PendingRead::Unusable(
-            "system clock is before the Unix epoch; refusing idempotency decision".into(),
-        );
+    let now = match now_unix() {
+        Ok(now) => now,
+        Err(detail) => return PendingRead::Unusable(detail),
     };
-    if now.saturating_sub(record.created_at_unix) >= PENDING_TTL_SECS {
+    if now.saturating_sub(record.created_at_unix) >= lease_secs {
         return PendingRead::Expired(record);
     }
     PendingRead::Valid(record)
@@ -994,124 +999,71 @@ pub(crate) async fn wait_for_peer_ready(
     key: &str,
     digest: &str,
     ttl: std::time::Duration,
+    timing: IdempotencyTiming,
 ) -> Result<WaitOutcome, ApiHttpError> {
-    wait_for_peer_ready_with_deadline(
-        runs_dir,
-        key,
-        digest,
-        ttl,
-        tokio::time::Instant::now() + PEER_WAIT,
-    )
-    .await
-}
-/// Inject a short deadline in tests; production uses 30s.
-async fn wait_for_peer_ready_with_deadline(
-    runs_dir: &Utf8PathBuf,
-    key: &str,
-    digest: &str,
-    ttl: std::time::Duration,
-    deadline: tokio::time::Instant,
-) -> Result<WaitOutcome, ApiHttpError> {
+    let started = tokio::time::Instant::now();
     loop {
         // Keep blocking I/O off Tokio. These reads are sequential, not atomic:
         // re-read Ready before any pending-derived return to catch a racing commit.
         let (ready, pending) = {
             let runs_dir = runs_dir.clone();
             let key = key.to_string();
-            tokio::task::spawn_blocking(move || {
-                (
-                    load_durable_ready_result(&runs_dir, &key, ttl),
-                    read_durable_pending(&runs_dir, &key),
-                )
+            super::storage(move || {
+                Ok((
+                    load_durable_ready_result(&runs_dir, &key, ttl)
+                        .map_err(|e| format!("failed to load idempotency record: {e}"))?,
+                    read_durable_pending(&runs_dir, &key, timing.pending_lease_secs),
+                ))
             })
-            .await
-            .map_err(|error| {
-                ApiHttpError::internal(format!("idempotency wait task failed: {error}"))
-            })?
+            .await?
         };
-        match ready {
-            Ok(Some(record)) => {
-                if record.digest != digest {
-                    return Err(idempotency_conflict());
-                }
-                return Ok(WaitOutcome::Ready(record));
+        if let Some(record) = ready {
+            if record.digest != digest {
+                return Err(idempotency_conflict());
             }
-            Ok(None) => {}
-            Err(detail) => {
-                // Atomic publication makes corrupt bytes real damage: fail immediately.
-                return Err(ApiHttpError::internal(format!(
-                    "failed to load idempotency record: {detail}"
-                )));
-            }
+            return Ok(WaitOutcome::Ready(record));
         }
-        // Catch commits between sequential reads before retry/deadline decisions.
-        let recheck_ready = |runs_dir: &Utf8PathBuf, key: &str| {
-            let runs_dir = runs_dir.clone();
-            let key = key.to_string();
-            async move {
-                tokio::task::spawn_blocking(move || load_durable_ready_result(&runs_dir, &key, ttl))
-                    .await
-                    .map_err(|error| {
-                        ApiHttpError::internal(format!("idempotency wait task failed: {error}"))
-                    })?
-                    .map_err(|detail| {
-                        ApiHttpError::internal(format!(
-                            "failed to load idempotency record: {detail}"
-                        ))
-                    })
-            }
-        };
-        match pending {
+        let retry = match pending {
             PendingRead::Valid(pending) => {
                 if pending.digest != digest {
                     return Err(idempotency_conflict());
                 }
+                None
             }
             PendingRead::Expired(pending) => {
                 if pending.digest != digest {
                     return Err(idempotency_conflict());
                 }
-                if let Some(record) = recheck_ready(runs_dir, key).await? {
-                    if record.digest != digest {
-                        return Err(idempotency_conflict());
-                    }
-                    return Ok(WaitOutcome::Ready(record));
-                }
-                return Ok(WaitOutcome::RetryClaim {
-                    adopted_run_id: pending.run_id.clone(),
-                });
+                Some(WaitOutcome::RetryClaim {
+                    adopted_run_id: pending.run_id,
+                })
             }
-            PendingRead::Absent => {
-                // Catch a commit racing the initial read before retrying.
-                if let Some(record) = recheck_ready(runs_dir, key).await? {
-                    if record.digest != digest {
-                        return Err(idempotency_conflict());
-                    }
-                    return Ok(WaitOutcome::Ready(record));
-                }
-                return Ok(WaitOutcome::RetryClaim {
-                    adopted_run_id: None,
-                });
-            }
+            PendingRead::Absent => Some(WaitOutcome::RetryClaim {
+                adopted_run_id: None,
+            }),
             PendingRead::Unusable(detail) => {
                 return Err(ApiHttpError::internal(format!(
                     "failed to load idempotency record: {detail}"
                 )));
             }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            // Recheck Ready at deadline before reporting a live-claim 503.
-            if let Some(record) = recheck_ready(runs_dir, key).await? {
+        };
+        if retry.is_some() || started.elapsed() >= timing.peer_wait {
+            // Catch a racing commit before retrying or reporting a live-claim 503.
+            if let Some(record) =
+                super::load_durable_ready_async(runs_dir.clone(), key.into(), ttl).await?
+            {
                 if record.digest != digest {
                     return Err(idempotency_conflict());
                 }
                 return Ok(WaitOutcome::Ready(record));
             }
-            return Err(ApiHttpError::service_unavailable(
-                "idempotent request is still in progress elsewhere; retry with the same key",
-            ));
+            return retry.ok_or_else(|| {
+                ApiHttpError::service_unavailable(
+                    "idempotent request is still in progress elsewhere; retry with the same key",
+                )
+            });
         }
-        tokio::time::sleep(PEER_POLL).await;
+        tokio::time::sleep(timing.poll_delay(started.elapsed())).await;
     }
 }
 /// Typed refusal: digest conflict is 409; storage errors never advertise Ready.
@@ -1193,7 +1145,7 @@ pub(crate) fn store_durable_ready_gated(
     let pending_read = snapshot
         .pending
         .as_deref()
-        .map(|bytes| parse_pending_bytes(key, bytes))
+        .map(|bytes| parse_pending_bytes(key, bytes, u64::MAX))
         .unwrap_or(PendingRead::Absent);
     if let Some(existing) = existing {
         if existing.digest != digest {
@@ -1469,6 +1421,100 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn configured_lease_controls_adoption_and_wait_without_retiring_evidence() {
+        use std::time::Duration;
+        let runs = temp_runs_dir("configured-lease");
+        let _temp = TempGuard(runs.clone());
+        let key = "configured-key";
+        let gate = ExecutionGate::try_acquire(&runs, key).unwrap().unwrap();
+        let ttl = policy::IDEMPOTENCY_TTL;
+        let long = IdempotencyTiming {
+            pending_lease_secs: 120,
+            peer_wait: Duration::from_millis(30),
+            // Longer than wait: contention must stop at wait, not at poll.
+            peer_poll: Duration::from_secs(10),
+        };
+        let claim = |digest, timing| {
+            claim_durable_pending_for_target_gated(
+                &gate,
+                key,
+                digest,
+                Some("reserved".into()),
+                ttl,
+                timing,
+                false,
+            )
+        };
+        let ClaimOutcome::Owner {
+            owner,
+            generation,
+            operation_id,
+            ..
+        } = claim("digest", long).unwrap()
+        else {
+            panic!("first claim must own");
+        };
+        let path = pending_path(&runs, key);
+        let mut pending: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        pending.created_at_unix = now_unix().unwrap() - 10;
+        std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let evidence = std::fs::read(&path).unwrap();
+        assert!(matches!(claim("digest", long).unwrap(), ClaimOutcome::Peer));
+        assert_eq!(
+            load_durable_pending_digest_result(&runs, key, long.pending_lease_secs)
+                .unwrap()
+                .as_deref(),
+            Some("digest")
+        );
+        let error = tokio::time::timeout(
+            Duration::from_secs(2),
+            wait_for_peer_ready(&runs, key, "digest", ttl, long),
+        )
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert_eq!(error.problem.status, 503);
+        assert_eq!(std::fs::read(&path).unwrap(), evidence);
+        let short = IdempotencyTiming {
+            pending_lease_secs: 1,
+            ..long
+        };
+        assert!(
+            load_durable_pending_digest_result(&runs, key, short.pending_lease_secs)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            matches!(wait_for_peer_ready(&runs, key, "digest", ttl, short).await.unwrap(), WaitOutcome::RetryClaim { adopted_run_id: Some(id) } if id == "reserved")
+        );
+        assert!(matches!(
+            claim("different", short).unwrap(),
+            ClaimOutcome::Conflict
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), evidence);
+        // Expiry is only an observation; the exact gate still excludes a peer.
+        assert!(ExecutionGate::try_acquire(&runs, key).unwrap().is_none());
+        let ClaimOutcome::Owner {
+            owner: adopted_owner,
+            generation: adopted_generation,
+            run_id,
+            operation_id: adopted_operation,
+        } = claim("digest", short).unwrap()
+        else {
+            panic!("short lease must permit same-digest adoption under the gate");
+        };
+        assert_ne!(owner, adopted_owner);
+        assert_eq!(adopted_generation, generation + 1);
+        assert_eq!(adopted_operation, operation_id);
+        assert_eq!(run_id.as_deref(), Some("reserved"));
+        assert!(
+            path.is_file(),
+            "adoption replaces rather than deletes Pending evidence"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn fifo_records_fail_closed_without_blocking() {
@@ -1603,9 +1649,9 @@ mod tests {
         let ttl = policy::IDEMPOTENCY_TTL;
         let deadline = created + ttl.as_secs();
         let now = Instant::now();
-        prune_idempotency(&mut cache, now, deadline - 1, ttl, 2).expect("prune before expiry");
+        prune_idempotency(&mut cache, now, deadline - 1, ttl, 2);
         assert!(cache.contains_key(&key), "last retained second must replay");
-        prune_idempotency(&mut cache, now, deadline, ttl, 2).expect("prune at expiry");
+        prune_idempotency(&mut cache, now, deadline, ttl, 2);
         assert!(cache.is_empty(), "cache insertion must not restart the TTL");
     }
 
@@ -1673,9 +1719,10 @@ mod tests {
         let bytes = serde_json::to_vec(&record).expect("serialize old Ready");
         std::fs::write(&path, &bytes).expect("age Ready");
 
-        let WaitOutcome::Ready(waited) = wait_for_peer_ready(&runs_dir, key, "digest", ttl)
-            .await
-            .expect("same-digest waiter")
+        let WaitOutcome::Ready(waited) =
+            wait_for_peer_ready(&runs_dir, key, "digest", ttl, IdempotencyTiming::DEFAULT)
+                .await
+                .expect("same-digest waiter")
         else {
             panic!("Ready must win")
         };
@@ -1742,7 +1789,14 @@ mod tests {
         )
         .expect("corrupt record should be written");
         let started = tokio::time::Instant::now();
-        let Err(error) = wait_for_peer_ready(&runs_dir, key, "d", policy::IDEMPOTENCY_TTL).await
+        let Err(error) = wait_for_peer_ready(
+            &runs_dir,
+            key,
+            "d",
+            policy::IDEMPOTENCY_TTL,
+            IdempotencyTiming::DEFAULT,
+        )
+        .await
         else {
             panic!("a corrupt Ready record must fail the wait");
         };
@@ -2028,8 +2082,12 @@ mod tests {
         let before = std::fs::read(path.as_std_path()).expect("pending record bytes");
 
         assert_eq!(
-            load_durable_pending_digest_result(&runs_dir, key)
-                .expect("read-only pending lookup should succeed"),
+            load_durable_pending_digest_result(
+                &runs_dir,
+                key,
+                IdempotencyTiming::DEFAULT.pending_lease_secs
+            )
+            .expect("read-only pending lookup should succeed"),
             Some(digest.to_string())
         );
         assert_eq!(
@@ -2543,12 +2601,15 @@ mod tests {
         let runs_dir = temp_runs_dir("waiter-deadline");
         let key = "key-wait";
         claim_owner(&runs_dir, key, "digest", "run-A");
-        let error = wait_for_peer_ready_with_deadline(
+        let error = wait_for_peer_ready(
             &runs_dir,
             key,
             "digest",
             policy::IDEMPOTENCY_TTL,
-            tokio::time::Instant::now() + std::time::Duration::from_millis(300),
+            IdempotencyTiming {
+                peer_wait: std::time::Duration::from_millis(300),
+                ..IdempotencyTiming::DEFAULT
+            },
         )
         .await
         .expect_err("a held live claim must exhaust the deadline");

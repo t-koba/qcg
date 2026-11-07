@@ -205,10 +205,25 @@ must be real directories/a regular file, not symlinks. No process waits for a ga
 holding the metadata lock. Request cancellation stops gate
 polling; a service blocking writer already in flight retains shared ownership
 until it exits. Process death releases the OS lock, not the Pending evidence.
-Contention uses the existing peer wait policy (30 seconds, polling every
-100 milliseconds); Pending's existing 60-second lease is unchanged. These
-fixed protocol defaults are not new environment settings. Lease expiry alone
-cannot supersede an owner that still holds its execution gate.
+The following positive-integer environment settings freeze once at boot;
+unset selects the default, while zero, negative, non-integer, overflowing or
+non-Unicode values refuse startup:
+
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `IDEMPOTENCY_PENDING_LEASE_SECS` | `60` | Seconds from Pending publication before a same-digest retry may adopt its reserved run and operation identity, after acquiring the exact key gate. |
+| `IDEMPOTENCY_PEER_WAIT_SECS` | `30` | Seconds spent polling for a contended execution gate or waiting for a peer's Ready publication; each wait has its own timeout and returns retryable `503` if still busy. |
+| `IDEMPOTENCY_PEER_POLL_MS` | `100` | Milliseconds between cross-process observations, capped by the remaining wait time. |
+
+Lease expiry alone cannot supersede an owner that still holds its execution
+gate. None of these settings authorizes age-only Pending deletion or adoption
+by a different digest. Shared-store peers should use the same Pending lease
+and reasonably synchronized clocks for consistent adoption timing; a shorter
+lease can permit earlier adoption only after the gate is released. Peer wait
+and poll settings may differ: they affect local latency/load, not ownership or
+stored-record compatibility. Ready TTL is independent and unchanged: shared
+peers still require matching `IDEMPOTENCY_TTL_SECS`. Changing these settings
+requires restarting the process; request paths never re-read the environment.
 
 A service execution that returns an error preserves its Pending claim: the
 error alone does not prove the operation had no effects. During ordinary
@@ -226,7 +241,7 @@ reconciling an earlier denial is not an accepted cancel.
 Releasing the claim on error could let a retry execute as a fresh owner over an
 already-accepted operation. Only the process-local waiter entry is withdrawn
 and woken; the
-durable Pending may remain unresolved after its existing 60-second lease. The
+durable Pending may remain unresolved after its configured adoption lease. The
 timestamp controls when a same-digest retry may adopt, measured from claim
 publication rather than from a new quarantine after the error; it does not
 authorize replacing Pending with a different digest. A different-digest request
@@ -369,7 +384,7 @@ Maintenance failures are warned and retryable evidence is retained; maintenance
 and publishers serialize on the same lock. The settings above,
 `IDEMPOTENCY_TTL_SECS`, and `IDEMPOTENCY_MAX_ENTRIES` freeze at startup: unset
 selects the default; zero, negative, non-integer, overflowing, or non-Unicode
-values refuse startup. Cadence is independent of pending-claim TTL/temp age.
+values refuse startup. Cadence and regular-temp age are independent of the Pending adoption lease.
 
 The same header is accepted by `POST /api/runs/{id}/fork`,
 `PUT /api/runs/{id}/questions/{qid}`,

@@ -493,7 +493,12 @@ async fn colliding_keys_hold_gates_concurrently_and_waiters_cancel_cleanly() {
         .is_err()
     );
     for key in ["customer-5", "customer-11"] {
-        let wait = acquire_execution_gate(runs.clone(), key.into(), "digest".into());
+        let wait = acquire_execution_gate(
+            runs.clone(),
+            key.into(),
+            "digest".into(),
+            config::IdempotencyTiming::DEFAULT,
+        );
         tokio::pin!(wait);
         assert!(
             tokio::time::timeout(Duration::from_millis(150), &mut wait)
@@ -639,7 +644,12 @@ async fn live_conflict_is_reported_without_waiting_for_the_gate() {
     .unwrap();
     let error = tokio::time::timeout(
         Duration::from_secs(5),
-        acquire_execution_gate(fixture.0.clone(), KEY.into(), "different".into()),
+        acquire_execution_gate(
+            fixture.0.clone(),
+            KEY.into(),
+            "different".into(),
+            config::IdempotencyTiming::DEFAULT,
+        ),
     )
     .await
     .unwrap()
@@ -648,7 +658,12 @@ async fn live_conflict_is_reported_without_waiting_for_the_gate() {
     assert_eq!(error.problem.status, 409);
     // Dropping a waiter cannot leave a blocking lock acquisition alive.
     {
-        let wait = acquire_execution_gate(fixture.0.clone(), KEY.into(), "original".into());
+        let wait = acquire_execution_gate(
+            fixture.0.clone(),
+            KEY.into(),
+            "original".into(),
+            config::IdempotencyTiming::DEFAULT,
+        );
         tokio::pin!(wait);
         assert!(futures_util::poll!(&mut wait).is_pending());
     }
@@ -2125,7 +2140,7 @@ async fn mutation_claim_fails_fast_during_maintenance_and_rechecks_deleted_targe
             "d",
             Some("target".into()),
             policy::IDEMPOTENCY_TTL,
-            &Default::default(),
+            config::IdempotencyTiming::DEFAULT,
             true,
         )
     };
@@ -2315,11 +2330,48 @@ fn mutation_claim_rejects_linked_and_non_directory_parents_before_publication() 
                 "d",
                 Some("target".into()),
                 policy::IDEMPOTENCY_TTL,
-                &Default::default(),
+                config::IdempotencyTiming::DEFAULT,
                 true,
             );
             assert!(result.is_err(), "{component}, linked={linked}");
             assert!(!pending(runs).exists());
         }
     }
+}
+
+#[tokio::test]
+async fn configured_gate_wait_expires_without_stealing_the_held_gate() {
+    let fixture = Fixture(
+        Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("configured-gate-{}", uuid::Uuid::now_v7())),
+    );
+    let gate = ExecutionGate::try_acquire(&fixture.0, KEY)
+        .unwrap()
+        .unwrap();
+    let timing = config::IdempotencyTiming {
+        peer_wait: Duration::from_millis(30),
+        peer_poll: Duration::from_secs(10),
+        ..config::IdempotencyTiming::DEFAULT
+    };
+    let error = tokio::time::timeout(
+        Duration::from_secs(2),
+        acquire_execution_gate(fixture.0.clone(), KEY.into(), "digest".into(), timing),
+    )
+    .await
+    .unwrap()
+    .err()
+    .expect("configured gate wait must expire");
+    assert_eq!(error.problem.status, 503);
+    assert!(
+        ExecutionGate::try_acquire(&fixture.0, KEY)
+            .unwrap()
+            .is_none()
+    );
+    drop(gate);
+    assert!(
+        acquire_execution_gate(fixture.0.clone(), KEY.into(), "digest".into(), timing)
+            .await
+            .is_ok()
+    );
 }

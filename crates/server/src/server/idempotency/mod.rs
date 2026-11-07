@@ -169,9 +169,11 @@ where
     }
     let directory = call.state.runs_dir.clone();
     let pending_key = key.clone();
-    if let Some(pending_digest) =
-        storage(move || durable::load_durable_pending_digest_result(&directory, &pending_key))
-            .await?
+    let lease_secs = call.state.idempotency_timing.pending_lease_secs;
+    if let Some(pending_digest) = storage(move || {
+        durable::load_durable_pending_digest_result(&directory, &pending_key, lease_secs)
+    })
+    .await?
     {
         if pending_digest != digest {
             return Err(idempotency_conflict());
@@ -245,8 +247,7 @@ where
                     durable::now_unix().map_err(ApiHttpError::internal)?,
                     policy_ttl,
                     policy_max_entries,
-                )
-                .map_err(ApiHttpError::internal)?;
+                );
                 match idempotency.get(&idempotency_key) {
                     Some(IdempotencyEntry::Ready { record, .. }) => {
                         let record = record.clone();
@@ -306,6 +307,7 @@ where
                             state.runs_dir.clone(),
                             idempotency_key.clone(),
                             request_digest.clone(),
+                            state.idempotency_timing,
                         )
                         .await?;
                         execution_gate = Some(Arc::clone(&gate));
@@ -315,7 +317,7 @@ where
                             digest,
                             reserved,
                             policy_ttl,
-                            state.idempotency_sweep.clone(),
+                            state.idempotency_timing,
                             !matches!(scope, "start_run" | "fork_run"),
                         )
                         .await?
@@ -327,6 +329,7 @@ where
                                     &idempotency_key,
                                     &request_digest,
                                     policy_ttl,
+                                    state.idempotency_timing,
                                 )
                                 .await?
                                 {
@@ -793,8 +796,9 @@ async fn acquire_execution_gate(
     runs_dir: camino::Utf8PathBuf,
     key: String,
     digest: String,
+    timing: config::IdempotencyTiming,
 ) -> Result<Arc<ExecutionGate>, ApiHttpError> {
-    let deadline = tokio::time::Instant::now() + durable::PEER_WAIT;
+    let started = tokio::time::Instant::now();
     loop {
         let dir = runs_dir.clone();
         let key = key.clone();
@@ -803,9 +807,13 @@ async fn acquire_execution_gate(
             let gate = ExecutionGate::try_acquire(&dir, &key).map_err(ApiHttpError::internal)?;
             // Observation can reject conflicts, never grant ownership.
             if gate.is_none()
-                && durable::load_durable_pending_digest_result(&dir, &key)
-                    .map_err(ApiHttpError::internal)?
-                    .is_some_and(|stored| stored != expected)
+                && durable::load_durable_pending_digest_result(
+                    &dir,
+                    &key,
+                    timing.pending_lease_secs,
+                )
+                .map_err(ApiHttpError::internal)?
+                .is_some_and(|stored| stored != expected)
             {
                 return Err(idempotency_conflict());
             }
@@ -816,12 +824,12 @@ async fn acquire_execution_gate(
         {
             return Ok(Arc::new(gate));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if started.elapsed() >= timing.peer_wait {
             return Err(ApiHttpError::service_unavailable(
                 "idempotent request is still in progress elsewhere; retry with the same key",
             ));
         }
-        tokio::time::sleep(durable::PEER_POLL).await;
+        tokio::time::sleep(timing.poll_delay(started.elapsed())).await;
     }
 }
 
@@ -832,7 +840,7 @@ async fn claim_durable_pending_async(
     digest: String,
     reserved_run_id: Option<String>,
     ttl: std::time::Duration,
-    sweep: Arc<durable::IdempotencySweep>,
+    timing: config::IdempotencyTiming,
     require_target: bool,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     tokio::task::spawn_blocking(move || {
@@ -842,7 +850,7 @@ async fn claim_durable_pending_async(
             &digest,
             reserved_run_id,
             ttl,
-            &sweep,
+            timing,
             require_target,
         )
     })
@@ -1119,6 +1127,7 @@ mod tests {
             oauth_allowed_origins: BTreeSet::new(),
             oauth_callback_url: None,
             idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_timing: crate::server::idempotency::config::IdempotencyTiming::DEFAULT,
             idempotency_ttl: policy::IDEMPOTENCY_TTL,
             idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
             idempotency_sweep: Default::default(),
@@ -1387,8 +1396,12 @@ mod tests {
         );
         // Durable evidence remains under the same identity.
         assert_eq!(
-            durable::load_durable_pending_digest_result(&runs, key)
-                .expect("pending digest should read"),
+            durable::load_durable_pending_digest_result(
+                &runs,
+                key,
+                state.idempotency_timing.pending_lease_secs
+            )
+            .expect("pending digest should read"),
             Some(digest.clone()),
             "the durable claim digest must survive the execution error"
         );

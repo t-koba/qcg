@@ -79,6 +79,7 @@ pub async fn serve_with_resolved_policy(
 pub struct ResolvedServerPolicy {
     pub container_timeouts: policy::ContainerTimeouts,
     pub read_cache_max_bytes: usize,
+    pub idempotency_timing: super::idempotency::config::IdempotencyTiming,
     pub idempotency_ttl: std::time::Duration,
     pub idempotency_max_entries: usize,
     pub idempotency_sweep_interval: std::time::Duration,
@@ -153,6 +154,7 @@ pub fn resolve_server_policy_with_container_timeouts(
     config: &ServerConfig,
     container_timeouts: policy::ContainerTimeouts,
 ) -> Result<ResolvedServerPolicy, String> {
+    let idempotency_timing = super::idempotency::config::IdempotencyTiming::resolve()?;
     let idempotency_ttl = super::idempotency::effective_idempotency_ttl()
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;
     let idempotency_max_entries = super::idempotency::effective_idempotency_max_entries()
@@ -351,6 +353,7 @@ pub fn resolve_server_policy_with_container_timeouts(
         container_timeouts,
         metrics_policy,
         read_cache_max_bytes,
+        idempotency_timing,
         idempotency_ttl,
         idempotency_max_entries,
         idempotency_sweep_interval,
@@ -402,6 +405,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         container_timeouts,
         metrics_policy,
         read_cache_max_bytes,
+        idempotency_timing,
         idempotency_ttl,
         idempotency_max_entries,
         idempotency_sweep_interval,
@@ -516,6 +520,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
         // Freeze the already-validated boot policy: requests never re-read
         // the environment (E04).
+        idempotency_timing,
         idempotency_ttl,
         idempotency_max_entries,
         idempotency_sweep: Arc::new(super::idempotency::durable::IdempotencySweep::new(
@@ -2757,6 +2762,17 @@ command = ["sh", "-c", "sleep 30"]"#,
             ("IDEMPOTENCY_TTL_SECS", "soon", "idempotency"),
             ("IDEMPOTENCY_MAX_ENTRIES", "0", "idempotency"),
             ("IDEMPOTENCY_MAX_ENTRIES", "many", "idempotency"),
+            (
+                "IDEMPOTENCY_PENDING_LEASE_SECS",
+                "0",
+                "IDEMPOTENCY_PENDING_LEASE_SECS",
+            ),
+            (
+                "IDEMPOTENCY_PEER_WAIT_SECS",
+                "soon",
+                "IDEMPOTENCY_PEER_WAIT_SECS",
+            ),
+            ("IDEMPOTENCY_PEER_POLL_MS", "0", "IDEMPOTENCY_PEER_POLL_MS"),
         ];
         for (variable, value, part) in cases {
             let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
@@ -3051,7 +3067,21 @@ command = ["sh", "-c", "sleep 30"]"#,
         std::fs::create_dir_all(&generators).expect("generators dir should create");
         let mut config = boot_config(&generators, &runs);
         config.providers_path = Some(root.join("missing-providers.toml"));
+        unsafe {
+            std::env::set_var("IDEMPOTENCY_PENDING_LEASE_SECS", "17");
+            std::env::set_var("IDEMPOTENCY_PEER_WAIT_SECS", "3");
+            std::env::set_var("IDEMPOTENCY_PEER_POLL_MS", "11");
+        }
         let policy = resolve_server_policy(&config).expect("policy should resolve clean");
+        assert_eq!(policy.idempotency_timing.pending_lease_secs, 17);
+        assert_eq!(
+            policy.idempotency_timing.peer_wait,
+            std::time::Duration::from_secs(3)
+        );
+        assert_eq!(
+            policy.idempotency_timing.peer_poll,
+            std::time::Duration::from_millis(11)
+        );
         // Freeze proves equality: two resolves under one env agree.
         let again = resolve_server_policy(&boot_config(&generators, &runs))
             .expect("second resolve should agree");
@@ -3064,6 +3094,9 @@ command = ["sh", "-c", "sleep 30"]"#,
         // SAFETY: the guard serializes environment mutation across tests.
         unsafe {
             std::env::set_var("AUTO_GC", "maybe");
+            std::env::set_var("IDEMPOTENCY_PENDING_LEASE_SECS", "0");
+            std::env::set_var("IDEMPOTENCY_PEER_WAIT_SECS", "invalid");
+            std::env::set_var("IDEMPOTENCY_PEER_POLL_MS", "0");
         }
         assert!(
             resolve_server_policy(&config).is_err(),
@@ -3081,12 +3114,15 @@ command = ["sh", "-c", "sleep 30"]"#,
         .await
         .expect_err("frozen policy must survive the env change past policy");
         assert!(
-            !error.to_string().contains("GC"),
+            !error.to_string().contains("GC") && !error.to_string().contains("IDEMPOTENCY"),
             "frozen serve must not fail on the poisoned env: {error}"
         );
         // SAFETY: still holding the guard.
         unsafe {
             std::env::remove_var("AUTO_GC");
+            std::env::remove_var("IDEMPOTENCY_PENDING_LEASE_SECS");
+            std::env::remove_var("IDEMPOTENCY_PEER_WAIT_SECS");
+            std::env::remove_var("IDEMPOTENCY_PEER_POLL_MS");
         }
     }
 

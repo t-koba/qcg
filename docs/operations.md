@@ -741,7 +741,19 @@ Admission records and run coordination locks are different mechanisms.
   resist capacity eviction and can temporarily exceed the budget. A retained
   key with identical content replays the original result; same-process identical
   pending requests wait and replay, while a request encountering another
-  process's pending claim may return `503 Service Unavailable`. Changed
+  process's pending claim may return `503 Service Unavailable`. Boot-frozen
+  positive integers `IDEMPOTENCY_PENDING_LEASE_SECS` (default 60),
+  `IDEMPOTENCY_PEER_WAIT_SECS` (default 30), and `IDEMPOTENCY_PEER_POLL_MS`
+  (default 100) control same-digest adoption timing and cross-process polling;
+  invalid, zero or non-Unicode values refuse boot. The wait timeout applies
+  separately to gate acquisition and Ready waiting, with polling capped by
+  the remaining wait. Shared peers should match the Pending lease for
+  consistent timing; wait/poll values may differ without changing ownership.
+  Expiry never bypasses the exact key gate, permits different-digest adoption,
+  or authorizes age-only Pending deletion. Ready TTL and its matching-peer
+  requirement are unchanged; the adoption lease does not govern temp cleanup.
+  See the [idempotency timing settings](http-server-guide.md) for
+  the full contract. Changed
   content for a still-bound key returns `409 Conflict`. Expiry, not cache
   eviction, makes the key eligible for new admission: a reuse may start
   another run and repeat side effects. Expiry does not delete or undo the

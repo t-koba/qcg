@@ -3,6 +3,7 @@ mod config;
 mod error;
 mod generators;
 mod idempotency;
+pub use idempotency::config::IdempotencyTiming;
 mod mcp;
 mod middleware;
 mod otlp;
