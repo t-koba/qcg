@@ -9,7 +9,7 @@ export const isTestPath = (p) => {
   return a.includes("tests") || a.includes("test_support") || ["tests.rs", "test_support.rs"].includes(a[a.length - 1]);
 };
 function braceDelta(s, q) {
-  let n = 0;
+  let n = 0, opened = false;
   for (let i = 0; i < s.length;) {
     if (q.block) { if (s.startsWith("/*", i)) { q.block++; i += 2; } else if (s.startsWith("*/", i)) { q.block--; i += 2; } else i++; continue; }
     if (q.raw !== null) { const e = s.indexOf('"' + "#".repeat(q.raw), i); if (e < 0) break; i = e + q.raw + 1; q.raw = null; continue; }
@@ -20,9 +20,13 @@ function braceDelta(s, q) {
     if (raw) { q.raw = (raw[1] || "").length; i += raw[0].length; }
     else if (ch) i += ch[0].length;
     else if (s[i] === '"') { q.quote = '"'; i++; }
-    else { n += s[i] === "{" ? 1 : s[i] === "}" ? -1 : 0; i++; }
+    else {
+      if (s[i] === "{") { n++; opened = true; }
+      else if (s[i] === "}") n--;
+      i++;
+    }
   }
-  return n;
+  return { delta: n, opened };
 }
 function isTestOnlyCfg(line) {
   return /^\s*#\[cfg\((?:test|all\((?:[^()]*,\s*)?test(?:\s*,[^()]*)?\)|any\(test,\s*feature\s*=\s*"test-hooks"\))\)\]\s*$/.test(line);
@@ -40,16 +44,16 @@ export function splitSrcFile(s, path) {
       let start = m;
       if (!a[m].includes("{")) { if (a[m].trim().endsWith(";") || !a[m + 1]?.trim().startsWith("{")) continue; start++; }
       const q = { block: 0, raw: null, quote: "" }; let depth = 0;
-      for (let end = start; end < a.length; end++) if ((depth += braceDelta(a[end], q)) === 0) { test += end - i + 1; i = end; break; }
+      for (let end = start; end < a.length; end++) if ((depth += braceDelta(a[end], q).delta) === 0) { test += end - i + 1; i = end; break; }
       continue;
     }
     const isLet = /^let\b/.test(a[m]?.trim() || ""), isIf = /^if\b/.test(a[m]?.trim() || "");
     if (!isLet && !isIf) continue;
     const q = { block: 0, raw: null, quote: "" }; let depth = 0, opened = false;
     for (let end = m; end < a.length; end++) {
-      const delta = braceDelta(a[end], q);
-      depth += delta;
-      opened ||= delta > 0;
+      const braces = braceDelta(a[end], q);
+      depth += braces.delta;
+      opened ||= braces.opened;
       if ((isLet && depth === 0 && a[end].includes(";")) || (isIf && opened && depth === 0)) {
         test += end - i + 1;
         i = end;

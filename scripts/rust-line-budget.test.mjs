@@ -30,6 +30,11 @@ test("test paths and test-only cfg items split physical lines", () => {
     '    #[cfg(any(test, feature = "test-hooks"))]', "    if let Some(hook) = hook {", "        hook();", "    }", "}", "",
   ].join("\n");
   assert.deepEqual(splitSrcFile(hooks, "crates/demo/src/lib.rs"), { product: 2, test: 8 });
+  const balancedIf = [
+    "#[cfg(test)]", "if true { test_hook(); }", "fn production() {",
+    "    perform_work();", "}", "fn after() {}", "",
+  ].join("\n");
+  assert.deepEqual(splitSrcFile(balancedIf, "crates/demo/src/lib.rs"), { product: 4, test: 2 });
   assert.deepEqual(splitSrcFile('#[cfg(any(test, feature = "test-hooks"))]\nmod hooks {\n}\n', "crates/demo/src/lib.rs"), { product: 0, test: 3 });
 });
 
