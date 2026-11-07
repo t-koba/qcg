@@ -242,8 +242,8 @@ impl ReadStore {
             }
             entries.remove(&path)
         };
-        // Unix identifies replacement by inode. Other platforms rebuild on any
-        // change rather than guessing whether a replacement was an append.
+        // Unix identity makes growth a candidate append.
+        // Other platforms rebuild rather than guess replacement semantics.
         use sha2::Digest as _;
         let mut view = RunReadView::default();
         let mut prefix_hash = sha2::Sha256::new();
@@ -254,8 +254,7 @@ impl ReadStore {
             && revision.len > entry.revision.len
             && let Some(expected_digest) = entry.prefix_digest.as_ref()
         {
-            // File identity and growth do not prove the old prefix is intact.
-            // Verify its complete digest before resuming the fold at the old offset.
+            // Inode and growth do not prove the prefix; verify it before resuming the fold.
             file.seek(std::io::SeekFrom::Start(0))?;
             let mut actual_hash = sha2::Sha256::new();
             let mut remaining = entry.revision.len;
@@ -272,9 +271,7 @@ impl ReadStore {
                     .fetch_add(count as u64, std::sync::atomic::Ordering::Relaxed);
                 remaining -= count as u64;
             }
-            if remaining == 0
-                && actual_hash.clone().finalize().as_slice() == expected_digest.as_slice()
-            {
+            if remaining == 0 && actual_hash.clone().finalize()[..] == expected_digest[..] {
                 view = Arc::unwrap_or_clone(prior_view);
                 prefix_hash = actual_hash;
             }
