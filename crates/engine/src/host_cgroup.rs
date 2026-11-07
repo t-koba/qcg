@@ -65,7 +65,7 @@ pub enum HostCgroupReconcile {
     NotBound,
     /// Binding already marked cleaned: idempotent no-op.
     AlreadyCleaned,
-    /// Subtree was killed, confirmed empty, and removed.
+    /// Subtree was removed, or a never-launched Prepared candidate was absent.
     Cleaned,
 }
 
@@ -265,6 +265,21 @@ pub fn bind_host_cgroup(
     meta_dir: &Utf8Path,
     run_id: &str,
 ) -> Result<Option<HostCgroupScope>, HostCgroupError> {
+    bind_host_cgroup_inner(
+        config,
+        meta_dir,
+        run_id,
+        #[cfg(test)]
+        || Ok(()),
+    )
+}
+
+fn bind_host_cgroup_inner(
+    config: &HostCgroupConfig,
+    meta_dir: &Utf8Path,
+    run_id: &str,
+    #[cfg(test)] _before_bound: impl FnOnce() -> Result<(), HostCgroupError>,
+) -> Result<Option<HostCgroupScope>, HostCgroupError> {
     let Some(_parent) = config.parent() else {
         return Ok(None);
     };
@@ -294,37 +309,49 @@ pub fn bind_host_cgroup(
         if !is_strictly_inside(&canonical_parent, &run_root) {
             return Err(HostCgroupError::bind("run root escapes delegated parent"));
         }
+        // Persist intent before creating any external resource. This path/nonce
+        // is evidence of an attempt, not durable ownership of an existing object.
+        let mut binding = HostCgroupBinding {
+            version: HOST_CGROUP_BINDING_VERSION,
+            run_id: run_id.to_string(),
+            nonce: nonce.clone(),
+            delegated_parent: canonical_parent.clone(),
+            run_root: run_root.clone(),
+            boot_id: boot_id.clone(),
+            prepared: true,
+            cleaned: false,
+            empty_confirmed: false,
+        };
+        write_binding_atomically(meta_dir, &binding)?;
         std::fs::create_dir(&run_root).map_err(|error| {
             HostCgroupError::bind(format!("cannot create per-run cgroup root: {error}"))
         })?;
         let canonical_root = run_root.canonicalize().map_err(|error| {
-            // Preserve the created directory for diagnosis; binding is not recorded.
             HostCgroupError::bind(format!("cannot canonicalize per-run cgroup root: {error}"))
         })?;
-        if !is_strictly_inside(&canonical_parent, &canonical_root) {
+        if canonical_root != run_root {
             return Err(HostCgroupError::bind(
-                "per-run cgroup root canonical path escapes delegated parent",
+                "per-run cgroup root canonical identity changed",
             ));
         }
         validate_delegated_parent(&canonical_root)?;
         validate_run_cgroup_files(&canonical_root)?;
-        // Empty leaf: prove kill works, without touching the owner/parent.
-        std::fs::write(canonical_root.join("cgroup.kill"), "1")?;
         if read_occupancy(&canonical_root)? {
             return Err(HostCgroupError::bind(
                 "new run cgroup unexpectedly occupied",
             ));
         }
-        let binding = HostCgroupBinding {
-            version: HOST_CGROUP_BINDING_VERSION,
-            run_id: run_id.to_string(),
-            nonce: nonce.clone(),
-            delegated_parent: canonical_parent.clone(),
-            run_root: canonical_root.clone(),
-            boot_id: boot_id.clone(),
-            cleaned: false,
-            empty_confirmed: false,
-        };
+        // Verify the kill interface only after confirming the new root is empty,
+        // then confirm it remains empty before publishing Bound.
+        std::fs::write(canonical_root.join("cgroup.kill"), "1")?;
+        if read_occupancy(&canonical_root)? {
+            return Err(HostCgroupError::bind(
+                "new run cgroup unexpectedly occupied after kill validation",
+            ));
+        }
+        #[cfg(test)]
+        let () = _before_bound()?;
+        binding.prepared = false;
         write_binding_atomically(meta_dir, &binding)?;
         Ok(Some(HostCgroupScope {
             delegated_parent: canonical_parent,
@@ -405,7 +432,12 @@ pub fn retire_host_scope(meta: &Utf8Path, scope: &HostCgroupScope) -> Result<(),
     let binding = load_host_binding(meta)?
         .ok_or_else(|| HostCgroupError::identity("missing host binding"))?;
     validate_binding(&binding, &HostCgroupConfig::disabled(), &scope.run_id)?;
-    if binding.scope() != *scope {
+    let Some(bound) = binding.scope() else {
+        return Err(HostCgroupError::identity(
+            "Prepared host-cgroup intent has no usable scope; ownership unproven; refusing kill/removal",
+        ));
+    };
+    if bound != *scope {
         return Err(HostCgroupError::identity(
             "host binding changed during execution",
         ));
@@ -466,7 +498,8 @@ fn validate_binding_record(
     binding: &HostCgroupBinding,
     expected: &str,
 ) -> Result<(), HostCgroupError> {
-    if binding.version != HOST_CGROUP_BINDING_VERSION
+    if !(binding.version == HOST_CGROUP_BINDING_VERSION
+        || (binding.version == 1 && !binding.prepared))
         || binding.run_id != expected
         || binding.nonce.len() != 32
         || !binding
@@ -476,6 +509,7 @@ fn validate_binding_record(
         || binding.boot_id.is_empty()
         || !binding_paths_match(binding, expected)
         || (binding.cleaned && !binding.empty_confirmed)
+        || (binding.prepared && binding.empty_confirmed && !binding.cleaned)
     {
         return Err(HostCgroupError::identity(
             "host-cgroup binding run/nonce/root/retirement identity mismatch; refusing",
@@ -504,15 +538,36 @@ fn binding_paths_match(binding: &HostCgroupBinding, expected: &str) -> bool {
 
 #[cfg(target_os = "linux")]
 fn retire_binding(meta: &Utf8Path, mut binding: HostCgroupBinding) -> Result<(), HostCgroupError> {
-    match std::fs::symlink_metadata(&binding.run_root) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && binding.empty_confirmed => {}
-        Err(error) => return Err(error.into()),
-        Ok(_) => {
-            kill_and_confirm(&binding.scope())?;
-            binding.empty_confirmed = true;
-            write_binding_atomically(meta, &binding)?;
-            remove_nested_cgroups(&binding.run_root)?;
-            std::fs::remove_dir(&binding.run_root)?;
+    if binding.prepared {
+        // No filesystem identity was durably recorded across mkdir/publication.
+        // Even an empty candidate at the intended name is not ours to remove.
+        match std::fs::symlink_metadata(&binding.run_root) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                binding.empty_confirmed = true;
+            }
+            candidate => {
+                return Err(HostCgroupError::identity(format!(
+                    "Prepared host-cgroup candidate exists or cannot be inspected ({candidate:?}); ownership unproven; refusing kill/removal"
+                )));
+            }
+        }
+    } else {
+        match std::fs::symlink_metadata(&binding.run_root) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound && binding.empty_confirmed => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                let Some(scope) = binding.scope() else {
+                    return Err(HostCgroupError::identity(
+                        "Prepared host-cgroup intent has no usable scope; refusing kill/removal",
+                    ));
+                };
+                kill_and_confirm(&scope)?;
+                binding.empty_confirmed = true;
+                write_binding_atomically(meta, &binding)?;
+                remove_nested_cgroups(&binding.run_root)?;
+                std::fs::remove_dir(&binding.run_root)?;
+            }
         }
     }
     binding.cleaned = true;
@@ -545,6 +600,7 @@ fn kill_and_confirm(scope: &HostCgroupScope) -> Result<(), HostCgroupError> {
             delegated_parent: scope.delegated_parent.clone(),
             run_root: scope.run_root.clone(),
             boot_id: scope.boot_id.clone(),
+            prepared: false,
             cleaned: false,
             empty_confirmed: false,
         },
@@ -785,6 +841,7 @@ mod cleaned_binding_tests {
             run_root: PathBuf::from(format!("{parent}/{}", run_root_name("run", &nonce))),
             delegated_parent: PathBuf::from(parent),
             boot_id: "previous-boot".into(),
+            prepared: false,
             cleaned,
             empty_confirmed,
         };
@@ -829,6 +886,7 @@ mod identity_tests {
             run_root: parent.join(run_root_name("run", &nonce)),
             delegated_parent: parent,
             boot_id: current_boot_id().unwrap(),
+            prepared: false,
             cleaned: true,
             empty_confirmed: true,
         };
@@ -1041,3 +1099,7 @@ mod identity_tests {
         std::fs::remove_dir_all(meta).unwrap();
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "tests/host_cgroup_prepared.rs"]
+mod prepared_tests;

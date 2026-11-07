@@ -429,7 +429,8 @@ fn host_cgroup_owner_sigkill_launch_and_workload_recovery() {
         let scope = engine::host_cgroup::load_host_binding(&meta)
             .unwrap()
             .unwrap()
-            .scope();
+            .scope()
+            .expect("Bound binding must yield a scope");
         if phase == "workload" {
             let membership = std::fs::read_to_string(meta.join("membership")).unwrap();
             assert_eq!(

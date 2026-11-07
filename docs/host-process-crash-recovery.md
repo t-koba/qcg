@@ -22,9 +22,10 @@ already be delegated to the qcg user: absolute, beneath `/sys/fs/cgroup`
 (never the mount itself), a v2 domain cgroup with writable `cgroup.procs`,
 readable `cgroup.events` with a valid `populated` field.
 No controllers are enabled or required; `cgroup.subtree_control` need not be
-writable. qcg creates a per-run child and verifies that its `cgroup.kill`
-works while empty, before binding or launching a payload. The parent itself
-need not grant kill permission. qcg never chowns or sudoes beneath a shared
+writable. qcg records intent before creating a per-run child, confirms the
+new root is empty, then writes `1` to its `cgroup.kill` interface and confirms
+it remains empty before publishing Bound or launching a payload. The parent
+itself need not grant kill permission. qcg never chowns or sudoes beneath a shared
 root at runtime. The host must expose cgroup v2 (`0::` in `/proc/self/cgroup`
 and `cgroup.controllers` at the mount).
 
@@ -59,9 +60,18 @@ external effect was unapplied or make an indeterminate operation safe to replay.
 
 When enabled, qcg binds one unique per-run-execution root beneath the
 authorized delegated parent before any host launch, including MCP connection
-setup. The binding is durably recorded in `meta/host-cgroup.json` with the
-run id, a fresh nonce, canonical parent and root paths, kernel boot id, and a
-cleaned flag. The root name is `qcg-<sanitized-run-id>-<nonce>`.
+setup. Schema v2 in `meta/host-cgroup.json` first durably records a Prepared
+intent (`prepared: true`) with the run id, a fresh nonce, canonical parent
+and intended root paths, kernel boot id, and retirement flags **before mkdir**.
+Only that exact path is created and validated while still Prepared: empty
+confirmation, `cgroup.kill` validation, then post-kill empty confirmation.
+Only then qcg publishes Bound (`prepared: false`) durably before returning a
+launch scope. A Prepared intent never yields a usable scope
+(`binding.scope()` is `None` while `prepared`).
+The root name is `qcg-<sanitized-run-id>-<nonce>`. Legacy v1 records without
+`prepared` remain Bound (default false), never Prepared; v1 with Prepared
+set is refused. Older binaries refuse v2 rather than misreading an intent as
+cleanup authority.
 
 Only permission-checked `trusted_host` commands and host-mode MCP stdio
 payloads attach this scope. Docker/Podman/Incus clients, lifecycle helpers,
@@ -97,7 +107,30 @@ and same kernel boot before targeting anything. With the parent variable
 unset it uses the persisted parent. It never infers ownership from PID/PGID
 numbers.
 
-Cleanup kills the whole root via `cgroup.kill`, confirms `cgroup.events`
+A Prepared intent does **not** prove ownership of an existing filesystem
+object. Reconciliation under exclusive run ownership first validates the run,
+nonce, boot, canonical parent and configured-parent identity. If the exact
+candidate is absent, it retires the never-launched attempt (`cleaned` and
+`empty_confirmed` record absence for Prepared), allowing a fresh nonce on the
+next attempt. If the candidate exists, even empty, or cannot be inspected,
+reconciliation returns a visible identity error, preserves the intent and
+candidate, and blocks same-run retries, deletion and retention GC. A persisted
+Prepared intent never authorizes `cgroup.kill` or directory removal during
+reconciliation and never yields a usable launch/cleanup scope; only the still-
+running binder may write `cgroup.kill` to its just-created, empty root as a
+validation probe. No name-prefix scan, parent sweep, or name-only deletion is
+used.
+
+This does not completely eliminate resource leaks: mkdir and durable Bound
+publication are separate operations, with no durable filesystem ownership
+identity across the gap. A crash or validation/publication error after mkdir
+can leave an ambiguous Prepared candidate that qcg cannot safely remove.
+Pre-change roots created before any sidecar was published remain untracked
+and also cannot be automatically removed. Keep the evidence and have the
+operator establish ownership outside qcg before any manual intervention;
+a matching run/nonce/path or an empty cgroup alone is insufficient proof.
+
+For Bound records, cleanup kills the whole root via `cgroup.kill`, confirms `cgroup.events`
 reports `populated 0`, and removes nested cgroups bottom-up. Confirmation
 uses deployment settings `QCG_HOST_CGROUP_CLEANUP_TIMEOUT_MS` (default 10000)
 and `QCG_HOST_CGROUP_POLL_MS` (default 50), positive integer milliseconds;
@@ -108,7 +141,7 @@ Binding updates use a unique create-new temporary file, file fsync, atomic
 rename, and metadata-directory fsync. Empty confirmation is durably recorded
 *before* directory removal, then `cleaned` is recorded after removal. Recovery
 can finish an interrupted retirement from that durable confirmation. Missing
-roots without it remain ambiguous and refuse cleanup. Timeouts, I/O errors,
+Bound roots without it remain ambiguous and refuse cleanup. Timeouts, I/O errors,
 or identity ambiguity retain evidence and block recovery/deletion; normal
 retirement errors are returned visibly. Stopping processes never resolves an
 indeterminate operation or bypasses Started/Repeat policy.
@@ -200,7 +233,15 @@ Tests without a configured parent skip live cgroup cases (including on a
 read-only local sandbox); a configured but unusable parent fails, never skips.
 Coverage includes launch membership, MCP transport launch, session escape,
 leader exit, sibling isolation, binding tampering, replay lease exclusion,
-incomplete-admission evidence retention, and interrupted retirement. A separate
+incomplete-admission evidence retention, and interrupted retirement. Test-only
+binding checkpoints also inject an error or SIGKILL the owner after root
+creation and validation but before Bound publication. They check byte-identical
+Prepared evidence, candidate identity and occupancy, Prepared scope absence,
+non-destructive refusal, sibling survival, absent-candidate retirement and v1
+Bound compatibility.
+Service deletion and GC tests also exercise Prepared refusal before normal
+Bound retirement. The existing delegated harness runs these tests; production
+has no environment-driven checkpoint or failure hook. A separate
 owner test executable uses qcg's binding/launch/reconciliation APIs: controlled
 pre-placement and pre-exec barriers plus a running workload let the runner
 SIGKILL the owner (not the command leader), then start a different owner to

@@ -510,7 +510,8 @@ command = ["sh", "-c", "cat /proc/self/cgroup > membership; echo $$ > pids; exec
             let scope = engine::host_cgroup::load_host_binding(&meta)
                 .unwrap()
                 .unwrap()
-                .scope();
+                .scope()
+                .expect("Bound binding must yield a scope");
             let membership = std::fs::read_to_string(fixture.0.join("out/membership")).unwrap();
             assert_eq!(
                 membership.trim(),

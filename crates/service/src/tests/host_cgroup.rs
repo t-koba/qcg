@@ -72,6 +72,7 @@ fn tampered_binding_is_refused_before_started_gate() {
         delegated_parent: std::path::PathBuf::from("/sys/fs/cgroup/qcg.slice"),
         run_root: std::path::PathBuf::from("/sys/fs/cgroup/other/qcg-run-n"),
         boot_id: "boot".into(),
+        prepared: false,
         cleaned: false,
         empty_confirmed: false,
     };
@@ -136,6 +137,7 @@ fn foreign_boot_is_refused_and_preserves_binding() {
             "a".repeat(32)
         )),
         boot_id: "definitely-not-the-current-boot".into(),
+        prepared: false,
         cleaned: false,
         empty_confirmed: false,
     };
@@ -278,6 +280,20 @@ fn wait_for_child_exit(child: &mut std::process::Child) {
     panic!("cgroup cleanup did not terminate the child");
 }
 
+// Synthetic Prepared evidence exercises the service's refusal boundary; the
+// engine tests separately crash during real creation before Bound publication.
+#[cfg(target_os = "linux")]
+fn mark_prepared(meta: &camino::Utf8Path) -> Vec<u8> {
+    let path = engine::host_cgroup::binding_path(meta);
+    let bound = std::fs::read(&path).unwrap();
+    let mut binding = engine::host_cgroup::load_host_binding(meta)
+        .unwrap()
+        .unwrap();
+    binding.prepared = true;
+    std::fs::write(path, serde_json::to_vec(&binding).unwrap()).unwrap();
+    bound
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn delete_reconciles_host_tree_before_retaining_started_journal() {
@@ -305,6 +321,17 @@ async fn delete_reconciles_host_tree_before_retaining_started_journal() {
     engine::host_cgroup::apply_scope_to_std_command(&mut command, &scope).unwrap();
     let mut child = command.spawn().unwrap();
     wait_for_child_placement(&scope, child.id());
+
+    let bound = mark_prepared(&meta);
+    let path = engine::host_cgroup::binding_path(&meta);
+    let prepared = std::fs::read(&path).unwrap();
+    let error = service.delete_run(id).await.unwrap_err();
+    assert!(error.to_string().contains("ownership unproven"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), prepared);
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(scope.run_root.is_dir() && run_dir.exists());
+    // Restore the test's known Bound record to exercise ordinary retirement.
+    std::fs::write(&path, bound).unwrap();
 
     // Deletion reconciles external processes first, then preserves the
     // unresolved operation journal under the existing Started policy.
@@ -364,6 +391,16 @@ fn retention_gc_reconciles_host_tree_before_removing_terminal_run() {
     engine::host_cgroup::apply_scope_to_std_command(&mut command, &scope).unwrap();
     let mut child = command.spawn().unwrap();
     wait_for_child_placement(&scope, child.id());
+
+    let bound = mark_prepared(&meta);
+    let path = engine::host_cgroup::binding_path(&meta);
+    let prepared = std::fs::read(&path).unwrap();
+    let error = crate::summaries::gc_run_directories(&runs, 0, 0, true, 100).unwrap_err();
+    assert!(error.to_string().contains("ownership unproven"), "{error}");
+    assert_eq!(std::fs::read(&path).unwrap(), prepared);
+    assert!(child.try_wait().unwrap().is_none());
+    assert!(scope.run_root.is_dir() && run_dir.exists());
+    std::fs::write(&path, bound).unwrap();
 
     let deleted = crate::summaries::gc_run_directories(&runs, 0, 0, true, 100).unwrap();
     assert_eq!(deleted, vec![run_dir.clone()]);

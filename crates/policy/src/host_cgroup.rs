@@ -21,7 +21,7 @@ pub const HOST_CGROUP_PARENT_ENV: &str = "QCG_HOST_CGROUP_PARENT";
 pub const HOST_CGROUP_BINDING_FILE: &str = "host-cgroup.json";
 
 /// Current binding schema version.
-pub const HOST_CGROUP_BINDING_VERSION: u32 = 1;
+pub const HOST_CGROUP_BINDING_VERSION: u32 = 2;
 
 /// Canonical cgroup-v2 mount point checked for prefix safety.
 pub const CGROUP2_MOUNT: &str = "/sys/fs/cgroup";
@@ -213,24 +213,31 @@ pub struct HostCgroupBinding {
     pub run_root: PathBuf,
     /// Kernel boot id at bind time.
     pub boot_id: String,
-    /// Whether the subtree was killed, confirmed empty, and removed.
+    /// Intent persisted before mkdir; never authorizes killing or removing a candidate.
+    /// Legacy v1 bindings are already Bound, not Prepared.
+    #[serde(default)]
+    pub prepared: bool,
+    /// Whether the subtree was retired (or a never-launched Prepared root was absent).
     #[serde(default)]
     pub cleaned: bool,
-    /// Durable empty confirmation before directory retirement.
+    /// Durable empty confirmation before directory retirement, or Prepared absence.
     #[serde(default)]
     pub empty_confirmed: bool,
 }
 
 impl HostCgroupBinding {
-    /// Scope view of this binding.
-    pub fn scope(&self) -> HostCgroupScope {
-        HostCgroupScope {
+    /// Bound scope view; `None` while Prepared (intent, never authority).
+    pub fn scope(&self) -> Option<HostCgroupScope> {
+        if self.prepared {
+            return None;
+        }
+        Some(HostCgroupScope {
             delegated_parent: self.delegated_parent.clone(),
             run_root: self.run_root.clone(),
             run_id: self.run_id.clone(),
             nonce: self.nonce.clone(),
             boot_id: self.boot_id.clone(),
-        }
+        })
     }
 }
 
