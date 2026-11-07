@@ -43,6 +43,10 @@ test("test paths and test-only cfg items split physical lines", () => {
     "#[cfg(test)]", "if {", "    true", "}", "{", "    test_hook();", "}", "fn production() {}", "",
   ].join("\n");
   assert.deepEqual(splitSrcFile(blockConditionMultiline, "crates/demo/src/lib.rs"), { product: 1, test: 7 });
+  const compoundBlockCondition = [
+    "#[cfg(test)]", "if { true } && { true }", "{", "    test_hook();", "}", "fn production() {}", "",
+  ].join("\n");
+  assert.deepEqual(splitSrcFile(compoundBlockCondition, "crates/demo/src/lib.rs"), { product: 1, test: 5 });
   assert.deepEqual(splitSrcFile('#[cfg(any(test, feature = "test-hooks"))]\nmod hooks {\n}\n', "crates/demo/src/lib.rs"), { product: 0, test: 3 });
 });
 

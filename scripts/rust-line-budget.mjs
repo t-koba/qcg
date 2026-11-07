@@ -10,19 +10,21 @@ export const isTestPath = (p) => {
 };
 function braceDelta(s, q) {
   let n = 0, opened = false, braces = [];
+  q.last ??= "";
   for (let i = 0; i < s.length;) {
     if (q.block) { if (s.startsWith("/*", i)) { q.block++; i += 2; } else if (s.startsWith("*/", i)) { q.block--; i += 2; } else i++; continue; }
-    if (q.raw !== null) { const e = s.indexOf('"' + "#".repeat(q.raw), i); if (e < 0) break; i = e + q.raw + 1; q.raw = null; continue; }
-    if (q.quote) { if (s[i] === "\\") i += 2; else if (s[i] === q.quote) { q.quote = ""; i++; } else i++; continue; }
+    if (q.raw !== null) { const e = s.indexOf('"' + "#".repeat(q.raw), i); if (e < 0) break; i = e + q.raw + 1; q.raw = null; q.last = "v"; continue; }
+    if (q.quote) { if (s[i] === "\\") i += 2; else if (s[i] === q.quote) { q.quote = ""; q.last = "v"; i++; } else i++; continue; }
     if (s.startsWith("//", i)) break;
     if (s.startsWith("/*", i)) { q.block = 1; i += 2; continue; }
     const raw = /^(?:br|r)(#+)?"/.exec(s.slice(i)), ch = /^'(?:\\.|[^'\\])'/.exec(s.slice(i));
     if (raw) { q.raw = (raw[1] || "").length; i += raw[0].length; }
-    else if (ch) i += ch[0].length;
+    else if (ch) { i += ch[0].length; q.last = "v"; }
     else if (s[i] === '"') { q.quote = '"'; i++; }
     else {
-      if (s[i] === "{") { n++; opened = true; braces.push(1); }
-      else if (s[i] === "}") { n--; braces.push(-1); }
+      if (s[i] === "{") { n++; opened = true; braces.push({ delta: 1, previous: q.last }); q.last = "{"; }
+      else if (s[i] === "}") { n--; braces.push({ delta: -1, previous: q.last }); q.last = "}"; }
+      else if (!/\s/.test(s[i])) q.last = s[i];
       i++;
     }
   }
@@ -50,22 +52,23 @@ export function splitSrcFile(s, path) {
     const isLet = /^let\b/.test(a[m]?.trim() || ""), isIf = /^if\b/.test(a[m]?.trim() || "");
     if (!isLet && !isIf) continue;
     if (isIf && /^if\s*\{/.test(a[m]?.trim() || "")) {
-      // The first block is the condition; the next is the if body.
+      // Blocks after a condition block can still be condition operands (e.g. `&& { ... }`).
       const q = { block: 0, raw: null, quote: "" };
       let conditionDepth = 0, conditionComplete = false, bodyDepth = 0;
       for (let end = m; end < a.length; end++) {
         let completed = false;
         for (const brace of braceDelta(a[end], q).braces) {
           if (!conditionComplete) {
-            conditionDepth += brace;
+            conditionDepth += brace.delta;
             if (conditionDepth === 0) conditionComplete = true;
             continue;
           }
           if (bodyDepth === 0) {
-            if (brace > 0) bodyDepth = brace;
+            const continuesCondition = brace.previous !== "" && "&|=+-*/%!<>^".includes(brace.previous);
+            if (brace.delta > 0 && !continuesCondition) bodyDepth = brace.delta;
             continue;
           }
-          bodyDepth += brace;
+          bodyDepth += brace.delta;
           if (bodyDepth === 0) {
             test += end - i + 1;
             i = end;
