@@ -1259,23 +1259,28 @@ async fn interaction_process_crash_with_lease(
     .await
     .unwrap();
     let run_dir = owner.run_dir_for(&id).await.unwrap();
-    let lease = if hold_execution_lease {
-        let lease = fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(run_dir.join("meta/execution.lock"))
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            match lease.try_lock() {
-                Ok(()) => break,
-                Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
-                Err(error) => panic!("lease failed: {error:?}"),
-            }
-            assert!(Instant::now() < deadline, "execution lease timed out");
+    // Waiting/Confirming is published before the old engine task necessarily
+    // drops its execution lease. Prove the handoff before the peer starts;
+    // otherwise it can exhaust the service lease wait while this current-thread
+    // test blocks at the child barrier, leaving no local resumer to drive it.
+    let lease = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(run_dir.join("meta/execution.lock"))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match lease.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) => tokio::task::yield_now().await,
+            Err(error) => panic!("lease failed: {error:?}"),
         }
+        assert!(Instant::now() < deadline, "execution lease timed out");
+    }
+    let lease = if hold_execution_lease {
         Some(lease)
     } else {
+        lease.unlock().unwrap();
         None
     };
     drop(owner);
