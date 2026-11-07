@@ -644,23 +644,27 @@ fn populate_checkpoint_fork(
     }
     let mut required_blobs = BTreeMap::<String, Utf8PathBuf>::new();
     for event in &selected {
+        if event["t"] == "agent_file_changes" {
+            let removed: BTreeSet<_> = event["removed_files"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            latest_files.retain(|path, _| !removed.contains(path.as_str()));
+        }
         if event.get("t").and_then(Value::as_str) != Some("step_finished") {
             continue;
         }
-        // Both success and failure pins must survive: historical revisions
-        // include failed-step-only updates, and resume verifies every
-        // historical blob. Collecting only `files` would orphan
-        // `failed_files` blobs and make a valid fork unresumable (E06).
-        let mut pins: Vec<&Value> = Vec::new();
-        if let Some(files) = event.get("files").and_then(Value::as_array) {
-            pins.extend(files.iter());
-        }
-        if let Some(failed) = event.get("failed_files").and_then(Value::as_array) {
-            pins.extend(failed.iter());
-        }
-        if pins.is_empty() {
-            continue;
-        }
+        // Keep success and failure pins: resume verifies every historical blob.
+        // Only successful or suspended step outputs project into the workspace.
+        let pins = ["files", "failed_files"].into_iter().flat_map(|key| {
+            event
+                .get(key)
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+        });
         let status = event.get("status").and_then(Value::as_str);
         let projects_workspace = matches!(
             status,
@@ -690,10 +694,8 @@ fn populate_checkpoint_fork(
         }
     }
     policy::path::validate_path_tree_set(latest_files.keys().map(|p| (p.as_str(), false)))?;
-    // Fresh target workspace, but every nested parent is still validated
-    // level by level: a pre-planted symlink inside the fresh tree must not
-    // redirect blob copies outside (strongest isolation, same invariant as
-    // FsGateway for file inputs).
+    // The target is fresh, but validate every parent to block symlink redirection.
+    // This preserves FsGateway's workspace-root confinement invariant.
     std::fs::create_dir_all(&target_workspace)?;
     let canonical_target_root = dunce::canonicalize(&target_workspace).map_err(|error| {
         ServiceError::Invalid(format!("fork target workspace is not canonical: {error}"))
@@ -705,9 +707,7 @@ fn populate_checkpoint_fork(
         if let Some(parent) = destination.parent() {
             ensure_dir_under_root(&target_workspace, &canonical_target_root, parent)?;
         }
-        // Consult the verified set BEFORE any copy or hash: a repeated
-        // digest across paths reuses the already-verified blob instead of
-        // recopying and rehashing the source (E06).
+        // Reuse prior digest verification across paths to avoid redundant copies/hashes (E06).
         if verified_blobs.contains(&digest) {
             let target_blob = target_meta.join("checkpoint-blobs").join(&digest);
             copy_verified_blob_to_workspace(&target_blob, &destination, &path, &digest)?;

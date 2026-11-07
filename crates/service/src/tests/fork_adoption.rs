@@ -1458,6 +1458,68 @@ async fn fork_reverse_name_order_projects_journal_later_revision() {
 }
 
 #[test]
+fn checkpoint_fork_does_not_restore_a_file_removed_after_its_success_pin() {
+    use sha2::{Digest as _, Sha256};
+
+    let root = temp_run_dir("fork-remove-after-pin");
+    let _guard = TempGuard(root.clone());
+    let source_dir = root.join("source");
+    let source_meta = run_meta_dir(&source_dir);
+    std::fs::create_dir_all(source_meta.join("checkpoint-blobs")).expect("source metadata");
+    let bytes = b"previously pinned bytes";
+    let digest = hex::encode(Sha256::digest(bytes));
+    std::fs::write(source_meta.join("checkpoint-blobs").join(&digest), bytes).expect("pinned blob");
+    let events = [
+        json!({
+            "t":"run_queued", "ts":"2026-01-01T00:00:00Z", "seq":1,
+            "run_id":"source", "generator":"g@1", "generator_path":"/tmp/g",
+            "contract_sha256":"sha", "inputs":{}, "answers":{}, "confirmations":{},
+            "schema_version":api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode":policy::ElapsedBudgetMode::WallClock,
+            "retention_days":0, "priority":0, "parent_run_id":null,
+            "effective_max_total_steps":64, "effective_policy_origin":"unit-test"
+        }),
+        json!({
+            "t":"step_finished", "ts":"2026-01-01T00:00:01Z", "seq":2,
+            "run_id":"source", "trace_id":"trace-source", "span_id":"span-2",
+            "node":"producer", "status":"success",
+            "files":[{"path":"out.txt", "sha256":digest}], "failed_files":[]
+        }),
+        json!({
+            "t":"agent_file_changes", "ts":"2026-01-01T00:00:02Z", "seq":3,
+            "run_id":"source", "trace_id":"trace-source", "span_id":"span-3",
+            "node":"agent", "removed_files":["out.txt"], "written_files":[]
+        }),
+    ];
+    let mut journal = String::new();
+    for event in events {
+        journal.push_str(&event.to_string());
+        journal.push('\n');
+    }
+    std::fs::write(source_meta.join("journal.jsonl"), journal).expect("source journal");
+
+    let fork_dir = root.join("fork");
+    crate::run_dirs::prepare_checkpoint_fork(
+        &source_dir,
+        "source",
+        &fork_dir,
+        "fork",
+        3,
+        &ForkStatePatch::default(),
+    )
+    .expect("checkpoint fork should succeed");
+
+    assert!(
+        !run_workspace_dir(&fork_dir).join("out.txt").exists(),
+        "the later removal must supersede the earlier success pin"
+    );
+    let state = engine::RunState::fold_journal(&run_meta_dir(&fork_dir).join("journal.jsonl"))
+        .expect("forked journal should fold");
+    assert!(state.removed_files.contains("out.txt"));
+    assert!(!state.latest_file_pins.contains_key("out.txt"));
+}
+
+#[test]
 fn confirmation_file_revision_is_restored_in_fork_without_pending_prompt() {
     use sha2::{Digest as _, Sha256};
 
