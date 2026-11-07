@@ -54,7 +54,7 @@ export function splitSrcFile(s, path) {
     if (isIf && /^if\s*\{/.test(a[m]?.trim() || "")) {
       // Blocks after a condition block can still be condition operands (e.g. `&& { ... }`).
       const q = { block: 0, raw: null, quote: "" };
-      let conditionDepth = 0, conditionComplete = false, bodyDepth = 0;
+      let conditionDepth = 0, conditionComplete = false, conditionOperandDepth = 0, bodyDepth = 0;
       for (let end = m; end < a.length; end++) {
         let completed = false;
         for (const brace of braceDelta(a[end], q).braces) {
@@ -63,9 +63,16 @@ export function splitSrcFile(s, path) {
             if (conditionDepth === 0) conditionComplete = true;
             continue;
           }
+          if (conditionOperandDepth > 0) {
+            conditionOperandDepth += brace.delta;
+            continue;
+          }
           if (bodyDepth === 0) {
             const continuesCondition = brace.previous !== "" && "&|=+-*/%!<>^".includes(brace.previous);
-            if (brace.delta > 0 && !continuesCondition) bodyDepth = brace.delta;
+            if (brace.delta > 0) {
+              if (continuesCondition) conditionOperandDepth = brace.delta;
+              else bodyDepth = brace.delta;
+            }
             continue;
           }
           bodyDepth += brace.delta;
