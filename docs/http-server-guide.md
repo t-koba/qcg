@@ -252,12 +252,16 @@ unrelated evidence is retained. Shutdown refusal can withdraw only a mailbox
 newly published by that call, not evidence accepted by an earlier request.
 Direct service and unkeyed HTTP cancels still generate fresh IDs.
 
-This is a **partial process-crash recovery step**, not a power-loss durability
-guarantee or general crash-after-acceptance reconciliation. Start/fork and
-answer/confirmation crash windows remain unresolved. Ambiguous Pending evidence
-is not reaped or retired by age; existing recovery and indeterminate-operation
-refusals still apply. An expired lease does not authorize takeover while its
-gate is held, and a released OS lock is not proof that an operation had no effects.
+This is process-crash recovery, not a power-loss durability guarantee. A
+same-key, same-request retry reconciles the tested post-acceptance/pre-Ready
+windows: start/fork reuse their reserved run identity, answer/confirmation
+retry the identical request against journaled service state, and cancel reuses
+its accepted mailbox identity. Process death releases the OS gate but retains Pending evidence; a
+retry may adopt it only under the existing same-digest rules. There is no
+age-only retirement or automatic conclusion that an operation had no effects;
+ambiguous evidence and existing indeterminate-operation refusals remain.
+An expired lease does not authorize takeover while its gate is held, and a
+released OS lock is not proof of power-loss durability.
 
 Legacy Pending JSON without an operation ID remains readable for live-peer
 waiting, but **expired adoption fails closed and retains the evidence** rather
