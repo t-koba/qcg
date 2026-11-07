@@ -3169,8 +3169,10 @@ async fn cancel_mailbox_precedes_denial_acceptance() {
             .manifest
             .runtime,
     );
-    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
-        .unwrap();
+    crate::run_dirs::request_remote_cancel_with_id(
+        &run_dir, &id, "peer", &operation, limits, None, false,
+    )
+    .unwrap();
     assert!(
         service
             .confirm(
@@ -3248,8 +3250,10 @@ async fn cancel_mailbox_precedes_confirmation_approval() {
             .manifest
             .runtime,
     );
-    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
-        .unwrap();
+    crate::run_dirs::request_remote_cancel_with_id(
+        &run_dir, &id, "peer", &operation, limits, None, false,
+    )
+    .unwrap();
     assert!(
         service
             .confirm(

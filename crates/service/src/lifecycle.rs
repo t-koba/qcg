@@ -484,27 +484,9 @@ impl LocalService {
                 runs.entry(run_id).or_insert(record);
             }
         }
-        // Merge durable journal progress into existing records so a browser
-        // attached to a non-owning process observes questions, answers, and
-        // terminal settlement. Remote cancel requests are honored here.
-        // The owner (task.is_some()) must observe them too: cancel its local
-        // token so the running engine stops, but never journal from here
-        // while the owner writer is live (A01/A02).
-        // Per-run lock release: filesystem I/O (cancel probe, fold, HITL)
-        // runs without holding the run-map lock, so refresh latency scales
-        // with I/O, not with lock contention against admission and
-        // subscribe (E12). Each iteration snapshots one run_dir, drops the
-        // lock for I/O, then re-acquires briefly to merge.
-        // A registration landing between the snapshot and its merge must
-        // not wait a full interval: one bounded delta pass covers ids that
-        // appeared mid-refresh. Two rounds cap the work under continuous
-        // admissions; anything newer waits for the next interval (E12).
-        // Staleness bound: the id collect/snapshot/merge gaps above mean a
-        // refresh observes state at most one 5 s interval plus two delta
-        // rounds old. That only delays convergence, never corrupts it: every
-        // merge re-derives from journal truth under a fresh write lock, so
-        // a racing admission or settlement wins by re-merge on the next
-        // interval instead of by lock ordering (E12).
+        // Merge journal/HITL state and remote cancels, including finished and
+        // peer records; live owners settle terminals. Keep I/O outside map locks
+        // and bound staleness to two passes plus the configured interval.
         let mut refreshed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         for _ in 0..2 {
             let ids: Vec<String> = {
@@ -557,68 +539,37 @@ impl LocalService {
                 let Some(record) = runs.get_mut(run_id.as_str()) else {
                     continue;
                 };
-                // Owner hand-off convergence (E12): adopt a changed
-                // execution-owner claim observed on disk. The claim is
-                // written by whoever holds the execution lease at spawn, so
-                // a peer takeover (shared-store hand-off, restart under a
-                // new owner id) surfaces here within one refresh interval
-                // instead of only at spawn time. The lease plus the journal
-                // stay authoritative; the claim is an advisory hint, and an
-                // unscannable claim keeps the current owner (never a guess).
+                // Treat owner hints as advisory; the execution lease stays authoritative.
                 if let Some(claimed) = read_run_execution_owner(&run_dir)
                     && claimed != record.owner_id
                 {
                     tracing::info!(run_id = %run_id, old_owner = %record.owner_id, new_owner = %claimed, "shared refresh observed an execution owner change");
                     record.owner_id = claimed;
                 }
-                // A finished handle no longer owns execution: merge durable
-                // progress for it instead of treating it as a live owner
-                // (E12). Live owners also merge read-only below: the fold and
-                // HITL maps converge terminal/pending/answers/prompts into
-                // memory without ever appending while the owner writer is live.
-                // Only the cancel token is prodded here; settlement stays with
-                // the owner writer (A01/A02/E12). The pre-I/O observations
-                // above are reused; no second filesystem probe occurs here.
                 if crate::types::task_slot_is_live(&record.task) {
-                    // Owner path: propagate peer cancel to the local engine task.
-                    // The engine task converts the control mailbox to a single
-                    // journal event under its own writer; this refresh never
-                    // appends while the owner writer is live. Journal I/O
-                    // failures skip this run instead of guessing cancel state.
+                    // Acceptance is journaled with mailbox publication; propagate
+                    // it and keep merging so live Waiting owners converge (E12).
                     if cancel_probe {
                         record.cancellation.cancel();
                     }
-                    // Fall through to the read-only merge below instead of
-                    // continuing: a live Waiting owner whose peer answered must
-                    // converge instead of staying stale (E12).
                 }
-                // Terminal settlement first: a bare cancel request must never
-                // shadow an owner-acknowledged terminal outcome as a bare
-                // "canceled" display. Cancellation only applies to runs with no
-                // durable terminal state yet.
+                // A bare cancel must never shadow a durable terminal outcome.
                 if let Some(terminal) = state.terminal.clone() {
                     record.state = terminal_status(&terminal);
                     continue;
                 }
                 if cancel_probe {
-                    // A peer requested cancellation via the shared journal.
-                    // Apply locally: stop any local task and mark the request
-                    // accepted. Only a journaled terminal state settles this
-                    // into `Canceled` (A02). Settlement follows through the
-                    // common finalizer: the periodic resumer spawns task-less
-                    // accepted runs and the spawned task settles, so refresh
-                    // itself never journals while ownership is ambiguous (B10).
+                    // Stop the live task; only its terminal settles cancellation (A02).
+                    // The shared finalizer handles task-less runs. Refresh never
+                    // settles ambiguous ownership (B10).
                     record.cancellation.cancel();
                     record.state = RunStatus::CancelRequested;
                     record.preempted = false;
                     record.clear_prompt();
                     continue;
                 }
-                // Refresh pending prompts and durable HITL maps from the journal.
-                // Journal I/O failures skip this run instead of merging
-                // half-read maps. Queue-order keys always derive from the
-                // journal so every process observes identical FIFO order.
-                // The pre-I/O HITL snapshot is reused (no second read).
+                // Refresh prompts/HITL from the journal; skip failures rather than
+                // merging partial maps. Queue order remains journal-derived.
                 let mut pending = state.settled_pending().cloned();
                 let (answers, confirmations) = hitl;
                 let requeue = |record: &mut RunRecord| {

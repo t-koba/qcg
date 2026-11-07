@@ -9,12 +9,21 @@ impl LocalService {
         run_dir: &Utf8Path,
         operation_id: &str,
     ) -> Result<Option<bool>, ApiError> {
-        let limits = match self.inner.runs.read().await.get(id) {
-            Some(record) => engine::JournalLimits::from(&record.contract.manifest.runtime),
+        let tracked = self.inner.runs.read().await.get(id).map(|record| {
+            (
+                engine::JournalLimits::from(&record.contract.manifest.runtime),
+                Some(record.events.clone()),
+            )
+        });
+        let (limits, events) = match tracked {
+            Some(tracked) => tracked,
             None => {
                 let state = self.authoritative_state(run_dir).await?;
                 let contract = crate::run_package::load(run_dir, &state).map_err(api_internal)?;
-                engine::JournalLimits::from(&contract.manifest.runtime)
+                (
+                    engine::JournalLimits::from(&contract.manifest.runtime),
+                    None,
+                )
             }
         };
         match crate::run_dirs::request_remote_cancel_with_id(
@@ -23,6 +32,8 @@ impl LocalService {
             &self.inner.owner_id,
             operation_id,
             limits,
+            events,
+            true,
         ) {
             Ok(published) => Ok(Some(published)),
             Err(crate::types::ServiceError::PreconditionFailed(_)) => {
@@ -31,14 +42,19 @@ impl LocalService {
                     limits,
                 )
                 .map_err(api_internal)?;
-                let confirmation = state
-                    .confirmations
-                    .iter()
-                    .find(|(_, approved)| !**approved)
-                    .ok_or_else(|| api_internal("cancel acceptance precondition changed"))?
-                    .0;
-                self.reconcile_denial(id, run_dir, confirmation).await?;
-                Ok(None)
+                if let Some((confirmation, _)) =
+                    state.confirmations.iter().find(|(_, approved)| !**approved)
+                {
+                    self.reconcile_denial(id, run_dir, confirmation).await?;
+                    return Ok(None);
+                }
+                if state.terminal.is_some() {
+                    if !crate::run_dirs::consume_cancel_control(run_dir, operation_id) {
+                        return Err(api_internal("stale cancel control could not be consumed"));
+                    }
+                    return Ok(None);
+                }
+                Err(api_internal("cancel acceptance precondition changed"))
             }
             Err(error) => Err(api_internal(error)),
         }
@@ -75,7 +91,7 @@ impl LocalService {
             return Ok(());
         }
         self.ensure_running()?;
-        // Publish before signaling; untracked peer owners also need acceptance.
+        // Journal acceptance after publication and before signaling.
         let run_dir = self.run_dir_for(&id).await?;
         let state = self.authoritative_state(&run_dir).await?;
         if let Some((confirmation, _)) =
@@ -83,7 +99,7 @@ impl LocalService {
         {
             return self.reconcile_denial(&id, &run_dir, confirmation).await;
         }
-        if state.terminal.is_some() || state.cancel_operations.contains(&operation_id) {
+        if state.terminal.is_some() {
             if !crate::run_dirs::consume_cancel_control(&run_dir, &operation_id) {
                 return Err(api_internal(
                     "cancel retry could not consume matching control",

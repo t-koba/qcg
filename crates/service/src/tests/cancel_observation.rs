@@ -459,7 +459,9 @@ async fn cancel_shutdown_refusal_withdraws_only_new_mailbox() {
                     &id,
                     "first-request",
                     &operation,
-                    engine::JournalLimits::default()
+                    engine::JournalLimits::default(),
+                    None,
+                    false
                 )
                 .unwrap()
             );
@@ -524,6 +526,8 @@ async fn cancel_retry_consumes_journaled_before_unlink_across_recovery() {
             "first-request",
             &operation,
             engine::JournalLimits::default(),
+            None,
+            false,
         )
         .unwrap();
         let mailbox =

@@ -95,6 +95,143 @@ content = "unexpected"
     );
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn active_operation_cancel_is_journaled_once_before_terminal() {
+    let root = temp_run_dir("active-cancel-order");
+    let _ = std::fs::remove_dir_all(&root);
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&generator).expect("generator directory should be created");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "active-cancel"
+name = "Active Cancel"
+version = "0.1.0"
+
+[permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects_scope = "invocation"
+side_effects = "allowed"
+commands = [{ bin = "sh", args = ["-c", "sleep 30"], purpose = "hold active cancellation", isolation = "trusted_host" }]
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "ask"
+type = "ask_user"
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[[flow]]
+id = "hold"
+type = "command"
+needs = ["ask"]
+[flow.params]
+command = ["sh", "-c", "sleep 30"]
+"#
+    )
+    .expect("generator manifest should be written");
+    let service = test_service(vec![root], runs);
+    let id = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            inputs: BTreeMap::new(),
+            ..Default::default()
+        })
+        .await
+        .expect("run should start");
+    let prompt = wait_for_snapshot(&service, &id, RunStatus::Waiting)
+        .await
+        .question
+        .expect("run should wait for its answer");
+    service
+        .answer(
+            id.clone(),
+            prompt.id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("yes"))]),
+            },
+        )
+        .await
+        .expect("answer should resume the run");
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            if read_journal_string(&service, id.clone())
+                .await
+                .lines()
+                .any(|line| {
+                    serde_json::from_str::<Value>(line)
+                        .is_ok_and(|event| event["t"] == "operation_started")
+                })
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .expect("command should start before cancellation");
+
+    let operation = uuid::Uuid::now_v7().to_string();
+    service
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await
+        .expect("active cancellation should settle");
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &id).await.state,
+        RunStatus::Canceled
+    );
+    service
+        .cancel_with_operation_id(id.clone(), operation.clone())
+        .await
+        .expect("retrying the same operation should be idempotent");
+    let stale = uuid::Uuid::now_v7().to_string();
+    service
+        .cancel_with_operation_id(id.clone(), stale.clone())
+        .await
+        .expect("a post-terminal cancellation should be a stale no-op");
+
+    let events: Vec<Value> = read_journal_string(&service, id.clone())
+        .await
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("journal event"))
+        .collect();
+    let seq = |event: &Value| event["seq"].as_u64().expect("event sequence");
+    let started = events
+        .iter()
+        .find(|event| event["t"] == "operation_started")
+        .expect("the active command should be journaled");
+    let accepted = events
+        .iter()
+        .find(|event| event["t"] == "user_cancel_requested" && event["operation_id"] == operation)
+        .expect("accepted cancel should be journaled");
+    let terminal = events
+        .iter()
+        .find(|event| event["t"] == "run_canceled")
+        .expect("canceled terminal should be journaled");
+    assert!(seq(started) < seq(accepted) && seq(accepted) < seq(terminal));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["t"] == "user_cancel_requested")
+            .count(),
+        1
+    );
+    assert!(
+        !events.iter().any(|event| event["operation_id"] == stale),
+        "a post-terminal stale request must not add an acceptance event"
+    );
+    let run_dir = service.run_dir_for(&id).await.expect("run directory");
+    assert!(!crate::run_dirs::has_pending_cancel_control(&run_dir));
+}
+
 #[tokio::test]
 async fn shutting_down_service_refuses_new_admissions() {
     // E05: the shutdown gate covers internal callers, not just the
@@ -941,8 +1078,10 @@ async fn accepted_cancel_mailbox_blocks_a_later_answer() {
             .runtime,
     );
     let operation = uuid::Uuid::now_v7().to_string();
-    crate::run_dirs::request_remote_cancel_with_id(&run_dir, &id, "peer", &operation, limits)
-        .expect("cancel mailbox should publish first");
+    crate::run_dirs::request_remote_cancel_with_id(
+        &run_dir, &id, "peer", &operation, limits, None, false,
+    )
+    .expect("cancel mailbox should publish first");
 
     let answer = service
         .answer(

@@ -1501,18 +1501,27 @@ pub(crate) fn request_remote_cancel(
     limits: JournalLimits,
 ) -> Result<String, ServiceError> {
     let operation_id = uuid::Uuid::now_v7().to_string();
-    request_remote_cancel_with_id(run_dir, run_id, requester, &operation_id, limits)?;
+    request_remote_cancel_with_id(
+        run_dir,
+        run_id,
+        requester,
+        &operation_id,
+        limits,
+        None,
+        false,
+    )?;
     Ok(operation_id)
 }
 
-/// Returns whether this call published new evidence. Attribution and timestamp
-/// belong to the first publisher; a retry only checks the logical identity.
+/// Returns true only for the first publication; retries preserve original attribution.
 pub(crate) fn request_remote_cancel_with_id(
     run_dir: &Utf8Path,
     run_id: &str,
     requester: &str,
     operation_id: &str,
     limits: JournalLimits,
+    event_sender: Option<tokio::sync::broadcast::Sender<api::RunEvent>>,
+    journal_acceptance: bool,
 ) -> Result<bool, ServiceError> {
     if !uuid::Uuid::parse_str(operation_id).is_ok_and(|id| id.to_string() == operation_id) {
         return Err(ServiceError::Invalid(
@@ -1520,8 +1529,7 @@ pub(crate) fn request_remote_cancel_with_id(
         ));
     }
     let dir = control_dir(run_dir);
-    // Pin before staging: Unix opens, publication, and retry reads stay
-    // relative to this inode even if the pathname is swapped.
+    // Unix pins staging, publication, and retry reads to one directory inode.
     #[cfg(unix)]
     let control_fd = open_control_dir_pinned(&dir)?;
     #[cfg(not(unix))]
@@ -1537,11 +1545,8 @@ pub(crate) fn request_remote_cancel_with_id(
             Ok(_) => {}
             Err(error) => return Err(ServiceError::Io(error)),
         }
-        // Non-Unix pathname races remain: untrusted concurrent writers are
-        // unsupported; use Unix for pinned-directory publication and cleanup.
+        // Non-Unix pathname races require trusted concurrent writers.
     }
-    // Sweeping stays on the drain path. Temp collisions retry fresh names,
-    // never change the stable operation identity or overwrite foreign bytes.
     let mut attempts = 0;
     let (temporary, path, mut file) = loop {
         if attempts >= 3 {
@@ -1605,20 +1610,15 @@ pub(crate) fn request_remote_cancel_with_id(
         "ts": chrono::Utc::now().to_rfc3339(),
     });
     let bytes = serde_json::to_vec(&payload)?;
-    // Readers ignore staging names. Hold the exclusive stage lock through
-    // sync and publication so the stale/unlocked-temp reaper cannot race us.
+    // Hold the stage lock through sync and publication to exclude reaping.
     let cleanup_unpublished = |temporary: &Utf8Path| {
-        // Leaked staging is reclaimable, but cleanup errors must be visible.
         #[cfg(unix)]
         {
             if let Some(name) = temporary.file_name()
                 && let Err(cleanup) = remove_cancel_temp_at(&control_fd, name)
+                && cleanup.kind() != std::io::ErrorKind::NotFound
             {
-                // A missing temp races a concurrent reaper and is not a
-                // leak; any other failure warns like the non-Unix path.
-                if cleanup.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(path = %temporary, %cleanup, "failed to clean unpublished cancel temp");
-                }
+                tracing::warn!(path = %temporary, %cleanup, "failed to clean unpublished cancel temp");
             }
         }
         #[cfg(not(unix))]
@@ -1632,8 +1632,7 @@ pub(crate) fn request_remote_cancel_with_id(
         cleanup_unpublished(&temporary);
         return Err(ServiceError::Io(error));
     }
-    // Refresh and sync mtime under the lock before writing: a crash must
-    // not leave fresh-looking staging whose content was never synced.
+    // Sync mtime under lock so incomplete staging is never fresh-looking.
     if let Err(error) = file
         .set_modified(std::time::SystemTime::now())
         .and_then(|()| file.sync_all())
@@ -1647,34 +1646,82 @@ pub(crate) fn request_remote_cancel_with_id(
             return Err(ServiceError::Io(error));
         }
     }
-    // Never overwrite accepted evidence. Publication removes the staging temp
-    // on failure; an existing destination is reusable only after a pinned,
-    // bounded, no-follow read proves the same logical operation.
     let mut published = None;
     let path_journal = run_meta_dir(run_dir).join("journal.jsonl");
-    // Stage I/O is outside the journal lock. Only final publication competes
-    // with confirmation acceptance; no timestamps or local task order decide.
-    let checked = JournalWriter::append_events_with(&path_journal, run_id, limits, None, |state| {
-        if state.confirmations.values().any(|approved| !approved) {
-            return Err(JournalError::PreconditionFailed(
-                "accepted denial must be reconciled before cancellation".into(),
-            ));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            published = Some(publish_cancel_control(
-                &control_fd,
-                &temporary,
-                &path,
-                &file,
-            ));
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            published = Some(publish_cancel_control(&dir, &temporary, &path, &file));
-        }
-        Ok(Vec::new())
-    });
+    // Stage outside the journal lock; serialize publication and acceptance with denials.
+    let checked = JournalWriter::append_events_with(
+        &path_journal,
+        run_id,
+        limits,
+        event_sender,
+        |state| {
+            if state.confirmations.values().any(|approved| !approved) {
+                return Err(JournalError::PreconditionFailed(
+                    "accepted denial must be reconciled before cancellation".into(),
+                ));
+            }
+            if journal_acceptance && state.terminal.is_some() {
+                return Err(JournalError::PreconditionFailed(
+                    "run is already terminal".into(),
+                ));
+            }
+            #[cfg(target_os = "linux")]
+            let publication = publish_cancel_control(&control_fd, &temporary, &path, &file);
+            #[cfg(not(target_os = "linux"))]
+            let publication = publish_cancel_control(&dir, &temporary, &path, &file);
+            let mut event_requester = requester.to_owned();
+            let valid = match publication {
+                Ok(()) => {
+                    published = Some(Ok(true));
+                    true
+                }
+                Err(ServiceError::Io(error))
+                    if error.kind() == std::io::ErrorKind::AlreadyExists =>
+                {
+                    match matching_cancel_control(
+                        #[cfg(not(unix))]
+                        &dir,
+                        #[cfg(unix)]
+                        &control_fd,
+                        run_id,
+                        operation_id,
+                    ) {
+                        Ok(Some(original_requester)) => {
+                            if !original_requester.is_empty() {
+                                event_requester = original_requester;
+                            }
+                            published = Some(Ok(false));
+                            true
+                        }
+                        Ok(None) => {
+                            published = Some(Err(ServiceError::Invalid(
+                                "cancel control vanished during retry".into(),
+                            )));
+                            false
+                        }
+                        Err(error) => {
+                            published = Some(Err(error));
+                            false
+                        }
+                    }
+                }
+                Err(error) => {
+                    published = Some(Err(error));
+                    false
+                }
+            };
+            Ok(
+                if journal_acceptance && valid && !state.cancel_operations.contains(operation_id) {
+                    vec![(
+                        "user_cancel_requested",
+                        json!({ "run_id": run_id, "operation_id": operation_id, "requester": event_requester }),
+                    )]
+                } else {
+                    Vec::new()
+                },
+            )
+        },
+    );
     if let Err(error) = checked {
         cleanup_unpublished(&temporary);
         return Err(match error {
@@ -1682,42 +1729,24 @@ pub(crate) fn request_remote_cancel_with_id(
             error => ServiceError::Invalid(error.to_string()),
         });
     }
-    let published = published.expect("publication selected under journal lock");
-    match published {
-        Ok(()) => {}
-        Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            if !matching_cancel_control(
-                #[cfg(not(unix))]
-                &dir,
-                #[cfg(unix)]
-                &control_fd,
-                run_id,
-                operation_id,
-            )? {
-                return Err(ServiceError::Invalid(
-                    "cancel control vanished during retry".into(),
-                ));
-            }
-            return Ok(false);
-        }
-        Err(error) => return Err(error),
+    let newly_published = published.expect("publication selected under journal lock")?;
+    if !newly_published {
+        return Ok(false);
     }
-    // A directory-sync error affects power-loss durability, not the process-
-    // crash boundary: publication has happened and cannot become a refusal.
+    // Directory-sync failure cannot revoke an already published control.
     if let Err(error) = sync_dir_entry(&dir) {
         tracing::warn!(path = %path, %error, "cancel control published but directory sync failed");
     }
     Ok(true)
 }
 
-/// Bounded identity check shared by retry and consumption. Unix pins the
-/// directory; non-Unix requires trusted writers (pathname swap races remain).
+/// Bounded mailbox identity check; Unix pins the directory, unlike non-Unix.
 fn matching_cancel_control(
     #[cfg(not(unix))] dir: &Utf8Path,
     #[cfg(unix)] control_fd: &File,
     run_id: &str,
     operation_id: &str,
-) -> Result<bool, ServiceError> {
+) -> Result<Option<String>, ServiceError> {
     if operation_id.is_empty() || operation_id.contains(['/', '\\', '\0']) {
         return Err(ServiceError::Invalid(
             "invalid cancel operation identity".into(),
@@ -1738,7 +1767,7 @@ fn matching_cancel_control(
         if fd < 0 {
             let error = std::io::Error::last_os_error();
             if error.kind() == std::io::ErrorKind::NotFound {
-                return Ok(false);
+                return Ok(None);
             }
             return Err(ServiceError::Io(error));
         }
@@ -1750,7 +1779,7 @@ fn matching_cancel_control(
         let path = dir.join(name);
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ServiceError::Io(error)),
         };
         if !metadata.is_file() || metadata.file_type().is_symlink() {
@@ -1781,7 +1810,9 @@ fn matching_cancel_control(
             "cancel control identity mismatch".into(),
         ));
     }
-    Ok(true)
+    Ok(Some(
+        control["requester"].as_str().unwrap_or_default().to_owned(),
+    ))
 }
 
 /// No-overwrite publication holds the stage lock across rename/link. Payload
@@ -2344,14 +2375,16 @@ pub(crate) fn consume_cancel_control(run_dir: &Utf8Path, operation_id: &str) -> 
         let run_id = run_dir
             .file_name()
             .ok_or_else(|| ServiceError::Invalid("run directory must have a run id".into()))?;
-        if !matching_cancel_control(
+        if matching_cancel_control(
             #[cfg(not(unix))]
             &dir,
             #[cfg(unix)]
             &control_fd,
             run_id,
             operation_id,
-        )? {
+        )?
+        .is_none()
+        {
             return Ok(());
         }
         #[cfg(unix)]
@@ -2742,6 +2775,8 @@ mod tests {
         let root = temp_root("stable-cancel");
         let _guard = TempGuard(root.clone());
         let run_dir = root.join("run-1");
+        std::fs::create_dir_all(run_meta_dir(&run_dir)).unwrap();
+        std::fs::write(run_meta_dir(&run_dir).join("journal.jsonl"), b"").unwrap();
         let operation = uuid::Uuid::now_v7().to_string();
         let path = control_dir(&run_dir).join(format!("cancel-{operation}.json"));
         assert!(
@@ -2750,7 +2785,9 @@ mod tests {
                 "run-1",
                 "original",
                 &operation,
-                engine::JournalLimits::default()
+                engine::JournalLimits::default(),
+                None,
+                false
             )
             .unwrap()
         );
@@ -2761,11 +2798,21 @@ mod tests {
                 "run-1",
                 "retry",
                 &operation,
-                engine::JournalLimits::default()
+                engine::JournalLimits::default(),
+                None,
+                true
             )
             .unwrap()
         );
         assert_eq!(std::fs::read(&path).unwrap(), original);
+        let journal =
+            std::fs::read_to_string(run_meta_dir(&run_dir).join("journal.jsonl")).unwrap();
+        let events: Vec<Value> = journal
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["requester"], "original");
         for field in ["op", "run_id", "operation_id"] {
             let mut damaged: Value = serde_json::from_slice(&original).unwrap();
             damaged[field] = "mismatch".into();
@@ -2777,7 +2824,9 @@ mod tests {
                     "run-1",
                     "retry",
                     &operation,
-                    engine::JournalLimits::default()
+                    engine::JournalLimits::default(),
+                    None,
+                    false
                 )
                 .is_err()
             );
@@ -2790,7 +2839,9 @@ mod tests {
                 "run-1",
                 "retry",
                 &operation,
-                engine::JournalLimits::default()
+                engine::JournalLimits::default(),
+                None,
+                false
             )
             .is_err()
         );
@@ -2807,7 +2858,9 @@ mod tests {
                     "run-1",
                     "retry",
                     &operation,
-                    engine::JournalLimits::default()
+                    engine::JournalLimits::default(),
+                    None,
+                    false
                 )
                 .is_err()
             );
@@ -2819,7 +2872,9 @@ mod tests {
                 "run-1",
                 "retry",
                 "../bad",
-                engine::JournalLimits::default()
+                engine::JournalLimits::default(),
+                None,
+                false
             )
             .is_err()
         );
