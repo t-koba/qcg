@@ -395,8 +395,11 @@ fn retention_gc_reconciles_host_tree_before_removing_terminal_run() {
     let bound = mark_prepared(&meta);
     let path = engine::host_cgroup::binding_path(&meta);
     let prepared = std::fs::read(&path).unwrap();
-    let error = crate::summaries::gc_run_directories(&runs, 0, 0, true, 100).unwrap_err();
-    assert!(error.to_string().contains("ownership unproven"), "{error}");
+    let selected = crate::summaries::gc_run_directories(&runs, 0, 0, true, 100).unwrap();
+    assert!(
+        selected.is_empty(),
+        "an ambiguous Prepared run must not be selected"
+    );
     assert_eq!(std::fs::read(&path).unwrap(), prepared);
     assert!(child.try_wait().unwrap().is_none());
     assert!(scope.run_root.is_dir() && run_dir.exists());
