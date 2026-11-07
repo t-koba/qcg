@@ -631,9 +631,8 @@ fn populate_checkpoint_fork(
     std::fs::create_dir_all(target_meta.join("checkpoint-blobs"))?;
 
     let mut latest_files = BTreeMap::<Utf8PathBuf, String>::new();
-    // Retain all historical blobs: resume verifies every pin on fork. (E06)
-    // Blob digests name store paths: validate hex shape before any stat so
-    // a malformed journal pin cannot probe arbitrary paths (E06).
+    // Retain all historical blobs for resume verification; validate digests before stat so malformed pins
+    // cannot probe arbitrary store paths. (E06)
     fn validate_blob_digest(path: &Utf8PathBuf, digest: &str) -> Result<(), ServiceError> {
         if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
             return Err(ServiceError::Invalid(format!(
@@ -645,13 +644,14 @@ fn populate_checkpoint_fork(
     let mut required_blobs = BTreeMap::<String, Utf8PathBuf>::new();
     for event in &selected {
         if event["t"] == "agent_file_changes" {
-            let removed: BTreeSet<_> = event["removed_files"]
+            for path in event["removed_files"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(Value::as_str)
-                .collect();
-            latest_files.retain(|path, _| !removed.contains(path.as_str()));
+            {
+                latest_files.remove(Utf8Path::new(path));
+            }
         }
         if event.get("t").and_then(Value::as_str) != Some("step_finished") {
             continue;
