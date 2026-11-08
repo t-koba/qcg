@@ -7,9 +7,7 @@ pub use mcp::*;
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
-    use std::sync::atomic::Ordering;
     use std::time::Duration;
-    use url::Url;
 
     fn remote_spec() -> McpServerSpec {
         McpServerSpec {
@@ -457,6 +455,7 @@ mod tests {
     #[cfg(feature = "mcp-oauth")]
     #[test]
     fn oauth_redirect_requires_https_or_loopback_http() {
+        use url::Url;
         validate_redirect_uri("http://127.0.0.1:43123/callback")
             .expect("loopback redirect should be valid");
         assert!(validate_redirect_uri("http://example.com/callback").is_err());
@@ -598,6 +597,7 @@ mod tests {
     #[cfg(feature = "mcp-oauth")]
     #[tokio::test]
     async fn authorization_cannot_be_cleared_while_sessions_are_active() {
+        use std::sync::atomic::Ordering;
         let runtime = McpRuntime::from_specs(vec![remote_spec()]).expect("runtime should load");
         runtime
             .active_sessions("tinyfish")
