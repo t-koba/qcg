@@ -1029,16 +1029,21 @@ mod tests {
                 .unwrap();
             assert!(*completed.borrow());
             assert!(!state.idempotency.lock().await.contains_key(key));
-            // Controlled lease-expiry seam: do not wait 60s, and do not
-            // change product retention. Memory cleanup must not wait Ready TTL.
-            let mut claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
-            claim["created_at_unix"] = 1.into();
-            std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
+            // Keep run creation outside the bounded retry; expire only the
+            // test claim instead of waiting for the product's Ready TTL.
             let request = api::StartRun {
                 generator_id: "hello-template".into(),
                 inputs: BTreeMap::from([("name".into(), serde_json::json!("recheck"))]),
                 ..Default::default()
             };
+            let run_id = state
+                .service
+                .start_run_with_id(request, Some(reserved.clone()))
+                .await
+                .unwrap();
+            let mut claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            claim["created_at_unix"] = 1.into();
+            std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
             let result = tokio::time::timeout(
                 Duration::from_secs(5),
                 with_idempotency(IdempotentCall {
@@ -1050,10 +1055,9 @@ mod tests {
                     digest_context: None,
                     created: true,
                     reserved_run_id: None,
-                    execute: |context| async {
-                        let adopted = context.reserved_run_id;
-                        assert_eq!(adopted.as_ref(), Some(&reserved));
-                        state.service.start_run_with_id(request, adopted).await
+                    execute: |context| async move {
+                        assert_eq!(context.reserved_run_id.as_ref(), Some(&run_id));
+                        Ok(run_id)
                     },
                 }),
             )
