@@ -75,6 +75,17 @@ jobs:
       - run: echo checked
         if: always()
 `],
+  ["merged job condition", `
+skip: &skip
+  if: github.event_name != 'push'
+  runs-on: ubuntu-latest
+jobs:
+  check:
+    <<: *skip
+    steps:
+      - run: echo checked
+        if: always()
+`],
   ["six-space job body", `
 jobs:
   check:
