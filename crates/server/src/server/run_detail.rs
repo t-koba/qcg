@@ -64,12 +64,12 @@ pub(crate) async fn read_run_bundle(
         .await
         .map_err(ApiHttpError::from_api)?;
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
-    // Tied to shutdown and client disconnect and joined (E05): the blocking
-    // zip writer aborts on shutdown instead of continuing detached, aborts
-    // when the client disconnects (receiver dropped, tied to the response
-    // lifetime), and the watcher awaits it so no blocking task survives the
-    // response. The task itself is bounded by artifact limits, so normal
-    // completion needs no abort.
+    // Tied to shutdown and client disconnect and joined (E05): request
+    // cancellation, then await the task. Shutdown's `take_until` ends the
+    // body stream; disconnect drops it. Tokio cannot abort a started blocking
+    // worker; ChannelWriter's bounded send stops it when the response receiver
+    // closes, and the watcher joins it. Normal completion needs no abort; the
+    // task is bounded by artifact limits.
     // No ETag: streaming archives cannot validate without hashing the full
     // body upfront (defeating streaming); clients condition on the snapshot
     // or artifact-list ETag as the queue-revision alternative (E16).
@@ -877,11 +877,11 @@ pub(crate) async fn read_artifacts_zip(
         .map_err(ApiHttpError::from_api)?;
     let limits = state.artifact_limits.effective();
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
-    // Tied to shutdown and client disconnect and joined (E05): aborts on
-    // shutdown instead of continuing detached, aborts when the client
-    // disconnects (receiver dropped, tied to the response lifetime). No
-    // ETag for the same streaming reason as the bundle path: clients use
-    // the artifact-list ETag (E16).
+    // Tied to shutdown and client disconnect and joined (E05): request abort,
+    // then await the task. A started blocking worker stops when the response
+    // receiver closes and ChannelWriter's bounded send fails; the watcher
+    // joins it. No ETag for the same streaming reason as the bundle path:
+    // clients use the artifact-list ETag (E16).
     let disconnect_sender = sender.clone();
     let mut blocking = tokio::task::spawn_blocking(move || {
         let writer = ChannelWriter {
@@ -1906,11 +1906,11 @@ mod tests {
 
     #[tokio::test]
     async fn bundle_and_zip_streams_end_at_shutdown_without_detached_writers() {
-        // E05: the spawned bundle/zip writers are joined on shutdown and
-        // aborted on client disconnect (watcher selects on both), and the
-        // response body ends at shutdown instead of holding the drain open.
-        // Real service, real tempdir storage, no mocks. Both carry no ETag;
-        // clients use the snapshot ETag (E16).
+        // E05: shutdown is requested before the writers are spawned, and the
+        // response bodies end instead of holding the drain open. Started
+        // workers rely on receiver closure, not handle abort; this test does
+        // not simulate client disconnect. Real service, real tempdir storage,
+        // no mocks. Both carry no ETag; clients use the snapshot ETag (E16).
         use axum::extract::{Path, State};
         use std::collections::{BTreeMap, BTreeSet};
         use std::sync::Arc;
