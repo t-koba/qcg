@@ -7,8 +7,8 @@ pub use mcp::*;
 mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
+    #[cfg(any(unix, feature = "mcp-oauth"))]
     use std::time::Duration;
-
     fn remote_spec() -> McpServerSpec {
         McpServerSpec {
             id: "tinyfish".into(),
