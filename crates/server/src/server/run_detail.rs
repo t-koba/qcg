@@ -2023,9 +2023,10 @@ mod tests {
         std::fs::create_dir_all(run_dir.join("meta")).unwrap();
         std::fs::create_dir_all(run_dir.join("workspace")).unwrap();
         let started = serde_json::json!({"t": "run_started", "seq": 1, "run_id": "budget-run",
-            "trace_id": "ab".repeat(16), "span_id": "cd01", "ts": "2026-01-01T00:00:00Z",
+            "trace_id": "ab".repeat(16), "span_id": "cd01", "ts": "2099-01-01T00:00:00Z",
             "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test", "inputs": {},
             "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            // A future start keeps the display-only live duration at zero.
             "elapsed_budget_mode": "wall_clock"});
         std::fs::write(run_dir.join("meta/journal.jsonl"), format!("{started}\n")).unwrap();
         std::fs::write(run_dir.join("workspace/a.bin"), b"data").unwrap();
