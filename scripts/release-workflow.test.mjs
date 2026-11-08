@@ -61,6 +61,18 @@ function assertUnconditionalJobs(source) {
   }
 }
 
+test("called CI retains required jobs and Rust platforms", () => {
+  const { jobs } = load(ci);
+  for (const id of ["rust", "demo-frontend", "e2e", "msrv", "security", "host-cgroup"]) {
+    assert.ok(Object.hasOwn(jobs, id), `CI must retain required job ${id}`);
+  }
+  const platforms = jobs.rust.strategy.matrix.os;
+  assert.ok(Array.isArray(platforms), "Rust OS matrix must be an array");
+  for (const os of ["ubuntu-latest", "macos-latest", "windows-latest"]) {
+    assert.ok(platforms.includes(os), `Rust OS matrix must retain ${os}`);
+  }
+});
+
 test("called CI jobs cannot skip required checks on tagged releases", () => {
   assertUnconditionalJobs(ci);
 });
