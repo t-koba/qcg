@@ -1029,25 +1029,22 @@ mod tests {
                 .unwrap();
             assert!(*completed.borrow());
             assert!(!state.idempotency.lock().await.contains_key(key));
-            // Keep run creation outside the bounded retry; expire only the
-            // test claim instead of waiting for the product's Ready TTL.
+            // Expire only the test claim; keep real run creation under retry.
             let request = api::StartRun {
                 generator_id: "hello-template".into(),
                 inputs: BTreeMap::from([("name".into(), serde_json::json!("recheck"))]),
                 ..Default::default()
             };
-            let run_id = state
-                .service
-                .start_run_with_id(request, Some(reserved.clone()))
-                .await
-                .unwrap();
             let mut claim: serde_json::Value = serde_json::from_slice(&original).unwrap();
             claim["created_at_unix"] = 1.into();
             std::fs::write(&path, serde_json::to_vec(&claim).unwrap()).unwrap();
-            let result = tokio::time::timeout(
-                Duration::from_secs(5),
+            let expected = reserved.clone();
+            let retry_state = state.clone();
+            let service = state.service.clone();
+            let (entered, wait) = tokio::sync::oneshot::channel();
+            let retry = tokio::spawn(async move {
                 with_idempotency(IdempotentCall {
-                    state: &state,
+                    state: &retry_state,
                     headers: &headers,
                     scope: "start_run",
                     target: "",
@@ -1055,15 +1052,24 @@ mod tests {
                     digest_context: None,
                     created: true,
                     reserved_run_id: None,
-                    execute: |context| async move {
-                        assert_eq!(context.reserved_run_id.as_ref(), Some(&run_id));
-                        Ok(run_id)
+                    execute: move |context| async move {
+                        let adopted = context.reserved_run_id;
+                        assert_eq!(adopted.as_ref(), Some(&expected));
+                        entered.send(()).unwrap();
+                        tokio::task::yield_now().await;
+                        service.start_run_with_id(request, adopted).await
                     },
-                }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
+                })
+                .await
+            });
+            match tokio::time::timeout(Duration::from_secs(5), wait).await {
+                Ok(Ok(())) => {}
+                result => {
+                    retry.abort();
+                    panic!("retry did not reach run creation: {result:?}");
+                }
+            }
+            let result = retry.await.unwrap().unwrap();
             assert_eq!(result.status(), axum::http::StatusCode::CREATED);
             assert_eq!(
                 durable::load_durable_ready_result(&runs, key, policy::IDEMPOTENCY_TTL)
