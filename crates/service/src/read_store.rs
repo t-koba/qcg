@@ -57,7 +57,7 @@ fn value_memory(value: &Value) -> usize {
 struct Revision {
     len: u64,
     modified: SystemTime,
-    identity: (u64, u64),
+    identity: Option<(u64, u64)>,
 }
 impl Revision {
     fn of(file: &File) -> std::io::Result<Self> {
@@ -65,10 +65,13 @@ impl Revision {
         #[cfg(unix)]
         let identity = {
             use std::os::unix::fs::MetadataExt;
-            (meta.dev(), meta.ino())
+            let inode = meta.ino();
+            (inode != 0).then_some((meta.dev(), inode))
         };
-        #[cfg(not(unix))]
-        let identity = (0, 0);
+        #[cfg(windows)]
+        let identity = crate::invalidation::file_info(file)?.0;
+        #[cfg(not(any(unix, windows)))]
+        let identity = None;
         Ok(Self {
             len: meta.len(),
             modified: meta.modified()?,
@@ -212,6 +215,7 @@ impl ReadStore {
         let prior = {
             let mut entries = self.lock();
             if let Some(entry) = entries.views.get(&path)
+                && revision.identity.is_some()
                 && entry.revision == revision
                 && (list || matches!(entry.view, CachedView::Full(_)))
             {
@@ -883,6 +887,33 @@ mod tests {
         );
         std::fs::remove_dir_all(directory).unwrap();
         std::fs::remove_dir_all(other).unwrap();
+    }
+    #[test]
+    fn replacement_with_same_length_and_mtime_refreshes_cached_list() {
+        let (directory, writer) = journal();
+        drop(writer);
+        let path = run_meta_dir(&directory).join("journal.jsonl");
+        let store = ReadStore::new(1, policy::DEFAULT_READ_CACHE_BYTES);
+        assert_eq!(store.list_item(&directory).unwrap().generator_id, "test");
+        let metadata = std::fs::metadata(&path).unwrap();
+        let modified = metadata.modified().unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let replacement_bytes = original.replace("\"test\"", "\"demo\"");
+        assert_eq!(replacement_bytes.len(), original.len());
+        let replacement = path.with_extension("replacement");
+        std::fs::write(&replacement, replacement_bytes).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&replacement)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        let replacement_metadata = std::fs::metadata(&replacement).unwrap();
+        assert_eq!(replacement_metadata.len(), metadata.len());
+        assert_eq!(replacement_metadata.modified().unwrap(), modified);
+        std::fs::rename(replacement, &path).unwrap();
+        assert_eq!(store.list_item(&directory).unwrap().generator_id, "demo");
+        std::fs::remove_dir_all(directory).unwrap();
     }
     #[test]
     fn read_includes_complete_final_value_without_trailing_lf() {

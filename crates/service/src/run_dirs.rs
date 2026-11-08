@@ -53,20 +53,7 @@ pub(crate) fn write_run_event(
     kind: &str,
     payload: Value,
 ) -> Result<(), ServiceError> {
-    let (run_id, journal_path, limits) = journal_target(record)?;
-    // Atomic single append under the cross-process journal lock. The writer
-    // re-folds the latest journal so seq assignment never duplicates values
-    // assigned concurrently by the running engine (A01).
-    JournalWriter::append_single_event(
-        &journal_path,
-        &run_id,
-        kind,
-        payload,
-        limits,
-        Some(record.events.clone()),
-    )
-    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    Ok(())
+    write_run_event_if(record, kind, payload, |_| Ok(()))
 }
 
 /// Check-and-append variant of [`write_run_event`]: `check` observes the

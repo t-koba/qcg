@@ -96,14 +96,30 @@ fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
 }
 
 #[cfg(windows)]
-fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::{
-        fs::{MetadataExt as _, OpenOptionsExt as _},
-        io::AsRawHandle as _,
-    };
+pub(crate) fn file_info(file: &std::fs::File) -> std::io::Result<(Option<(u64, u64)>, u32)> {
+    use std::os::windows::io::AsRawHandle as _;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        GetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+    // SAFETY: the handle is live and info is writable storage of the required type.
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: success above initialized all fields.
+    let info = unsafe { info.assume_init() };
+    let index = (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow);
+    Ok((
+        (index != 0).then_some((u64::from(info.dwVolumeSerialNumber), index)),
+        info.nNumberOfLinks,
+    ))
+}
+
+#[cfg(windows)]
+fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
     };
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -115,14 +131,7 @@ fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
             "invalidation is not a regular, unlinked file",
         ));
     }
-    let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
-    // SAFETY: the handle is live and info is writable storage of the required
-    // type. The API initializes it on success; no uninitialized read on error.
-    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: success above initialized all fields.
-    if unsafe { info.assume_init() }.nNumberOfLinks != 1 {
+    if file_info(&file)?.1 != 1 {
         return Err(std::io::Error::other("invalidation is hard-linked"));
     }
     Ok(file)
