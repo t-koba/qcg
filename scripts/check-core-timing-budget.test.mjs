@@ -33,7 +33,7 @@ printf '%s' "$(qcg_test_time_budget_for_label ${JSON.stringify(label)})"`, {
   return r.stdout;
 }
 
-test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspace", () => {
+test("v3 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspace", () => {
   assert.equal(budgetFor("default workspace"), "151");
   assert.equal(
     budgetFor("default workspace", {
@@ -42,9 +42,10 @@ test("v2 profile budgets only Linux exact-cache-hit rustc-1.99.1 default workspa
     "151",
   );
   assert.equal(budgetFor("MCP no-default"), "16");
-  assert.equal(budgetFor("server no-default"), "48");
+  assert.equal(budgetFor("server no-default"), "16");
   assert.equal(budgetFor("MCP live server"), "27");
   assert.equal(budgetFor("MCP no-default live server"), "24");
+  assert.equal(budgetFor("server no-default build"), "");
   assert.equal(budgetFor("unknown invocation"), "");
   assert.equal(budgetFor("default workspace ", BUDGETED_ENV), "");
   assert.equal(
@@ -91,7 +92,30 @@ test("every timing ceiling follows its recorded evidence", () => {
       /^#   (.+): mean ([\d.]+), sample SD ([\d.]+), max (\d+) -> (\d+)s$/gm,
     ),
   ];
-  assert.equal(lines.length, 5, "policy comment must record all five ceilings");
+  assert.equal(
+    lines.length,
+    4,
+    "policy comment must retain four statistical ceilings",
+  );
+  const server = policy.match(
+    /^#   server no-default: harness sample \(([\d., ]+) s\), margin ([\d.]+) -> (\d+)s$/m,
+  );
+  assert.ok(server, "policy must record the post-build budget basis");
+  const harnessSample = server[1].split(", ").map(Number);
+  assert.deepEqual(harnessSample, [10.23, 10.40]);
+  assert.equal(Number(server[2]), 1.5);
+  assert.equal(
+    Math.ceil(Number(server[2]) * Math.max(...harnessSample)),
+    Number(server[3]),
+  );
+  assert.equal(Number(server[3]), Number(budgetFor("server no-default")));
+  assert.ok(
+    policy.includes(
+      'qcg_test_time "server no-default build" cargo test -p server --no-default-features --locked --no-run\n' +
+        'qcg_test_time "server no-default" cargo test -p server --no-default-features --locked\n',
+    ),
+    "build must precede the unchanged feature-off test command",
+  );
   const sampleMatch = policy.match(/\(([\d, ]+) s\)\./);
   assert.ok(sampleMatch, "policy comment must record the default-workspace sample");
   const sample = sampleMatch[1].split(", ").map(Number);
@@ -153,7 +177,7 @@ echo "rc=$?"`,
   assert.match(r.stderr, /qcg-test-time-budget exceeded/);
   assert.match(r.stderr, /label="default workspace"/);
   assert.match(r.stderr, /budget_s=151/);
-  assert.match(r.stderr, /policy=v2/);
+  assert.match(r.stderr, /policy=v3/);
 
   // Unbudgeted labels never exceed, even far above the budget.
   r = bash(
@@ -182,7 +206,7 @@ echo "rc=$?"`,
   assert.match(r.stdout, /qcg-test-time label="default workspace" result=passed elapsed_s=/);
   assert.match(
     r.stdout,
-    /qcg-test-time-budget policy=v2 label="default workspace" budget_s=151 elapsed_s=\d+ verdict=within/,
+    /qcg-test-time-budget policy=v3 label="default workspace" budget_s=151 elapsed_s=\d+ verdict=within/,
   );
 
   // Unbudgeted label reports no budget and still passes.
@@ -242,6 +266,8 @@ rm -f "$GITHUB_STEP_SUMMARY"
 set +e
 qcg_test_time "default workspace" true
 qcg_test_time "MCP no-default" true
+qcg_test_time "server no-default build" true
+qcg_test_time "server no-default" true
 fake_over_budget() { SECONDS=$((start + 152)); }
 qcg_test_time "default workspace" fake_over_budget
 echo "rc=$?"`,
@@ -254,12 +280,12 @@ echo "rc=$?"`,
     );
     assert.equal(r.status, 0, r.stderr);
     const text = readFileSync(summary, "utf8");
-    assert.match(text, /timing_budget_policy=v2/);
-    assert.match(text, /budgets_s=\{default workspace:151; MCP no-default:16; server no-default:48;/);
+    assert.match(text, /timing_budget_policy=v3/);
+    assert.match(text, /budgets_s=\{default workspace:151; MCP no-default:16; server no-default:16;/);
     assert.match(text, /MCP live server:27; MCP no-default live server:24\}/);
     assert.ok(
       text.includes(
-        "timing_budget_basis=Each Linux invocation ceiling is ceil(mean+3*sample_sd) of the exact-cache-hit sample its regime records in the policy comment; three SD is an engineering margin, not a calibrated false-alarm guarantee.",
+        "timing_budget_basis=server no-default: ceil(1.5 * max(10.23, 10.40))=16s from observed harness durations, with room for Cargo overhead; other four ceilings retain ceil(mean+3*sample_sd) from their exact-cache-hit samples. Engineering margins, not calibrated false-alarm guarantees. Prior same-source whole invocations were 54s (43.75s build + 10.23s harness) and 51s (39.94s build + 10.40s harness), versus a prior same-image 42s; 54s/48s failed v2 despite all 195 tests passing.",
       ),
       "timing summary must carry the complete basis sentence",
     );
@@ -270,9 +296,13 @@ echo "rc=$?"`,
     assert.match(text, /\| default workspace \| passed \| \d+ \| 151 \| within \|/);
     assert.match(text, /\| MCP no-default \| passed \| \d+ \| 16 \| within \|/);
     assert.match(text, /\| default workspace \| passed \| 152 \| 151 \| exceeded \|/);
+    assert.match(text, /server no-default measures the post-build Cargo test invocation/);
+    assert.match(text, /server no-default build is a separate visible, unbudgeted diagnostic/);
+    assert.match(text, /\| server no-default build \| passed \| \d+ \| none \| none \|/);
+    assert.match(text, /\| server no-default \| passed \| \d+ \| 16 \| within \|/);
     assert.match(text, /\*\*qcg-test-time-budget exceeded\*\*/);
     const artifactText = readFileSync(artifact, "utf8");
-    assert.match(artifactText, /timing_budget_policy=v2/);
+    assert.match(artifactText, /timing_budget_policy=v3/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
     rmSync(artifact, { force: true });

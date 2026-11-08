@@ -9,29 +9,33 @@ cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.."
 _qcg_test_time_header_written=0
 _qcg_test_time_artifact="target/qcg-test-time-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}.md"
 
-# Measured invocation budget v2 (Bash SECONDS whole-command invocation
-# wall time, including Cargo/build overhead; NOT test-only timing).
-# Evidence: exact-cache-hit Linux whole-command observations. Each ceiling is
-# ceil(mean+3*sample_SD) of the sample that describes its current regime; the
-# small invocations keep the v1 sample (n=16: 15 historical plus run
-# 40102552370 / SHA 3ffa8bed) and the default workspace uses four later passes
-# (103, 121, 123, 127 s). One parseable line per ceiling:
+# Measured invocation budget v3 (Bash SECONDS whole-command wall time,
+# not pure test or per-test timing). server no-default measures the post-build
+# Cargo test invocation; its separate build row is visible and unbudgeted.
+# Evidence: same-source Linux server no-default whole invocations took 54s
+# (43.75s build + 10.23s harness) and 51s (39.94s build + 10.40s harness),
+# versus a prior same-image 42s. All 195 tests passed, but 54s/48s failed v2.
+# The new server ceiling is ceil(1.5 * max observed harness duration), leaving
+# room for Cargo overhead while catching substantial test-runtime regressions:
+#   server no-default: harness sample (10.23, 10.40 s), margin 1.5 -> 16s
+# The other four ceilings retain v2's ceil(mean+3*sample_SD) exact-cache-hit
+# evidence: small invocations use v1 (n=16: 15 historical plus run 40102552370 /
+# SHA 3ffa8bed); default workspace uses four later passes (103, 121, 123, 127 s).
 #   MCP no-default: mean 12.00, sample SD 1.26, max 14 -> 16s
-#   server no-default: mean 33.81, sample SD 4.68, max 41 -> 48s
 #   MCP live server: mean 19.94, sample SD 2.26, max 24 -> 27s
 #   MCP no-default live server: mean 18.44, sample SD 1.67, max 21 -> 24s
 #   default workspace: mean 118.50, sample SD 10.63, max 127 -> 151s
-# Three SD is an engineering envelope, not a calibrated false-alarm guarantee;
+# Margins are engineering envelopes, not calibrated false-alarm guarantees;
 # changing thresholds requires a new policy version and fresh evidence. Apply
 # only with RUNNER_OS=Linux, cargo exact cache hit=true and rustc=1.99.1. Other
 # OS/groups, cache/setup brackets, CI job duration and run/day totals remain
 # unbudgeted.
 # Focused tests synthesize elapsed time through Bash SECONDS; production
 # policy values are fixed here and cannot be raised through the environment.
-QCG_TEST_TIME_BUDGET_POLICY_VERSION=v2
+QCG_TEST_TIME_BUDGET_POLICY_VERSION=v3
 QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S=151
 QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_S=16
-QCG_TEST_TIME_BUDGET_LINUX_SERVER_NO_DEFAULT_S=48
+QCG_TEST_TIME_BUDGET_LINUX_SERVER_NO_DEFAULT_S=16
 QCG_TEST_TIME_BUDGET_LINUX_MCP_LIVE_SERVER_S=27
 QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_LIVE_SERVER_S=24
 QCG_TEST_TIME_BUDGET_RUSTC_VERSION=1.99.1
@@ -85,7 +89,7 @@ qcg_test_time_check_budget() {
     return 0
   fi
   if [[ "$elapsed" =~ ^[0-9]+$ ]] && [[ "$budget" =~ ^[0-9]+$ ]] && (( elapsed > budget )); then
-    printf 'qcg-test-time-budget exceeded: label="%s" elapsed_s=%s budget_s=%s policy=%s (Bash SECONDS whole-command invocation wall time, including Cargo/build overhead). Action: investigate the slowdown from the qcg-test-time-* timing artifact; do not raise the budget to hide a regression (budgets ratchet down only after speedups with new evidence).\n' "$label" "$elapsed" "$budget" "$QCG_TEST_TIME_BUDGET_POLICY_VERSION" >&2
+    printf 'qcg-test-time-budget exceeded: label="%s" elapsed_s=%s budget_s=%s policy=%s (Bash SECONDS whole-command invocation wall time; see timing artifact for phase split). Action: investigate the slowdown from the qcg-test-time-* timing artifact; do not raise the budget to hide a regression (budgets ratchet down only after speedups with new evidence).\n' "$label" "$elapsed" "$budget" "$QCG_TEST_TIME_BUDGET_POLICY_VERSION" >&2
     return 1
   fi
   return 0
@@ -122,9 +126,9 @@ qcg_test_time() {
         qcg_rustc_version
         printf 'context: RUNNER_OS=%s rustc=%s\n\n' "${RUNNER_OS:-$(uname -s)}" "$_qcg_rustc_version_line"
         printf 'cargo_cache_exact_hit=%s restore_bracket_elapsed_s=%s (whole-second pre-test bracket; runner overhead included, cache post-save excluded)\n\n' "${QCG_RUST_CACHE_EXACT_HIT:-unknown}" "${QCG_RUST_CACHE_RESTORE_BRACKET_ELAPSED_S:-unknown}"
-        printf 'timing_budget_policy=%s Linux_exact_hit_rustc=%s budgets_s={default workspace:%s; MCP no-default:%s; server no-default:%s; MCP live server:%s; MCP no-default live server:%s}; other profiles unbudgeted. Values are Bash SECONDS whole-command invocation wall time including Cargo/build overhead, not test-only timing.\n\n' "$QCG_TEST_TIME_BUDGET_POLICY_VERSION" "$QCG_TEST_TIME_BUDGET_RUSTC_VERSION" "$QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_S" "$QCG_TEST_TIME_BUDGET_LINUX_SERVER_NO_DEFAULT_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_LIVE_SERVER_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_LIVE_SERVER_S"
-        printf 'timing_budget_basis=Each Linux invocation ceiling is ceil(mean+3*sample_sd) of the exact-cache-hit sample its regime records in the policy comment; three SD is an engineering margin, not a calibrated false-alarm guarantee.\n\n'
-        printf 'Values use Bash SECONDS (whole-second resolution; a displayed 0 may mean <1s) and are whole-command invocation wall time, including Cargo/build overhead. '
+        printf 'timing_budget_policy=%s Linux_exact_hit_rustc=%s budgets_s={default workspace:%s; MCP no-default:%s; server no-default:%s; MCP live server:%s; MCP no-default live server:%s}; other profiles unbudgeted. Values are Bash SECONDS whole-command invocation wall time including Cargo overhead, not pure test or per-test timing. server no-default measures the post-build Cargo test invocation; server no-default build is a separate visible, unbudgeted diagnostic.\n\n' "$QCG_TEST_TIME_BUDGET_POLICY_VERSION" "$QCG_TEST_TIME_BUDGET_RUSTC_VERSION" "$QCG_TEST_TIME_BUDGET_LINUX_DEFAULT_WORKSPACE_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_S" "$QCG_TEST_TIME_BUDGET_LINUX_SERVER_NO_DEFAULT_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_LIVE_SERVER_S" "$QCG_TEST_TIME_BUDGET_LINUX_MCP_NO_DEFAULT_LIVE_SERVER_S"
+        printf 'timing_budget_basis=server no-default: ceil(1.5 * max(10.23, 10.40))=16s from observed harness durations, with room for Cargo overhead; other four ceilings retain ceil(mean+3*sample_sd) from their exact-cache-hit samples. Engineering margins, not calibrated false-alarm guarantees. Prior same-source whole invocations were 54s (43.75s build + 10.23s harness) and 51s (39.94s build + 10.40s harness), versus a prior same-image 42s; 54s/48s failed v2 despite all 195 tests passing.\n\n'
+        printf 'Values use Bash SECONDS (whole-second resolution; a displayed 0 may mean <1s) and are whole-command invocation wall times. The server no-default test row is post-build; its separate build row records compilation. '
         printf "Cargo's normal \`test result ... finished in\` lines remain target-harness timing, not per-test timing.\n\n"
         printf '| invocation | result | elapsed_s | budget_s | budget_result |\n'
         printf '|---|---|---|---|---|\n'
@@ -175,6 +179,8 @@ qcg_test_time "default workspace" cargo test --workspace --locked
 # configuration; server covers the no-CORS build (identical test names do not
 # imply identical compile-gated branches).
 qcg_test_time "MCP no-default" cargo test -p mcp --no-default-features --locked
+# Separate compilation from the post-build test invocation budget.
+qcg_test_time "server no-default build" cargo test -p server --no-default-features --locked --no-run
 qcg_test_time "server no-default" cargo test -p server --no-default-features --locked
 bash scripts/check-fixtures.sh
 bash scripts/package-dist.sh --dry-run
