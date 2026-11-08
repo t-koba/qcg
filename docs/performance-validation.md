@@ -163,19 +163,43 @@ transport benchmark. The first-request whole-process RSS high-water mark was
 and this debug build make these observations unsuitable as release latency or
 memory estimates.
 
+### Deflate-level tradeoff
+
+A controlled scratch comparison (check job
+`cbb4ab6ec9bdb809e5a8036e58f4a4e0f401755b92f49cfca584d54e3decbb65`, command
+record `92d5e410276e48feb3e36dc5e3bbef2c`, based on source digest
+`ed266c2d163ee0655f240ce4930acb397129d7f5918a0f48ce4105ce3c169e3c`) compared
+the package default with `compression_level(Some(1))` on every non-directory
+entry. Four fresh servers ran two requests each in default/level-1/level-1/
+default order. Each used identical 12 MiB journal bytes and a 2 MiB random
+artifact; the instrumented debug binaries and option change existed only in
+disposable copies.
+
+| Variant (4 requests) | Headers ms (range) | Body ms (range; median) | ZIP bytes | Body CPU ticks (range; median) | Process RSS HWM after body, KiB (two servers) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Package default | 258–1,239 | 7,335–9,492; 8,255 | 11,474,597 | 747–954; 834 | 92,424–100,700 |
+| Deflate level 1 | 208–1,294 | 4,242–5,759; 5,535 | 14,765,325 | 473–591; 564 | 95,176–100,300 |
+
+All eight archives passed `ZipFile.testzip()` and exact journal/artifact byte
+checks, with identical entry lists. Level 1 reduced median body wall time by
+about 33% and body CPU ticks by about 32%, but increased output by 3,290,728
+bytes (28.7%) to within 2,011,891 bytes of the 16 MiB output limit. Header
+ranges and whole-process RSS overlap substantially; this does not establish a
+memory benefit. This tradeoff is not safe to adopt globally: at the same source
+size, less compression consumes much more of the bounded output budget and can
+reject bundles that the current setting accepts. Preserve the package default
+and current output limit; no production compression change is justified by this
+single fixture.
+
 Source review explains the phases: `run_bundle_parts` reads and folds the
 journal, constructs typed events and snapshot metadata, checks artifact paths
 and lengths, and hashes artifact contents before responding. The blocking ZIP
 writer then streams the journal and artifacts again, deflates entries, and
 rechecks artifact hashes while copying. The source-byte/entry limits bound
-accepted fixtures, not whole-process RSS. No cap-neutral optimization is
-justified by these measurements: removing either artifact hash pass would
-weaken pre-response verification or stream-time mutation detection, and
-changing compression could alter the existing compressed-output limit. No
-compression/buffer variant was measured; retain the implementation and require
-a controlled before/after comparison before proposing one. The profile did not
-test disconnect, shutdown, or slow clients, and no cancellation behavior was
-changed.
+accepted fixtures, not whole-process RSS. Removing either artifact hash pass
+would weaken pre-response verification or stream-time mutation detection. No
+buffer-size variant was measured. The profile did not test disconnect, shutdown,
+or slow clients, and no cancellation behavior was changed.
 
 ## Release and slow live consumers
 
