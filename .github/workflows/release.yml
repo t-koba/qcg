@@ -7,10 +7,17 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Local reusable workflows run from this tag's commit, not a prior main SHA.
+  # Every required CI job must pass before release artifacts are built.
+  required-ci:
+    name: Required CI on release commit
+    uses: ./.github/workflows/ci.yml
+
   # Build and smoke-test installable archives on each release OS; these are
-  # artifact checks in addition to the push/PR verification workflow.
+  # additional distribution checks after the required CI verification.
   bundle:
     name: Bundle (${{ matrix.os }})
+    needs: required-ci
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:

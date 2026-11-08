@@ -18,6 +18,8 @@ are matched against Cargo's registered tests and executed in CI.
 | Bounded read performance | [measurement protocol](performance-validation.md) | Read-view counters, HTTP snapshot/list and full-history SSE matrices; release measurements and 54 slow live-tail conditions in both store modes |
 | Product comparison | [comparison protocol](comparison-protocol.md) | Deterministic real qcg/LangGraph/Temporal runs are recorded; Dify runs through a separate native-DSL adapter with the same input/output validator; real LLM comparison requires a common model credential |
 
+A `v*` tag release calls the repository-local CI workflow at that tag's commit. All CI jobs must pass before the release bundle matrix starts; the bundle version and archive smoke checks remain additional gates before publication. A result from a different branch or SHA does not qualify.
+
 Local validation uses Linux. A workflow definition is not evidence
 that macOS/Windows jobs have executed; that coverage requires CI on those hosts.
 Environment mutation tests execute in isolated subprocesses with 60-second
