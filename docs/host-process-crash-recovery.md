@@ -16,6 +16,27 @@ disabled: launches keep their existing live process-group cancellation and no
 crash-cleanup claim is made. A present-but-invalid value fails before any
 host command or MCP stdio launch, without fallback to a PID/PGID claim.
 
+For a systemd service, set `Delegate=yes` in its `[Service]` section (see
+[systemd resource control](https://www.freedesktop.org/software/systemd/man/latest/systemd.resource-control.html)):
+
+```ini
+[Service]
+Delegate=yes
+```
+
+After the service is active, query its `ControlGroup` property:
+
+```bash
+systemctl show qcg.service --property=ControlGroup --value
+```
+
+The returned path is relative to `/sys/fs/cgroup`; set
+`QCG_HOST_CGROUP_PARENT` to that directory in the service environment. For
+example, `/system.slice/qcg.service` maps to
+`/sys/fs/cgroup/system.slice/qcg.service`. Use the actual value for the unit;
+user services and custom slices have different paths. qcg's startup checks
+remain authoritative for the configured parent and required interfaces.
+
 Installing qcg on a cgroup-v2 host, or placing its service in a delegated
 systemd unit, does not enable cleanup by itself. The configured parent must
 already be delegated to the qcg user: absolute, beneath `/sys/fs/cgroup`
