@@ -42,3 +42,12 @@ test("tag releases wait for local CI on the same commit before bundle publicatio
   assert.doesNotMatch(bundle, /^    if:.*\b(?:always|failure|cancelled)\s*\(/m);
   assert.doesNotMatch(publish, /^    if:.*\b(?:always|failure|cancelled)\s*\(/m);
 });
+
+test("called CI jobs cannot skip required checks on tagged releases", () => {
+  // Job keys use four spaces; deeper step-level conditions remain allowed.
+  assert.doesNotMatch(
+    ci,
+    /^    if\s*:/m,
+    "CI jobs must run unconditionally when called from a tagged release",
+  );
+});
