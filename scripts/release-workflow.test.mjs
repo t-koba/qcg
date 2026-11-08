@@ -49,6 +49,15 @@ test("tag releases wait for local CI on the same commit before bundle publicatio
   assert.doesNotMatch(publish, /^    if:.*\b(?:always|failure|cancelled)\s*\(/m);
 });
 
+test("GitHub Release publication stays tag-only on manual dispatch", () => {
+  const { jobs } = load(release);
+  assert.equal(
+    jobs["github-release"].if,
+    "startsWith(github.ref, 'refs/tags/')",
+    "manual branch dispatch must not publish a GitHub release",
+  );
+});
+
 function assertUnconditionalJobs(source) {
   const { jobs } = load(source);
   assert.ok(jobs && typeof jobs === "object" && !Array.isArray(jobs));
