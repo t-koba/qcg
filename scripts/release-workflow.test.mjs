@@ -1,6 +1,12 @@
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
+import { createRequire } from "node:module";
 import assert from "node:assert/strict";
+
+// Reuse the locked verification dependencies installed before check-core.sh.
+const { load } = createRequire(
+  new URL("../frontend/generator/package.json", import.meta.url),
+)("js-yaml");
 
 const ci = readFileSync(new URL("../.github/workflows/ci.yml", import.meta.url), "utf8");
 const release = readFileSync(
@@ -43,11 +49,49 @@ test("tag releases wait for local CI on the same commit before bundle publicatio
   assert.doesNotMatch(publish, /^    if:.*\b(?:always|failure|cancelled)\s*\(/m);
 });
 
+function assertUnconditionalJobs(source) {
+  const { jobs } = load(source);
+  assert.ok(jobs && typeof jobs === "object" && !Array.isArray(jobs));
+  for (const [id, job] of Object.entries(jobs)) {
+    assert.ok(job && typeof job === "object" && !Array.isArray(job));
+    assert.ok(
+      !Object.hasOwn(job, "if"),
+      `CI job ${id} must run unconditionally when called from a tagged release`,
+    );
+  }
+}
+
 test("called CI jobs cannot skip required checks on tagged releases", () => {
-  // Job keys use four spaces; deeper step-level conditions remain allowed.
-  assert.doesNotMatch(
-    ci,
-    /^    if\s*:/m,
-    "CI jobs must run unconditionally when called from a tagged release",
-  );
+  assertUnconditionalJobs(ci);
 });
+
+for (const [name, source] of [
+  ["quoted job condition", `
+jobs:
+  check:
+    "if": github.event_name != 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo checked
+        if: always()
+`],
+  ["six-space job body", `
+jobs:
+  check:
+      if: github.event_name != 'push'
+      runs-on: ubuntu-latest
+      steps:
+        - run: echo checked
+          if: always()
+`],
+]) {
+  test(`rejects ${name} but permits step conditions`, () => {
+    assert.throws(
+      () => assertUnconditionalJobs(source),
+      /CI job check must run unconditionally/,
+    );
+    assert.doesNotThrow(() => assertUnconditionalJobs(
+      source.replace(/^ +"?if"?: github\.event_name != 'push'\n/m, ""),
+    ));
+  });
+}
