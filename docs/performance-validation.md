@@ -104,6 +104,79 @@ budget with full views; the snapshot/SSE matrix keeps its explicit 256 MiB
 full-view budget. Cache eviction still requires a cold reconstruction, and
 warm listing retains O(number of runs) directory, revision and sidecar checks.
 
+## Run-bundle streaming
+
+The actual `GET /api/runs/{id}/bundle` endpoint was profiled on the exact
+source digest `0e44d572d6a462f88925c60075c93b78a3f4fe5e8416f3e791bc1403d9788005`
+using its debug CLI binary (check job `48313d3c7209cb64e403e20d27aa43fbd4ef82f40ffce42512ae3433a0ef4815`,
+command record `d9927d73a2154065b2e870f05d97170f`). Synthetic completed-run
+journals were 1/8/12 MiB with 0/2 MiB random artifacts; journal records were
+about 256 KiB so each stayed below the 8 MiB per-event parser limit. All six
+responses passed Python's `ZipFile.testzip()`, and every fixture fit the route's
+effective 16 MiB / 1,000-entry limits. Each size case used one fresh server
+process and two sequential requests; these are two observations, not percentiles
+or release-build/production latency.
+
+| Journal / artifact MiB | Headers ms (req 1 / 2) | Body ms (req 1 / 2) | ZIP bytes | CPU ticks H/B (req 1 / req 2) | Cumulative RSS HWM KiB after req 1 / 2 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 / 0 | 513.58 / 20.03 | 727.67 / 750.56 | 782,124 | 51/72 / 2/73 | 60,216 / 61,840 |
+| 8 / 2 | 493.10 / 213.99 | 7,480.78 / 6,359.44 | 8,349,141 | 68/749 / 22/643 | 86,376 / 86,376 |
+| 12 / 2 | 335.10 / 235.94 | 7,865.36 / 8,170.84 | 11,474,287 | 33/798 / 24/820 | 77,344 / 82,260 |
+
+Headers-to-body timing is an approximation: preparation finishes before the
+response is built, while the ZIP writer starts concurrently and can enqueue
+initial chunks before the client sees headers. In a separate largest-fixture
+12 MiB + 2 MiB run (check job
+`9e543ae3a9afdcb4451029c42d3a2bf71a7ccc704608004686c9a57d77fde9fb`, command
+record `d72b799e029b4e8b8c4d2e899f58ed3b`), the first request measured
+469 ms to headers and 7,129 ms for the body, with 75 header-phase and 735
+body-phase process CPU ticks. `/proc` high-water RSS was 39,584 KiB before the
+request, 90,296 KiB at headers, and 94,680 KiB after the body. The second
+request did not raise the high-water mark. Thus most observed additional peak
+memory preceded the body, while streaming added about 4.3 MiB; these are
+whole-process high-water samples, not per-allocation measurements or an RSS
+quota. First-request `rchar` was anomalously higher than the repeat, so it is
+not used to attribute journal/artifact reads. The body CPU and wall times were
+close on this host, but combine deflate work, bounded-channel backpressure and
+HTTP delivery; this experiment does not isolate transport from compression.
+
+A separate disposable instrumented source copy (check job
+`ac6dcb751559b32e94038d42e157cd2e8b0127db0735b4867f12a5a80eaca1aa`, command
+record `28c7f955d3fb492b8159d3e191526bc9`) recorded internal phase durations on
+the 12 MiB + 2 MiB fixture. Its input tree digest was
+`7b27a741f9154a2e6eca6489e90c5451774225af5556c8601fc069485ba0f756`; the
+workspace difference from the matrix source was this documentation draft, and
+Rust instrumentation was applied only in the disposable copy.
+
+| Request | Journal/manifest read, parse/fold and artifact metadata ms | Snapshot assembly ms | Artifact preflight SHA-256 ms | Total preparation ms | ZIP writer ms |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1 | 294.457 | 0.207 | 87.942 | 383.165 | 9,014.710 |
+| 2 | 160.720 | 0.241 | 77.133 | 238.741 | 6,115.459 |
+
+The same run measured 736/248 ms to response headers and 9,024/6,146 ms for
+the body, with 852/637 process CPU ticks during the two bodies. The ZIP writer
+phase accounts for most of the measured wall time in this artifact-heavy
+fixture, but it includes journal and artifact reads, deflate, streamed artifact
+hashing, and bounded-channel backpressure; it is not an isolated compressor or
+transport benchmark. The first-request whole-process RSS high-water mark was
+104,360 KiB by headers and did not rise while the body drained. Instrumentation
+and this debug build make these observations unsuitable as release latency or
+memory estimates.
+
+Source review explains the phases: `run_bundle_parts` reads and folds the
+journal, constructs typed events and snapshot metadata, checks artifact paths
+and lengths, and hashes artifact contents before responding. The blocking ZIP
+writer then streams the journal and artifacts again, deflates entries, and
+rechecks artifact hashes while copying. The source-byte/entry limits bound
+accepted fixtures, not whole-process RSS. No cap-neutral optimization is
+justified by these measurements: removing either artifact hash pass would
+weaken pre-response verification or stream-time mutation detection, and
+changing compression could alter the existing compressed-output limit. No
+compression/buffer variant was measured; retain the implementation and require
+a controlled before/after comparison before proposing one. The profile did not
+test disconnect, shutdown, or slow clients, and no cancellation behavior was
+changed.
+
 ## Release and slow live consumers
 
 Release HTTP/SSE runs repeat all 27
