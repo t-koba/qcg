@@ -111,10 +111,16 @@ test("every timing ceiling follows its recorded evidence", () => {
   assert.equal(Number(server[3]), Number(budgetFor("server no-default")));
   assert.ok(
     policy.includes(
-      'qcg_test_time "server no-default build" cargo test -p server --no-default-features --locked --no-run\n' +
-        'qcg_test_time "server no-default" cargo test -p server --no-default-features --locked\n',
+      'qcg_test_time "MCP no-default" env CARGO_BUILD_WARNINGS=deny cargo test -p mcp --no-default-features --locked\n',
     ),
-    "build must precede the unchanged feature-off test command",
+    "MCP no-default tests must deny local compiler lint warnings",
+  );
+  assert.ok(
+    policy.includes(
+      'qcg_test_time "server no-default build" env CARGO_BUILD_WARNINGS=deny cargo test -p server --no-default-features --locked --no-run\n' +
+        'qcg_test_time "server no-default" env CARGO_BUILD_WARNINGS=deny cargo test -p server --no-default-features --locked\n',
+    ),
+    "warn-denying build must precede the unchanged feature-off test command",
   );
   const sampleMatch = policy.match(/\(([\d, ]+) s\)\./);
   assert.ok(sampleMatch, "policy comment must record the default-workspace sample");

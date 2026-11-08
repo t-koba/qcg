@@ -177,11 +177,12 @@ cargo clippy --workspace --all-targets --locked -- -D warnings
 qcg_test_time "default workspace" cargo test --workspace --locked
 # Compile and run feature-off variants on every OS. MCP covers the no-OAuth
 # configuration; server covers the no-CORS build (identical test names do not
-# imply identical compile-gated branches).
-qcg_test_time "MCP no-default" cargo test -p mcp --no-default-features --locked
+# imply identical compile-gated branches). Cargo 1.97+ denies local lint warnings
+# without RUSTFLAGS cache churn; scope it to these feature-off variants.
+qcg_test_time "MCP no-default" env CARGO_BUILD_WARNINGS=deny cargo test -p mcp --no-default-features --locked
 # Separate compilation from the post-build test invocation budget.
-qcg_test_time "server no-default build" cargo test -p server --no-default-features --locked --no-run
-qcg_test_time "server no-default" cargo test -p server --no-default-features --locked
+qcg_test_time "server no-default build" env CARGO_BUILD_WARNINGS=deny cargo test -p server --no-default-features --locked --no-run
+qcg_test_time "server no-default" env CARGO_BUILD_WARNINGS=deny cargo test -p server --no-default-features --locked
 bash scripts/check-fixtures.sh
 bash scripts/package-dist.sh --dry-run
 if [[ "$(uname -s)" == Linux ]]; then
