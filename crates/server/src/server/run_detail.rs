@@ -1905,6 +1905,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn channel_writer_exits_after_response_receiver_closes() {
+        use std::io::Write as _;
+
+        let (sender, receiver) =
+            tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(1);
+        let (started, first_chunk_sent) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut writer = ChannelWriter { sender };
+            writer
+                .write_all(b"first")
+                .expect("first chunk should enter the full channel");
+            started.send(()).expect("test should observe first chunk");
+            writer.write_all(b"second").unwrap_err()
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_chunk_sent)
+            .await
+            .expect("worker should start")
+            .expect("first chunk should be sent");
+        drop(receiver);
+        let error = tokio::time::timeout(std::time::Duration::from_secs(2), worker)
+            .await
+            .expect("receiver closure should stop the writer")
+            .expect("blocking worker should join");
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
     async fn bundle_and_zip_streams_end_at_shutdown_without_detached_writers() {
         // E05: shutdown is requested before the writers are spawned, and the
         // response bodies end instead of holding the drain open. Started
