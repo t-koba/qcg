@@ -140,6 +140,42 @@ equivalence to Docker's CLI. Missing resources, daemon errors, and cleanup
 failures must remain unresolved, not successful cleanup. An empty lookup must
 never clear a durable Started operation.
 
+## Incus v6.23.0 contract audit
+
+The source review does not establish a safe Incus recovery primitive. The
+version-pinned [`instances_post.go`](https://github.com/lxc/incus/blob/v6.23.0/cmd/incusd/instances_post.go)
+creates a task operation with no `onCancel` callback for image/empty instance
+creation, then runs instance creation asynchronously. Incus operations expose
+`may_cancel` only when a cancel callback or cancelable HTTP request is present;
+`DELETE /operations/{id}` is a best-effort operation cancellation API, not a
+durable create fence or proof that no later side effect can complete. The
+create request does not provide a client-selected durable operation key, and
+the caller learns the generated operation UUID only in the asynchronous
+response. A lost response or qcg SIGKILL therefore has no proven terminal
+create outcome or acknowledged cancel-and-drain barrier. This is a source
+contract review, not a direct daemon disconnect/cancellation test.
+
+The deletion route in
+[`instance_delete.go`](https://github.com/lxc/incus/blob/v6.23.0/cmd/incusd/instance_delete.go)
+resolves `DELETE /instances/{name}` (scoped by project), loads the instance by
+name, then schedules `inst.Delete(false)`. The route/client contract reviewed
+has no expected immutable instance ID, ownership token, or generation
+precondition on deletion. A prior GET/name/marker check consequently cannot
+prove that a later name-addressed delete still targets the same instance.
+Incus's internal database ID and per-instance operation locks do not provide
+qcg a documented public compare-and-delete contract.
+
+Do not implement Incus cleanup from this evidence: durable create fencing and
+identity-conditional destruction are both unproven, and the isolated Incus
+daemon needed for direct race/SIGKILL coverage was not available. Source
+receipts for this bounded v6.23.0 audit are `202e3034190bc5b8be2738c9a8bdd3e58e8684347622b3c89f5d87a0d05bb5f8`
+(creation route), `e71ed65300f794adf617e8da8fb92e7a16345b6b590f3a1c610854ef6ddae443`
+(create implementation), `2e157865047bfc55ef3c7411c1964de58adb9695468ccb0087ed79fbee625801`
+(deletion route), and `5b1d242142dcf6939d0af93fb551893e1a4a26a9991c01c177dc600151e59c54`
+(operation cancellation lifecycle). These are partial source-review evidence,
+not crash-cleanup acceptance. Keep Incus effects unresolved and split this
+backend from any future backend whose complete contract and tests differ.
+
 ## Real-backend identity diagnostic
 
 `scripts/probe-container-identity.py` prepares a bounded, destructive protocol
