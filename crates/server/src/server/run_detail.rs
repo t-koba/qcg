@@ -100,9 +100,9 @@ pub(crate) async fn read_run_bundle(
                     tracing::warn!(%error, "bundle writer failed during shutdown abort");
                 }
             }
-            // Client disconnect (receiver dropped, response lifetime ended):
-            // abort the writer so it cannot continue detached past the
-            // disconnected response (E05).
+            // Client disconnect closes the receiver: ChannelWriter's blocking_send
+            // fails, letting a started writer exit cooperatively. Abort alone cannot
+            // stop it; this handler's watcher joins the task (E05).
             _ = disconnect_sender.closed() => {
                 blocking.abort();
                 if let Err(error) = blocking.await
@@ -911,8 +911,8 @@ pub(crate) async fn read_artifacts_zip(
                     tracing::warn!(%error, "artifacts zip writer failed during shutdown abort");
                 }
             }
-            // Client disconnect (receiver dropped): abort so the writer
-            // cannot continue detached past the disconnected response (E05).
+            // Client disconnect closes the receiver: ChannelWriter's blocking_send
+            // fails so a started writer exits cooperatively; abort alone cannot stop it, handler's watcher joins the task (E05).
             _ = disconnect_sender.closed() => {
                 blocking.abort();
                 if let Err(error) = blocking.await
@@ -1908,8 +1908,7 @@ mod tests {
     async fn channel_writer_exits_after_response_receiver_closes() {
         use std::io::Write as _;
 
-        let (sender, receiver) =
-            tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(1);
+        let (sender, receiver) = tokio::sync::mpsc::channel::<Result<Vec<u8>, io::Error>>(1);
         let (started, first_chunk_sent) = tokio::sync::oneshot::channel();
         let worker = tokio::task::spawn_blocking(move || {
             let mut writer = ChannelWriter { sender };
