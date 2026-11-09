@@ -15,7 +15,6 @@ use std::convert::Infallible;
 use std::io::{self, Write};
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tokio_stream::wrappers::ReceiverStream;
 pub(crate) async fn run_snapshot(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -64,17 +63,11 @@ pub(crate) async fn read_run_bundle(
         .await
         .map_err(ApiHttpError::from_api)?;
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
-    // Tied to shutdown and client disconnect and joined (E05): request
-    // cancellation, then await the task. Shutdown's `take_until` ends the
-    // body stream; disconnect drops it. Tokio cannot abort a started blocking
-    // worker; ChannelWriter's bounded send stops it when the response receiver
-    // closes, and the watcher joins it. Normal completion needs no abort; the
-    // task is bounded by artifact limits.
     // No ETag: streaming archives cannot validate without hashing the full
     // body upfront (defeating streaming); clients condition on the snapshot
     // or artifact-list ETag as the queue-revision alternative (E16).
     let disconnect_sender = sender.clone();
-    let mut blocking = tokio::task::spawn_blocking(move || {
+    let blocking = tokio::task::spawn_blocking(move || {
         let writer = ChannelWriter {
             sender: sender.clone(),
         };
@@ -88,43 +81,13 @@ pub(crate) async fn read_run_bundle(
             }
         }
     });
-    let shutdown = state.shutdown.clone();
-    let shutdown_watch = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = shutdown_watch.cancelled() => {
-                blocking.abort();
-                if let Err(error) = blocking.await
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "bundle writer failed during shutdown abort");
-                }
-            }
-            // Client disconnect closes the receiver: ChannelWriter's blocking_send
-            // fails, letting a started writer exit cooperatively. Abort alone cannot
-            // stop it; this handler's watcher joins the task (E05).
-            _ = disconnect_sender.closed() => {
-                blocking.abort();
-                if let Err(error) = blocking.await
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "bundle writer failed during disconnect abort");
-                }
-            }
-            result = &mut blocking => {
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "bundle writer task failed");
-                }
-            }
-        }
-    });
-    // Ends at shutdown like the artifacts zip: the draining connection
-    // closes instead of holding graceful drain open (E05).
-    let stream = ReceiverStream::new(receiver).take_until(async move {
-        shutdown.cancelled().await;
-    });
+    let (stream, _watcher) = zip_response_stream(
+        receiver,
+        disconnect_sender,
+        blocking,
+        state.shutdown.clone(),
+        "bundle",
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
@@ -877,13 +840,10 @@ pub(crate) async fn read_artifacts_zip(
         .map_err(ApiHttpError::from_api)?;
     let limits = state.artifact_limits.effective();
     let (sender, receiver) = mpsc::channel::<Result<Vec<u8>, io::Error>>(4);
-    // Tied to shutdown and client disconnect and joined (E05): request abort,
-    // then await the task. A started blocking worker stops when the response
-    // receiver closes and ChannelWriter's bounded send fails; the watcher
-    // joins it. No ETag for the same streaming reason as the bundle path:
+    // No ETag for the same streaming reason as the bundle path:
     // clients use the artifact-list ETag (E16).
     let disconnect_sender = sender.clone();
-    let mut blocking = tokio::task::spawn_blocking(move || {
+    let blocking = tokio::task::spawn_blocking(move || {
         let writer = ChannelWriter {
             sender: sender.clone(),
         };
@@ -899,44 +859,13 @@ pub(crate) async fn read_artifacts_zip(
             }
         }
     });
-    let shutdown = state.shutdown.clone();
-    let shutdown_watch = shutdown.clone();
-    tokio::spawn(async move {
-        tokio::select! {
-            _ = shutdown_watch.cancelled() => {
-                blocking.abort();
-                if let Err(error) = blocking.await
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "artifacts zip writer failed during shutdown abort");
-                }
-            }
-            // Client disconnect closes the receiver: ChannelWriter's blocking_send
-            // fails so a started writer exits cooperatively; abort alone cannot stop it, handler's watcher joins the task (E05).
-            _ = disconnect_sender.closed() => {
-                blocking.abort();
-                if let Err(error) = blocking.await
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "artifacts zip writer failed during disconnect abort");
-                }
-            }
-            result = &mut blocking => {
-                if let Err(error) = result
-                    && !error.is_cancelled()
-                {
-                    tracing::warn!(%error, "artifacts zip writer task failed");
-                }
-            }
-        }
-    });
-    // The zip body ends at shutdown like every other long-lived stream:
-    // the draining connection closes instead of holding graceful drain
-    // open (E05). Read endpoints stay admissible during the drain; only
-    // mutating work is refused with 503.
-    let stream = ReceiverStream::new(receiver).take_until(async move {
-        shutdown.cancelled().await;
-    });
+    let (stream, _watcher) = zip_response_stream(
+        receiver,
+        disconnect_sender,
+        blocking,
+        state.shutdown.clone(),
+        "artifacts",
+    );
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/zip")
@@ -947,6 +876,77 @@ pub(crate) async fn read_artifacts_zip(
         .header(header::CACHE_CONTROL, "no-store")
         .body(Body::from_stream(stream))
         .map_err(ApiHttpError::internal)
+}
+// The body is the sole strong receiver owner: disconnect drops it. The watcher
+// closes it on shutdown even if Hyper stops polling under socket backpressure.
+// Abort only prevents queued blocking work; receiver closure stops started sends.
+// Both cancellation paths join the worker (E05), including error delivery through
+// the same bounded channel. No forwarding task or extra chunk buffer is needed.
+// The returned handle allows tests to observe the watcher's join, not just EOF.
+fn zip_response_stream(
+    receiver: mpsc::Receiver<Result<Vec<u8>, io::Error>>,
+    sender: mpsc::Sender<Result<Vec<u8>, io::Error>>,
+    mut blocking: tokio::task::JoinHandle<()>,
+    shutdown: tokio_util::sync::CancellationToken,
+    archive: &'static str,
+) -> (
+    impl futures_util::Stream<Item = Result<Vec<u8>, io::Error>> + Send + 'static,
+    tokio::task::JoinHandle<()>,
+) {
+    let receiver = Arc::new(std::sync::Mutex::new(receiver));
+    // A strong watcher reference would keep a disconnected receiver alive.
+    let weak = Arc::downgrade(&receiver);
+    let shutdown_watch = shutdown.clone();
+    let watcher = tokio::spawn(async move {
+        tokio::select! {
+            _ = shutdown_watch.cancelled() => {
+                if let Some(receiver) = weak.upgrade() {
+                    // Close before awaiting: abort cannot interrupt blocking_send.
+                    // This must not depend on the body's next poll or its drop.
+                    receiver.lock().unwrap_or_else(|e| e.into_inner()).close();
+                }
+                blocking.abort();
+                if let Err(error) = blocking.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, archive, "zip writer failed during shutdown abort");
+                }
+            }
+            // Dropping the body closes the receiver, so blocking_send fails.
+            // Abort alone cannot stop a started writer; always join it (E05).
+            _ = sender.closed() => {
+                blocking.abort();
+                if let Err(error) = blocking.await
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, archive, "zip writer failed during disconnect abort");
+                }
+            }
+            result = &mut blocking => {
+                // Normal completion needs no abort; artifact limits bound the task.
+                // Dropping this watcher's sender lets the body finish draining.
+                if let Err(error) = result
+                    && !error.is_cancelled()
+                {
+                    tracing::warn!(%error, archive, "zip writer task failed");
+                }
+            }
+        }
+    });
+    // Lock only around nonblocking poll_recv/close, never an await or send.
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        receiver
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .poll_recv(cx)
+    })
+    // Closing rejects sends; take_until also discards queued chunks at shutdown.
+    // It is not responsible for releasing the writer under socket backpressure.
+    // Read endpoints remain admissible during drain; only mutations are refused
+    // with 503. A ZIP admitted during drain follows this same cancellation path.
+    // The response ends rather than holding graceful drain open (E05).
+    .take_until(async move { shutdown.cancelled().await });
+    (stream, watcher)
 }
 pub(crate) struct ChannelWriter {
     sender: mpsc::Sender<Result<Vec<u8>, io::Error>>,
@@ -1928,6 +1928,96 @@ mod tests {
             .expect("receiver closure should stop the writer")
             .expect("blocking worker should join");
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[tokio::test]
+    async fn zip_response_body_drop_joins_writer_and_normal_completion_drains() {
+        for disconnect in [false, true] {
+            let (sender, receiver) = mpsc::channel(1);
+            let disconnect_sender = sender.clone();
+            let (started, first_chunk_sent) = tokio::sync::oneshot::channel();
+            let (finished, outcome) = tokio::sync::oneshot::channel();
+            let worker = tokio::task::spawn_blocking(move || {
+                let mut writer = ChannelWriter { sender };
+                writer.write_all(b"zip").unwrap();
+                started.send(()).unwrap();
+                let result = writer.write_all(b"end");
+                finished.send(result).unwrap();
+            });
+            let (stream, watcher) = zip_response_stream(
+                receiver,
+                disconnect_sender,
+                worker,
+                tokio_util::sync::CancellationToken::new(),
+                "test",
+            );
+            let body = Body::from_stream(stream);
+            tokio::time::timeout(std::time::Duration::from_secs(2), first_chunk_sent)
+                .await
+                .unwrap()
+                .unwrap();
+            if disconnect {
+                drop(body);
+            } else {
+                let bytes = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    axum::body::to_bytes(body, 6),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert_eq!(bytes.as_ref(), b"zipend");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
+                .await
+                .unwrap()
+                .unwrap();
+            let result = outcome.await.unwrap();
+            if disconnect {
+                assert_eq!(result.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+            } else {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn zip_shutdown_joins_started_writer_without_polling_body() {
+        let (sender, receiver) = mpsc::channel(1);
+        let disconnect_sender = sender.clone();
+        let (started, first_chunk_sent) = tokio::sync::oneshot::channel();
+        let (finished, write_result) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let mut writer = ChannelWriter { sender };
+            writer.write_all(b"first").unwrap();
+            // The channel is full. Announce the next send from this started
+            // worker, without relying on a sleep or a task scheduling order.
+            started.send(()).unwrap();
+            let error = writer.write_all(b"second").unwrap_err();
+            finished.send(error.kind()).unwrap();
+        });
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let (stream, watcher) = zip_response_stream(
+            receiver,
+            disconnect_sender,
+            worker,
+            shutdown.clone(),
+            "test",
+        );
+        // Keep the production body alive but never poll it: this is not an
+        // HTTP disconnect test. Only the watcher can close its receiver.
+        let body = Body::from_stream(stream);
+        tokio::time::timeout(std::time::Duration::from_secs(2), first_chunk_sent)
+            .await
+            .unwrap()
+            .unwrap();
+        shutdown.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(2), watcher)
+            .await
+            .expect("shutdown watcher must join without body polling")
+            .expect("watcher must not panic");
+        assert_eq!(write_result.await.unwrap(), io::ErrorKind::BrokenPipe);
+        drop(body);
     }
 
     #[tokio::test]
