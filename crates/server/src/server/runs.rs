@@ -1,5 +1,5 @@
 use anyhow::Result;
-use api::{ForkRun, RunListQuery, RunListResponse, StartRun};
+use api::{ForkRun, RunListQuery, StartRun};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -37,80 +37,42 @@ pub(crate) async fn list_runs(
         .map_err(|error| {
             ApiHttpError::bad_request_field("since", format!("since must be RFC 3339: {error}"))
         })?;
-    let mut items = state
+    // Cursor is `started_at|run_id`; bare run_id cursors are rejected
+    // instead of silently misordered. Descending serves newest-first views
+    // (B12); ordering is `(started_at, run_id)` because run_id alone embeds
+    // the generator prefix and never sorts globally by time (C01).
+    let cursor = query
+        .cursor
+        .as_deref()
+        .map(|cursor| {
+            cursor
+                .split_once('|')
+                .map(|(started_at, run_id)| (started_at.to_string(), run_id.to_string()))
+                .ok_or_else(|| {
+                    ApiHttpError::bad_request_field(
+                        "cursor",
+                        "cursor must have form `started_at|run_id`",
+                    )
+                })
+        })
+        .transpose()?;
+    let response = state
         .service
-        .list_run_items()
+        .list_run_page(service::RunPage {
+            limit,
+            since,
+            cursor,
+            state: query.state,
+            generator_id: query.generator_id,
+            descending: matches!(query.order, Some(api::RunListOrder::Desc)),
+        })
         .await
         .map_err(ApiHttpError::from_api)?;
-    // Stable chronological order across generators comes from
-    // list_run_items as (started_at, run_id); run_id alone embeds the
-    // generator prefix and never sorts globally by time (C01).
-    // Cursor is `started_at|run_id` for the new order. Bare run_id cursors
-    // are rejected instead of silently misordered.
-    let cursor_position = match query.cursor.as_deref() {
-        None => None,
-        Some(cursor) => match cursor.split_once('|') {
-            Some((started_at, run_id)) => Some((started_at.to_string(), run_id.to_string())),
-            None => {
-                return Err(ApiHttpError::bad_request_field(
-                    "cursor",
-                    "cursor must have form `started_at|run_id`",
-                ));
-            }
-        },
-    };
-    // A run with an unparseable started_at is journal corruption: gc fails
-    // on the same condition, so listing must fail closed as well instead of
-    // silently dropping the run from filtered results.
-    if since.is_some() {
-        for item in &items {
-            if let Err(error) = chrono::DateTime::parse_from_rfc3339(&item.started_at) {
-                return Err(ApiHttpError::internal(format!(
-                    "run `{}` has invalid started_at: {error}",
-                    item.run_id
-                )));
-            }
-        }
-    }
-    // Descending order serves newest-first views: the same
-    // `started_at|run_id` cursor compares flipped, and the page is cut
-    // from the newest end so capped fetches never lose recent runs (B12).
-    // Ascending keeps the original contract byte-for-byte.
-    let descending = matches!(query.order, Some(api::RunListOrder::Desc));
-    items.retain(|item| {
-        query.state.is_none_or(|run_state| item.state == run_state)
-            && query
-                .generator_id
-                .as_ref()
-                .is_none_or(|generator_id| &item.generator_id == generator_id)
-            && since.is_none_or(|since| {
-                chrono::DateTime::parse_from_rfc3339(&item.started_at)
-                    .is_ok_and(|started_at| started_at >= since)
-            })
-            && cursor_position
-                .as_ref()
-                .is_none_or(|(cursor_started, cursor_id)| {
-                    if descending {
-                        (&item.started_at, &item.run_id) < (cursor_started, cursor_id)
-                    } else {
-                        (&item.started_at, &item.run_id) > (cursor_started, cursor_id)
-                    }
-                })
-    });
-    if descending {
-        items.reverse();
-    }
-    let next_cursor = (items.len() > limit).then(|| {
-        let last = &items[limit - 1];
-        format!("{}|{}", last.started_at, last.run_id)
-    });
-    items.truncate(limit);
     // Weak ETag over the exact list body (E16): any item move changes the
     // validator, and `If-None-Match` (including `*` and weak comparison)
     // yields 304 via the single conditional entry point. Syntactically
     // invalid validators fail closed with 400 (E16).
-    let body = serde_json::to_vec(&RunListResponse { items, next_cursor })
-        .map_err(ApiHttpError::internal)?;
+    let body = serde_json::to_vec(&response).map_err(ApiHttpError::internal)?;
     conditional_response(&headers, body, "application/json")
 }
 
