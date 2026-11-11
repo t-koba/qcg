@@ -110,6 +110,19 @@ event, artifact, and journal routes. Principal paths include:
   recorded an unmetered hosted-search charge, or its pricing contract cannot
   be resolved
 
+### Listing runs
+
+`GET /api/runs` pages run history ordered by `(started_at, run_id)`, ascending
+or newest-first with `order=desc`. The `cursor` is `started_at|run_id`; `since`,
+`generator_id` and `state` filter the page. A request validates the runs it
+returns and the runs it has to examine to fill the page (the page plus the one
+run that decides `next_cursor`, and any run a `state` filter skips); it fails if
+one of those journals or sidecars is corrupt. A corrupt run that the request
+does not examine does not affect it: the corruption surfaces when that run is
+listed on a page, read in detail, or processed by garbage collection. Runs
+added, changed, deleted or collected by another process appear on the next
+request.
+
 ### Invalidating a successful result
 
 `POST /api/runs/{id}/invalidation` requires JSON:

@@ -101,8 +101,16 @@ The list-only HTTP matrix now uses the 64 MiB product default and records
 across twenty refreshes. This allows request traffic while rejecting repeated
 reads of the 1 MiB target journal. Compact list projections share the cache
 budget with full views; the snapshot/SSE matrix keeps its explicit 256 MiB
-full-view budget. Cache eviction still requires a cold reconstruction, and
-warm listing retains O(number of runs) directory, revision and sidecar checks.
+full-view budget. Cache eviction still requires a cold reconstruction.
+
+A list request reads the runs directory by name only and keeps each run's
+ordering facts (`started_at`, `generator_id`) in memory. Warm, its journal
+and sidecar work (open, revision check, sidecar read) is proportional to the
+rows it examines, not to run history; the remaining per-request cost is the
+directory read and in-memory ordering, O(number of runs) in names without file
+access. After a restart the facts are empty, so the first listing reads each
+journal once (O(number of runs)); later listings are bounded as above. Nothing
+is persisted to avoid that first pass.
 
 ## Run-bundle streaming
 
