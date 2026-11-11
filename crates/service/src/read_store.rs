@@ -139,6 +139,9 @@ impl Cache {
 #[derive(Debug)]
 pub(crate) struct ReadStore {
     entries: Mutex<Cache>,
+    /// Immutable ordering facts per run directory name: the identity event's
+    /// `started_at` and `generator_id`. Memory only; learned lazily.
+    facts: Mutex<BTreeMap<String, (String, String)>>,
     shards: [Mutex<()>; 64],
     max_entries: usize,
     max_bytes: usize,
@@ -157,6 +160,7 @@ impl ReadStore {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: Mutex::new(Cache::default()),
+            facts: Mutex::default(),
             shards: std::array::from_fn(|_| Mutex::new(())),
             max_entries,
             max_bytes,
@@ -178,10 +182,42 @@ impl ReadStore {
         item.invalidation = crate::invalidation::read_invalidation(directory)?;
         Ok(item)
     }
-    // Prune only after a complete successful census; concurrent readers lose at most a reusable entry.
-    pub fn prune(&self, root: &Utf8Path, items: &[api::RunListItem]) {
-        let live: std::collections::BTreeSet<&str> =
-            items.iter().map(|item| item.run_id.as_str()).collect();
+    fn facts(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (String, String)>> {
+        self.facts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+    pub fn remember(&self, item: &api::RunListItem) {
+        self.facts().insert(
+            item.run_id.clone(),
+            (item.started_at.clone(), item.generator_id.clone()),
+        );
+    }
+    /// Drops everything remembered about a directory that is no longer a run.
+    pub fn forget(&self, directory: &Utf8Path) {
+        self.facts().remove(directory.file_name().unwrap());
+        self.lock()
+            .remove(&run_meta_dir(directory).join("journal.jsonl"));
+    }
+    pub fn is_known(&self, name: &str) -> bool {
+        self.facts().contains_key(name)
+    }
+    /// Known `(started_at, run_id, generator_id)` rows accepted by `keep`,
+    /// ascending by `(started_at, run_id)`.
+    pub fn ordered(
+        &self,
+        keep: impl Fn(&str, &str, &str) -> bool,
+    ) -> Vec<(String, String, String)> {
+        let mut rows: Vec<_> = (self.facts().iter())
+            .filter(|(name, (started, generator))| keep(started, name, generator))
+            .map(|(name, (started, generator))| (started.clone(), name.clone(), generator.clone()))
+            .collect();
+        rows.sort();
+        rows
+    }
+    // Prune only after a complete successful enumeration; concurrent readers lose at most a reusable entry.
+    pub fn prune(&self, root: &Utf8Path, live: &std::collections::BTreeSet<&str>) {
+        self.facts().retain(|name, _| live.contains(name.as_str()));
         let mut entries = self.lock();
         let dead: Vec<_> = entries
             .views
@@ -536,8 +572,22 @@ mod tests {
             .unwrap();
         (directory, writer)
     }
+    fn page(limit: usize) -> crate::RunPage {
+        crate::RunPage {
+            limit,
+            ..Default::default()
+        }
+    }
+    fn try_page(
+        root: &Utf8Path,
+        cap: usize,
+        store: &ReadStore,
+        page: crate::RunPage,
+    ) -> Result<Vec<api::RunListItem>, ServiceError> {
+        Ok(crate::summaries::list_items_page(root, cap, store, &page)?.items)
+    }
     fn census(root: &Utf8Path, store: &ReadStore) -> Vec<api::RunListItem> {
-        crate::summaries::list_items_cached(root, 100, store).unwrap()
+        try_page(root, 100, store, page(usize::MAX)).unwrap()
     }
     #[test]
     fn compact_census_coalesces_beyond_full_count_limit_and_refreshes_sidecars() {
@@ -564,7 +614,7 @@ mod tests {
         assert_ne!(before, after);
         assert_eq!(store.applied.load(Ordering::Relaxed), 2);
         std::fs::write(&sidecar, b"broken").unwrap();
-        assert!(crate::summaries::list_items_cached(root, 100, &store).is_err());
+        assert!(try_page(root, 100, &store, page(usize::MAX)).is_err());
         std::fs::remove_file(&sidecar).unwrap();
         // A compact hit must not substitute for a full detail read.
         assert_eq!(store.read(&run).unwrap().state.last_seq, 1);
@@ -608,10 +658,10 @@ mod tests {
             .unwrap()
             .write_all(b"broken\n")
             .unwrap();
-        // Every candidate is validated before any HTTP filter/page selection.
-        assert!(crate::summaries::list_items_cached(root, 100, &store).is_err());
+        // A run the request examines is validated; a corrupt one fails it.
+        assert!(try_page(root, 100, &store, page(usize::MAX)).is_err());
         std::fs::write(&path, []).unwrap();
-        // Empty/missing journals are excluded and pruned on a successful scan.
+        // Empty/missing journals are excluded and their entries dropped.
         std::fs::remove_file(off_page).unwrap();
         assert!(census(root, &store).is_empty());
         assert!(store.entries.lock().unwrap().views.is_empty());
@@ -633,7 +683,7 @@ mod tests {
             vec![gone.clone()]
         );
         journal_at(root.join("remaining"));
-        assert!(crate::summaries::list_items_cached(root, 0, &store).is_err());
+        assert!(try_page(root, 0, &store, page(usize::MAX)).is_err());
         assert!(
             store
                 .entries

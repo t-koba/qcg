@@ -1129,14 +1129,27 @@ impl LocalService {
         Ok(run_dir)
     }
 
+    /// Every run, oldest first; each run is validated.
     pub async fn list_run_items(&self) -> Result<Vec<RunListItem>, ApiError> {
-        // A bounded blocking scan projects cached read views. Unchanged
-        // journals are not folded again for each list request.
+        let page = crate::summaries::RunPage {
+            limit: usize::MAX,
+            ..Default::default()
+        };
+        Ok(self.list_run_page(page).await?.items)
+    }
+
+    /// One page of run history; only the runs it examines are validated.
+    pub async fn list_run_page(
+        &self,
+        page: crate::summaries::RunPage,
+    ) -> Result<api::RunListResponse, ApiError> {
         let directory = self.inner.runs_dir.clone();
         let cap = self.inner.deployment_policy.max_directory_scan_entries;
         let store = self.inner.read_store.clone();
-        self.blocking_read(move || crate::summaries::list_items_cached(&directory, cap, &store))
-            .await
+        self.blocking_read(move || {
+            crate::summaries::list_items_page(&directory, cap, &store, &page)
+        })
+        .await
     }
 
     /// In-flight preemption fact for observability only: counts in-memory
