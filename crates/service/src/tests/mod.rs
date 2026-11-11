@@ -20,4 +20,6 @@ pub(crate) mod package_pinning;
 
 mod invalidation;
 
+mod run_page;
+
 mod budget_failures;
