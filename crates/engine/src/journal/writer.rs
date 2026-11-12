@@ -818,6 +818,7 @@ impl JournalWriter {
                 );
             }
             let event = RunEvent::from_flat(&value).map_err(JournalError::InvalidEvent)?;
+            let first_queued = kind == "run_queued" && state.queued_at.is_none();
             let mut next_state = state.clone();
             next_state.apply(&value)?;
             let state_bytes = serialize_bounded(&next_state, self.limits.max_state_bytes, "state")?;
@@ -826,6 +827,7 @@ impl JournalWriter {
                 JournalError::InvalidEvent(format!("journal event is not UTF-8: {error}"))
             })?;
             append_serialized_json_line(&mut *file, bytes, &mut stats, self.limits)?;
+            super::counters::observe(kind, &value, first_queued);
             // Durability ordering (Q2): terminal events seal the run and
             // operation mappings (`operation_started`/`operation_finished`)
             // precede any external send, so both fsync the journal file
@@ -1089,9 +1091,11 @@ impl JournalWriter {
                 object.insert("span_id".into(), Value::String(api::span_id_for_seq(seq)));
             }
             let event = RunEvent::from_flat(&value).map_err(JournalError::InvalidEvent)?;
+            let first_queued = kind == "run_queued" && state.queued_at.is_none();
             state.apply(&value)?;
             let bytes = serialize_bounded(&value, limits.max_event_bytes, "event")?;
             append_serialized_json_line(&mut file, bytes, &mut stats, limits)?;
+            super::counters::observe(kind, &value, first_queued);
             if api::is_terminal_event_kind(kind)
                 || matches!(
                     kind,

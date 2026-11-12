@@ -1155,18 +1155,22 @@ impl LocalService {
         .await
     }
 
-    /// In-flight preemption fact for observability only: counts in-memory
-    /// runs currently marked preempted. No threshold or alert lives here;
-    /// policy decisions stay outside. Async so the read takes the lock
-    /// instead of reporting 0 under contention.
-    pub async fn preempted_inflight(&self) -> usize {
-        self.inner
-            .runs
-            .read()
-            .await
-            .values()
-            .filter(|record| record.preempted)
-            .count()
+    /// Observability facts from memory only, never from disk: the tracked
+    /// runs by state, and how many of them are marked preempted. No
+    /// threshold or alert lives here; policy decisions stay outside. Async so
+    /// the read takes the lock instead of reporting 0 under contention.
+    pub async fn live_runs(&self) -> (BTreeMap<RunStatus, usize>, usize) {
+        let runs = self.inner.runs.read().await;
+        let mut states = BTreeMap::new();
+        // Settled records linger until evicted; terminal counts come from
+        // the since-start counters instead.
+        for record in runs.values().filter(|record| !record.state.is_terminal()) {
+            *states.entry(record.state).or_default() += 1;
+        }
+        (
+            states,
+            runs.values().filter(|record| record.preempted).count(),
+        )
     }
 
     pub(crate) fn load_generator(&self, id: &str) -> Result<Contract, ApiError> {

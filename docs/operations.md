@@ -1016,13 +1016,25 @@ Unattended limits:
   exits/panics are logged and supervised with the same bounded restart
   backoff. Shutdown interrupts retry/restart waits; the server's existing
   shutdown grace/deadline still bounds in-progress work.
-- `GET /metrics` exposes gauges only: durable runs by state, active, queued,
-  waiting, confirming, in-flight preempted (`qcg_runs_preempted`), distinct
-  generators, and per-generator counts under a bounded selection
-  (`METRICS_GENERATOR_LIMIT`, default 20, 1-256; `METRICS_PINNED_GENERATORS`,
-  optional comma-separated generator ids that survive truncation when present).
-  Pinned ids lead id-ascending, the remainder fills top by run count, and the
-  scrape never exceeds the budget.
+- `GET /metrics` reports **this process's own activity** and never reads the
+  run directory, so a scrape costs the same on an empty store and on years of
+  history, and a corrupt old run cannot break it. Sources:
+  `runs_total{state}` is the in-memory tracked runs for live states (`queued`,
+  `running`, `waiting`, `confirming`, `cancel_requested`) and, for terminal
+  states (`success`, `failed`, `canceled`, `interrupted`), the runs this
+  process settled since it started (counted at the terminal journal append).
+  `runs_active`, `runs_queued`, `runs_waiting`, `runs_confirming` and
+  `runs_preempted` are gauges over the tracked runs. `generators` and
+  `generator_runs_total{generator}` count runs this process admitted since
+  start, under a bounded selection (`METRICS_GENERATOR_LIMIT`, default 20,
+  1-256; `METRICS_PINNED_GENERATORS`, optional comma-separated generator ids
+  that survive truncation when present; pinned ids lead id-ascending, the
+  remainder fills top by count, and the scrape never exceeds the budget).
+  Before this change `runs_total` and the generator series were a census of
+  every run in the store; they are now since-start values, so rates and
+  `increase()` work and a restart resets them. With several processes on a
+  shared store each instance reports its own activity; nothing is aggregated
+  across processes, and a run resumed by another instance counts there.
   Latency histograms, error rates, queue dwell, preemption totals, and GC
   deletion or failure counts are not exported; alert thresholds live outside.
 - OTLP export exists in implementation (`OTLP_ENDPOINT`,

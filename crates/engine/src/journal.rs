@@ -1,8 +1,10 @@
+mod counters;
 mod read;
 mod serialize;
 mod types;
 mod writer;
 
+pub use counters::run_counters;
 pub use read::*;
 pub use serialize::*;
 pub use types::*;

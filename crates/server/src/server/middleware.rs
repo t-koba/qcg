@@ -4,7 +4,7 @@ use axum::http::{HeaderMap, HeaderValue, Method, header};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -153,39 +153,24 @@ pub(crate) fn resolve_metrics_policy() -> Result<MetricsPolicy, String> {
     })
 }
 
+/// Metrics come from state this process maintains as events happen: the
+/// tracked in-memory runs and counters bumped at journal appends. A scrape
+/// reads no run directory, so its cost does not grow with history.
 pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Response, ApiHttpError> {
-    let runs = state
-        .service
-        .list_run_items()
-        .await
-        .map_err(ApiHttpError::from_api)?;
-    // Single fold over the one `list_run_items` scan: every metric below is
-    // derived here, so a scrape performs no second scan and no extra I/O.
-    let mut states = BTreeMap::<String, usize>::new();
-    let mut generators = BTreeMap::<String, usize>::new();
-    let mut active = 0_usize;
-    let mut queued = 0_usize;
-    let mut waiting = 0_usize;
-    let mut confirming = 0_usize;
-    for run in &runs {
-        *states.entry(run.state.to_string()).or_default() += 1;
-        *generators.entry(run.generator_id.clone()).or_default() += 1;
-        match run.state {
-            api::RunStatus::Queued => {
-                queued += 1;
-                active += 1;
-            }
-            api::RunStatus::Running => active += 1,
-            api::RunStatus::Waiting => waiting += 1,
-            api::RunStatus::Confirming => confirming += 1,
-            _ => {}
-        }
-    }
-    let generator_count = generators.len();
-    let generator_runs =
-        select_generator_runs(generators.into_iter().collect(), &state.metrics_policy);
+    let (live, preempted) = state.service.live_runs().await;
+    let (admitted, settled) = service::run_counters();
+    let count = |status| live.get(&status).copied().unwrap_or(0);
+    let active = count(api::RunStatus::Queued) + count(api::RunStatus::Running);
+    let generator_count = admitted.len();
+    let generator_runs = select_generator_runs(
+        admitted
+            .into_iter()
+            .map(|(id, runs)| (id, runs as usize))
+            .collect(),
+        &state.metrics_policy,
+    );
     let mut body = String::from(
-        "# HELP runs_total Number of durable runs by state.\n# TYPE runs_total gauge\n",
+        "# HELP runs_total Runs of this process by state: tracked runs now for live states, runs settled since process start for terminal states.\n# TYPE runs_total gauge\n",
     );
     body.push_str("# TYPE otlp_export_failures_total counter\n");
     body.push_str(&format!(
@@ -197,34 +182,44 @@ pub(crate) async fn metrics(State(state): State<Arc<AppState>>) -> Result<Respon
         "otlp_rejected_spans_total {}\n",
         super::otlp::REJECTED_SPANS.load(std::sync::atomic::Ordering::Relaxed)
     ));
-    for (status, count) in states {
-        body.push_str(&format!("runs_total{{state=\"{status}\"}} {count}\n"));
+    let live = live
+        .iter()
+        .map(|(status, runs)| (status.to_string(), *runs as u64));
+    let settled = settled
+        .iter()
+        .map(|(status, runs)| (status.to_string(), *runs));
+    for (status, runs) in live.chain(settled) {
+        body.push_str(&format!("runs_total{{state=\"{status}\"}} {runs}\n"));
     }
     body.push_str("# HELP runs_active Number of queued or running runs.\n");
     body.push_str("# TYPE runs_active gauge\n");
     body.push_str(&format!("runs_active {active}\n"));
     body.push_str("# HELP runs_queued Number of queued runs.\n");
     body.push_str("# TYPE runs_queued gauge\n");
-    body.push_str(&format!("runs_queued {queued}\n"));
+    body.push_str(&format!("runs_queued {}\n", count(api::RunStatus::Queued)));
     body.push_str("# HELP runs_waiting Number of runs waiting for interactive input.\n");
     body.push_str("# TYPE runs_waiting gauge\n");
-    body.push_str(&format!("runs_waiting {waiting}\n"));
+    body.push_str(&format!(
+        "runs_waiting {}\n",
+        count(api::RunStatus::Waiting)
+    ));
     body.push_str("# HELP runs_confirming Number of runs waiting for confirmation.\n");
     body.push_str("# TYPE runs_confirming gauge\n");
-    body.push_str(&format!("runs_confirming {confirming}\n"));
-    // Mechanism fact only: in-flight preempted runs held in memory.
-    // No threshold or alert lives here; policy stays outside.
-    let preempted = state.service.preempted_inflight().await;
+    body.push_str(&format!(
+        "runs_confirming {}\n",
+        count(api::RunStatus::Confirming)
+    ));
+    // Mechanism fact only; no threshold or alert lives here.
     body.push_str("# HELP runs_preempted Number of in-memory runs currently marked preempted.\n");
     body.push_str("# TYPE runs_preempted gauge\n");
     body.push_str(&format!("runs_preempted {preempted}\n"));
     body.push_str(
-        "# HELP generators Number of distinct generators represented in the run inventory.\n",
+        "# HELP generators Distinct generators this process admitted runs for since start.\n",
     );
     body.push_str("# TYPE generators gauge\n");
     body.push_str(&format!("generators {generator_count}\n"));
     body.push_str(
-        "# HELP generator_runs_total Number of durable runs per generator (bounded selection).\n",
+        "# HELP generator_runs_total Runs this process admitted per generator since start (bounded selection).\n",
     );
     body.push_str("# TYPE generator_runs_total gauge\n");
     for (generator, count) in generator_runs {
@@ -425,6 +420,7 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use service::{LocalService, RunStoreMode};
+    use std::collections::BTreeMap;
 
     /// Removes the temp root on drop so a failed assertion cannot leak test
     /// directories (E04).
@@ -458,19 +454,39 @@ type = "command"
 [flow.params]
 command = ["sh", "-c", "sleep 30"]"#;
 
+    async fn scrape(state: &Arc<AppState>) -> String {
+        let response = metrics(State(Arc::clone(state)))
+            .await
+            .expect("metrics should render");
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("metrics body should read");
+        String::from_utf8(body.to_vec()).expect("metrics must be UTF-8")
+    }
+
+    fn series(body: &str, name: &str) -> u64 {
+        body.lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix(' ')?.parse().ok())
+            .unwrap_or(0)
+    }
+
     #[tokio::test]
-    async fn metrics_exposes_run_and_generator_series() {
-        // The new series must be present in one scrape and derived from the
-        // single run-list scan the endpoint already performs.
+    async fn metrics_follow_run_events_and_never_read_the_run_store() {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .expect("temporary directory path should be UTF-8")
             .join(format!("metrics-{}", uuid::Uuid::now_v7()));
         let _temp_guard = TempGuard(root.clone());
         let generators = root.join("generators");
         let runs = root.join("runs");
-        std::fs::create_dir_all(generators.join("slow")).expect("generator dir should create");
-        std::fs::write(generators.join("slow/qcg.toml"), SLOW_MANIFEST)
-            .expect("slow manifest should write");
+        // Counters are process-wide and tests share the process: a unique
+        // generator id keeps this test's series its own.
+        let id = format!("probe-{}", uuid::Uuid::now_v7().as_simple());
+        std::fs::create_dir_all(generators.join(&id)).expect("generator dir should create");
+        std::fs::write(
+            generators.join(&id).join("qcg.toml"),
+            SLOW_MANIFEST.replace("id = \"slow\"", &format!("id = \"{id}\"")),
+        )
+        .expect("slow manifest should write");
         let state = Arc::new(AppState {
             service: LocalService::with_generator_roots_policy_and_store_mode(
                 vec![generators.clone()],
@@ -503,42 +519,46 @@ command = ["sh", "-c", "sleep 30"]"#;
         let run_id = state
             .service
             .start_run(api::StartRun {
-                generator_id: "slow".into(),
+                generator_id: id.clone(),
                 inputs: BTreeMap::new(),
                 ..Default::default()
             })
             .await
             .expect("slow run should start");
-        let response = metrics(State(Arc::clone(&state)))
-            .await
-            .expect("metrics should render");
-        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("metrics body should read");
-        let body = String::from_utf8(body.to_vec()).expect("metrics must be UTF-8");
-        // The run is queued or running, never waiting or confirming.
+        // A corrupt historical run, then no run directory at all: a scrape
+        // that touched the store could not succeed.
+        std::fs::create_dir_all(runs.join("corrupt-old/meta")).unwrap();
+        std::fs::write(runs.join("corrupt-old/meta/journal.jsonl"), "{not json\n").unwrap();
+        let live = scrape(&state).await;
+        assert_eq!(series(&live, "runs_active"), 1, "{live}");
         assert!(
-            body.contains("runs_active 1\n"),
-            "active runs must count the started run: {body}"
+            live.contains("runs_total{state=\"queued\"} 1\n")
+                || live.contains("runs_total{state=\"running\"} 1\n"),
+            "{live}"
         );
-        assert!(
-            body.contains("runs_total{state=\"queued\"} 1\n")
-                || body.contains("runs_total{state=\"running\"} 1\n"),
-            "the started run must appear in the state fold: {body}"
+        assert!(live.contains("runs_waiting 0\n") && live.contains("runs_confirming 0\n"));
+        assert_eq!(
+            series(
+                &live,
+                &format!("generator_runs_total{{generator=\"{id}\"}}")
+            ),
+            1,
+            "admission moves the per-generator counter: {live}"
         );
-        assert!(
-            body.contains("runs_waiting 0\n") && body.contains("runs_confirming 0\n"),
-            "zero gauges must still be exported: {body}"
-        );
-        assert!(
-            body.contains("generators 1\n"),
-            "the generator count must be derived from the run inventory: {body}"
-        );
-        assert!(
-            body.contains("generator_runs_total{generator=\"slow\"} 1\n"),
-            "per-generator run totals must be exported: {body}"
-        );
+        let canceled = series(&live, "runs_total{state=\"canceled\"}");
         let _ = state.service.cancel(run_id).await;
+        std::fs::remove_dir_all(&runs).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let after = scrape(&state).await;
+            if series(&after, "runs_total{state=\"canceled\"}") > canceled
+                && series(&after, "runs_active") == 0
+            {
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline, "no settle: {after}");
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]
