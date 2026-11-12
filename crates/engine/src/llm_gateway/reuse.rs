@@ -10,6 +10,9 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Arc, Mutex};
 
+/// Recorded `(seq, memo_ref)` pairs by `(node, request digest)`.
+type Calls = BTreeMap<(String, String), VecDeque<(u64, String)>>;
+
 const MEMO_DIR: &str = "llm-memo";
 
 /// Recorded responses of a source run, by node and request digest, consumed
@@ -17,7 +20,7 @@ const MEMO_DIR: &str = "llm-memo";
 pub struct ReuseSource {
     run_id: String,
     metadata: Utf8PathBuf,
-    calls: Mutex<BTreeMap<(String, String), VecDeque<(u64, String)>>>,
+    calls: Mutex<Calls>,
 }
 
 impl ReuseSource {

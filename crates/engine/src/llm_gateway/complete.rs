@@ -237,10 +237,10 @@ impl<'a> LlmGateway<'a> {
             .complete_inner(node, request, routes, event_extra)
             .await;
         self.release_reservation(reservation);
-        if let (Some(digest), Ok(response)) = (&digest, &complete_result) {
-            if let Err(error) = self.record_response(node, digest, response, None) {
-                tracing::warn!(node = %node.id, %error, "model response was not recorded for reuse");
-            }
+        if let (Some(digest), Ok(response)) = (&digest, &complete_result)
+            && let Err(error) = self.record_response(node, digest, response, None)
+        {
+            tracing::warn!(node = %node.id, %error, "model response was not recorded for reuse");
         }
         complete_result
     }
