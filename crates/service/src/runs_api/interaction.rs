@@ -1,6 +1,42 @@
 //! Interaction operations.
 use super::*;
 
+/// Lock-held acceptance check shared by answers and confirmations: the run is
+/// live, no cancel was accepted, the pending prompt is the expected one at the
+/// observed generation, and `decided` has not already recorded a response.
+fn prompt_precondition<'a>(
+    run_dir: Utf8PathBuf,
+    pending_seq: Option<u64>,
+    (prompt, done): (&'static str, &'static str),
+    is_prompt: impl Fn(&engine::Interaction) -> bool + 'a,
+    decided: impl Fn(&engine::RunState) -> bool + 'a,
+) -> impl FnOnce(&engine::RunState) -> Result<(), engine::JournalError> + 'a {
+    move |state| {
+        use engine::JournalError::PreconditionFailed;
+        let refuse = |reason: &str| Err(PreconditionFailed(reason.into()));
+        if state.terminal.is_some() {
+            return refuse("run is already terminal");
+        }
+        if state.cancel_requested
+            || !crate::run_dirs::list_pending_cancel_controls(&run_dir)
+                .map_err(|error| engine::JournalError::InvalidEvent(error.to_string()))?
+                .is_empty()
+        {
+            return refuse("a cancel was accepted");
+        }
+        if !state.settled_pending().is_some_and(&is_prompt) {
+            return refuse(&format!("run is not waiting for this {prompt}"));
+        }
+        if state.pending_seq.is_none() || state.pending_seq != pending_seq {
+            return refuse("pending prompt generation changed; refresh and retry");
+        }
+        if decided(state) {
+            return refuse(done);
+        }
+        Ok(())
+    }
+}
+
 impl LocalService {
     pub async fn answer(
         &self,
@@ -132,46 +168,16 @@ impl LocalService {
                     "values": check_answer,
                     "queued_at": queued_now.to_rfc3339(),
                 }),
-                move |state| {
-                    use engine::JournalError;
-                    if state.terminal.is_some() {
-                        return Err(JournalError::PreconditionFailed(
-                            "run is already terminal".into(),
-                        ));
-                    }
-                    if state.cancel_requested
-                        || !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
-                            .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
-                            .is_empty()
-                    {
-                        return Err(JournalError::PreconditionFailed(
-                            "a cancel was accepted".into(),
-                        ));
-                    }
-                    match state.settled_pending() {
-                        Some(engine::Interaction::Question { question })
-                            if question.id == check_question_id => {}
-                        _ => {
-                            return Err(JournalError::PreconditionFailed(
-                                "run is not waiting for this question".into(),
-                            ));
-                        }
-                    }
-                    match (state.pending_seq, check_pending_seq) {
-                        (Some(current), Some(expected)) if current == expected => {}
-                        _ => {
-                            return Err(JournalError::PreconditionFailed(
-                                "pending prompt generation changed; refresh and retry".into(),
-                            ));
-                        }
-                    }
-                    if state.answers.contains_key(&check_question_id) {
-                        return Err(JournalError::PreconditionFailed(
-                            "question was already answered".into(),
-                        ));
-                    }
-                    Ok(())
-                },
+                prompt_precondition(
+                    check_run_dir,
+                    check_pending_seq,
+                    ("question", "question was already answered"),
+                    |interaction| {
+                        matches!(interaction, engine::Interaction::Question { question }
+                            if question.id == check_question_id)
+                    },
+                    |state| state.answers.contains_key(&check_question_id),
+                ),
             );
             match accepted {
                 // The rejection already happened atomically; re-fold outside
@@ -314,46 +320,16 @@ impl LocalService {
                     "approved": approved,
                     "queued_at": queued_now.to_rfc3339(),
                 }),
-                move |state| {
-                    use engine::JournalError;
-                    if state.terminal.is_some() {
-                        return Err(JournalError::PreconditionFailed(
-                            "run is already terminal".into(),
-                        ));
-                    }
-                    if state.cancel_requested
-                        || !crate::run_dirs::list_pending_cancel_controls(&check_run_dir)
-                            .map_err(|error| JournalError::InvalidEvent(error.to_string()))?
-                            .is_empty()
-                    {
-                        return Err(JournalError::PreconditionFailed(
-                            "a cancel was accepted".into(),
-                        ));
-                    }
-                    match state.settled_pending() {
-                        Some(engine::Interaction::Confirmation { confirm })
-                            if confirm.id == check_confirmation_id => {}
-                        _ => {
-                            return Err(JournalError::PreconditionFailed(
-                                "run is not waiting for this confirmation".into(),
-                            ));
-                        }
-                    }
-                    match (state.pending_seq, check_pending_seq) {
-                        (Some(current), Some(expected)) if current == expected => {}
-                        _ => {
-                            return Err(JournalError::PreconditionFailed(
-                                "pending prompt generation changed; refresh and retry".into(),
-                            ));
-                        }
-                    }
-                    if state.confirmations.contains_key(&check_confirmation_id) {
-                        return Err(JournalError::PreconditionFailed(
-                            "confirmation was already decided".into(),
-                        ));
-                    }
-                    Ok(())
-                },
+                prompt_precondition(
+                    check_run_dir,
+                    check_pending_seq,
+                    ("confirmation", "confirmation was already decided"),
+                    |interaction| {
+                        matches!(interaction, engine::Interaction::Confirmation { confirm }
+                            if confirm.id == check_confirmation_id)
+                    },
+                    |state| state.confirmations.contains_key(&check_confirmation_id),
+                ),
             ) {
                 // The rejection already happened atomically; re-fold outside
                 // the guard only to classify which error to report.
