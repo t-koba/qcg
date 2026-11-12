@@ -56,7 +56,15 @@ pub(crate) fn collect_verified_with_limits(
             manifest.artifacts.len()
         )));
     }
-    engine::validate_output_manifest_paths(&manifest)?;
+    verify_manifest_artifacts(run_dir, &manifest)
+}
+
+/// Checks each manifest artifact's path and on-disk size against the workspace.
+pub(crate) fn verify_manifest_artifacts(
+    run_dir: &Utf8Path,
+    manifest: &OutputManifest,
+) -> Result<Vec<VerifiedArtifact>, ServiceError> {
+    engine::validate_output_manifest_paths(manifest)?;
     let mut verified = Vec::new();
     for artifact in &manifest.artifacts {
         let fs_path = resolve_artifact_path(&run_workspace_dir(run_dir), &artifact.path)?;

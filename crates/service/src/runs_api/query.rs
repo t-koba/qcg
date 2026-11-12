@@ -261,28 +261,13 @@ impl LocalService {
                     Err(e) => return Err(ServiceError::Io(e)),
                     Ok(f) => Some(f.metadata().map_err(ServiceError::Io)?.len()),
                 };
-                let mut verified = Vec::new();
-                if let Some(m) = &manifest {
-                    check_bundle_limits(0, m.artifacts.len(), &limits)?;
-                    engine::validate_output_manifest_paths(m)?;
-                    for artifact in &m.artifacts {
-                        let fp =
-                            resolve_artifact_path(&run_workspace_dir(&directory), &artifact.path)?;
-                        let len = std::fs::metadata(&fp)?.len();
-                        if len != artifact.bytes {
-                            return Err(ServiceError::Invalid(format!(
-                                "artifact `{}` bytes mismatch: manifest={}, actual={len}",
-                                artifact.path, artifact.bytes
-                            )));
-                        }
-                        verified.push(crate::artifacts::VerifiedArtifact {
-                            path: artifact.path.clone(),
-                            fs_path: fp,
-                            bytes: artifact.bytes,
-                            sha256: artifact.sha256.clone(),
-                        });
+                let verified = match &manifest {
+                    Some(m) => {
+                        check_bundle_limits(0, m.artifacts.len(), &limits)?;
+                        crate::artifacts::verify_manifest_artifacts(&directory, m)?
                     }
-                }
+                    None => Vec::new(),
+                };
                 Ok((
                     manifest,
                     manifest_len,
