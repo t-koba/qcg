@@ -695,57 +695,32 @@ pub fn redact_http_args_for_journal(args: &serde_json::Value) -> serde_json::Val
         .map(str::to_owned)
     {
         let declared = object.get("sensitive_query");
+        let stripped = serde_json::Value::String(
+            url_value
+                .split('?')
+                .next()
+                .unwrap_or(REDACTED_PLACEHOLDER)
+                .to_string(),
+        );
         // No implicit fallback: a malformed declaration is not treated as
         // "no secrets". Strip the query fail-closed (E09).
         let names = match sensitive_names_from_decl(declared) {
             Ok(names) => names,
             Err(_) => {
-                object.insert(
-                    "url".into(),
-                    serde_json::Value::String(
-                        url_value
-                            .split('?')
-                            .next()
-                            .unwrap_or(REDACTED_PLACEHOLDER)
-                            .to_string(),
-                    ),
-                );
+                object.insert("url".into(), stripped.clone());
                 Vec::new()
             }
         };
         if !names.is_empty() {
-            match sensitive_query_values(&url_value, &names) {
-                Ok(sensitive) => {
-                    if let Ok(url) = redact_url_preserving_keys(&url_value, &sensitive) {
-                        object.insert("url".into(), serde_json::Value::String(url));
-                    } else {
-                        object.insert(
-                            "url".into(),
-                            serde_json::Value::String(
-                                url_value
-                                    .split('?')
-                                    .next()
-                                    .unwrap_or(REDACTED_PLACEHOLDER)
-                                    .to_string(),
-                            ),
-                        );
-                    }
-                }
-                Err(_) => {
-                    // Fail closed: a typo or absent name must not leave the
-                    // raw query in the journal.
-                    object.insert(
-                        "url".into(),
-                        serde_json::Value::String(
-                            url_value
-                                .split('?')
-                                .next()
-                                .unwrap_or(REDACTED_PLACEHOLDER)
-                                .to_string(),
-                        ),
-                    );
-                }
-            }
+            // Fail closed: a typo or absent name must not leave the raw
+            // query in the journal.
+            let redacted = sensitive_query_values(&url_value, &names)
+                .ok()
+                .and_then(|sensitive| redact_url_preserving_keys(&url_value, &sensitive).ok());
+            object.insert(
+                "url".into(),
+                redacted.map_or(stripped, serde_json::Value::String),
+            );
         }
     }
     if let Some(headers) = object
