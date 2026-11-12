@@ -170,11 +170,8 @@ pub(crate) fn binary_available(bin: &str) -> bool {
 }
 
 pub(crate) fn executable_file_exists(path: &std::path::Path) -> bool {
-    if path.is_file() {
-        return true;
-    }
     #[cfg(windows)]
-    if path.extension().is_none() {
+    if !path.is_file() && path.extension().is_none() {
         let extensions =
             std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string());
         return extensions.split(';').any(|extension| {
@@ -182,7 +179,7 @@ pub(crate) fn executable_file_exists(path: &std::path::Path) -> bool {
             !extension.is_empty() && path.with_extension(extension).is_file()
         });
     }
-    false
+    path.is_file()
 }
 
 pub(crate) async fn execute_container_backend_candidate(

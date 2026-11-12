@@ -2,6 +2,7 @@ pub(crate) mod admission;
 pub(crate) mod artifacts;
 pub(crate) mod cancel;
 pub(crate) mod cancel_observation;
+#[cfg(unix)]
 mod container_effects;
 pub(crate) mod endpoints;
 pub(crate) mod execution;
