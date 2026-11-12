@@ -40,23 +40,6 @@ impl LocalService {
         engine::validate_output_manifest_paths(&manifest).map_err(api_internal)?;
         Ok((manifest, run_dir))
     }
-    pub async fn artifacts_json(
-        &self,
-        id: String,
-        limits: &crate::package::ArtifactZipLimits,
-    ) -> Result<Vec<u8>, ApiError> {
-        let (manifest, _) = self
-            .artifact_manifest_with_limits(&id, Some(limits))
-            .await?;
-        bounded_json(&manifest, limits)
-    }
-    pub async fn snapshot_json(
-        &self,
-        id: String,
-        limits: &crate::package::ArtifactZipLimits,
-    ) -> Result<Vec<u8>, ApiError> {
-        bounded_json(&self.snapshot_with_limits(id, limits).await?, limits)
-    }
     pub async fn snapshot_with_limits(
         &self,
         id: String,
@@ -208,18 +191,7 @@ impl LocalService {
     }
 }
 
-fn bounded_json(
-    value: &impl serde::Serialize,
-    limits: &crate::package::ArtifactZipLimits,
-) -> Result<Vec<u8>, ApiError> {
-    let limit = limits.effective().max_bytes.unwrap();
-    let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit));
-    serde_json::to_writer(&mut body, value).map_err(api_internal)?;
-    check_json_size(body.written, limit)?;
-    Ok(body.inner)
-}
-
-fn check_json_size(actual: u64, limit: u64) -> Result<(), ApiError> {
+pub(crate) fn check_json_size(actual: u64, limit: u64) -> Result<(), ApiError> {
     if actual > limit {
         return Err(ApiError::TooLarge {
             actual_bytes: actual as usize,

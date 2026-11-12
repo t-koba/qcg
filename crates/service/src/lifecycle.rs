@@ -18,9 +18,7 @@ use crate::types::{
     SharedRecoveryStatus,
 };
 use api::RunEvent;
-use api::{
-    ApiError, McpAuthorizationStart, McpServerList, McpServerSummary, RunListItem, RunStatus,
-};
+use api::{ApiError, McpAuthorizationStart, McpServerList, McpServerSummary, RunStatus};
 use camino::{Utf8Path, Utf8PathBuf};
 use contract::Contract;
 use engine::{Engine, Interaction, Progress, RunFailureKind, RunOptions};
@@ -1130,15 +1128,6 @@ impl LocalService {
             return Err(ApiError::not_found(format!("run `{id}` was not found")));
         }
         Ok(run_dir)
-    }
-
-    /// Every run, oldest first; each run is validated.
-    pub async fn list_run_items(&self) -> Result<Vec<RunListItem>, ApiError> {
-        let page = crate::summaries::RunPage {
-            limit: usize::MAX,
-            ..Default::default()
-        };
-        Ok(self.list_run_page(page).await?.items)
     }
 
     /// One page of run history; only the runs it examines are validated.

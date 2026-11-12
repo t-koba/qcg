@@ -30,6 +30,56 @@ pub use run_dirs::*;
 pub use summaries::*;
 pub use types::*;
 
+/// Whole-store reads that production never makes (it reads bounded pages and
+/// size-capped bodies); tests use them as oracles.
+#[cfg(any(test, feature = "test-hooks"))]
+#[doc(hidden)]
+mod census {
+    use crate::{LocalService, artifacts::api_internal, runs_api::artifacts::check_json_size};
+    use api::{ApiError, RunListItem};
+
+    impl LocalService {
+        /// Every run, oldest first; each run is validated.
+        pub async fn list_run_items(&self) -> Result<Vec<RunListItem>, ApiError> {
+            let page = crate::summaries::RunPage {
+                limit: usize::MAX,
+                ..Default::default()
+            };
+            Ok(self.list_run_page(page).await?.items)
+        }
+
+        pub async fn artifacts_json(
+            &self,
+            id: String,
+            limits: &crate::package::ArtifactZipLimits,
+        ) -> Result<Vec<u8>, ApiError> {
+            let (manifest, _) = self
+                .artifact_manifest_with_limits(&id, Some(limits))
+                .await?;
+            bounded_json(&manifest, limits)
+        }
+
+        pub async fn snapshot_json(
+            &self,
+            id: String,
+            limits: &crate::package::ArtifactZipLimits,
+        ) -> Result<Vec<u8>, ApiError> {
+            bounded_json(&self.snapshot_with_limits(id, limits).await?, limits)
+        }
+    }
+
+    fn bounded_json(
+        value: &impl serde::Serialize,
+        limits: &crate::package::ArtifactZipLimits,
+    ) -> Result<Vec<u8>, ApiError> {
+        let limit = limits.effective().max_bytes.unwrap();
+        let mut body = crate::artifacts::CountingWriter::new(Vec::new(), Some(limit));
+        serde_json::to_writer(&mut body, value).map_err(api_internal)?;
+        check_json_size(body.written, limit)?;
+        Ok(body.inner)
+    }
+}
+
 #[cfg(any(test, feature = "test-hooks"))]
 #[doc(hidden)]
 pub mod denial_settlement_test_hooks {

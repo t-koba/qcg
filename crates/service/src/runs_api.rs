@@ -419,7 +419,7 @@ enum ProbeRejection {
 }
 
 mod admission;
-mod artifacts;
+pub(crate) mod artifacts;
 mod cancellation;
 mod interaction;
 mod preemption;
