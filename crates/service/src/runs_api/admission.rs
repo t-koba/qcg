@@ -168,6 +168,32 @@ impl LocalService {
         Ok(())
     }
 
+    /// Phase 2a: a losing admission allocates nothing. `Some(run_id)` means the
+    /// retry converged onto an already registered record, verified against the
+    /// admission snapshot (a rival registering after the snapshot read leaves
+    /// it empty and falls back to one fresh read) (E03).
+    async fn admission_gate(
+        &self,
+        run_id: &str,
+        run_dir: &Utf8Path,
+        created_fresh: bool,
+        snapshot: &crate::run_dirs::AdoptSnapshot,
+        identity: &AdoptedRunIdentity<'_>,
+    ) -> Result<Option<String>, ApiError> {
+        let own_dir = created_fresh.then_some(run_dir);
+        match self.probe_admission(run_id).await {
+            Ok(AdmissionProbe::Proceed) => Ok(None),
+            Ok(AdmissionProbe::Converged) => {
+                verify_live_admission_from_snapshot(snapshot, identity, run_dir)?;
+                Ok(Some(run_id.to_owned()))
+            }
+            Err(ProbeRejection::Shutdown) => Err(refused_shutdown(own_dir)?),
+            Err(ProbeRejection::Capacity) => {
+                Err(refused_capacity(own_dir, self.inner.max_tracked_runs)?)
+            }
+        }
+    }
+
     /// Phase-2a admission probe shared by start and fork (E03). Decides
     /// shutdown, duplicate, and capacity under the run-map lock before the
     /// caller allocates a broadcast channel, a cancellation token, a task
@@ -559,37 +585,20 @@ impl LocalService {
         // removes only this admission's own fresh directory; the id is a
         // fresh UUIDv7 no concurrent canceller can know, so no live mailbox
         // is destroyed with it (E03).
-        match self.probe_admission(&run_id).await {
-            Ok(AdmissionProbe::Proceed) => {}
-            Ok(AdmissionProbe::Converged) => {
-                // Reuse the adoption snapshot when it exists: a second
-                // journal read here would double I/O per converged retry
-                // (E03). A fresh (empty) snapshot means a rival registered
-                // after our adoption read; fall back to a fresh read so the
-                // retry converges instead of conflicting on empty input.
-                let identity = AdoptedRunIdentity {
-                    inputs: &inputs,
-                    contract_sha256: &contract.sha256,
-                    package_sha256: Some(&package_sha256),
-                    priority,
-                    parent: None,
-                    answers: &answers,
-                    confirmations: &confirmations,
-                };
-                verify_live_admission_from_snapshot(&adopt_snapshot, &identity, &run_dir)?;
-                return Ok(run_id);
-            }
-            Err(ProbeRejection::Shutdown) => {
-                return Err(refused_shutdown(
-                    created_fresh.then_some(run_dir.as_path()),
-                )?);
-            }
-            Err(ProbeRejection::Capacity) => {
-                return Err(refused_capacity(
-                    created_fresh.then_some(run_dir.as_path()),
-                    self.inner.max_tracked_runs,
-                )?);
-            }
+        let identity = AdoptedRunIdentity {
+            inputs: &inputs,
+            contract_sha256: &contract.sha256,
+            package_sha256: Some(&package_sha256),
+            priority,
+            parent: None,
+            answers: &answers,
+            confirmations: &confirmations,
+        };
+        if let Some(id) = self
+            .admission_gate(&run_id, &run_dir, created_fresh, &adopt_snapshot, &identity)
+            .await?
+        {
+            return Ok(id);
         }
         // All per-admission allocations happen after the probe, so rejected
         // admissions allocate nothing (E03).
@@ -928,36 +937,20 @@ impl LocalService {
         // removes only this admission's own fresh directory; the id is a
         // fresh UUIDv7 no concurrent canceller can know, so no live mailbox
         // is destroyed with it (E03).
-        match self.probe_admission(&run_id).await {
-            Ok(AdmissionProbe::Proceed) => {}
-            Ok(AdmissionProbe::Converged) => {
-                // Reuse the single admission snapshot when it exists, never
-                // a second scan or fold (E03). A rival that registered after
-                // our snapshot read leaves it empty here; fall back to a
-                // fresh read so the retry converges instead of conflicting.
-                let identity = AdoptedRunIdentity {
-                    inputs: &inputs,
-                    contract_sha256: &contract.sha256,
-                    package_sha256: Some(&package_sha256),
-                    priority: request.priority.unwrap_or(0),
-                    parent: Some(source_id),
-                    answers: &fork_answers,
-                    confirmations: &fork_confirmations,
-                };
-                verify_live_admission_from_snapshot(&fork_snapshot, &identity, &run_dir)?;
-                return Ok(run_id);
-            }
-            Err(ProbeRejection::Shutdown) => {
-                return Err(refused_shutdown(
-                    created_fresh.then_some(run_dir.as_path()),
-                )?);
-            }
-            Err(ProbeRejection::Capacity) => {
-                return Err(refused_capacity(
-                    created_fresh.then_some(run_dir.as_path()),
-                    self.inner.max_tracked_runs,
-                )?);
-            }
+        let identity = AdoptedRunIdentity {
+            inputs: &inputs,
+            contract_sha256: &contract.sha256,
+            package_sha256: Some(&package_sha256),
+            priority: request.priority.unwrap_or(0),
+            parent: Some(source_id),
+            answers: &fork_answers,
+            confirmations: &fork_confirmations,
+        };
+        if let Some(id) = self
+            .admission_gate(&run_id, &run_dir, created_fresh, &fork_snapshot, &identity)
+            .await?
+        {
+            return Ok(id);
         }
         // All per-admission allocations happen after the probe, so rejected
         // admissions allocate nothing (E03).
