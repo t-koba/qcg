@@ -226,9 +226,9 @@ impl LocalService {
                 let limits = engine::JournalLimits::default();
                 let durable =
                     engine::read_last_seq_from_file_tail(&meta.join("journal.jsonl"), limits)
-                        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                        .map_err(ServiceError::invalid)?;
                 let audit = engine::read_last_seq_from_file_tail(&meta.join("audit.jsonl"), limits)
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                    .map_err(ServiceError::invalid)?;
                 Ok(durable.max(audit))
             })
             .await?;

@@ -43,9 +43,8 @@ pub(crate) fn settle_active_elapsed(record: &RunRecord) -> Result<(), ServiceErr
         Some(record.events.clone()),
         limits,
     )
-    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
-    engine::settle_active_elapsed(&journal, chrono::Utc::now())
-        .map_err(|error| ServiceError::Invalid(error.to_string()))
+    .map_err(ServiceError::invalid)?;
+    engine::settle_active_elapsed(&journal, chrono::Utc::now()).map_err(ServiceError::invalid)
 }
 
 pub(crate) fn write_run_event(
@@ -173,7 +172,7 @@ pub(crate) fn settle_confirmed_denial(
         }
         Ok(settlement.into_iter().skip(suffix.len()).collect())
     })
-    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    .map_err(ServiceError::invalid)?;
     Ok(())
 }
 
@@ -833,7 +832,7 @@ fn populate_checkpoint_fork(
         let audit_events =
             engine::read_journal_values(&source_audit_path, JournalLimits::default())
                 .map(|scan| scan.events)
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                .map_err(ServiceError::invalid)?;
         for event in audit_events {
             let Some(seq) = event.get("seq").and_then(Value::as_u64) else {
                 continue;
@@ -930,11 +929,10 @@ fn populate_checkpoint_fork(
     // Sync the directory entry like every other journal publication path:
     // without it a power loss can lose the fork journal itself (Q2).
     sync_dir_entry(&target_meta).map_err(ServiceError::Io)?;
-    let state = RunState::fold_journal(&journal_path)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let state = RunState::fold_journal(&journal_path).map_err(ServiceError::invalid)?;
     state
         .persist_atomic(&target_meta.join("state.json"))
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        .map_err(ServiceError::invalid)?;
     Ok(())
 }
 
@@ -1242,8 +1240,7 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     }
     // Reuse one read for folding and admission identity.
     let events = read_events_from_meta(&run_meta_dir(run_dir))?;
-    let state =
-        RunState::fold_values(&events).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let state = RunState::fold_values(&events).map_err(ServiceError::invalid)?;
     match state.run_id.as_deref() {
         Some(existing) if existing == run_id => {}
         Some(_) => {

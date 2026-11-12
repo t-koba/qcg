@@ -154,7 +154,7 @@ fn sweep(
             // failures preserve evidence, and previews must remain read-only.
             if delete {
                 let config = engine::host_cgroup::host_cgroup_config_from_env()
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                    .map_err(ServiceError::invalid)?;
                 let meta = run_meta_dir(&path);
                 engine::host_cgroup::reconcile_host_cgroup(
                     &meta,
@@ -162,7 +162,7 @@ fn sweep(
                     path.file_name()
                         .ok_or_else(|| ServiceError::Invalid("run directory lacks id".into()))?,
                 )
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                .map_err(ServiceError::invalid)?;
             }
             let (summary, state) = run_summary_core_with_state(&path)?;
             state

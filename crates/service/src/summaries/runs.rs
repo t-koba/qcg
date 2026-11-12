@@ -29,8 +29,7 @@ pub fn run_generator_root(run_dir: &Utf8Path) -> Result<Utf8PathBuf, ServiceErro
 
 /// The contract the run used: pinned package bytes, or the recorded path for legacy runs.
 pub fn load_run_contract(run_dir: &Utf8Path) -> Result<contract::Contract, ServiceError> {
-    contract::Contract::load(run_generator_root(run_dir)?)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))
+    contract::Contract::load(run_generator_root(run_dir)?).map_err(ServiceError::invalid)
 }
 
 pub fn read_run_inputs(run_dir: &Utf8Path) -> Result<BTreeMap<String, Value>, ServiceError> {
@@ -57,8 +56,7 @@ pub(super) fn run_summary_core_with_state(
     run_dir: &Utf8Path,
 ) -> Result<(RunSummary, engine::RunState), ServiceError> {
     let values = read_journal_events(run_dir)?;
-    let state = engine::RunState::fold_values(&values)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let state = engine::RunState::fold_values(&values).map_err(ServiceError::invalid)?;
     let events = values
         .iter()
         .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))
@@ -79,8 +77,7 @@ pub(crate) struct RunSelectorInfo {
 
 pub(crate) fn run_selector_info(run_dir: &Utf8Path) -> Result<RunSelectorInfo, ServiceError> {
     let values = read_journal_events(run_dir)?;
-    let state = engine::RunState::fold_values(&values)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let state = engine::RunState::fold_values(&values).map_err(ServiceError::invalid)?;
     let events = values
         .iter()
         .map(|event| RunEvent::from_flat(event).map_err(ServiceError::Invalid))

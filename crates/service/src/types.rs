@@ -124,6 +124,11 @@ pub enum ServiceError {
     #[error(transparent)]
     Zip(#[from] zip::result::ZipError),
 }
+impl ServiceError {
+    pub(crate) fn invalid(error: impl std::fmt::Display) -> Self {
+        Self::Invalid(error.to_string())
+    }
+}
 impl From<ServiceError> for ApiError {
     fn from(error: ServiceError) -> Self {
         match error {

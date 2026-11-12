@@ -117,11 +117,10 @@ pub(crate) fn truncate_trailing_canceled_events(run_dir: &Utf8Path) -> Result<bo
     if removed {
         // Re-fold to refresh state.json after truncation; failures fail
         // closed instead of leaving state.json ahead of the journal.
-        let state = engine::RunState::fold_journal(&path)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let state = engine::RunState::fold_journal(&path).map_err(ServiceError::invalid)?;
         state
             .persist_atomic(&path.with_file_name("state.json"))
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+            .map_err(ServiceError::invalid)?;
     }
     Ok(removed)
 }
@@ -132,7 +131,7 @@ pub(crate) fn truncate_trailing_canceled_events(run_dir: &Utf8Path) -> Result<bo
 /// fragment is repaired first so every scanned line is complete.
 fn truncate_to_last_non_canceled(path: &Utf8Path) -> Result<bool, ServiceError> {
     engine::repair_truncated_tail_locked(path, JournalLimits::default())
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        .map_err(ServiceError::invalid)?;
     let len = std::fs::metadata(path)?.len();
     if len == 0 {
         return Ok(false);
@@ -239,7 +238,7 @@ pub(crate) fn has_remote_cancel_request(run_dir: &Utf8Path) -> Result<bool, Serv
 pub(crate) fn read_events_from_meta(meta_dir: &Utf8Path) -> Result<Vec<Value>, ServiceError> {
     read_journal_values(&meta_dir.join("journal.jsonl"), JournalLimits::default())
         .map(|scan| scan.events)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))
+        .map_err(ServiceError::invalid)
 }
 
 /// Merged public record view: durable and observation records share one seq
@@ -252,7 +251,7 @@ pub(crate) fn read_merged_events_from_meta(
     if audit_path.exists() {
         let mut observed = read_journal_values(&audit_path, JournalLimits::default())
             .map(|scan| scan.events)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+            .map_err(ServiceError::invalid)?;
         if !observed.is_empty() {
             events.append(&mut observed);
             // Both streams are append-only and share one seq space, so a

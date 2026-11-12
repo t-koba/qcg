@@ -1205,9 +1205,7 @@ pub fn copy_dir_all(
             )));
         }
         let path = entry.path().to_path_buf();
-        let rel = path
-            .strip_prefix(source)
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+        let rel = path.strip_prefix(source).map_err(ServiceError::invalid)?;
         if rel.as_str().is_empty() {
             if !file_type.is_dir() {
                 return Err(ServiceError::Invalid(format!(
@@ -1507,10 +1505,8 @@ fn verify_package_inventory(root: &Utf8Path, limits: &PackageLimits) -> Result<(
             )));
         }
         let path = entry.path().to_path_buf();
-        let relative = portable_relative_path(
-            path.strip_prefix(root)
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?,
-        );
+        let relative =
+            portable_relative_path(path.strip_prefix(root).map_err(ServiceError::invalid)?);
         if !relative.is_empty() {
             namespace.push((relative.clone(), entry.file_type().is_dir()));
         }

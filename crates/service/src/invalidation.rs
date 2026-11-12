@@ -123,8 +123,7 @@ fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
 fn stage(run_dir: &Utf8Path, record: &RunInvalidation) -> Result<Utf8PathBuf, ServiceError> {
     let parent = run_dir.join("meta");
     let temp = parent.join(format!(".invalidation-{}.tmp", uuid::Uuid::now_v7()));
-    let bytes =
-        serde_json::to_vec(record).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let bytes = serde_json::to_vec(record).map_err(ServiceError::invalid)?;
     if bytes.len() > 32768 {
         return Err(ServiceError::Invalid(
             "invalidation exceeds 32768 bytes".into(),

@@ -15,7 +15,7 @@ use super::summary::run_meta_dir;
 
 pub(crate) fn fold_run_state(run_dir: &Utf8Path) -> Result<RunState, ServiceError> {
     RunState::fold_journal(&run_meta_dir(run_dir).join("journal.jsonl"))
-        .map_err(|error| ServiceError::Invalid(error.to_string()))
+        .map_err(ServiceError::invalid)
 }
 
 /// Latest durable FIFO key: the explicit `queued_at` payload field
@@ -201,8 +201,7 @@ fn rehydrate_run(
     // below (identity, scheduling, HITL maps, queue key): a restart
     // never pays a scan per field per run.
     let journal_values = read_journal_events(run_dir)?;
-    let state = RunState::fold_values(&journal_values)
-        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let state = RunState::fold_values(&journal_values).map_err(ServiceError::invalid)?;
     if state.terminal.is_some() {
         return Ok(None);
     }

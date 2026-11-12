@@ -364,9 +364,7 @@ impl ReadStore {
                 Err(error) => return Err(error.into()),
             };
             let event = RunEvent::from_flat(&value).map_err(ServiceError::Invalid)?;
-            view.state
-                .apply(&value)
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+            view.state.apply(&value).map_err(ServiceError::invalid)?;
             #[cfg(test)]
             self.applied
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -481,7 +479,7 @@ impl LocalService {
             .clone()
             .acquire_owned()
             .await
-            .map_err(|e| ServiceError::Invalid(e.to_string()))?;
+            .map_err(ServiceError::invalid)?;
         let guard = ACCEPTANCE_GUARD.try_with(Clone::clone).ok();
         tokio::task::spawn_blocking(move || {
             let _guard = guard;
@@ -489,7 +487,7 @@ impl LocalService {
             read()
         })
         .await
-        .map_err(|e| ServiceError::Invalid(e.to_string()))?
+        .map_err(ServiceError::invalid)?
     }
 
     pub(crate) async fn blocking_read<T: Send + 'static>(

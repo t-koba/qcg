@@ -991,7 +991,7 @@ impl LocalService {
                 .llm_runtime
                 .mcp
                 .resolve(id)
-                .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                .map_err(ServiceError::invalid)?;
             items.push(McpServerSummary {
                 id: id.to_string(),
                 transport: profile.transport_name().to_string(),
@@ -1002,7 +1002,7 @@ impl LocalService {
                     .mcp
                     .is_authorized(id)
                     .await
-                    .map_err(|error| ServiceError::Invalid(error.to_string()))?,
+                    .map_err(ServiceError::invalid)?,
             });
         }
         Ok(McpServerList { items })
@@ -1019,7 +1019,7 @@ impl LocalService {
             .mcp
             .start_authorization(id, redirect_uri)
             .await
-            .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+            .map_err(ServiceError::invalid)?;
         Ok(McpAuthorizationStart { authorization_url })
     }
 
@@ -1032,7 +1032,7 @@ impl LocalService {
             .mcp
             .complete_authorization(callback_url)
             .await
-            .map_err(|error| ServiceError::Invalid(error.to_string()))
+            .map_err(ServiceError::invalid)
     }
 
     pub async fn clear_mcp_authorization(&self, id: &str) -> Result<(), ServiceError> {
@@ -1041,7 +1041,7 @@ impl LocalService {
             .mcp
             .clear_authorization(id)
             .await
-            .map_err(|error| ServiceError::Invalid(error.to_string()))
+            .map_err(ServiceError::invalid)
     }
 
     pub async fn cancel_pending_mcp_authorization(&self, id: &str) -> Result<(), ServiceError> {
@@ -1050,7 +1050,7 @@ impl LocalService {
             .mcp
             .cancel_pending_authorization(id)
             .await
-            .map_err(|error| ServiceError::Invalid(error.to_string()))
+            .map_err(ServiceError::invalid)
     }
 
     /// Skip busy maintenance; propagate other failures for bounded GC retry.
@@ -1311,10 +1311,10 @@ impl LocalService {
                 // preserves the journal.
                 if let Err(error) = (|| {
                     let config = engine::host_cgroup::host_cgroup_config_from_env()
-                        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                        .map_err(ServiceError::invalid)?;
                     let meta = run_meta_dir(&run_dir);
                     engine::host_cgroup::reconcile_host_cgroup(&meta, &config, &run_id)
-                        .map_err(|error| ServiceError::Invalid(error.to_string()))?;
+                        .map_err(ServiceError::invalid)?;
                     Ok::<_, ServiceError>(())
                 })() {
                     tracing::error!(run_id = %run_id, %error, "host-cgroup reconciliation refused re-entry; journal retained");

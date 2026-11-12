@@ -31,8 +31,7 @@ pub(crate) fn load_identity(
     })?;
     let root = package_dir(run_dir);
     verify(&root, expected)?;
-    let contract =
-        Contract::load(&root).map_err(|error| ServiceError::Invalid(error.to_string()))?;
+    let contract = Contract::load(&root).map_err(ServiceError::invalid)?;
     if contract_sha256 != Some(contract.sha256.as_str()) {
         return Err(ServiceError::Invalid(
             "pinned generator contract identity mismatch".into(),

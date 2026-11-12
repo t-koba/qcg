@@ -231,8 +231,7 @@ impl LocalService {
                 })?;
                 let j_len = scan.stats.bytes as u64;
                 let vals = scan.events;
-                let disk_state = RunState::fold_values(&vals)
-                    .map_err(|e| ServiceError::Invalid(e.to_string()))?;
+                let disk_state = RunState::fold_values(&vals).map_err(ServiceError::invalid)?;
                 let events = vals
                     .iter()
                     .map(|v| RunEvent::from_flat(v).map_err(ServiceError::Invalid))
@@ -678,7 +677,7 @@ impl LocalService {
             let scanned = self
                 .blocking_read(move || {
                     Self::scan_queue_disk_candidates(&directory, cap, &store)
-                        .map_err(|error| crate::ServiceError::Invalid(error.to_string()))
+                        .map_err(crate::ServiceError::invalid)
                 })
                 .await?;
             *cache = Some(scanned);
