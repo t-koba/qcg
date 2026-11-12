@@ -352,7 +352,7 @@ fn resumed_builtin_call(checkpoint: Option<&AgentCheckpoint>) -> Option<McpSuspe
 impl StepExecutor for LlmAgentStep {
     engine::step_type_id!("llm.agent");
 
-    engine::parallel_step_traits!();
+    engine::parallel_step_traits!(OptIn);
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
@@ -2348,6 +2348,7 @@ mod tests {
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         };
         let tools = vec![ToolDecl::AskUser {
@@ -2566,6 +2567,7 @@ mod tests {
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         };
         let run = engine::RunContext::for_tests(

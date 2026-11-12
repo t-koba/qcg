@@ -730,7 +730,7 @@ impl LocalService {
         reserved_run_id: Option<String>,
     ) -> Result<String, ApiError> {
         self.ensure_running()?;
-        if request.at_seq == 0 {
+        if request.at_seq == 0 && request.reuse.is_none() {
             return Err(ApiError::invalid_field(
                 "at_seq",
                 "checkpoint sequence must be greater than zero",
@@ -1004,6 +1004,7 @@ impl LocalService {
                 "retention_days": staged.contract.manifest.retention.days,
                 "priority": staged.priority,
                 "parent_run_id": &staged.parent_run_id,
+                "reuse": request.reuse,
                 "queued_at": fresh_queued_at.map(|at| at.to_rfc3339()),
                 "effective_max_total_steps": fork_effective.max_total_steps,
                 "effective_policy_origin": fork_effective.origin,

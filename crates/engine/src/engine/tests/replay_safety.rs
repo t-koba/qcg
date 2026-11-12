@@ -13,6 +13,7 @@ impl StepExecutor for ReplaySafeForeachController {
         crate::StepTraits {
             parallel_safe: false,
             control_flow: crate::StepControlFlow::Foreach,
+            reuse: Default::default(),
         }
     }
     fn replay_safe_after_interruption(&self) -> bool {

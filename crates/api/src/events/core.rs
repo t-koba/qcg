@@ -10,8 +10,8 @@ use super::interaction::{
 use super::llm::{
     AgentCheckpointEventData, AgentCompletedEventData, AgentDelegatedEventData,
     AgentFailedEventData, AgentFileChangesEventData, AgentHandoffEventData,
-    ContextCompactedEventData, LlmCallEventData, LlmDeltaEventData, LlmRouteFailedEventData,
-    LlmValidationFailedEventData,
+    ContextCompactedEventData, LlmCallEventData, LlmDeltaEventData, LlmMemoEventData,
+    LlmRouteFailedEventData, LlmValidationFailedEventData,
 };
 use super::resources::ResourceEventData;
 use super::run::{GraphResolvedEventData, RunStartedEventData};
@@ -103,6 +103,7 @@ run_event_data_registry! {
     "regenerate_attempt_finished" => RegenerateAttemptFinished: AttemptFinishedEventData,
     "llm_call" => LlmCall: LlmCallEventData,
     "llm_delta" => LlmDelta: LlmDeltaEventData,
+    "llm_memo" => LlmMemo: LlmMemoEventData,
     "agent_checkpoint" => AgentCheckpoint: AgentCheckpointEventData,
     "agent_file_changes" => AgentFileChanges: AgentFileChangesEventData,
     "agent_delegated" => AgentDelegated: AgentDelegatedEventData,

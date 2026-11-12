@@ -368,8 +368,11 @@ pub(crate) enum RunsCommand {
     },
     Fork {
         id: String,
-        #[arg(long = "at-seq")]
-        at_seq: u64,
+        #[arg(long = "at-seq", required_unless_present = "reuse")]
+        at_seq: Option<u64>,
+        /// Serve the source's recorded model responses to identical requests.
+        #[arg(long)]
+        reuse: bool,
         #[arg(long = "state-patch", value_name = "JSON_FILE")]
         state_patch: Option<Utf8PathBuf>,
         #[arg(long = "answer")]

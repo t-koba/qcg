@@ -127,6 +127,7 @@ async fn local_prompt_context_limits_reach_terminal_failures_without_dispatch() 
             llm_provider: Some(provider.clone()),
             llm_seed_override: None,
             run_refs: BTreeMap::new(),
+            reuse: None,
             cancellation: Default::default(),
             shutdown: None,
             scheduler_yield: Default::default(),

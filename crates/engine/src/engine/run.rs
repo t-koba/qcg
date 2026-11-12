@@ -611,6 +611,7 @@ impl Engine {
             parallel_compatibility: options.parallel_compatibility,
             snapshot_source: self.snapshot_source.clone(),
             run_refs: Arc::new(options.run_refs),
+            reuse: options.reuse,
             replay_through: replay.state.last_seq,
             replayed_steps: Arc::new(replay.steps.clone()),
             checkpoint_accounting: Arc::new(Mutex::new(CheckpointAccounting::default())),

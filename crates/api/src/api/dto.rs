@@ -63,10 +63,25 @@ pub struct ForkStatePatch {
     pub step_statuses: BTreeMap<String, String>,
 }
 
+/// How a fork reuses the source run's recorded work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkReuse {
+    /// Identical model requests are answered from the source's responses.
+    Matching,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ForkRun {
+    /// Checkpoint sequence to restore. Zero or omitted with `reuse` restarts
+    /// from the source's initial state.
+    #[serde(default)]
     pub at_seq: u64,
+    /// Continue the source by serving its recorded model responses to
+    /// identical requests instead of calling the provider again.
+    #[serde(default)]
+    pub reuse: Option<ForkReuse>,
     #[serde(default)]
     pub state_patch: ForkStatePatch,
     /// Pre-provisioned answers keyed by question id, consumed without interaction.

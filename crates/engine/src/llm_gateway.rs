@@ -2,9 +2,11 @@ mod complete;
 mod cost;
 mod merge;
 mod retry;
+mod reuse;
 mod scan;
 mod types;
 
+pub use reuse::ReuseSource;
 pub use types::*;
 
 #[cfg(test)]
@@ -17,6 +19,8 @@ mod tests {
     mod context_exhaustion;
     #[path = "retry_policy.rs"]
     mod retry_policy;
+    #[path = "reuse_digest.rs"]
+    mod reuse_digest;
     #[path = "tier_cost.rs"]
     mod tier_cost;
     #[path = "web_search_cost.rs"]
@@ -848,6 +852,7 @@ mod tests {
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         }
     }

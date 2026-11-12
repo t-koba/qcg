@@ -151,6 +151,7 @@ version = "0.1.0"
             on_fail: None,
             failure: None,
             retry,
+            reuse: None,
             params: toml::Table::new(),
         }
     }
@@ -504,6 +505,7 @@ version = "0.1.0"
                 }),
                 failure: None,
                 retry: None,
+                reuse: None,
                 params: toml::Table::new(),
             }],
         );

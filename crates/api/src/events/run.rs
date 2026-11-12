@@ -47,6 +47,9 @@ pub struct RunStartedEventData {
     /// Parent run id for runs created by fork.
     #[serde(default)]
     pub parent_run_id: Option<String>,
+    /// Set on a continuation: the parent's recorded model responses serve identical requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reuse: Option<crate::ForkReuse>,
     /// Effective step budget after resolving the deployment ceiling.
     #[serde(default)]
     pub effective_max_total_steps: Option<usize>,

@@ -24,7 +24,7 @@ pub(crate) struct LlmRepairStep {
 impl StepExecutor for LlmRepairStep {
     engine::step_type_id!("llm.repair");
 
-    engine::parallel_step_traits!();
+    engine::parallel_step_traits!(Default);
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

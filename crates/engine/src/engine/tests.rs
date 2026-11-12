@@ -36,6 +36,7 @@ pub(super) fn run_options(output_dir: Utf8PathBuf) -> RunOptions {
         llm_provider: None,
         llm_seed_override: None,
         run_refs: BTreeMap::new(),
+        reuse: None,
         cancellation: CancellationToken::new(),
         shutdown: None,
         scheduler_yield: tokio_util::sync::CancellationToken::new(),
@@ -417,6 +418,18 @@ fn step_registry_validation_errors_identify_flow_nodes_and_hooks() {
         error.contains("hook `run_started`: line 1: step type `missing.hook` is not registered"),
         "{error}"
     );
+}
+
+#[test]
+fn reuse_matching_is_refused_for_a_step_type_that_records_no_responses() {
+    let mut reusing = node("n", "test.pass");
+    reusing.reuse = Some(contract::StepReuse::Matching);
+    let contract = test_contract(Utf8Path::new("reuse-root"), manifest(vec![reusing]));
+    let error = test_registry()
+        .validate_contract(&contract)
+        .expect_err("an undeclared executor cannot opt in")
+        .to_string();
+    assert!(error.contains("records model responses"), "{error}");
 }
 
 #[test]
@@ -918,6 +931,7 @@ impl StepExecutor for TestForeachStep {
         crate::StepTraits {
             parallel_safe: false,
             control_flow: crate::StepControlFlow::Foreach,
+            reuse: Default::default(),
         }
     }
 
@@ -5200,6 +5214,7 @@ async fn foreach_single_charge_matches_live_and_fold() {
             StepTraits {
                 parallel_safe: false,
                 control_flow: crate::StepControlFlow::Foreach,
+                reuse: Default::default(),
             }
         }
         async fn execute(
@@ -5798,6 +5813,7 @@ pub(super) fn node(id: &str, kind: &str) -> NodeDef {
         on_fail: None,
         failure: None,
         retry: None,
+        reuse: None,
         params: Default::default(),
     }
 }
@@ -6698,6 +6714,7 @@ fn unregistered_kinds_force_sequential_fail_closed() {
         on_fail: None,
         failure: None,
         retry: None,
+        reuse: None,
         params: Default::default(),
     };
     assert!(
@@ -6767,6 +6784,7 @@ async fn foreach_early_return_preserves_failed_files() {
             crate::StepTraits {
                 parallel_safe: false,
                 control_flow: crate::StepControlFlow::Foreach,
+                reuse: Default::default(),
             }
         }
         async fn execute(

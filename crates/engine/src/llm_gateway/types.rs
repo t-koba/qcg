@@ -13,4 +13,5 @@ pub struct LlmGateway<'a> {
     pub(crate) cancellation: CancellationToken,
     pub(crate) budget: policy::LlmCostBudget,
     pub(crate) pricing: Vec<ModelRef>,
+    pub(crate) reuse: Option<super::reuse::ReuseCtx>,
 }

@@ -38,6 +38,7 @@ fn agent_node() -> NodeDef {
         on_fail: None,
         failure: None,
         retry: None,
+        reuse: None,
         params: Default::default(),
     }
 }
@@ -3177,3 +3178,5 @@ mod context_limits;
 mod choose_exhaustion;
 
 mod fill_exhaustion;
+
+mod continuation_reuse;

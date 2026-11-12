@@ -24,7 +24,7 @@ pub(crate) struct LlmChooseStep {
 #[async_trait]
 impl StepExecutor for LlmChooseStep {
     engine::step_type_id!("llm.choose");
-    engine::parallel_step_traits!();
+    engine::parallel_step_traits!(Default);
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(
             &["prompt", "options", "max_iterations", "max_tokens_total"],

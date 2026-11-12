@@ -579,6 +579,15 @@ fn populate_checkpoint_fork(
 ) -> Result<(), ServiceError> {
     let source_meta = run_meta_dir(source_dir);
     let source_events = read_events_from_meta(&source_meta)?;
+    // Zero names the initial state: the sequence of the first `run_started`.
+    let at_seq = match at_seq {
+        0 => source_events
+            .iter()
+            .find(|event| event["t"] == "run_started")
+            .and_then(|event| event["seq"].as_u64())
+            .unwrap_or(0),
+        seq => seq,
+    };
     if !source_events
         .iter()
         .any(|event| event.get("seq").and_then(Value::as_u64) == Some(at_seq))

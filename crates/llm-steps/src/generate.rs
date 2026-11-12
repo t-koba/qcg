@@ -28,7 +28,7 @@ pub(crate) struct LlmFillStep {
 impl StepExecutor for LlmGenerateStep {
     engine::step_type_id!("llm.generate");
 
-    engine::parallel_step_traits!();
+    engine::parallel_step_traits!(Default);
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(&["prompt"], llm_common_properties(json!({}))))
@@ -66,7 +66,7 @@ impl StepExecutor for LlmGenerateStep {
 impl StepExecutor for LlmFillStep {
     engine::step_type_id!("llm.fill");
 
-    engine::parallel_step_traits!();
+    engine::parallel_step_traits!(Default);
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(

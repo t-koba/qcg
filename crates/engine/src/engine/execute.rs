@@ -707,6 +707,7 @@ impl Engine {
             .registry
             .get(&node.kind)
             .ok_or_else(|| StepError::failed(&node.id, "validated executor is missing"))?;
+        let reuse = executor.traits().reuses(node);
         let mut step_context = StepContext {
             run: context,
             journal,
@@ -738,6 +739,7 @@ impl Engine {
                     },
                     pricing,
                 )
+                .with_reuse(reuse, context.reuse.clone(), &context.metadata)
             }),
         };
         step_context.step_checkpoint(node).await?;

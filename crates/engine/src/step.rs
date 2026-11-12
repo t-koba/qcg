@@ -1,7 +1,7 @@
 use api::{ConfirmSpec, FormSpec};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use contract::{Contract, FieldType, InputField, NodeDef, RuntimeLimits, StepType};
+use contract::{Contract, FieldType, InputField, NodeDef, RuntimeLimits, StepReuse, StepType};
 use minijinja::{Environment, ErrorKind};
 use model::Finding;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -257,9 +257,31 @@ pub trait StepExecutor: Send + Sync {
 pub struct StepTraits {
     pub parallel_safe: bool,
     pub control_flow: StepControlFlow,
+    pub reuse: ReuseSupport,
+}
+
+/// Whether a step type's recorded model responses may serve a continuation.
+/// Fail closed: an executor that declares nothing is never reused.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ReuseSupport {
+    #[default]
+    None,
+    /// Reused only when the contract sets `reuse = "matching"`.
+    OptIn,
+    /// Reused unless the contract sets `reuse = "never"`.
+    Default,
 }
 
 impl StepTraits {
+    /// The effective reuse decision for `node` under the contract policy.
+    pub fn reuses(&self, node: &NodeDef) -> bool {
+        match (node.reuse, self.reuse) {
+            (Some(StepReuse::Never), _) | (_, ReuseSupport::None) => false,
+            (Some(StepReuse::Matching), _) => true,
+            (None, support) => support == ReuseSupport::Default,
+        }
+    }
+
     /// Traits for executors that are safe to run in parallel waves.
     pub fn parallel() -> Self {
         Self {
@@ -275,6 +297,14 @@ macro_rules! parallel_step_traits {
     () => {
         fn traits(&self) -> $crate::StepTraits {
             $crate::StepTraits::parallel()
+        }
+    };
+    ($reuse:ident) => {
+        fn traits(&self) -> $crate::StepTraits {
+            $crate::StepTraits {
+                reuse: $crate::ReuseSupport::$reuse,
+                ..$crate::StepTraits::parallel()
+            }
         }
     };
 }
@@ -426,6 +456,14 @@ impl StepRegistry {
             Some(executor) => executor
                 .validate(node, contract)
                 .and_then(|()| {
+                    if node.reuse == Some(StepReuse::Matching)
+                        && executor.traits().reuse == ReuseSupport::None
+                    {
+                        return Err(StepError::failed(
+                            &node.id,
+                            "reuse = \"matching\" needs a step type that records model responses",
+                        ));
+                    }
                     if executor.traits().control_flow == StepControlFlow::Foreach {
                         self.foreach_block(node, contract, &step_params(node, "foreach")?)?;
                     }
@@ -843,5 +881,43 @@ mod tests {
             )
             .expect_err("template fuel should be bounded");
         assert!(error.to_string().contains("fuel"));
+    }
+}
+
+#[cfg(test)]
+mod reuse_tests {
+    use super::*;
+
+    fn node(reuse: Option<StepReuse>) -> NodeDef {
+        let mut node: NodeDef = toml::from_str("id = \"n\"\ntype = \"x\"").unwrap();
+        node.reuse = reuse;
+        node
+    }
+
+    #[test]
+    fn contract_policy_cannot_widen_what_the_step_type_declares() {
+        use ReuseSupport::{Default as ByDefault, None as Undeclared, OptIn};
+        use StepReuse::{Matching, Never};
+        for (support, policy, expected) in [
+            (Undeclared, None, false),
+            (Undeclared, Some(Matching), false),
+            (Undeclared, Some(Never), false),
+            (OptIn, None, false),
+            (OptIn, Some(Matching), true),
+            (OptIn, Some(Never), false),
+            (ByDefault, None, true),
+            (ByDefault, Some(Matching), true),
+            (ByDefault, Some(Never), false),
+        ] {
+            let traits = StepTraits {
+                reuse: support,
+                ..StepTraits::default()
+            };
+            assert_eq!(
+                traits.reuses(&node(policy)),
+                expected,
+                "{support:?} {policy:?}"
+            );
+        }
     }
 }

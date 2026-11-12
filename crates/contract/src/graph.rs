@@ -261,6 +261,7 @@ type = "check.format"
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         }
     }

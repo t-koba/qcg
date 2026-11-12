@@ -1285,6 +1285,7 @@ mod tests {
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         };
         let ctx = RunContext {
@@ -1304,6 +1305,7 @@ mod tests {
             llm_seed_override: None,
             templates: TemplateService,
             run_refs: Arc::new(std::collections::BTreeMap::new()),
+            reuse: None,
             cancellation: CancellationToken::new(),
             parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
             elapsed_deadline: None,

@@ -234,6 +234,27 @@ pub struct LlmRouteFailedEventData {
     pub web_search: Option<WebSearchLiability>,
 }
 
+/// A model response kept beside the journal so a continuation can serve it,
+/// or one served from the parent run (`reused_from`) instead of a provider call.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LlmMemoEventData {
+    /// SHA-256 of the node identity and the full provider request.
+    pub request_digest: String,
+    /// SHA-256 of the stored response; the sidecar is named after it.
+    pub memo_ref: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reused_from: Option<LlmReusedFrom>,
+}
+
+/// Where a reused response was recorded.
+#[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct LlmReusedFrom {
+    pub run_id: String,
+    pub seq: u64,
+}
+
 pub type LlmRouteFailureKind = model::LlmErrorKind;
 
 /// Unknown possible hosted-search spend, without fabricated usage or response metadata.

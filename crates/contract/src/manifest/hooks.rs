@@ -121,6 +121,7 @@ impl HookDef {
             on_fail: None,
             failure: None,
             retry: self.retry.clone(),
+            reuse: None,
             params: self.params.clone(),
         }
     }

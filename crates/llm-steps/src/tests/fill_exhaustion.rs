@@ -124,6 +124,7 @@ output_file = "out.json"
             llm_provider: Some(provider.clone()),
             llm_seed_override: None,
             run_refs: BTreeMap::new(),
+            reuse: None,
             cancellation: Default::default(),
             shutdown: None,
             scheduler_yield: Default::default(),

@@ -48,6 +48,7 @@ impl RunContext {
             elapsed_deadline: None,
             snapshot_source: None,
             run_refs: Arc::new(std::collections::BTreeMap::new()),
+            reuse: None,
             replay_through: 0,
             replayed_steps: Arc::new(std::collections::BTreeMap::new()),
             checkpoint_accounting: Arc::new(Mutex::new(

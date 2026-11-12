@@ -2734,6 +2734,7 @@ mod tests {
             on_fail: None,
             failure: None,
             retry: None,
+            reuse: None,
             params: Default::default(),
         };
         let tools = vec![ToolDecl::FsWrite {
@@ -2926,6 +2927,7 @@ mod approval_e2e {
                 on_fail: None,
                 failure: None,
                 retry: None,
+                reuse: None,
                 params: Default::default(),
             }
         }

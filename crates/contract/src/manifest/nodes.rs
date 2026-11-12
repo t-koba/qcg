@@ -37,9 +37,24 @@ pub struct NodeDef {
     /// cancellation errors fail fast.
     #[serde(default)]
     pub retry: Option<RetryPolicy>,
+    /// Whether a continuation (`fork` with `reuse = "matching"`) may serve this
+    /// step's recorded external results instead of repeating the effect.
+    /// Omitted means the step type's default (see the contract reference).
+    #[serde(default)]
+    pub reuse: Option<StepReuse>,
     #[serde(default)]
     #[schemars(skip)]
     pub params: toml::Table,
+}
+
+/// Per-step reuse policy for run continuation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum StepReuse {
+    /// Serve a recorded result when the request is identical.
+    Matching,
+    /// Always repeat the effect.
+    Never,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

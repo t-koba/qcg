@@ -382,6 +382,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             RunsCommand::Fork {
                 id,
                 at_seq,
+                reuse,
                 state_patch,
                 answers,
                 confirms,
@@ -402,7 +403,8 @@ async fn run_async() -> Result<std::process::ExitCode> {
                     .fork_run(
                         &id,
                         ForkRun {
-                            at_seq,
+                            at_seq: at_seq.unwrap_or(0),
+                            reuse: reuse.then_some(api::ForkReuse::Matching),
                             state_patch,
                             answers: load_answers(answers)?,
                             confirmations: load_confirmations(confirms, confirmations_file)?,
@@ -420,7 +422,11 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&snapshot)?);
                 } else {
-                    println!("forked {id}@{at_seq} -> {fork_id} ({})", snapshot.state);
+                    println!(
+                        "forked {id}@{} -> {fork_id} ({})",
+                        at_seq.map_or_else(|| "start".to_string(), |seq| seq.to_string()),
+                        snapshot.state
+                    );
                 }
             }
             RunsCommand::Trace {

@@ -76,6 +76,27 @@ pub(crate) fn load_or_resolve_run_refs(
     Ok(resolved)
 }
 
+/// The parent's recorded model responses when this run is a continuation
+/// (`reuse` on its queued record). An unreadable parent yields none, so every
+/// step simply executes.
+pub(crate) fn reuse_source(
+    runs_dir: &Utf8Path,
+    journaled: &[serde_json::Value],
+) -> Option<std::sync::Arc<engine::ReuseSource>> {
+    let queued = journaled
+        .iter()
+        .find(|event| event["t"] == "run_queued" && event["reuse"] == "matching")?;
+    let parent = queued["parent_run_id"]
+        .as_str()
+        .filter(|id| policy::is_safe_path_component(id))?;
+    let dir = runs_dir.join(parent);
+    let events = crate::summaries::read_journal_events(&dir).ok()?;
+    let metadata = crate::summaries::run_meta_dir(&dir);
+    Some(std::sync::Arc::new(engine::ReuseSource::from_events(
+        parent, &metadata, &events,
+    )))
+}
+
 #[derive(Debug)]
 struct SourceRun {
     run_id: String,

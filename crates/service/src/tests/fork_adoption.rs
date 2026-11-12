@@ -2698,3 +2698,47 @@ async fn fork_does_not_inherit_source_audit_raise_after_recovery() {
     drop(recovered);
     wait_for_runs_store_release(&runs).await;
 }
+
+#[tokio::test]
+async fn reuse_fork_restarts_from_the_initial_state_and_records_the_continuation() {
+    let runs = temp_run_dir("fork-reuse");
+    let _ = std::fs::remove_dir_all(&runs);
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let service = test_service(vec![generators], runs.clone());
+    let source = start_ask_user_and_answer(&service, "brief").await;
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &source).await.state,
+        RunStatus::Succeeded
+    );
+    // Without a checkpoint or reuse the request is still refused.
+    assert!(
+        service
+            .fork_run_with_id(&source, ForkRun::default(), Some("fork-reuse-none".into()))
+            .await
+            .is_err()
+    );
+    let child = service
+        .fork_run_with_id(
+            &source,
+            ForkRun {
+                reuse: Some(api::ForkReuse::Matching),
+                ..Default::default()
+            },
+            Some("fork-reuse-child".into()),
+        )
+        .await
+        .expect("reuse fork needs no checkpoint sequence");
+    let events = crate::summaries::read_journal_events(&runs.join(&child)).unwrap();
+    let queued = events
+        .iter()
+        .find(|e| e["t"] == "run_queued" && e["reuse"] == "matching");
+    assert_eq!(
+        queued.expect("continuation is journaled")["parent_run_id"],
+        source.as_str()
+    );
+    // Work done by the source is not carried over: the child starts at its initial state.
+    assert!(!events.iter().any(|e| e["t"] == "step_finished"));
+    assert!(crate::run_refs::reuse_source(&runs, &events).is_some());
+    assert!(crate::run_refs::reuse_source(&runs, &[]).is_none());
+}

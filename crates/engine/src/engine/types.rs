@@ -245,6 +245,8 @@ pub struct RunOptions {
     /// Resolved `run_ref` resources by resource name. An unresolved
     /// referenced resource fails the run instead of silently skipping it.
     pub run_refs: BTreeMap<String, RunRefMaterial>,
+    /// Recorded model responses of the run this run continues, if any.
+    pub reuse: Option<Arc<crate::ReuseSource>>,
     /// Cooperative scheduler request, observed only between complete nodes/waves.
     /// Unlike cancellation this never interrupts already-started work.
     pub scheduler_yield: CancellationToken,
@@ -301,6 +303,7 @@ pub struct RunContext {
     pub snapshot_source: Option<Arc<dyn RunSnapshotSource>>,
     /// Resolved run references for this execution; immutable for the run.
     pub run_refs: Arc<BTreeMap<String, RunRefMaterial>>,
+    pub reuse: Option<Arc<crate::ReuseSource>>,
     pub(crate) replay_through: u64,
     pub(crate) replayed_steps: Arc<BTreeMap<String, ReplayedStep>>,
     pub(crate) checkpoint_accounting: Arc<Mutex<CheckpointAccounting>>,

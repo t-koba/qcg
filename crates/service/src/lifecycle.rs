@@ -1616,6 +1616,7 @@ impl LocalService {
                         return;
                     }
                 };
+                let reuse = crate::run_refs::reuse_source(&service.inner.runs_dir, &journaled);
                 let scheduler_yield = service
                     .inner
                     .runs
@@ -1646,6 +1647,7 @@ impl LocalService {
                             llm_seed_override: None,
                             cancellation,
                             run_refs,
+                            reuse,
                             shutdown: Some(service.shutdown_token()),
                             scheduler_yield,
                         },
@@ -1886,6 +1888,7 @@ impl LocalService {
                     llm_provider: Some(Arc::clone(&runtime.provider)),
                     llm_seed_override: run.llm_seed_override,
                     run_refs: run_refs.clone(),
+                    reuse: None,
                     cancellation: run.cancellation.clone(),
                     // Direct executions also stop at the service drain (E05).
                     shutdown: Some(self.shutdown_token()),
