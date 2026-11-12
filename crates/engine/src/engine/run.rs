@@ -44,6 +44,21 @@ pub(crate) const STARTUP_SWEEP_FRAGMENTS: [&str; 1] = [".part-"];
 
 /// Refreshes only statuses and reasons from the journal fold. Live outputs,
 /// inputs, and foreach item remain owned by the execution scope.
+/// Publishes the output that settles a node on a handled failure and marks it
+/// successful; returns the output name journaled with it. The single shared
+/// output-name helper keeps the declared alias winning (E10).
+fn settle_with_output<'a>(
+    vars: &mut ValueBag,
+    states: &mut BTreeMap<String, NodeState>,
+    node: &'a contract::NodeDef,
+    output: &Option<serde_json::Value>,
+) -> &'a str {
+    let output_name = super::types::output_name_for(node);
+    vars.publish_step_output(&node.id, node.output.as_deref(), output, None);
+    states.insert(node.id.clone(), NodeState::Success);
+    output_name
+}
+
 pub(super) fn sync_live_outcomes(vars: &mut ValueBag, journal: &JournalWriter) {
     let folded = journal.state();
     vars.sync_outcome_metadata(&folded.vars);
@@ -1011,42 +1026,21 @@ impl Engine {
                                     RepairCycleOutcome::Repaired { output } => {
                                         // Single shared output-name helper
                                         // (E10): declared alias wins.
-                                        let output_name = super::types::output_name_for(node);
-                                        vars.publish_step_output(
-                                            &node.id,
-                                            node.output.as_deref(),
-                                            &output,
-                                            None,
-                                        );
-                                        states.insert(id.clone(), NodeState::Success);
+                                        let output_name = settle_with_output(&mut vars, &mut states, node, &output);
                                         journal.event(
                                             "step_finished",
                                             with_failed_evidence(json!({ "node": id, "status": "repaired", "output": output, "output_name": output_name }), &failure_output, &failure_file_pins)?,
                                         )?;
                                     }
                                     RepairCycleOutcome::Routed { to, output } => {
-                                        let output_name = super::types::output_name_for(node);
-                                        vars.publish_step_output(
-                                            &node.id,
-                                            node.output.as_deref(),
-                                            &Some(output.clone()),
-                                            None,
-                                        );
-                                        states.insert(id.clone(), NodeState::Success);
+                                        let output_name = settle_with_output(&mut vars, &mut states, node, &Some(output.clone()));
                                         journal.event(
                                             "step_finished",
                                             with_failed_evidence(json!({ "node": id, "status": "routed", "to": to, "output": output, "output_name": output_name }), &failure_output, &failure_file_pins)?,
                                         )?;
                                     }
                                     RepairCycleOutcome::Answered { output } => {
-                                        let output_name = super::types::output_name_for(node);
-                                        vars.publish_step_output(
-                                            &node.id,
-                                            node.output.as_deref(),
-                                            &Some(output.clone()),
-                                            None,
-                                        );
-                                        states.insert(id.clone(), NodeState::Success);
+                                        let output_name = settle_with_output(&mut vars, &mut states, node, &Some(output.clone()));
                                         journal.event(
                                             "step_finished",
                                             with_failed_evidence(json!({ "node": id, "status": "answered_on_fail", "output": output, "output_name": output_name }), &failure_output, &failure_file_pins)?,
@@ -1064,14 +1058,7 @@ impl Engine {
                             }
                             Some(OnFail::Route { to }) => {
                                 let output = json!({ "routed_to": to, "findings": findings, "failed_output": failure_output, "failed_files": failure_file_pins });
-                                let output_name = super::types::output_name_for(node);
-                                vars.publish_step_output(
-                                    &node.id,
-                                    node.output.as_deref(),
-                                    &Some(output.clone()),
-                                    None,
-                                );
-                                states.insert(id.clone(), NodeState::Success);
+                                let output_name = settle_with_output(&mut vars, &mut states, node, &Some(output.clone()));
                                 journal.event(
                                     "step_finished",
                                     with_failed_evidence(json!({ "node": id, "status": "routed", "to": to, "findings": findings, "output": output, "output_name": output_name }), &failure_output, &failure_file_pins)?,
@@ -1085,14 +1072,7 @@ impl Engine {
                                 let question_id = format!("{}:on_fail", node.id);
                                 if let Some(answer) = context.answers.get(&question_id) {
                                     let output = json!({ "answer": answer, "findings": findings });
-                                    let output_name = super::types::output_name_for(node);
-                                    vars.publish_step_output(
-                                        &node.id,
-                                        node.output.as_deref(),
-                                        &Some(output.clone()),
-                                        None,
-                                    );
-                                    states.insert(id.clone(), NodeState::Success);
+                                    let output_name = settle_with_output(&mut vars, &mut states, node, &Some(output.clone()));
                                     journal.event(
                                         "step_finished",
                                         with_failed_evidence(json!({ "node": id, "status": "answered_on_fail", "answer": answer, "output": output, "output_name": output_name }), &failure_output, &failure_file_pins)?,
