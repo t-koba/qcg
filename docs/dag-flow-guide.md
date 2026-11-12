@@ -87,10 +87,28 @@ downstream nodes see deterministic `steps.*` values. Parallel `patch` nodes
 must target disjoint files: overlapping patches stay caller-exclusive and the
 second writer fails with a base or anchor mismatch instead of overwriting
 silently. The direct `command`, `check.command`, and `check.container` step
-types, along with LLM, HTTP, `ask_user`, and `foreach`, stay on the single-node
-path. `check.tool` is a parallel-safe validator step even when its selected
+types, along with HTTP, `ask_user`, `foreach`, `llm.decide` and `llm.catalog`,
+stay on the single-node path. The other LLM step types run in parallel waves. `check.tool` is a parallel-safe validator step even when its selected
 tool backend uses command or container execution; existing fallback
 confirmation behavior still applies.
+
+## Continuing a run
+
+`qcg runs fork <id> --reuse` (or `POST /api/runs/{id}/fork` with
+`{"reuse": "matching"}`) starts a child of a failed, canceled or finished run
+from the source's initial state, with the same inputs unless patched. The child
+walks the whole DAG again. Each model request is digested together with its
+node id, step type and the complete provider request (model, parameters,
+rendered messages, schema, tools). When the source recorded a response for the
+same node and digest under a step that finished successfully, the child serves
+that response instead of calling the provider and journals `llm_memo` with
+`reused_from`; the step's own logic (validation, file writes, output) still
+runs on it. Any change to a rendered prompt, a step definition, a model
+parameter or a read file changes the digest, so that request is repeated and
+steps reading its result see new inputs. Responses are not served from steps
+that failed, and a missing or altered recorded response is repeated. Effects
+other than model calls are never reused, and answers and confirmations are
+supplied again with the fork request. A step's `reuse` key can set `never`.
 
 Parallel starts and finishes are marked with `"parallel": true` in the journal.
 

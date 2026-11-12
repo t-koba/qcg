@@ -555,6 +555,13 @@ Common node fields:
 - `on_fail`
 - `failure`
 - `retry` (optional execution retry policy, see below)
+- `reuse` (optional, `matching` or `never`): whether a continuation may serve
+  this step's recorded model responses to identical requests. Omitted means the
+  step type's default: `matching` for `llm.generate`, `llm.fill`, `llm.choose`
+  and `llm.repair`; `llm.agent` reuses only with an explicit `matching`; every
+  other step type, including `llm.decide`, never reuses and rejects
+  `reuse = "matching"` at contract load. Steps with external effects (commands,
+  HTTP, MCP calls) are always repeated.
 - `params` (closed, step-specific table)
 
 Root-level `parallel = ["lint", "test"]` explicitly identifies a contiguous

@@ -192,12 +192,14 @@ JSON event output go to stdout.
   journal containing an unresolved fail-closed (`fail`, including pre-policy)
   `Started` external operation. A `repeat` `Started` source passes this gate,
   but replay still starts a distinct run rather than reconciling the source journal.
-- `qcg runs fork <id> --at-seq N [--state-patch patch.json]
+- `qcg runs fork <id> (--at-seq N | --reuse) [--state-patch patch.json]
   [--answer id=value]... [--confirm id=approve|deny]...
   [--confirmations-file file.json] [--runs-dir dir] [--json]` restores
   content-addressed files and folded state
   at an exact journal sequence, applies explicit input/step patches, and resumes
-  the remaining DAG as a new run.
+  the remaining DAG as a new run. `--reuse` instead restarts from the source's
+  initial state and serves the source's recorded model responses to identical
+  requests (see the DAG flow guide); `--at-seq` may be combined with it.
 - `qcg runs invalidate <id> --reason "..." --actor-label "..."
   [--runs-dir dir] [--json]` irreversibly invalidates a durably successful
   run's result without changing its execution status or journal. Both strings

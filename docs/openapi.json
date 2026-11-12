@@ -994,6 +994,16 @@
         ],
         "type": "object"
       },
+      "ForkReuse": {
+        "description": "How a fork reuses the source run's recorded work.",
+        "oneOf": [
+          {
+            "const": "matching",
+            "description": "Identical model requests are answered from the source's responses.",
+            "type": "string"
+          }
+        ]
+      },
       "ForkRun": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "additionalProperties": false,
@@ -1004,6 +1014,7 @@
             "type": "object"
           },
           "at_seq": {
+            "description": "Checkpoint sequence to restore. Zero or omitted with `reuse` restarts\nfrom the source's initial state.",
             "format": "uint64",
             "minimum": 0,
             "type": "integer"
@@ -1023,13 +1034,21 @@
               "null"
             ]
           },
+          "reuse": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ForkReuse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Continue the source by serving its recorded model responses to\nidentical requests instead of calling the provider again."
+          },
           "state_patch": {
             "$ref": "#/components/schemas/ForkStatePatch"
           }
         },
-        "required": [
-          "at_seq"
-        ],
         "title": "ForkRun",
         "type": "object"
       },
@@ -2132,6 +2151,54 @@
           }
         ]
       },
+      "LlmMemoEventData": {
+        "additionalProperties": false,
+        "description": "A model response kept beside the journal so a continuation can serve it,\nor one served from the parent run (`reused_from`) instead of a provider call.",
+        "properties": {
+          "memo_ref": {
+            "description": "SHA-256 of the stored response; the sidecar is named after it.",
+            "type": "string"
+          },
+          "request_digest": {
+            "description": "SHA-256 of the node identity and the full provider request.",
+            "type": "string"
+          },
+          "reused_from": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/LlmReusedFrom"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "request_digest",
+          "memo_ref"
+        ],
+        "type": "object"
+      },
+      "LlmReusedFrom": {
+        "additionalProperties": false,
+        "description": "Where a reused response was recorded.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          },
+          "seq": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "run_id",
+          "seq"
+        ],
+        "type": "object"
+      },
       "LlmRouteFailedEventData": {
         "additionalProperties": false,
         "properties": {
@@ -3066,6 +3133,7 @@
               "lagged",
               "llm_call",
               "llm_delta",
+              "llm_memo",
               "llm_route_failed",
               "llm_validation_failed",
               "mcp_authorization_required",
@@ -3217,6 +3285,9 @@
           },
           {
             "$ref": "#/components/schemas/LlmDeltaEventData"
+          },
+          {
+            "$ref": "#/components/schemas/LlmMemoEventData"
           },
           {
             "$ref": "#/components/schemas/AgentCheckpointEventData"
@@ -3835,6 +3906,17 @@
               "integer",
               "null"
             ]
+          },
+          "reuse": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ForkReuse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Set on a continuation: the parent's recorded model responses serve identical requests."
           },
           "schema_version": {
             "format": "uint32",

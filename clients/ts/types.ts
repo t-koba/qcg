@@ -285,7 +285,16 @@ type QcgModel42 = {
     answers?: {
         [key: string]: unknown;
     };
-    at_seq: number;
+    /**
+     * Checkpoint sequence to restore. Zero or omitted with `reuse` restarts
+     * from the source's initial state.
+     */
+    at_seq?: number;
+    /**
+     * Continue the source by serving its recorded model responses to
+     * identical requests instead of calling the provider again.
+     */
+    reuse?: 'matching' | null;
     /**
      * Pre-provisioned confirmation decisions keyed by confirmation id.
      */

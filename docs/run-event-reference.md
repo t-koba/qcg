@@ -59,6 +59,12 @@ Unreported-task replay remains separately guarded by the executor's explicit
 `replay_safe_after_interruption` capability; checkpoints alone never authorize
 replay.
 
+`llm_memo` records a model response kept beside the journal (`llm-memo/<memo_ref>.json`)
+for steps whose reuse policy allows it, with the SHA-256 `request_digest` of the node
+and request. In a continuation (`run_queued.reuse = "matching"`) a served response is
+journaled as `llm_memo` with `reused_from` (`run_id`, `seq` of the source record) and no
+`llm_call`, so it adds no tokens or cost. Journals without `llm_memo` events reuse nothing.
+
 Completion `llm_call` events carry optional `stop_reason` (absent in older
 journals and decision calls). `model_context_window_exceeded` retains Anthropic's
 context-exhaustion terminal after its reported tokens and configured cost have
@@ -159,6 +165,7 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `regenerate_attempt_finished` | `attempt`, `status` |
 | `llm_call` | `provider`, `model`, `max_tokens`, `tokens`, `cost_microusd`; optional: `web_search` (`calls`, `cost_microusd`, `events`, `citations`) |
 | `llm_delta` | `provider`, `model`, `index`, `text` |
+| `llm_memo` | `request_digest`, `memo_ref` |
 | `agent_checkpoint` | `turn`, `phase`, `checkpoint` |
 | `agent_file_changes` | `removed_files`, `written_files` |
 | `agent_delegated` | `agent`, `tool_call_id`, `tools`, `max_calls`, `max_iterations`, `max_tokens_total`, `max_tool_calls_total` |
