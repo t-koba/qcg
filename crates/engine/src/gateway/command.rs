@@ -38,6 +38,9 @@ pub struct CmdGateway {
     /// Run-scoped cgroup-v2 cleanup scope when crash recovery is enabled.
     /// `None` preserves existing live cancellation with no crash claim.
     host_cgroup: Option<policy::HostCgroupScope>,
+    /// Journals container effect intents and closures; `None` creates
+    /// containers unjournaled (gateways built outside a run).
+    effects: Option<std::sync::Arc<dyn container::EffectLedger>>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -65,6 +68,7 @@ impl CmdGateway {
             extra_allowed_roots: Vec::new(),
             cancellation: CancellationToken::new(),
             host_cgroup: None,
+            effects: None,
         }
     }
 
@@ -95,6 +99,17 @@ impl CmdGateway {
     pub fn with_host_cgroup(mut self, scope: Option<policy::HostCgroupScope>) -> Self {
         self.host_cgroup = scope;
         self
+    }
+
+    /// Attaches the run's container effect ledger.
+    pub fn with_effects(mut self, ledger: std::sync::Arc<dyn container::EffectLedger>) -> Self {
+        self.effects = Some(ledger);
+        self
+    }
+
+    /// The run's container effect ledger, shared with MCP launches.
+    pub fn effect_ledger(&self) -> Option<std::sync::Arc<dyn container::EffectLedger>> {
+        self.effects.clone()
     }
 
     /// Current run-scoped cgroup scope, if any.
@@ -217,133 +232,75 @@ impl CmdGateway {
                 readonly: *readonly,
             })
             .collect();
-        match backend {
+        // The intent is journaled and the unique name allocated before any
+        // daemon call; both families create the instance under that name.
+        let session = provision(
+            &backend,
+            &Provision {
+                timeouts: self.container_timeouts,
+                image: spec.image,
+                mounts: &mounts,
+                ledger: self.effects.clone(),
+                cancel: &self.cancellation,
+            },
+        )
+        .await?;
+        let guard = SessionGuard::new(session.clone());
+        let container_argv = match &backend {
             Backend::Docker {
-                ref binary,
-                ref runtime_flag,
-            } => {
-                // Tracking file lives outside the mounted workspace so the
-                // container cannot tamper with the tracked container id.
-                let cidfile = std::env::temp_dir().join(format!(
-                    ".container-{}.cid",
-                    uuid::Uuid::now_v7().as_simple()
-                ));
-                let container_argv = container::docker_run_argv(&container::DockerRunSpec {
-                    binary,
-                    runtime_flag: runtime_flag.as_deref(),
-                    cidfile: cidfile.as_path(),
-                    mounts: &mounts,
-                    workdir: spec.workdir,
-                    env_names: &[],
-                    image: spec.image,
-                    workload: spec.workload_argv,
-                    stdin_pipe: spec.stdin.is_some(),
-                });
-                let session = container::Session {
-                    timeouts: self.container_timeouts,
-                    backend: backend.clone(),
-                    id: container::InstanceId::CidFile(cidfile),
-                };
-                let guard = SessionGuard::new(session.clone());
-                let result = self
-                    // Runtime clients are not host payloads; daemon lifecycle
-                    // stays under the existing container owner, never this scope.
-                    .run_host_process(
-                        &container_argv,
-                        timeout_seconds,
-                        output_limit_bytes,
-                        spec.stdin,
-                        None,
-                    )
-                    .await;
-                // Awaited cleanup on every exit path; `--rm` normally removes
-                // the container, but a client-side timeout leaves the daemon
-                // side running without this. Disarm only on success: a
-                // failed teardown stays armed so the guard backstop retries
-                // it instead of orphaning the container (B06).
-                match teardown(&session).await {
-                    Ok(()) => guard.disarm(),
-                    Err(error) => {
-                        // Aggregate for shutdown reporting: the workload
-                        // result below stays the workload's own outcome
-                        // (failing it would lose successful work and invite
-                        // duplicate side effects on retry), while the
-                        // cleanup failure stays visible and retried (C05).
-                        container::record_cleanup_failure();
-                        tracing::warn!(%error, "container teardown failed; guard backstop remains armed");
-                    }
-                }
-                result
-            }
-            managed => {
-                let provisioned = provision(
-                    &managed,
-                    &Provision {
-                        timeouts: self.container_timeouts,
-                        image: spec.image,
-                        mounts: &mounts,
-                        id_prefix: "container",
-                        cancel: &self.cancellation,
-                    },
-                )
-                .await?;
-                let instance = match &provisioned.id {
-                    container::InstanceId::Name(name) => name.clone(),
-                    container::InstanceId::CidFile(_) => {
-                        return Err(GatewayError::Container(
-                            container::ContainerError::StageFailed {
-                                stage: "provision",
-                                instance: "unknown".into(),
-                                detail: "managed provision returned no instance name".into(),
-                            },
-                        ));
-                    }
-                };
-                let guard = SessionGuard::new(provisioned.clone());
-                let workdir = spec.workdir.or_else(|| {
+                binary,
+                runtime_flag,
+            } => container::docker_run_argv(&container::DockerRunSpec {
+                binary,
+                runtime_flag: runtime_flag.as_deref(),
+                name: &session.name,
+                labels: &session.labels(),
+                mounts: &mounts,
+                workdir: spec.workdir,
+                env_names: &[],
+                image: spec.image,
+                workload: spec.workload_argv,
+                stdin_pipe: spec.stdin.is_some(),
+            }),
+            Backend::Incus { binary } => container::incus_exec_argv(
+                binary,
+                &session.name,
+                spec.workdir.or_else(|| {
                     mounts
                         .first()
                         .map(|mount| mount.guest)
                         .filter(|guest| !guest.is_empty())
-                });
-                let container_argv = match &managed {
-                    Backend::Incus { binary } => container::incus_exec_argv(
-                        binary,
-                        &instance,
-                        workdir,
-                        &[],
-                        spec.workload_argv,
-                    ),
-                    Backend::Docker { .. } => {
-                        return Err(GatewayError::Container(
-                            container::ContainerError::StageFailed {
-                                stage: "argv",
-                                instance: instance.clone(),
-                                detail: "docker backends take the one-shot path".into(),
-                            },
-                        ));
-                    }
-                };
-                let result = self
-                    // Runtime clients are not host payloads; daemon lifecycle
-                    // stays under the existing container owner, never this scope.
-                    .run_host_process(
-                        &container_argv,
-                        timeout_seconds,
-                        output_limit_bytes,
-                        spec.stdin,
-                        None,
-                    )
-                    .await;
-                if let Err(error) = teardown(&provisioned).await {
-                    container::record_cleanup_failure();
-                    tracing::warn!(%error, "managed container teardown failed; guard backstop remains armed");
-                } else {
-                    guard.disarm();
-                }
-                result
+                }),
+                &[],
+                spec.workload_argv,
+            ),
+        };
+        let result = self
+            // Runtime clients are not host payloads; daemon lifecycle
+            // stays under the existing container owner, never this scope.
+            .run_host_process(
+                &container_argv,
+                timeout_seconds,
+                output_limit_bytes,
+                spec.stdin,
+                None,
+            )
+            .await;
+        // Awaited cleanup on every exit path (`--rm` alone leaves a
+        // client-side timeout's daemon container running). Disarm only on
+        // success: a failed teardown stays armed so the guard backstop
+        // retries it, and the workload result below stays the workload's own
+        // outcome (failing it would lose successful work and invite
+        // duplicate side effects on retry) while the failure remains
+        // visible for shutdown reporting (B06, C05).
+        match teardown(&session).await {
+            Ok(()) => guard.disarm(),
+            Err(error) => {
+                container::record_cleanup_failure();
+                tracing::warn!(%error, "container teardown failed; guard backstop remains armed");
             }
         }
+        result
     }
 
     #[doc(hidden)]
@@ -813,7 +770,9 @@ mod daemon_policy_tests {
             permissions,
             Utf8PathBuf::from_path_buf(daemon.root.clone()).unwrap(),
         )
-        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([30, 30, 30, 1]).unwrap())
+        .with_container_timeouts(
+            policy::ContainerTimeouts::from_seconds([30, 30, 30, 1, 1]).unwrap(),
+        )
         .with_host_cgroup(Some(policy::HostCgroupScope {
             delegated_parent: "/sys/fs/cgroup/missing".into(),
             run_root: "/sys/fs/cgroup/missing/invalid".into(),
@@ -828,10 +787,10 @@ mod daemon_policy_tests {
         // allow three seconds for their client startup (the fixture has
         // measured 444ms under load), still below the eight-second fake hang.
         for (mode, stage, seconds, budget) in [
-            ("hang-admin", "discover-pool", [30, 30, 1, 30], 1),
-            ("hang-init", "init", [1, 30, 30, 30], 1),
-            ("hang-start", "start", [30, 3, 30, 30], 3),
-            ("hang-probe", "wait-ready", [30, 3, 30, 30], 3),
+            ("hang-admin", "discover-pool", [30, 30, 1, 30, 1], 1),
+            ("hang-init", "init", [1, 30, 30, 30, 1], 1),
+            ("hang-start", "start", [30, 3, 30, 30, 1], 3),
+            ("hang-probe", "wait-ready", [30, 3, 30, 30, 1], 3),
         ] {
             daemon.mode(mode);
             let target = gateway
@@ -884,7 +843,7 @@ mod daemon_policy_tests {
         permissions.containers.runtime = Some(contract::ContainerRuntime::Docker);
         let docker = CmdGateway::new(permissions, gateway.workspace.clone())
             .with_host_cgroup(gateway.host_cgroup.clone())
-            .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
+            .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 5]).unwrap());
         daemon.mode("docker-workload");
         let start = std::time::Instant::now();
         docker
@@ -905,8 +864,79 @@ mod daemon_policy_tests {
         let log = daemon.log();
         assert!(log.contains("run --rm"), "{log}");
         assert!(
-            log.contains("kill test-id") && log.contains("rm -f test-id"),
+            log.contains("kill qcg-") && log.contains("rm -f qcg-"),
             "{log}"
         );
+    }
+
+    #[tokio::test]
+    async fn container_effect_is_journaled_under_its_creation_name_and_closed_on_teardown() {
+        let Some(daemon) = Daemon::isolated(
+            "gateway::command::daemon_policy_tests::container_effect_is_journaled_under_its_creation_name_and_closed_on_teardown",
+        ) else {
+            return;
+        };
+        let meta = Utf8PathBuf::from_path_buf(daemon.root.join("runs/run-x/meta")).unwrap();
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal =
+            crate::JournalWriter::create(&meta.join("journal.jsonl"), "run-x", false, None)
+                .unwrap();
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+                    "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                }),
+            )
+            .unwrap();
+        let mut permissions = Permissions::default();
+        permissions.containers.runtime = Some(contract::ContainerRuntime::Docker);
+        let gateway = CmdGateway::new(permissions, meta.clone())
+            .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 5]).unwrap())
+            .with_effects(std::sync::Arc::new(crate::JournalEffects::new(
+                &meta,
+                "run-x",
+                crate::JournalLimits::default(),
+            )));
+        let argv = vec!["echo".to_string()];
+        gateway
+            .run_container_workload(
+                ContainerWorkload {
+                    image: &format!("alpine@sha256:{}", "a".repeat(64)),
+                    mounts: &[],
+                    workdir: None,
+                    workload_argv: &argv,
+                    stdin: None,
+                },
+                5,
+                None,
+            )
+            .await
+            .unwrap();
+        let events = std::fs::read_to_string(meta.join("journal.jsonl")).unwrap();
+        let lines: Vec<serde_json::Value> = events
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let intent = lines
+            .iter()
+            .find(|e| e["t"] == "effect_intent")
+            .expect("intent journaled");
+        let closed = lines
+            .iter()
+            .find(|e| e["t"] == "effect_closed")
+            .expect("closure journaled");
+        let name = intent["effect"].as_str().unwrap();
+        assert_eq!(closed["effect"], name);
+        assert_eq!(closed["outcome"], "released");
+        assert_eq!(intent["backend"]["Docker"]["binary"], "docker");
+        let log = daemon.log();
+        assert!(log.contains(&format!("--name {name} ")), "{log}");
+        assert!(log.contains("--label qcg.run=run-x"), "{log}");
+        assert!(log.contains(&format!("--label qcg.effect={name}")), "{log}");
+        let state = crate::RunState::fold_journal(&meta.join("journal.jsonl")).unwrap();
+        assert!(state.effects.is_empty());
     }
 }

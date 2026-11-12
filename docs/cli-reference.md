@@ -437,8 +437,9 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   values refuse boot.
 - `CONTAINER_CREATE_TIMEOUT_SECS` (default `600`),
   `CONTAINER_START_TIMEOUT_SECS` (default `120`),
-  `CONTAINER_ADMIN_TIMEOUT_SECS` (default `60`), and
-  `CONTAINER_STOP_TIMEOUT_SECS` (default `30`): host container-daemon
+  `CONTAINER_ADMIN_TIMEOUT_SECS` (default `60`),
+  `CONTAINER_STOP_TIMEOUT_SECS` (default `30`), and
+  `CONTAINER_RECLAIM_SETTLE_SECS` (default `10`): host container-daemon
   operation budgets in seconds, each in `1..=3600`. Unset selects the default;
   malformed, zero, overflowing, or out-of-range values refuse server startup
   before bind and CLI execution. The CLI resolves the bundle for `run` except

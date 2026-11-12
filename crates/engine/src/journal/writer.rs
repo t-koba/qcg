@@ -842,6 +842,7 @@ impl JournalWriter {
                 || matches!(
                     kind,
                     "operation_started"
+                        | "effect_intent"
                         | "operation_finished"
                         | "run_yielded"
                         | "elapsed_accounted"
@@ -1095,6 +1096,7 @@ impl JournalWriter {
                 || matches!(
                     kind,
                     "operation_started"
+                        | "effect_intent"
                         | "operation_finished"
                         | "run_yielded"
                         | "elapsed_accounted"

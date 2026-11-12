@@ -203,6 +203,11 @@ pub struct RunState {
     /// HITL resume after a warned `run_started` hook has no undeclared
     /// duplicate execution. Successful hooks replay via node outcomes.
     pub hooks_settled: BTreeSet<String>,
+    /// Container effects whose `effect_intent` has no `effect_closed` yet,
+    /// keyed by unique instance name with the journaled backend. Each is
+    /// reclaimed by name before the run's journal may be deleted.
+    #[serde(default)]
+    pub effects: BTreeMap<String, Value>,
 }
 
 impl Default for RunState {
@@ -248,6 +253,7 @@ impl Default for RunState {
             mcp_pending: BTreeMap::new(),
             mcp_resumed: BTreeMap::new(),
             hooks_settled: BTreeSet::new(),
+            effects: BTreeMap::new(),
         }
     }
 }
@@ -320,6 +326,11 @@ impl RunState {
     /// deletion nor GC is cleanup; they must not erase evidence while the
     /// external outcome is unknown.
     pub fn ensure_no_inflight_operations(&self) -> Result<(), String> {
+        if let Some(name) = self.effects.keys().next() {
+            return Err(format!(
+                "container effect `{name}` is not yet confirmed removed; recovery reclaims it by name before the run may be deleted"
+            ));
+        }
         if let Some((id, _)) = self
             .operation_records
             .iter()
@@ -455,14 +466,17 @@ impl RunState {
             )));
         }
         // Final runs accept only explicit lifecycle restarts. `run_interrupted` is
-        // nonterminal and HITL resume appends after it; any other post-final event is invalid.
+        // nonterminal and HITL resume appends after it; any other post-final event is invalid,
+        // except `effect_closed`: a late cleanup or recovery may still confirm an instance gone.
         if self.terminal.as_ref().is_some_and(|terminal| {
             matches!(
                 terminal,
                 TerminalState::Succeeded | TerminalState::Failed | TerminalState::Canceled
             )
-        }) && !matches!(kind, "run_queued" | "run_started" | "run_resumed")
-        {
+        }) && !matches!(
+            kind,
+            "run_queued" | "run_started" | "run_resumed" | "effect_closed"
+        ) {
             return Err(crate::JournalError::InvalidEvent(format!(
                 "final run cannot accept `{kind}`"
             )));
@@ -1248,6 +1262,19 @@ impl RunState {
                     // the dir-backed guard loads and integrity-checks the
                     // sidecar on resend (E07).
                     record.result_ref = result_ref;
+                }
+            }
+            "effect_intent" => {
+                if let (Some(name), Some(backend)) = (
+                    event.get("effect").and_then(Value::as_str),
+                    event.get("backend"),
+                ) {
+                    self.effects.insert(name.to_string(), backend.clone());
+                }
+            }
+            "effect_closed" => {
+                if let Some(name) = event.get("effect").and_then(Value::as_str) {
+                    self.effects.remove(name);
                 }
             }
             kind if api::INTERNAL_RUN_EVENT_KINDS.contains(&kind) => {

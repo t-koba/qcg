@@ -591,7 +591,12 @@ impl Engine {
                 // all other absolutes still fail closed.
                 .with_extra_allowed_root(metadata_dir.clone())
                 .with_cancellation(options.cancellation.clone())
-                .with_host_cgroup(host_scope.clone()),
+                .with_host_cgroup(host_scope.clone())
+                .with_effects(Arc::new(crate::JournalEffects::new(
+                    &metadata_dir,
+                    &run_id,
+                    journal_limits,
+                ))),
             http: HttpGateway::new(
                 contract.manifest.permissions.clone(),
                 std::time::Duration::from_secs(contract.manifest.runtime.http_timeout_seconds),

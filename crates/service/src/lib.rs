@@ -6,6 +6,7 @@ pub use package::{
 };
 
 mod artifacts;
+mod effects;
 mod event_reader;
 pub use event_reader::{EVENT_BATCH_BYTES, EVENT_BATCH_COUNT, EventBatch, EventCursor};
 mod catalog;

@@ -25,6 +25,8 @@ pub struct RunEvent {
 pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
     "budget_charged",
+    "effect_closed",
+    "effect_intent",
     "elapsed_exceeded",
     "foreach_sibling_drained",
     "foreach_iteration_settled",

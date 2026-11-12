@@ -9,7 +9,8 @@ use crate::run_dirs::{
 };
 use crate::summaries::{
     fold_run_state, has_remote_cancel_request, read_merged_events_from_meta,
-    read_optional_output_manifest, refresh_runs, rehydrate_runs, run_meta_dir, run_workspace_dir,
+    read_optional_output_manifest, refresh_runs, rehydrate_runs_with_effects, run_meta_dir,
+    run_workspace_dir,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalService, LocalServiceInner, RunRecord,
@@ -157,7 +158,7 @@ impl LocalService {
             RunStoreMode::Exclusive => lock_runs_directory(&runs_dir)?,
             RunStoreMode::SharedFilesystem => lock_runs_directory_shared(&runs_dir)?,
         });
-        let runs = rehydrate_runs(
+        let (runs, effects) = rehydrate_runs_with_effects(
             &runs_dir,
             max_tracked_runs,
             policy.max_directory_scan_entries,
@@ -176,6 +177,7 @@ impl LocalService {
                 generator_roots: roots,
                 runs_dir,
                 runs: RwLock::new(runs),
+                unreconciled_effects: Mutex::new(effects),
                 llm_runtime,
                 execution_permits: Arc::new(PriorityPermits::new(max_active_runs)),
                 max_active_runs,
@@ -868,6 +870,7 @@ impl LocalService {
         if self.is_shutting_down() {
             return;
         }
+        self.reconcile_startup_effects().await;
         // Disk scan for untracked Queued orphans (Q3): shutdown leaves
         // never-tracked Queued journals on disk (see shutdown exception),
         // and a peer may have admitted Queued runs this process never
@@ -1318,6 +1321,19 @@ impl LocalService {
                     Ok::<_, ServiceError>(())
                 })() {
                     tracing::error!(run_id = %run_id, %error, "host-cgroup reconciliation refused re-entry; journal retained");
+                    service.mark_spawn_failed(&run_id).await;
+                    return;
+                }
+                // Container effects of the dead previous owner are reclaimed
+                // by journaled name under the same lease, before any replay.
+                if let Err(error) = crate::effects::reconcile_run_effects(
+                    &run_dir,
+                    &run_id,
+                    service.inner.deployment_policy.container_timeouts,
+                )
+                .await
+                {
+                    tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
                     service.mark_spawn_failed(&run_id).await;
                     return;
                 }

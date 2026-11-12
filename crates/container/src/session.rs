@@ -6,34 +6,48 @@
 //! dropped by an outer timeout or abort.
 
 use std::path::PathBuf;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
 use super::backend::Backend;
+use super::effect::{EffectLedger, begin};
 use super::error::ContainerError;
 use super::plans::{self, Mount};
 
 pub const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// How a live instance is addressed during cleanup.
-#[derive(Debug, Clone)]
-pub enum InstanceId {
-    /// Docker-family tracking file holding the container id.
-    CidFile(PathBuf),
-    /// Managed instance name (Incus-like).
-    Name(String),
-}
-
-/// A live container handle owned until [`teardown`] runs.
+/// A live container handle owned until [`teardown`] runs. The instance is
+/// addressed by its unique journaled `name`; a successful teardown closes
+/// the ledger intent.
 #[derive(Debug, Clone)]
 pub struct Session {
     /// Deployment bundle captured before any daemon side effect.
     pub timeouts: policy::ContainerTimeouts,
     pub backend: Backend,
-    pub id: InstanceId,
+    pub name: String,
+    pub ledger: Option<Arc<dyn EffectLedger>>,
+}
+
+impl Session {
+    /// Owner labels to attach when creating the instance.
+    pub fn labels(&self) -> Vec<(String, String)> {
+        self.ledger
+            .as_ref()
+            .map(|ledger| ledger.labels(&self.name))
+            .unwrap_or_default()
+    }
+
+    fn close(&self, outcome: &str) {
+        if let Some(ledger) = &self.ledger
+            && let Err(error) = ledger.close(&self.name, outcome)
+        {
+            // The intent stays open; the next reconciliation closes it.
+            tracing::warn!(%error, instance = self.name.as_str(), "effect closure was not journaled");
+        }
+    }
 }
 
 /// Guard that cleans up unless disarmed after an awaited teardown
@@ -185,37 +199,20 @@ impl Drop for SessionGuard {
 /// Teardown commands are idempotent, so cleaning a never-created instance
 /// is a harmless no-op.
 struct ProvisionGuard {
-    timeouts: policy::ContainerTimeouts,
-    backend: Backend,
-    name: String,
-    config_path: Option<PathBuf>,
+    session: Session,
     committed: bool,
 }
 
 impl ProvisionGuard {
-    fn new(
-        backend: &Backend,
-        name: String,
-        config_path: Option<PathBuf>,
-        timeouts: policy::ContainerTimeouts,
-    ) -> Self {
+    fn new(session: Session) -> Self {
         Self {
-            backend: backend.clone(),
-            timeouts,
-            name,
-            config_path,
+            session,
             committed: false,
         }
     }
 
-    /// Transfers ownership to the live session; suppresses Drop cleanup.
-    fn commit(mut self) {
-        self.committed = true;
-    }
-
-    /// Releases ownership after an explicitly awaited cleanup succeeded;
-    /// suppresses the Drop backstop so a settled provision is not torn
-    /// down twice.
+    /// Transfers ownership to the live session, or releases it after an
+    /// awaited cleanup succeeded; either way Drop does nothing.
     fn disarm(mut self) {
         self.committed = true;
     }
@@ -223,15 +220,9 @@ impl ProvisionGuard {
 
 impl Drop for ProvisionGuard {
     fn drop(&mut self) {
-        if self.committed {
-            return;
+        if !self.committed {
+            spawn_detached_cleanup(self.session.clone(), None);
         }
-        let session = Session {
-            backend: self.backend.clone(),
-            timeouts: self.timeouts,
-            id: InstanceId::Name(self.name.clone()),
-        };
-        spawn_detached_cleanup(session, self.config_path.clone());
     }
 }
 
@@ -240,53 +231,34 @@ pub struct Provision<'a> {
     pub timeouts: policy::ContainerTimeouts,
     pub image: &'a str,
     pub mounts: &'a [Mount<'a>],
-    /// Filename prefix for docker-family tracking files in the temp dir.
-    pub id_prefix: &'a str,
+    /// Journals the intent before creation; `None` creates unjournaled.
+    pub ledger: Option<Arc<dyn EffectLedger>>,
     pub cancel: &'a CancellationToken,
 }
 
-/// Provisions an isolated instance. Docker-family backends only allocate a
-/// tracking file; managed backends create, configure, and start the
-/// instance and wait for readiness. Failures clean up partial state before
-/// returning so no orphan survives a failed provision.
+/// Provisions an isolated instance under a freshly journaled name.
+/// Docker-family backends only allocate the name (`run --name` creates the
+/// container); managed backends create, configure, and start the instance
+/// and wait for readiness. Failures clean up partial state before returning
+/// so no orphan survives a failed provision.
 pub async fn provision(backend: &Backend, spec: &Provision<'_>) -> Result<Session, ContainerError> {
     plans::validate_image_for_backend(backend, spec.image)?;
+    let session = begin(backend, spec.timeouts, spec.ledger.clone())?;
     match backend {
-        Backend::Docker { .. } => {
-            let cidfile = std::env::temp_dir().join(format!(
-                ".{}-{}.cid",
-                spec.id_prefix,
-                uuid::Uuid::now_v7().as_simple()
-            ));
-            Ok(Session {
-                backend: backend.clone(),
-                timeouts: spec.timeouts,
-                id: InstanceId::CidFile(cidfile),
-            })
-        }
-        Backend::Incus { binary } => provision_incus(binary, spec).await,
+        Backend::Docker { .. } => Ok(session),
+        Backend::Incus { binary } => provision_incus(binary, spec, session).await,
     }
 }
 
-async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, ContainerError> {
-    let name = plans::instance_name();
+async fn provision_incus(
+    binary: &str,
+    spec: &Provision<'_>,
+    session: Session,
+) -> Result<Session, ContainerError> {
+    let name = session.name.clone();
     // Own the instance name before the first daemon side effect so an
     // aborted or dropped provision still cleans up (B06).
-    let guard = ProvisionGuard::new(
-        &Backend::Incus {
-            binary: binary.to_string(),
-        },
-        name.clone(),
-        None,
-        spec.timeouts,
-    );
-    let cleanup = || Session {
-        timeouts: spec.timeouts,
-        backend: Backend::Incus {
-            binary: binary.to_string(),
-        },
-        id: InstanceId::Name(name.clone()),
-    };
+    let guard = ProvisionGuard::new(session.clone());
     let result: Result<(), ContainerError> = async {
         // Storage pool from the daemon's own default profile.
         let pool_output = run_admin(
@@ -316,7 +288,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
         // Launch by fingerprint so exactly the pinned bits run; a missing
         // local image fails closed and tells the operator to pre-pull it.
         run_admin(
-            &plans::incus_init_argv(binary, &pool, fingerprint, &name),
+            &plans::incus_init_argv(binary, &pool, fingerprint, &name, &session.labels()),
             spec.timeouts.create(),
             spec.cancel,
             &name,
@@ -375,8 +347,7 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
     .await;
     match result {
         Ok(()) => {
-            let session = cleanup();
-            guard.commit();
+            guard.disarm();
             Ok(session)
         }
         Err(error) => {
@@ -385,12 +356,13 @@ async fn provision_incus(binary: &str, spec: &Provision<'_>) -> Result<Session, 
             // name down would stop or delete a foreign instance (D01).
             if matches!(error, ContainerError::InstanceExists { .. }) {
                 guard.disarm();
+                session.close("refused");
                 return Err(error);
             }
             // Awaited cleanup first for observability; the guard backstop
             // stays armed only if this fails, so a settled provision is
             // never torn down twice.
-            if teardown(&cleanup()).await.is_err() {
+            if teardown(&session).await.is_err() {
                 record_cleanup_failure();
                 tracing::warn!(
                     instance = name.as_str(),
@@ -417,22 +389,6 @@ fn is_instance_exists_report(stderr: &str, instance: &str) -> bool {
         .any(|marker| lower.contains(marker))
 }
 
-/// Reads a Docker-family tracking file. `Ok(None)` covers the states that
-/// prove no container identity was ever recorded (missing file, empty
-/// content); an unreadable file (invalid UTF-8, permissions, I/O) is an
-/// error so teardown never reports success while the identity is unknown
-/// (D06).
-fn read_cidfile(cidfile: &std::path::Path) -> Result<Option<String>, ContainerError> {
-    match std::fs::read_to_string(cidfile) {
-        Ok(contents) => {
-            let id = contents.trim().to_string();
-            Ok((!id.is_empty()).then_some(id))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(ContainerError::Io(error)),
-    }
-}
-
 /// Awaited teardown on every exit path. Returns infrastructure failures
 /// (spawn failure, daemon timeout, unexpected non-zero exit) so callers log
 /// them with the instance identity; the Drop guard re-attempts via
@@ -442,71 +398,20 @@ fn read_cidfile(cidfile: &std::path::Path) -> Result<Option<String>, ContainerEr
 /// ([`ContainerError::InstanceAbsent`]) is success; any other failure keeps
 /// the tracking identity for retry.
 pub async fn teardown(session: &Session) -> Result<(), ContainerError> {
-    match session {
-        Session {
-            backend: Backend::Docker { binary, .. },
-            id: InstanceId::CidFile(cidfile),
-            ..
-        } => {
-            let Some(id) = read_cidfile(cidfile)? else {
-                let _ = std::fs::remove_file(cidfile);
-                return Ok(());
-            };
-            if let Err(error) = run_admin_timed(
-                &[binary.as_str(), "kill", &id],
-                session.timeouts.stop(),
-                &id,
-                "kill",
-            )
-            .await
-            {
-                tracing::warn!(%error, instance = id.as_str(), "container kill failed; continuing to rm");
+    for (index, (argv, stage)) in plans::teardown_argvs(&session.backend, &session.name)
+        .into_iter()
+        .enumerate()
+    {
+        match run_admin_timed_vec(&argv, session.timeouts.stop(), &session.name, stage).await {
+            Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => {}
+            Err(error) if index == 0 => {
+                tracing::warn!(%error, instance = session.name.as_str(), "instance stop failed; continuing to delete");
             }
-            match run_admin_timed(
-                &[binary.as_str(), "rm", "-f", &id],
-                session.timeouts.stop(),
-                &id,
-                "rm",
-            )
-            .await
-            {
-                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => {}
-                Err(error) => return Err(error),
-            }
-            // Remove the tracking file only after successful kill+rm so a
-            // failed teardown keeps the identity for operator retry.
-            std::fs::remove_file(cidfile)?;
-            Ok(())
+            Err(error) => return Err(error),
         }
-        Session {
-            backend: Backend::Incus { binary },
-            id: InstanceId::Name(name),
-            ..
-        } => {
-            if let Err(error) = run_admin_timed_vec(
-                &plans::incus_stop_argv(binary, name),
-                session.timeouts.stop(),
-                name,
-                "stop",
-            )
-            .await
-            {
-                tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to delete");
-            }
-            match run_admin_timed_vec(
-                &plans::incus_delete_argv(binary, name),
-                session.timeouts.stop(),
-                name,
-                "delete",
-            )
-            .await
-            {
-                Ok(()) | Err(ContainerError::InstanceAbsent { .. }) => Ok(()),
-                Err(error) => Err(error),
-            }
-        }
-        _ => Ok(()),
     }
+    session.close("released");
+    Ok(())
 }
 
 /// Whether daemon stderr proves the instance itself is absent (C05).
@@ -610,74 +515,32 @@ fn only_report_punctuation(text: &str) -> bool {
 /// [`teardown`]: stop failures never abort the delete, and an
 /// already-absent instance is success.
 pub fn teardown_sync(session: &Session) -> Result<(), ContainerError> {
-    match session {
-        Session {
-            backend: Backend::Docker { binary, .. },
-            id: InstanceId::CidFile(cidfile),
-            ..
-        } => {
-            let Some(id) = read_cidfile(cidfile)? else {
-                let _ = std::fs::remove_file(cidfile);
-                return Ok(());
-            };
-            for (args, stage) in [
-                (vec!["kill", id.as_str()], "kill"),
-                (vec!["rm", "-f", id.as_str()], "rm"),
-            ] {
-                if let Err(error) =
-                    run_sync_bounded(binary, &args, session.timeouts.stop(), &id, stage)
-                {
-                    if stage == "rm" && matches!(error, ContainerError::InstanceAbsent { .. }) {
-                        continue;
-                    }
-                    if stage == "kill" {
-                        tracing::warn!(%error, instance = id.as_str(), "container kill failed; continuing to rm");
-                        continue;
-                    }
-                    return Err(error);
-                }
+    for (index, (argv, stage)) in plans::teardown_argvs(&session.backend, &session.name)
+        .into_iter()
+        .enumerate()
+    {
+        let Some((bin, args)) = argv.split_first() else {
+            continue;
+        };
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        match run_sync_bounded(bin, &args, session.timeouts.stop(), &session.name, stage) {
+            Ok(_) | Err(ContainerError::InstanceAbsent { .. }) => {}
+            Err(error) if index == 0 => {
+                tracing::warn!(%error, instance = session.name.as_str(), "instance stop failed; continuing to delete");
             }
-            std::fs::remove_file(cidfile)?;
-            Ok(())
+            Err(error) => return Err(error),
         }
-        Session {
-            backend: Backend::Incus { binary },
-            id: InstanceId::Name(name),
-            ..
-        } => {
-            for (argv, stage) in [
-                (plans::incus_stop_argv(binary, name), "stop"),
-                (plans::incus_delete_argv(binary, name), "delete"),
-            ] {
-                let Some((bin, args)) = argv.split_first() else {
-                    continue;
-                };
-                let args: Vec<&str> = args.iter().map(String::as_str).collect();
-                if let Err(error) =
-                    run_sync_bounded(bin, &args, session.timeouts.stop(), name, stage)
-                {
-                    if matches!(error, ContainerError::InstanceAbsent { .. }) {
-                        continue;
-                    }
-                    if stage == "stop" {
-                        tracing::warn!(%error, instance = name.as_str(), "instance stop failed; continuing to delete");
-                        continue;
-                    }
-                    return Err(error);
-                }
-            }
-            Ok(())
-        }
-        _ => Ok(()),
     }
+    session.close("released");
+    Ok(())
 }
 
 #[derive(Debug)]
-struct AdminOutput {
-    stdout: String,
+pub(crate) struct AdminOutput {
+    pub(crate) stdout: String,
 }
 
-async fn run_admin(
+pub(crate) async fn run_admin(
     argv: &[String],
     timeout: std::time::Duration,
     cancel: &CancellationToken,
@@ -1265,90 +1128,26 @@ mod tests {
         assert!(large.detail().len() < 1024);
     }
 
-    fn bogus_docker_session(id_contents: &str) -> (tempfile_like::TempCid, Session) {
-        tempfile_like::TempCid::create(id_contents)
-    }
-
-    fn bogus_docker_session_bytes(id_contents: &[u8]) -> (tempfile_like::TempCid, Session) {
-        tempfile_like::TempCid::create_bytes(id_contents)
-    }
-
-    mod tempfile_like {
-        use super::*;
-
-        pub(crate) struct TempCid {
-            pub(crate) path: PathBuf,
-        }
-
-        impl TempCid {
-            pub(crate) fn create(contents: &str) -> (TempCid, Session) {
-                Self::create_bytes(contents.as_bytes())
-            }
-
-            pub(crate) fn create_bytes(contents: &[u8]) -> (TempCid, Session) {
-                let path = std::env::temp_dir()
-                    .join(format!(".test-cid-{}", uuid::Uuid::now_v7().as_simple()));
-                std::fs::write(&path, contents).expect("test cidfile should be written");
-                let session = Session {
-                    timeouts: policy::ContainerTimeouts::default(),
-                    backend: Backend::Docker {
-                        binary: "definitely-not-a-binary".into(),
-                        runtime_flag: None,
-                    },
-                    id: InstanceId::CidFile(path.clone()),
-                };
-                (TempCid { path }, session)
-            }
-        }
-
-        impl Drop for TempCid {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.path);
-            }
+    fn bogus_docker_session() -> Session {
+        Session {
+            timeouts: policy::ContainerTimeouts::default(),
+            backend: Backend::Docker {
+                binary: "definitely-not-a-binary".into(),
+                runtime_flag: None,
+            },
+            name: "qcg-deadbeef".into(),
+            ledger: None,
         }
     }
 
     #[test]
-    fn failed_teardown_keeps_the_tracking_file() {
-        // B06: a failed teardown must keep the identity for operator retry
-        // instead of deleting the evidence: the error identifies the
-        // instance and the tracking file survives on disk.
-        let (cid, session) = bogus_docker_session("deadbeef");
-        let error = teardown_sync(&session).expect_err("bogus binary must fail teardown");
+    fn failed_teardown_reports_the_instance() {
+        // B06: a failed teardown identifies the instance for operator retry.
+        let error =
+            teardown_sync(&bogus_docker_session()).expect_err("bogus binary must fail teardown");
         assert!(
-            error.to_string().contains("deadbeef") || error.to_string().contains("failed to spawn"),
+            error.to_string().contains("qcg-deadbeef"),
             "failure must identify the instance, got: {error}"
-        );
-        assert!(
-            cid.path.exists(),
-            "cidfile must survive a failed teardown for operator retry"
-        );
-    }
-
-    #[test]
-    fn empty_tracking_file_teardown_succeeds_and_cleans_up() {
-        let (cid, session) = bogus_docker_session("   \n");
-        teardown_sync(&session).expect("empty id means nothing to stop");
-        assert!(
-            !cid.path.exists(),
-            "empty tracking file carries no identity and is removed"
-        );
-    }
-
-    #[test]
-    fn unreadable_tracking_file_teardown_fails_and_preserves_evidence() {
-        // D06: invalid UTF-8 must not read as an empty id (success). The
-        // identity is unknown, so teardown fails and keeps the file for
-        // the operator instead of claiming the instance is gone.
-        let (cid, session) = bogus_docker_session_bytes(&[0xff, 0xfe, 0x00]);
-        let error = teardown_sync(&session).expect_err("unreadable id must not read as success");
-        assert!(
-            matches!(error, ContainerError::Io(_)),
-            "unreadable tracking file must surface as an I/O failure, got: {error}"
-        );
-        assert!(
-            cid.path.exists(),
-            "unreadable tracking file must survive for operator recovery"
         );
     }
 
@@ -1481,14 +1280,14 @@ mod tests {
     async fn dropped_provision_guard_cleanup_is_joinable() {
         // B06: ownership held across a dropped provision still cleans up,
         // and shutdown can await the detached work.
-        let guard = ProvisionGuard::new(
-            &Backend::Incus {
+        let guard = ProvisionGuard::new(Session {
+            timeouts: policy::ContainerTimeouts::default(),
+            backend: Backend::Incus {
                 binary: "definitely-not-a-binary".into(),
             },
-            format!("test{}", uuid::Uuid::now_v7().as_simple()),
-            None,
-            policy::ContainerTimeouts::default(),
-        );
+            name: format!("test{}", uuid::Uuid::now_v7().as_simple()),
+            ledger: None,
+        });
         drop(guard);
         tokio::time::timeout(
             std::time::Duration::from_secs(30),
@@ -1508,10 +1307,7 @@ mod tests {
         // C05: a finished cleanup thread is not proof the instance is
         // gone. Failures aggregate separately so shutdown reports them.
         let before = await_outstanding_cleanups(std::time::Duration::from_secs(5)).await;
-        // Keep the tracking file alive until the detached backstop has
-        // finished: dropping TempCid first would let the cleanup observe a
-        // missing file as success and record nothing.
-        let (_cid, session) = bogus_docker_session("deadbeef");
+        let session = bogus_docker_session();
         {
             // Drop the guard: the detached backstop fails on the bogus
             // binary and must record the failure.
@@ -1531,7 +1327,7 @@ mod tests {
 
 #[cfg(all(test, unix))]
 #[path = "../test_support/mod.rs"]
-mod daemon_policy_test_support;
+pub(crate) mod daemon_policy_test_support;
 
 #[cfg(all(test, unix))]
 mod daemon_policy_tests {
@@ -1545,7 +1341,7 @@ mod daemon_policy_tests {
         ) else {
             return;
         };
-        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 5]).unwrap();
         check_cleanup_paths(&daemon, timeouts, false).await;
 
         // Provision keeps the complete bundle on successful transfer too.
@@ -1559,7 +1355,7 @@ mod daemon_policy_tests {
             timeouts,
             image: &image,
             mounts: &[],
-            id_prefix: "test",
+            ledger: None,
             cancel: &cancel,
         };
         let session = provision(&backend, &spec).await.unwrap();
@@ -1607,7 +1403,7 @@ mod daemon_policy_tests {
         ) else {
             return;
         };
-        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 5]).unwrap();
         check_cleanup_paths(&daemon, timeouts, true).await;
     }
 
@@ -1620,13 +1416,6 @@ mod daemon_policy_tests {
     ) {
         for path in ["async", "sync", "drop", "spawn-failure"] {
             daemon.mode("hang-stop");
-            let id = if docker {
-                let file = daemon.root.join("cid");
-                std::fs::write(&file, "owned-id").unwrap();
-                InstanceId::CidFile(file)
-            } else {
-                InstanceId::Name("owned-name".into())
-            };
             let session = Session {
                 timeouts,
                 backend: if docker {
@@ -1639,7 +1428,8 @@ mod daemon_policy_tests {
                         binary: "incus".into(),
                     }
                 },
-                id,
+                name: "owned-name".into(),
+                ledger: None,
             };
             match path {
                 "async" => {
@@ -1704,31 +1494,26 @@ mod daemon_policy_tests {
                 "{path} ignored frozen stop timeout: {gap:?}"
             );
             assert!(daemon.log().contains(if docker {
-                "rm -f owned-id"
+                "rm -f owned-name"
             } else {
                 "delete -f owned-name"
             }));
         }
         daemon.mode("hang-delete");
-        let session = if docker {
-            let file = daemon.root.join("cid-delete");
-            std::fs::write(&file, "owned-id").unwrap();
-            Session {
-                timeouts,
-                backend: Backend::Docker {
+        let session = Session {
+            timeouts,
+            backend: if docker {
+                Backend::Docker {
                     binary: "docker".into(),
                     runtime_flag: None,
-                },
-                id: InstanceId::CidFile(file),
-            }
-        } else {
-            Session {
-                timeouts,
-                backend: Backend::Incus {
+                }
+            } else {
+                Backend::Incus {
                     binary: "incus".into(),
-                },
-                id: InstanceId::Name("owned-name".into()),
-            }
+                }
+            },
+            name: "owned-name".into(),
+            ledger: None,
         };
         for sync in [false, true] {
             let start = std::time::Instant::now();

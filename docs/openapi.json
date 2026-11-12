@@ -3116,6 +3116,8 @@
               "confirm_request",
               "context_compacted",
               "dry_run",
+              "effect_closed",
+              "effect_intent",
               "elapsed_accounted",
               "elapsed_exceeded",
               "foreach_budget_exhausted",

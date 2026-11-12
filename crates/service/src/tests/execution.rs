@@ -3839,7 +3839,7 @@ async fn denied_confirmation_settles_failed_without_executing_side_effect() {
 #[cfg(unix)]
 #[allow(dead_code)]
 #[path = "../../../container/test_support/mod.rs"]
-mod daemon_policy_test_support;
+pub(super) mod daemon_policy_test_support;
 
 #[cfg(unix)]
 #[tokio::test]
@@ -3894,7 +3894,8 @@ images = ["images:alpine@sha256:{0}"]
         DEFAULT_MAX_TRACKED_RUNS,
         RunStoreMode::Exclusive,
         ServiceDeploymentPolicy {
-            container_timeouts: policy::ContainerTimeouts::from_seconds([30, 30, 1, 30]).unwrap(),
+            container_timeouts: policy::ContainerTimeouts::from_seconds([30, 30, 1, 30, 1])
+                .unwrap(),
             ..ServiceDeploymentPolicy::default()
         },
     )

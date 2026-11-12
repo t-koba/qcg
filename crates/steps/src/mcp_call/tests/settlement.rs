@@ -318,6 +318,7 @@ async fn execute(
                 commands: Vec::new(),
                 workspace: ctx.run.workspace.as_std_path().to_owned(),
                 host_cgroup: None,
+                effects: None,
             },
             ctx.run.cancellation.clone(),
         )
@@ -351,6 +352,7 @@ async fn execute_large(
                 commands: Vec::new(),
                 workspace: ctx.run.workspace.as_std_path().to_owned(),
                 host_cgroup: None,
+                effects: None,
             },
             ctx.run.cancellation.clone(),
         )

@@ -11,6 +11,8 @@ publish.workspace = true
 [dependencies]
 policy = { path = "../policy" }
 contract = { path = "../contract" }
+getrandom = "0.4"
+serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
 tokio-util.workspace = true

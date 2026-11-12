@@ -9,9 +9,10 @@ pub struct ContainerTimeouts {
     start: Duration,
     admin: Duration,
     stop: Duration,
+    settle: Duration,
 }
 
-const DEFAULT_SECONDS: [u64; 4] = [600, 120, 60, 30];
+const DEFAULT_SECONDS: [u64; 5] = [600, 120, 60, 30, 10];
 
 impl Default for ContainerTimeouts {
     fn default() -> Self {
@@ -20,11 +21,12 @@ impl Default for ContainerTimeouts {
 }
 
 impl ContainerTimeouts {
-    pub const ENV_NAMES: [&str; 4] = [
+    pub const ENV_NAMES: [&str; 5] = [
         "CONTAINER_CREATE_TIMEOUT_SECS",
         "CONTAINER_START_TIMEOUT_SECS",
         "CONTAINER_ADMIN_TIMEOUT_SECS",
         "CONTAINER_STOP_TIMEOUT_SECS",
+        "CONTAINER_RECLAIM_SETTLE_SECS",
     ];
 
     /// Each operation accepts 1..=3600 seconds. Unset selects its default.
@@ -49,18 +51,19 @@ impl ContainerTimeouts {
         Self::from_seconds(seconds)
     }
 
-    pub fn from_seconds(seconds: [u64; 4]) -> Result<Self, String> {
+    pub fn from_seconds(seconds: [u64; 5]) -> Result<Self, String> {
         for (name, value) in Self::ENV_NAMES.iter().zip(seconds) {
             if !(1..=3600).contains(&value) {
                 return Err(invalid(name));
             }
         }
-        let [create, start, admin, stop] = seconds.map(Duration::from_secs);
+        let [create, start, admin, stop, settle] = seconds.map(Duration::from_secs);
         Ok(Self {
             create,
             start,
             admin,
             stop,
+            settle,
         })
     }
 
@@ -75,6 +78,11 @@ impl ContainerTimeouts {
     }
     pub fn stop(self) -> Duration {
         self.stop
+    }
+    /// Wait before the final absence re-check of a journaled effect: a
+    /// create submitted before a crash may still be completing.
+    pub fn settle(self) -> Duration {
+        self.settle
     }
 }
 
@@ -94,16 +102,17 @@ mod tests {
                 defaults.create(),
                 defaults.start(),
                 defaults.admin(),
-                defaults.stop()
+                defaults.stop(),
+                defaults.settle()
             ],
-            [600, 120, 60, 30].map(Duration::from_secs)
+            [600, 120, 60, 30, 10].map(Duration::from_secs)
         );
         let mut source = Some(OsString::from("1"));
         let frozen = ContainerTimeouts::resolve(|_| source.clone()).unwrap();
         source = Some(OsString::from("3600"));
         let next = ContainerTimeouts::resolve(|_| source.clone()).unwrap();
-        assert_eq!(frozen, ContainerTimeouts::from_seconds([1; 4]).unwrap());
-        assert_eq!(next, ContainerTimeouts::from_seconds([3600; 4]).unwrap());
+        assert_eq!(frozen, ContainerTimeouts::from_seconds([1; 5]).unwrap());
+        assert_eq!(next, ContainerTimeouts::from_seconds([3600; 5]).unwrap());
         for (index, name) in ContainerTimeouts::ENV_NAMES.iter().enumerate() {
             let one = ContainerTimeouts::resolve(|key| (key == *name).then(|| "2".into())).unwrap();
             let mut expected = DEFAULT_SECONDS;

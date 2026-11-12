@@ -12,6 +12,8 @@ pub struct McpAccess {
     /// Run-scoped cgroup-v2 cleanup scope when crash recovery is enabled.
     /// `None` preserves existing live cancellation with no crash claim.
     pub host_cgroup: Option<policy::HostCgroupScope>,
+    /// Journals container effect intents; `None` creates unjournaled.
+    pub effects: Option<std::sync::Arc<dyn container::EffectLedger>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

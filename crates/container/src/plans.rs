@@ -4,6 +4,7 @@
 
 use std::path::Path;
 
+use super::backend::Backend;
 use super::error::ContainerError;
 
 /// Host-to-guest bind mount shared by all families.
@@ -20,7 +21,9 @@ pub struct Mount<'a> {
 pub struct DockerRunSpec<'a> {
     pub binary: &'a str,
     pub runtime_flag: Option<&'a str>,
-    pub cidfile: &'a Path,
+    /// Unique effect name (see [`effect_name`]) and its owner labels.
+    pub name: &'a str,
+    pub labels: &'a [(String, String)],
     pub mounts: &'a [Mount<'a>],
     pub workdir: Option<&'a str>,
     pub env_names: &'a [String],
@@ -43,8 +46,10 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
     if spec.stdin_pipe {
         argv.push("-i".into());
     }
-    argv.push("--cidfile".into());
-    argv.push(spec.cidfile.to_string_lossy().into_owned());
+    argv.extend(["--name".into(), spec.name.to_string()]);
+    for (key, value) in spec.labels {
+        argv.extend(["--label".into(), format!("{key}={value}")]);
+    }
     argv.extend([
         "--network".into(),
         "none".into(),
@@ -80,17 +85,71 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
     argv
 }
 
-/// Unique instance name valid for Incus and LXD: lowercase
-/// `ctr` prefix plus the full 128-bit UUID as hex, no hyphen.
-/// UUIDv7 encodes its entropy in the low
-/// bits while the high bits are timestamp and counter, so truncating the
-/// prefix makes names created in the same millisecond collide (D01).
-pub fn instance_name() -> String {
-    instance_name_for(uuid::Uuid::now_v7())
+/// Unique effect name valid for every backend: `qcg-` plus 128 bits from the
+/// OS RNG as 32 lowercase hex digits. The token is the proof of ownership:
+/// an instance with this exact name exists only because we created it.
+pub fn effect_name() -> Result<String, ContainerError> {
+    let mut token = [0_u8; 16];
+    getrandom::fill(&mut token).map_err(|error| ContainerError::StageFailed {
+        stage: "name",
+        instance: String::new(),
+        detail: format!("OS randomness unavailable: {error}"),
+    })?;
+    Ok(format!(
+        "qcg-{}",
+        token.map(|byte| format!("{byte:02x}")).concat()
+    ))
 }
 
-fn instance_name_for(id: uuid::Uuid) -> String {
-    format!("ctr{}", id.as_simple())
+/// Whether `name` has the exact shape [`effect_name`] produces.
+pub fn is_effect_name(name: &str) -> bool {
+    name.strip_prefix("qcg-").is_some_and(|token| {
+        token.len() == 32
+            && token
+                .bytes()
+                .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    })
+}
+
+/// Stop-then-delete argv (with stage names) for one named instance.
+pub fn teardown_argvs(backend: &Backend, name: &str) -> [(Vec<String>, &'static str); 2] {
+    match backend {
+        Backend::Docker { binary, .. } => [
+            (vec![binary.clone(), "kill".into(), name.into()], "kill"),
+            (
+                vec![binary.clone(), "rm".into(), "-f".into(), name.into()],
+                "rm",
+            ),
+        ],
+        Backend::Incus { binary } => [
+            (incus_stop_argv(binary, name), "stop"),
+            (incus_delete_argv(binary, name), "delete"),
+        ],
+    }
+}
+
+/// Lists instances whose name matches `name`; the caller compares exactly.
+pub fn presence_argv(backend: &Backend, name: &str) -> Vec<String> {
+    let strings = |parts: &[&str]| {
+        parts
+            .iter()
+            .map(|part| part.to_string())
+            .collect::<Vec<_>>()
+    };
+    match backend {
+        Backend::Docker { binary, .. } => {
+            let mut argv = vec![binary.clone()];
+            argv.extend(strings(&["ps", "-a", "--filter"]));
+            argv.push(format!("name={name}"));
+            argv.extend(strings(&["--format", "{{.Names}}"]));
+            argv
+        }
+        Backend::Incus { binary } => {
+            let mut argv = vec![binary.clone(), "list".into(), name.into()];
+            argv.extend(strings(&["--format", "csv", "-c", "n"]));
+            argv
+        }
+    }
 }
 
 /// Splits a pinned `<ref>@sha256:<fingerprint>` image reference. Docker
@@ -178,16 +237,19 @@ pub fn incus_init_argv(
     pool: &str,
     image_fingerprint: &str,
     name: &str,
+    labels: &[(String, String)],
 ) -> Vec<String> {
-    vec![
-        binary.into(),
-        "init".into(),
-        "--no-profiles".into(),
+    let mut argv = vec![binary.into(), "init".into(), "--no-profiles".into()];
+    for (key, value) in labels {
+        argv.extend(["-c".into(), format!("user.{key}={value}")]);
+    }
+    argv.extend([
         "-s".into(),
         pool.into(),
         image_fingerprint.into(),
         name.into(),
-    ]
+    ]);
+    argv
 }
 
 pub fn incus_device_add_argv(
@@ -277,34 +339,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn instance_names_keep_the_full_uuid() {
-        // D01: UUIDv7 values differing only below the truncated 64-bit
-        // prefix must produce distinct names.
-        let first = uuid::Uuid::parse_str("01a088b5-a200-748d-8500-123401020304")
-            .expect("fixture UUID should parse");
-        let second = uuid::Uuid::parse_str("01a088b5-a200-748d-8500-123505060708")
-            .expect("fixture UUID should parse");
-        let first_name = instance_name_for(first);
-        let second_name = instance_name_for(second);
-        assert_ne!(first_name, second_name);
-        assert_eq!(first_name, "ctr01a088b5a200748d8500123401020304");
-        assert_eq!(second_name, "ctr01a088b5a200748d8500123505060708");
-    }
-
-    #[test]
-    fn generated_instance_names_are_distinct_and_safe() {
-        let names: Vec<String> = (0..64).map(|_| instance_name()).collect();
+    fn effect_names_are_distinct_valid_and_recognized() {
+        let names: Vec<String> = (0..64).map(|_| effect_name().unwrap()).collect();
         for name in &names {
-            assert_eq!(name.len(), 35, "ctr plus a full UUID is 35 chars: {name}");
-            assert!(
-                name.starts_with("ctr")
-                    && name[3..]
-                        .bytes()
-                        .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-                "{name} must stay alphanumeric lowercase"
-            );
+            assert_eq!(name.len(), 36, "{name}");
+            assert!(is_effect_name(name), "{name}");
         }
         let unique: std::collections::BTreeSet<&String> = names.iter().collect();
         assert_eq!(unique.len(), names.len(), "names must be distinct");
+        for foreign in [
+            "qcg-",
+            "qcg-ABCDEF0123456789abcdef0123456789",
+            "ctr0123",
+            "prod-db",
+        ] {
+            assert!(!is_effect_name(foreign), "{foreign}");
+        }
     }
 }

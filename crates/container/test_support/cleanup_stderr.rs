@@ -103,7 +103,7 @@ exit 0
 
     fn session(&self, docker: bool) -> Session {
         Session {
-            timeouts: policy::ContainerTimeouts::from_seconds([1; 4]).unwrap(),
+            timeouts: policy::ContainerTimeouts::from_seconds([1; 5]).unwrap(),
             backend: if docker {
                 Backend::Docker {
                     binary: self.binary.clone(),
@@ -114,13 +114,8 @@ exit 0
                     binary: self.binary.clone(),
                 }
             },
-            id: if docker {
-                let cidfile = self.root.join("cid");
-                std::fs::write(&cidfile, "owned-id").unwrap();
-                InstanceId::CidFile(cidfile)
-            } else {
-                InstanceId::Name("owned-id".into())
-            },
+            name: "owned-id".into(),
+            ledger: None,
         }
     }
 }
@@ -184,9 +179,6 @@ async fn check_inherited_stderr(sync: bool) {
             } else {
                 result.expect("final cleanup must still succeed");
             }
-            if let InstanceId::CidFile(path) = &session.id {
-                assert_eq!(path.exists(), mode == "held-delete");
-            }
         }
     }
 }
@@ -221,18 +213,12 @@ async fn check_unrelated_absence_phrases_fail(sync: bool) {
                 std::fs::read_to_string(client.root.join("log")).unwrap(),
                 format!("{}\n{final_stage}\n", if docker { "kill" } else { "stop" })
             );
-            if let InstanceId::CidFile(path) = session.id {
-                assert!(
-                    path.exists(),
-                    "failed rm must retain Docker cidfile evidence"
-                );
-            }
         }
     }
 }
 
 #[tokio::test]
-async fn unrelated_absence_phrases_fail_teardown_and_retain_cidfiles() {
+async fn unrelated_absence_phrases_fail_teardown() {
     check_unrelated_absence_phrases_fail(false).await;
     check_unrelated_absence_phrases_fail(true).await;
 }
@@ -249,9 +235,6 @@ async fn supported_absence_reports_still_complete_teardown() {
                 teardown(&session).await
             };
             result.expect("supported explicit absence report is success");
-            if let InstanceId::CidFile(path) = session.id {
-                assert!(!path.exists(), "confirmed absence may remove cidfile");
-            }
         }
     }
 }
@@ -399,10 +382,6 @@ async fn inline_cleanup_attempts_both_commands_when_command_worker_cannot_spawn(
         for mode in ["success", "absent", "running"] {
             let client = Client::new(mode);
             let session = client.session(docker);
-            let cidfile = match &session.id {
-                InstanceId::CidFile(path) => Some(path.clone()),
-                _ => None,
-            };
             let config = client.root.join("config");
             std::fs::write(&config, "owned config").unwrap();
             let start = std::time::Instant::now();
@@ -419,9 +398,6 @@ async fn inline_cleanup_attempts_both_commands_when_command_worker_cannot_spawn(
                 "{mode}: stop/kill and delete/rm must actually be attempted"
             );
             assert!(!config.exists());
-            if let Some(path) = cidfile {
-                assert_eq!(path.exists(), mode != "success", "{mode}: fail closed");
-            }
         }
     }
     // In particular, stderr discarded by this fallback is not absence proof.
@@ -559,7 +535,8 @@ async fn inline_cleanup_stays_outstanding_until_fallback_finishes() {
         backend: Backend::Incus {
             binary: daemon.root.join("missing-client").to_str().unwrap().into(),
         },
-        id: InstanceId::Name("owned-id".into()),
+        name: "owned-id".into(),
+        ledger: None,
     };
     let worker = {
         let entered = entered.clone();

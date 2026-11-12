@@ -118,6 +118,7 @@ these startup environment variables (seconds):
 | `CONTAINER_START_TIMEOUT_SECS` | 120 | Managed start and readiness (each) |
 | `CONTAINER_ADMIN_TIMEOUT_SECS` | 60 | Daemon discovery and configuration (each command) |
 | `CONTAINER_STOP_TIMEOUT_SECS` | 30 | Cleanup stop/kill/delete/rm (each command) |
+| `CONTAINER_RECLAIM_SETTLE_SECS` | 10 | Wait before the final absence re-check of an orphaned effect ([container recovery](container-crash-recovery.md)) |
 
 Every value must be an integer in **1..=3600**; unset selects the documented
 operation default. Malformed (including empty or non-Unicode), zero,

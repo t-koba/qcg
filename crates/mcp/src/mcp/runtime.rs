@@ -804,99 +804,61 @@ impl McpRuntime {
                 let workload: Vec<String> = std::iter::once(bin.to_string())
                     .chain(args.iter().cloned())
                     .collect();
-                let (command, session) = match &backend {
+                let mount = container::Mount {
+                    host: &access.workspace,
+                    guest: "/work",
+                    readonly: false,
+                };
+                // The intent is journaled and the unique name allocated
+                // before any daemon call; both families create under it.
+                let session = container::provision(
+                    &backend,
+                    &container::Provision {
+                        timeouts: self.container_timeouts,
+                        image,
+                        mounts: std::slice::from_ref(&mount),
+                        ledger: access.effects.clone(),
+                        cancel: &cancellation,
+                    },
+                )
+                .await
+                .map_err(|error| McpError::Transport(error.to_string()))?;
+                let argv = match &backend {
                     container::Backend::Docker {
                         binary,
                         runtime_flag,
                     } => {
-                        let mount = container::Mount {
-                            host: &access.workspace,
-                            guest: "/work",
-                            readonly: false,
-                        };
-                        // cidfile stays outside the mounted workspace so the
-                        // container cannot tamper with the tracked container id.
-                        let cidfile = std::env::temp_dir().join(format!(
-                            ".mcp-container-{}-{}.cid",
-                            profile.id(),
-                            uuid::Uuid::now_v7().as_simple()
-                        ));
                         let env_names: Vec<String> =
                             server_env.iter().map(|(name, _)| name.clone()).collect();
-                        let argv = container::docker_run_argv(&container::DockerRunSpec {
+                        // `-e NAME` passes the client env value through; the
+                        // values themselves are set by the shared env block
+                        // below, so they never appear in argv.
+                        container::docker_run_argv(&container::DockerRunSpec {
                             binary,
                             runtime_flag: runtime_flag.as_deref(),
-                            cidfile: &cidfile,
+                            name: &session.name,
+                            labels: &session.labels(),
                             mounts: &[mount],
                             workdir: Some("/work"),
                             env_names: &env_names,
                             image,
                             workload: &workload,
                             stdin_pipe: true,
-                        });
-                        let (bin, args) = argv.split_first().ok_or_else(|| {
-                            McpError::Configuration("MCP server argv is empty".into())
-                        })?;
-                        let mut command = tokio::process::Command::new(bin);
-                        command.args(args);
-                        // `-e NAME` passes the client env value through; the
-                        // values themselves are set by the shared env block
-                        // below, so they never appear in argv.
-                        let session = container::Session {
-                            timeouts: self.container_timeouts,
-                            backend: backend.clone(),
-                            id: container::InstanceId::CidFile(cidfile),
-                        };
-                        (command, session)
+                        })
                     }
-                    managed => {
-                        let mount = container::Mount {
-                            host: &access.workspace,
-                            guest: "/work",
-                            readonly: false,
-                        };
-                        let session = container::provision(
-                            managed,
-                            &container::Provision {
-                                timeouts: self.container_timeouts,
-                                image,
-                                mounts: &[mount],
-                                id_prefix: "mcp-container",
-                                cancel: &cancellation,
-                            },
-                        )
-                        .await
-                        .map_err(|error| McpError::Transport(error.to_string()))?;
-                        let name = match &session.id {
-                            container::InstanceId::Name(name) => name.clone(),
-                            container::InstanceId::CidFile(_) => {
-                                return Err(McpError::Transport(
-                                    "managed provision returned no instance name".into(),
-                                ));
-                            }
-                        };
-                        let argv = match managed {
-                            container::Backend::Incus { binary } => container::incus_exec_argv(
-                                binary,
-                                &name,
-                                None,
-                                &server_env,
-                                &workload,
-                            ),
-                            container::Backend::Docker { .. } => {
-                                return Err(McpError::Configuration(
-                                    "docker backends take the one-shot path".into(),
-                                ));
-                            }
-                        };
-                        let (bin, args) = argv.split_first().ok_or_else(|| {
-                            McpError::Configuration("MCP server argv is empty".into())
-                        })?;
-                        let mut command = tokio::process::Command::new(bin);
-                        command.args(args);
-                        (command, session)
-                    }
+                    container::Backend::Incus { binary } => container::incus_exec_argv(
+                        binary,
+                        &session.name,
+                        None,
+                        &server_env,
+                        &workload,
+                    ),
                 };
+                let (bin, args) = argv
+                    .split_first()
+                    .ok_or_else(|| McpError::Configuration("MCP server argv is empty".into()))?;
+                let mut command = tokio::process::Command::new(bin);
+                command.args(args);
                 (command, Some(session))
             }
         };

@@ -174,6 +174,7 @@ async fn modern_mrtr_is_exposed_for_durable_hitl_and_can_resume() {
         commands: vec![],
         workspace: std::env::current_dir().unwrap(),
         host_cgroup: None,
+        effects: None,
     };
     let session = runtime
         .connect("mrtr", &access, CancellationToken::new())
@@ -279,6 +280,7 @@ async fn malformed_success_json_fails_immediately_instead_of_timing_out() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let started = std::time::Instant::now();
     let error = match runtime
@@ -335,6 +337,7 @@ async fn streamable_http_sessions_use_real_protocol_and_keep_state_isolated() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let (one, two) = tokio::join!(
         runtime.connect("shared", &access, CancellationToken::new()),
@@ -409,6 +412,7 @@ async fn streamable_http_bounds_raw_json_before_deserialization() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let session = runtime
         .connect("bounded", &access, CancellationToken::new())
@@ -462,6 +466,7 @@ async fn streamable_http_call_honors_run_cancellation() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let run_cancellation = CancellationToken::new();
     let session = runtime
@@ -602,6 +607,7 @@ async fn streamable_http_task_poll_honors_run_cancellation() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let run_cancellation = CancellationToken::new();
     let session = runtime
@@ -690,6 +696,7 @@ async fn streamable_http_task_poll_honors_cancellation_near_deadline() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let run_cancellation = CancellationToken::new();
     let session = runtime
@@ -844,6 +851,7 @@ async fn streamable_http_task_input_required_fails_at_hitl_boundary() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let session = runtime
         .connect("task-input", &access, CancellationToken::new())
@@ -1011,6 +1019,7 @@ async fn streamable_http_task_poll_restarts_with_a_fresh_task() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     // First generation, scoped so the restart drops it whole: the pinned
     // (never spawned) future models the process dying mid-poll with the
@@ -1107,6 +1116,7 @@ async fn streamable_http_timeout_closes_the_session() {
         commands: vec![],
         workspace: std::env::current_dir().expect("workspace should exist"),
         host_cgroup: None,
+        effects: None,
     };
     let session = runtime
         .connect("timeout", &access, CancellationToken::new())

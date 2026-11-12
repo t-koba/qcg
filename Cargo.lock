@@ -697,7 +697,9 @@ name = "container"
 version = "0.1.0"
 dependencies = [
  "contract",
+ "getrandom 0.4.3",
  "policy",
+ "serde",
  "thiserror 2.0.20",
  "tokio",
  "tokio-util",

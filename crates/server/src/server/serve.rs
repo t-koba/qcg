@@ -2043,7 +2043,7 @@ command = ["sh", "-c", "sleep 30"]"#,
         let frozen = resolve_server_policy(&config).unwrap();
         assert_eq!(
             frozen.container_timeouts,
-            policy::ContainerTimeouts::from_seconds([1, 2, 3, 4]).unwrap()
+            policy::ContainerTimeouts::from_seconds([1, 2, 3, 4, 5]).unwrap()
         );
         for name in policy::ContainerTimeouts::ENV_NAMES {
             for value in ["bad", "0", "3601", "18446744073709551616"] {
@@ -2055,7 +2055,7 @@ command = ["sh", "-c", "sleep 30"]"#,
                 assert!(error.contains(name), "{error}");
                 assert_eq!(
                     frozen.container_timeouts,
-                    policy::ContainerTimeouts::from_seconds([1, 2, 3, 4]).unwrap()
+                    policy::ContainerTimeouts::from_seconds([1, 2, 3, 4, 5]).unwrap()
                 );
             }
             // SAFETY: same isolated subprocess as above.

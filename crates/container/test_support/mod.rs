@@ -77,7 +77,22 @@ case "$1:$mode" in
   init:hang-init|profile:hang-admin|start:hang-start|stop:hang-stop|kill:hang-stop|delete:hang-delete|rm:hang-delete) exec /bin/sleep 8 ;;
   exec:hang-probe) case "$*" in *'-- true') exec /bin/sleep 8 ;; esac ;;
 esac
+case "$1:$mode" in
+  ps:broken|list:broken) echo 'cannot connect to the daemon' >&2; exit 1 ;;
+esac
 case "$1" in
+  ps|list)
+    if [ "$mode" = late ] && [ ! -f "$root/seen" ]; then
+      : > "$root/seen"; cat "$root/late" >> "$root/instances"
+    else
+      /bin/cat "$root/instances" 2>/dev/null
+    fi
+    ;;
+  kill|stop|rm|delete)
+    for last; do :; done
+    /bin/grep -vx -- "$last" "$root/instances" > "$root/instances.tmp"
+    /bin/mv "$root/instances.tmp" "$root/instances"
+    ;;
   profile) echo pool ;;
   exec)
     case "$*" in *'-- true') ;; *)
@@ -85,11 +100,6 @@ case "$1" in
     esac
     ;;
   run)
-    shift
-    while [ "$#" -gt 0 ]; do
-      if [ "$1" = --cidfile ]; then shift; echo test-id > "$1"; fi
-      shift
-    done
     if [ "$mode" = docker-workload ]; then exec /bin/sleep 2; fi
     if [ -f "$root/server" ]; then exec "$(/bin/cat "$root/server")" --session-id daemon-policy; fi
     ;;
@@ -104,6 +114,7 @@ exit 0
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         std::fs::write(root.join("mode"), "ok").unwrap();
+        std::fs::write(root.join("instances"), "").unwrap();
         let paths = std::env::join_paths(std::iter::once(root.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
         ))
@@ -130,6 +141,24 @@ exit 0
     pub fn mode(&self, mode: &str) {
         std::fs::write(self.root.join("mode"), mode).unwrap();
         std::fs::write(self.root.join("log"), "").unwrap();
+    }
+
+    /// Instances the fake daemon currently holds, one name per line.
+    pub fn set_instances(&self, names: &[&str]) {
+        std::fs::write(self.root.join("instances"), names.join("\n") + "\n").unwrap();
+    }
+
+    pub fn instances(&self) -> Vec<String> {
+        let text = std::fs::read_to_string(self.root.join("instances")).unwrap_or_default();
+        text.lines()
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect()
+    }
+
+    /// Makes `name` appear only after the first listing (a late create).
+    pub fn create_late(&self, name: &str) {
+        std::fs::write(self.root.join("late"), format!("{name}\n")).unwrap();
     }
 
     pub fn log(&self) -> String {

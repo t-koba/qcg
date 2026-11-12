@@ -8,20 +8,22 @@
 //! including when the awaiting future is dropped by timeout or abort.
 
 mod backend;
+mod effect;
 mod error;
 mod plans;
 mod session;
 
 pub use backend::{Backend, backend_for, binary_available, resolve_backend};
+pub use effect::{EffectLedger, Reclaimed, begin, reclaim};
 pub use error::ContainerError;
 pub use plans::{
-    DockerRunSpec, Mount, docker_run_argv, incus_delete_argv, incus_device_add_argv,
+    DockerRunSpec, Mount, docker_run_argv, effect_name, incus_delete_argv, incus_device_add_argv,
     incus_exec_argv, incus_init_argv, incus_pool_argv, incus_probe_argv, incus_secure_argv,
-    incus_start_argv, incus_stop_argv, instance_name, split_pinned_image, validate_guest_path,
+    incus_start_argv, incus_stop_argv, is_effect_name, split_pinned_image, validate_guest_path,
     validate_image_for_backend,
 };
 pub use session::{
-    CleanupWaitOutcome, InstanceId, PROBE_INTERVAL, Provision, Session, SessionGuard,
+    CleanupWaitOutcome, PROBE_INTERVAL, Provision, Session, SessionGuard,
     await_outstanding_cleanups, provision, record_cleanup_failure, teardown, teardown_sync,
 };
 
@@ -74,7 +76,7 @@ mod tests {
 
     #[test]
     fn docker_run_argv_matches_the_hardened_shape() {
-        let cidfile = Path::new("/tmp/.container-abc.cid");
+        let labels = [("qcg.run".to_string(), "r1".to_string())];
         let mounts = [Mount {
             host: Path::new("/runs/r1/workspace"),
             guest: "/work",
@@ -83,7 +85,8 @@ mod tests {
         let argv = docker_run_argv(&DockerRunSpec {
             binary: "docker",
             runtime_flag: None,
-            cidfile,
+            name: "qcg-0123456789abcdef0123456789abcdef",
+            labels: &labels,
             mounts: &mounts,
             workdir: Some("/work"),
             env_names: &[],
@@ -98,8 +101,10 @@ mod tests {
                 "run",
                 "--rm",
                 "-i",
-                "--cidfile",
-                "/tmp/.container-abc.cid",
+                "--name",
+                "qcg-0123456789abcdef0123456789abcdef",
+                "--label",
+                "qcg.run=r1",
                 "--network",
                 "none",
                 "--read-only",
@@ -127,7 +132,6 @@ mod tests {
 
     #[test]
     fn docker_run_argv_marks_readonly_mounts_and_server_env() {
-        let cidfile = Path::new("/tmp/x.cid");
         let mounts = [Mount {
             host: Path::new("/runs/r1/workspace"),
             guest: "/src",
@@ -136,7 +140,8 @@ mod tests {
         let argv = docker_run_argv(&DockerRunSpec {
             binary: "podman",
             runtime_flag: None,
-            cidfile,
+            name: "qcg-x",
+            labels: &[],
             mounts: &mounts,
             workdir: None,
             env_names: &["API_TOKEN".to_string()],
@@ -156,7 +161,8 @@ mod tests {
         let argv = docker_run_argv(&DockerRunSpec {
             binary: "docker",
             runtime_flag: Some("runsc"),
-            cidfile: Path::new("/tmp/x.cid"),
+            name: "qcg-x",
+            labels: &[],
             mounts: &[],
             workdir: None,
             env_names: &[],
@@ -187,11 +193,19 @@ mod tests {
     fn incus_lifecycle_argv_is_fully_pinned() {
         let name = "ctr0123456789abcdef";
         assert_eq!(
-            incus_init_argv("incus", "default", "abc123", name),
+            incus_init_argv(
+                "incus",
+                "default",
+                "abc123",
+                name,
+                &[("qcg.run".to_string(), "r1".to_string())]
+            ),
             vec![
                 "incus",
                 "init",
                 "--no-profiles",
+                "-c",
+                "user.qcg.run=r1",
                 "-s",
                 "default",
                 "abc123",
@@ -245,20 +259,6 @@ mod tests {
             incus_delete_argv("incus", name),
             vec!["incus", "delete", "-f", name]
         );
-    }
-
-    #[test]
-    fn instance_names_fit_every_backend() {
-        for _ in 0..100 {
-            let name = instance_name();
-            assert!(name.starts_with("ctr"));
-            assert_eq!(name.len(), 35, "ctr plus the full UUID: {name}");
-            assert!(
-                name.bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()),
-                "name must be alphanumeric without hyphens: {name}"
-            );
-        }
     }
 
     #[test]

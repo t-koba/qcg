@@ -1,4 +1,5 @@
 mod artifact;
+mod effects;
 mod engine;
 mod gateway;
 pub mod host_cgroup;
@@ -16,6 +17,7 @@ mod validation;
 pub(crate) mod test_support;
 
 pub use artifact::*;
+pub use effects::JournalEffects;
 pub use engine::*;
 pub use gateway::*;
 pub use journal::*;

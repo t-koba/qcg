@@ -55,7 +55,7 @@ mod tests {
         spec.command = vec!["mcp-server".into()];
         spec.allowed_hosts.clear();
         spec.timeout_seconds = 3;
-        let timeouts = policy::ContainerTimeouts::from_seconds([1; 4]).unwrap();
+        let timeouts = policy::ContainerTimeouts::from_seconds([1; 5]).unwrap();
         let runtime = McpRuntime::from_specs(vec![spec.clone()])
             .unwrap()
             .with_container_timeouts(timeouts);
@@ -69,6 +69,7 @@ mod tests {
             }],
             workspace: daemon.root.clone(),
             host_cgroup: None,
+            effects: None,
         };
         for (mode, stage) in [
             ("hang-admin", "discover-pool"),
@@ -139,7 +140,7 @@ mod tests {
             );
             let log = daemon.log();
             assert!(
-                log.contains(if docker { "rm -f test-id" } else { "delete -f" }),
+                log.contains(if docker { "rm -f qcg-" } else { "delete -f" }),
                 "{log}"
             );
         }
@@ -621,6 +622,7 @@ mod tests {
             commands: vec![McpCommandAccess::trusted_host(vec!["other".into()])],
             workspace: std::env::temp_dir(),
             host_cgroup: None,
+            effects: None,
         };
         assert!(access.validate(profile).is_err());
     }

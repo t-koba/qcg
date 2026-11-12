@@ -61,6 +61,7 @@ fn access(commands: &[Vec<String>]) -> McpAccess {
             .collect(),
         workspace: std::env::current_dir().expect("test workspace should be available"),
         host_cgroup: None,
+        effects: None,
     }
 }
 
@@ -188,7 +189,7 @@ async fn frozen_daemon_policy_reaches_normal_container_session_close() {
     let argv = vec!["mcp-server".to_string()];
     let runtime = McpRuntime::from_specs(vec![spec("container", argv.clone())])
         .unwrap()
-        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 4]).unwrap());
+        .with_container_timeouts(policy::ContainerTimeouts::from_seconds([1; 5]).unwrap());
     for docker in [false, true] {
         daemon.mode("hang-stop");
         let access = McpAccess {
@@ -232,7 +233,7 @@ async fn frozen_daemon_policy_reaches_normal_container_session_close() {
         assert!(
             daemon
                 .log()
-                .contains(if docker { "rm -f test-id" } else { "delete -f" })
+                .contains(if docker { "rm -f qcg-" } else { "delete -f" })
         );
     }
 }

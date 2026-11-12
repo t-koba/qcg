@@ -3,7 +3,7 @@ use contract::ContainerRuntime;
 /// Resolved container backend: a concrete client binary. The LXD runtime
 /// keeps the genuine upstream CLI name `lxc` (like `docker`/`podman` keep
 /// theirs); it is a binary name, not a leftover variant (E-cleanup).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Backend {
     Docker {
         binary: String,
@@ -15,6 +15,21 @@ pub enum Backend {
 }
 
 impl Backend {
+    /// Whether this is a client `backend_for` can produce. A backend read
+    /// back from a journal is acted on only when it passes.
+    pub fn is_declared(&self) -> bool {
+        match self {
+            Self::Docker {
+                binary,
+                runtime_flag,
+            } => {
+                matches!(binary.as_str(), "docker" | "podman")
+                    && runtime_flag.as_deref().is_none_or(|flag| flag == "runsc")
+            }
+            Self::Incus { binary } => matches!(binary.as_str(), "incus" | "lxc"),
+        }
+    }
+
     /// Stable display name for logs, plans, and journal audit fields.
     pub fn display_name(&self) -> &'static str {
         match self {

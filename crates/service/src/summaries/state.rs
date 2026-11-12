@@ -116,7 +116,26 @@ pub(crate) fn rehydrate_runs(
     max_tracked_runs: usize,
     max_scan_entries: usize,
 ) -> Result<BTreeMap<String, RunRecord>, ServiceError> {
-    scan_runs(runs_dir, max_tracked_runs, max_scan_entries, false).map(|(runs, _)| runs)
+    rehydrate_runs_with_effects(runs_dir, max_tracked_runs, max_scan_entries).map(|(runs, _)| runs)
+}
+
+/// Startup recovery: also reports every run directory (terminal or direct
+/// included) whose folded journal still holds an unconfirmed container
+/// effect, so the one scan seeds effect reconciliation too.
+pub(crate) fn rehydrate_runs_with_effects(
+    runs_dir: &Utf8Path,
+    max_tracked_runs: usize,
+    max_scan_entries: usize,
+) -> Result<(BTreeMap<String, RunRecord>, Vec<Utf8PathBuf>), ServiceError> {
+    let mut effects = Vec::new();
+    scan_runs(
+        runs_dir,
+        max_tracked_runs,
+        max_scan_entries,
+        false,
+        &mut effects,
+    )
+    .map(|(runs, _)| (runs, effects))
 }
 
 /// Periodic recovery isolates entry failures, but never suppresses directory
@@ -126,7 +145,13 @@ pub(crate) fn refresh_runs(
     max_tracked_runs: usize,
     max_scan_entries: usize,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
-    scan_runs(runs_dir, max_tracked_runs, max_scan_entries, true)
+    scan_runs(
+        runs_dir,
+        max_tracked_runs,
+        max_scan_entries,
+        true,
+        &mut Vec::new(),
+    )
 }
 
 fn scan_runs(
@@ -134,6 +159,7 @@ fn scan_runs(
     max_tracked_runs: usize,
     max_scan_entries: usize,
     tolerate_entry_errors: bool,
+    effects: &mut Vec<Utf8PathBuf>,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
     let mut records = BTreeMap::new();
     let mut failures = 0;
@@ -162,7 +188,7 @@ fn scan_runs(
             .map_err(|path| {
                 ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
             })
-            .and_then(|run_dir| rehydrate_run(&run_dir, &mut nonterminal_runs));
+            .and_then(|run_dir| rehydrate_run(&run_dir, &mut nonterminal_runs, effects));
         // Count validated non-terminal journals even if their package or
         // manifest could not be loaded; isolation must not bypass the cap.
         if nonterminal_runs > max_tracked_runs {
@@ -189,6 +215,7 @@ fn scan_runs(
 fn rehydrate_run(
     run_dir: &Utf8Path,
     nonterminal_runs: &mut usize,
+    effects: &mut Vec<Utf8PathBuf>,
 ) -> Result<Option<(String, RunRecord)>, ServiceError> {
     let journal_path = run_meta_dir(run_dir).join("journal.jsonl");
     if !is_regular_directory(run_dir)? || !is_regular_file(&journal_path)? {
@@ -202,6 +229,9 @@ fn rehydrate_run(
     // never pays a scan per field per run.
     let journal_values = read_journal_events(run_dir)?;
     let state = RunState::fold_values(&journal_values).map_err(ServiceError::invalid)?;
+    if !state.effects.is_empty() {
+        effects.push(run_dir.to_owned());
+    }
     if state.terminal.is_some() {
         return Ok(None);
     }
