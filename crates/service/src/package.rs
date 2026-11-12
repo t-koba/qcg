@@ -641,13 +641,7 @@ pub fn unpack_package(
         unpacked_bytes = unpacked_bytes
             .checked_add(header.uncompressed_size_hint())
             .ok_or_else(|| ServiceError::Invalid("archive expanded size overflowed".into()))?;
-        if let Some(limit) = limits.max_bytes
-            && unpacked_bytes > limit
-        {
-            return Err(ServiceError::Invalid(format!(
-                "archive expanded size exceeds {limit} bytes"
-            )));
-        }
+        ensure_within(limits.max_bytes, unpacked_bytes, "archive expanded size")?;
         // Every archive entry must carry a nonzero mode in the high word
         // of external attributes; creator-system metadata does not change
         // where this explicit mode is stored. Mode-less entries are refused
@@ -1007,13 +1001,7 @@ pub fn package_identity_sha256(
             total_bytes = total_bytes
                 .checked_add(read_bytes)
                 .ok_or_else(|| ServiceError::Invalid("package byte count overflowed".into()))?;
-            if let Some(limit) = limits.max_bytes
-                && total_bytes > limit
-            {
-                return Err(ServiceError::Invalid(format!(
-                    "package source exceeds {limit} bytes"
-                )));
-            }
+            ensure_within(limits.max_bytes, total_bytes, "package source")?;
             digest.update(&buffer[..read_len]);
         }
         let after = file.metadata().map_err(ServiceError::Io)?;
@@ -1113,13 +1101,7 @@ fn collect_identity_entries(
             total_bytes = total_bytes
                 .checked_add(size)
                 .ok_or_else(|| ServiceError::Invalid("package source size overflowed".into()))?;
-            if let Some(limit) = limits.max_bytes
-                && total_bytes > limit
-            {
-                return Err(ServiceError::Invalid(format!(
-                    "package source exceeds {limit} bytes"
-                )));
-            }
+            ensure_within(limits.max_bytes, total_bytes, "package source")?;
         }
         // Fail closed when mtime is unavailable so later comparisons have a
         // stable snapshot to compare against.
@@ -1293,13 +1275,7 @@ pub fn copy_dir_all(
         copied_bytes = copied_bytes
             .checked_add(metadata.len())
             .ok_or_else(|| ServiceError::Invalid("package source size overflowed".into()))?;
-        if let Some(limit) = limits.max_bytes
-            && copied_bytes > limit
-        {
-            return Err(ServiceError::Invalid(format!(
-                "package source exceeds {limit} bytes"
-            )));
-        }
+        ensure_within(limits.max_bytes, copied_bytes, "package source")?;
         let explicit_mode = explicit_source_mode(&metadata, false);
         // Handle-relative staging and replace with the final mode applied
         // BEFORE the rename, never post-rename (E15). The source is read
@@ -1586,6 +1562,15 @@ fn open_verified_file_nofollow(path: &Utf8Path, relative: &str) -> Result<File, 
 /// therefore subsumed (sanitize is idempotent) and removed there.
 fn permission_bits(metadata: &std::fs::Metadata) -> u32 {
     files::sanitized_metadata_mode(metadata)
+}
+
+fn ensure_within(limit: Option<u64>, total: u64, what: &str) -> Result<(), ServiceError> {
+    match limit {
+        Some(limit) if total > limit => Err(ServiceError::Invalid(format!(
+            "{what} exceeds {limit} bytes"
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// SHA256 of an already-opened (already nofollow-verified) handle (E15):
