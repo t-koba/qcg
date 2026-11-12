@@ -204,6 +204,20 @@ pub(crate) fn is_regular_directory(path: &Utf8Path) -> Result<bool, ServiceError
     }
 }
 
+/// Refuses a symbolic link at `path`; a missing path passes only when `missing_ok`.
+pub(crate) fn refuse_symlink(
+    path: impl AsRef<std::path::Path>,
+    missing_ok: bool,
+    message: impl FnOnce() -> String,
+) -> Result<(), ServiceError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(ServiceError::Invalid(message())),
+        Ok(_) => Ok(()),
+        Err(error) if missing_ok && error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
+}
+
 pub(crate) fn is_regular_file(path: &Utf8Path) -> Result<bool, ServiceError> {
     match std::fs::symlink_metadata(path) {
         Ok(metadata) => Ok(metadata.file_type().is_file()),
@@ -1080,16 +1094,9 @@ fn wipe_incomplete_run_dir(run_dir: &Utf8Path) -> Result<(), ServiceError> {
     }
     let keep = run_meta_dir(run_dir).join("control");
     // Refuse linked mailboxes, including swaps; never follow them during wiping.
-    match std::fs::symlink_metadata(&keep) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(ServiceError::Invalid(format!(
-                "cancel control directory `{keep}` is a symlink; refusing wipe"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ServiceError::Io(error)),
-    }
+    refuse_symlink(&keep, true, || {
+        format!("cancel control directory `{keep}` is a symlink; refusing wipe")
+    })?;
     // Enumerated no-follow deletion preserves concurrent mailbox publication.
     // Recurse only into real ancestors of keep; remove links as links.
     fn wipe_except(dir: &Utf8Path, keep: &Utf8Path) -> Result<(), ServiceError> {
@@ -1339,19 +1346,12 @@ fn safe_join_under_root(
             Err(error) => return Err(ServiceError::Io(error)),
         }
     }
-    match std::fs::symlink_metadata(&joined) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ServiceError::Invalid(format!(
-                "checkpoint file `{relative}` is a symlink"
-            )));
-        }
-        Ok(_) => {}
-        // A missing leaf is a fresh output path and stays admissible; any
-        // other probe failure (permissions, I/O) fails closed instead of
-        // treating an unscannable leaf as safe (E06).
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(ServiceError::Io(error)),
-    }
+    // A missing leaf is a fresh output path and stays admissible; any
+    // other probe failure (permissions, I/O) fails closed instead of
+    // treating an unscannable leaf as safe (E06).
+    refuse_symlink(&joined, true, || {
+        format!("checkpoint file `{relative}` is a symlink")
+    })?;
     Ok(joined)
 }
 
@@ -1523,15 +1523,9 @@ pub(crate) fn request_remote_cancel_with_id(
     {
         std::fs::create_dir_all(&dir)?;
         // create_dir_all follows links: refuse a symlinked mailbox.
-        match std::fs::symlink_metadata(&dir) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(ServiceError::Invalid(format!(
-                    "cancel control directory `{dir}` is a symlink; refusing publish"
-                )));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(ServiceError::Io(error)),
-        }
+        refuse_symlink(&dir, false, || {
+            format!("cancel control directory `{dir}` is a symlink; refusing publish")
+        })?;
         // Non-Unix pathname races require trusted concurrent writers.
     }
     let mut attempts = 0;

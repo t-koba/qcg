@@ -11,6 +11,7 @@ use policy::{is_safe_relative_path, portable_relative_path};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::File;
 
+use crate::run_dirs::refuse_symlink;
 use crate::types::ServiceError;
 
 /// `st_mode` file-type mask and symlink type bits for ZIP entries.
@@ -104,25 +105,15 @@ fn open_archive_nofollow(archive: &Utf8Path) -> Result<File, ServiceError> {
     };
     #[cfg(not(unix))]
     let file = {
-        match std::fs::symlink_metadata(archive) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(ServiceError::Invalid(format!(
-                    "package archive `{archive}` is a symbolic link; refusing to read"
-                )));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(ServiceError::Io(error)),
-        }
+        refuse_symlink(archive, false, || {
+            format!("package archive `{archive}` is a symbolic link; refusing to read")
+        })?;
         let file = File::open(archive).map_err(ServiceError::Io)?;
-        match std::fs::symlink_metadata(archive) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(ServiceError::Invalid(format!(
-                    "package archive `{archive}` changed to a symlink during open; refusing to read"
-                )));
-            }
-            Ok(_) => {}
-            Err(error) => return Err(ServiceError::Io(error)),
-        }
+        refuse_symlink(archive, false, || {
+            format!(
+                "package archive `{archive}` changed to a symlink during open; refusing to read"
+            )
+        })?;
         file
     };
     if !file.metadata().map_err(ServiceError::Io)?.is_file() {
@@ -169,15 +160,9 @@ fn open_pinned_dir(path: &Utf8Path) -> Result<PinnedDir, ServiceError> {
     // must fail here instead of pinning through it to outside. The
     // `O_NOFOLLOW` open below is authoritative; this pre-probe only improves
     // the error.
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            return Err(ServiceError::Invalid(format!(
-                "package target `{path}` is a symbolic link; refusing to pin"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) => return Err(ServiceError::Io(error)),
-    }
+    refuse_symlink(path, false, || {
+        format!("package target `{path}` is a symbolic link; refusing to pin")
+    })?;
     // Canonicalize once so the pin anchors the real target, not a path
     // that traverses a link. The target must already exist (callers
     // pre-create it); a missing target fails here instead of later with
@@ -739,16 +724,9 @@ pub fn unpack_package(
                 // symmetric with the directory path (E15-5). The staging
                 // helper re-probes the leaf immediately before the rename
                 // and refuses links there as well.
-                match std::fs::symlink_metadata(&out) {
-                    Ok(metadata) if metadata.file_type().is_symlink() => {
-                        return Err(ServiceError::Invalid(format!(
-                            "archive file `{rel}` collides with an existing symbolic link"
-                        )));
-                    }
-                    Ok(_) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(ServiceError::Io(error)),
-                }
+                refuse_symlink(&out, true, || {
+                    format!("archive file `{rel}` collides with an existing symbolic link")
+                })?;
                 stage_file_path(&out, archived_mode, |output| {
                     copy_package_entry(
                         &mut entry,
@@ -808,15 +786,11 @@ fn package_dir_leaf_path(out: &Utf8Path, rel: &Utf8Path, mode: u32) -> Result<()
         }
         Err(error) => return Err(ServiceError::Io(error)),
     }
-    match std::fs::symlink_metadata(out) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(ServiceError::Invalid(format!(
-                "archive directory `{rel}` changed to a symbolic link during unpack; refusing mode change"
-            )));
-        }
-        Ok(_) => {}
-        Err(error) => return Err(ServiceError::Io(error)),
-    }
+    refuse_symlink(out, false, || {
+        format!(
+            "archive directory `{rel}` changed to a symbolic link during unpack; refusing mode change"
+        )
+    })?;
     apply_restored_mode(out, mode)?;
     Ok(())
 }
@@ -1356,16 +1330,9 @@ pub fn copy_dir_all(
             // Fail closed on a symlinked destination, symmetric with the
             // directory path (E15-5); the staging helper re-probes the leaf
             // immediately before the rename and refuses links there too.
-            match std::fs::symlink_metadata(&dest) {
-                Ok(metadata) if metadata.file_type().is_symlink() => {
-                    return Err(ServiceError::Invalid(format!(
-                        "package destination `{dest}` collides with an existing symbolic link"
-                    )));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ServiceError::Io(error)),
-            }
+            refuse_symlink(&dest, true, || {
+                format!("package destination `{dest}` collides with an existing symbolic link")
+            })?;
             stage_file_path(&dest, explicit_mode, |output| {
                 let copied = std::io::copy(&mut input, output)?;
                 if copied != metadata.len() {
