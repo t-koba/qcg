@@ -431,29 +431,6 @@ mod tests {
         }
     }
 
-    const SLOW_MANIFEST: &str = r#"
-[generator]
-id = "slow"
-name = "Slow"
-version = "0.1.0"
-
-[permissions]
-fs_read = []
-fs_write = []
-network = []
-side_effects_scope = "invocation"
-side_effects = "allowed"
-commands = [{ bin = "sh", args = ["-c", "sleep 30"], purpose = "metrics test", isolation = "trusted_host" }]
-
-
-[permissions.containers]
-enabled = false
-[[flow]]
-id = "sleep"
-type = "command"
-[flow.params]
-command = ["sh", "-c", "sleep 30"]"#;
-
     async fn scrape(state: &Arc<AppState>) -> String {
         let response = metrics(State(Arc::clone(state)))
             .await
@@ -470,6 +447,29 @@ command = ["sh", "-c", "sleep 30"]"#;
             .unwrap_or(0)
     }
 
+    const ASK_MANIFEST: &str = r#"
+[generator]
+id = "{id}"
+name = "Ask"
+version = "0.1.0"
+
+[permissions]
+fs_read = []
+fs_write = []
+network = []
+side_effects_scope = "invocation"
+side_effects = "allowed"
+commands = []
+
+[permissions.containers]
+enabled = false
+[[flow]]
+id = "ask"
+type = "ask_user"
+[flow.params]
+content = "Continue?"
+options = ["yes"]"#;
+
     #[tokio::test]
     async fn metrics_follow_run_events_and_never_read_the_run_store() {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
@@ -484,7 +484,7 @@ command = ["sh", "-c", "sleep 30"]"#;
         std::fs::create_dir_all(generators.join(&id)).expect("generator dir should create");
         std::fs::write(
             generators.join(&id).join("qcg.toml"),
-            SLOW_MANIFEST.replace("id = \"slow\"", &format!("id = \"{id}\"")),
+            ASK_MANIFEST.replace("{id}", &id),
         )
         .expect("slow manifest should write");
         let state = Arc::new(AppState {
@@ -529,14 +529,17 @@ command = ["sh", "-c", "sleep 30"]"#;
         // that touched the store could not succeed.
         std::fs::create_dir_all(runs.join("corrupt-old/meta")).unwrap();
         std::fs::write(runs.join("corrupt-old/meta/journal.jsonl"), "{not json\n").unwrap();
-        let live = scrape(&state).await;
-        assert_eq!(series(&live, "runs_active"), 1, "{live}");
-        assert!(
-            live.contains("runs_total{state=\"queued\"} 1\n")
-                || live.contains("runs_total{state=\"running\"} 1\n"),
-            "{live}"
-        );
-        assert!(live.contains("runs_waiting 0\n") && live.contains("runs_confirming 0\n"));
+        // The run suspends on a question, so no child process is spawned.
+        let live = loop {
+            let live = scrape(&state).await;
+            if series(&live, "runs_waiting") == 1 {
+                break live;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        };
+        assert_eq!(series(&live, "runs_active"), 0, "{live}");
+        assert_eq!(series(&live, "runs_total{state=\"waiting\"}"), 1, "{live}");
+        assert_eq!(series(&live, "runs_confirming"), 0, "{live}");
         assert_eq!(
             series(
                 &live,
@@ -552,7 +555,7 @@ command = ["sh", "-c", "sleep 30"]"#;
         loop {
             let after = scrape(&state).await;
             if series(&after, "runs_total{state=\"canceled\"}") > canceled
-                && series(&after, "runs_active") == 0
+                && series(&after, "runs_waiting") == 0
             {
                 break;
             }
