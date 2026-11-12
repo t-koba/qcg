@@ -377,6 +377,19 @@ fn state_json_seq_floor(journal_path: &Utf8Path) -> Result<u64, JournalError> {
     }
 }
 
+/// Stamps the identity fields every journal record carries.
+fn stamp_event(object: &mut serde_json::Map<String, Value>, kind: &str, seq: u64, run_id: &str) {
+    object.insert("t".into(), Value::String(kind.into()));
+    object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
+    object.insert("seq".into(), Value::Number(seq.into()));
+    object.insert("run_id".into(), Value::String(run_id.into()));
+    object.insert(
+        "trace_id".into(),
+        Value::String(api::trace_id_for_run(run_id)),
+    );
+    object.insert("span_id".into(), Value::String(api::span_id_for_seq(seq)));
+}
+
 impl JournalWriter {
     pub fn create(
         path: &Utf8Path,
@@ -566,15 +579,7 @@ impl JournalWriter {
             let event_run_id = self.run_id.clone();
             {
                 let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
-                object.insert("t".into(), Value::String(kind.into()));
-                object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
-                object.insert("seq".into(), Value::Number(seq.into()));
-                object.insert("run_id".into(), Value::String(event_run_id.clone()));
-                object.insert(
-                    "trace_id".into(),
-                    Value::String(api::trace_id_for_run(&event_run_id)),
-                );
-                object.insert("span_id".into(), Value::String(api::span_id_for_seq(seq)));
+                stamp_event(object, kind, seq, &event_run_id);
                 let parent_scope = object
                     .get("node")
                     .and_then(Value::as_str)
@@ -797,15 +802,7 @@ impl JournalWriter {
                 )));
             }
             let event_run_id = self.run_id.clone();
-            object.insert("t".into(), Value::String(kind.into()));
-            object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
-            object.insert("seq".into(), Value::Number(seq.into()));
-            object.insert("run_id".into(), Value::String(event_run_id.clone()));
-            object.insert(
-                "trace_id".into(),
-                Value::String(api::trace_id_for_run(&event_run_id)),
-            );
-            object.insert("span_id".into(), Value::String(api::span_id_for_seq(seq)));
+            stamp_event(object, kind, seq, &event_run_id);
             let parent_scope = object
                 .get("node")
                 .and_then(Value::as_str)
@@ -1080,15 +1077,7 @@ impl JournalWriter {
                 .ok_or_else(|| JournalError::InvalidEvent("journal seq overflowed".into()))?;
             {
                 let object = value.as_object_mut().ok_or(JournalError::InvalidPayload)?;
-                object.insert("t".into(), Value::String(kind.into()));
-                object.insert("ts".into(), Value::String(Utc::now().to_rfc3339()));
-                object.insert("seq".into(), Value::Number(seq.into()));
-                object.insert("run_id".into(), Value::String(event_run_id.clone()));
-                object.insert(
-                    "trace_id".into(),
-                    Value::String(api::trace_id_for_run(&event_run_id)),
-                );
-                object.insert("span_id".into(), Value::String(api::span_id_for_seq(seq)));
+                stamp_event(object, kind, seq, &event_run_id);
             }
             let event = RunEvent::from_flat(&value).map_err(JournalError::InvalidEvent)?;
             let first_queued = kind == "run_queued" && state.queued_at.is_none();
