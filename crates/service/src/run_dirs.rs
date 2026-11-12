@@ -2122,6 +2122,10 @@ pub(crate) fn list_pending_cancel_controls(
             return Err(ServiceError::Io(error));
         }
     }
+    let unreadable = |path: &std::path::Path, error: std::io::Error| {
+        tracing::warn!(path = %path.display(), %error, "cancel control unreadable; failing scan");
+        ServiceError::Io(error)
+    };
     let mut pending = Vec::new();
     // Bind controls to the containing run directory, never an empty fallback.
     let Some(expected_run_id) = run_dir.file_name() else {
@@ -2154,10 +2158,7 @@ pub(crate) fn list_pending_cancel_controls(
         let meta = match std::fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cancel control unreadable; failing scan");
-                return Err(ServiceError::Io(error));
-            }
+            Err(error) => return Err(unreadable(&path, error)),
         };
         // Classify temps byte-exactly before UTF-8 conversion. All scan cleanup
         // uses the shared reapers and their symlink/age/lock discipline.
@@ -2254,8 +2255,7 @@ pub(crate) fn list_pending_cancel_controls(
                     if error.kind() == std::io::ErrorKind::NotFound {
                         continue;
                     }
-                    tracing::warn!(path = %path.display(), %error, "cancel control unreadable; failing scan");
-                    return Err(ServiceError::Io(error));
+                    return Err(unreadable(&path, error));
                 }
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -2264,10 +2264,7 @@ pub(crate) fn list_pending_cancel_controls(
                 // whole mailbox (E01).
                 continue;
             }
-            Err(error) => {
-                tracing::warn!(path = %path.display(), %error, "cancel control unreadable; failing scan");
-                return Err(ServiceError::Io(error));
-            }
+            Err(error) => return Err(unreadable(&path, error)),
         }
         if bytes.len() as u64 > MAX_CONTROL_FILE_BYTES {
             reap_foreign_control_entry(&path, &meta, "removing oversize cancel control");
@@ -2287,10 +2284,7 @@ pub(crate) fn list_pending_cancel_controls(
                 let reap_meta = match std::fs::symlink_metadata(&path) {
                     Ok(reap_meta) => reap_meta,
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                    Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "cancel control unreadable; failing scan");
-                        return Err(ServiceError::Io(error));
-                    }
+                    Err(error) => return Err(unreadable(&path, error)),
                 };
                 reap_foreign_control_entry(
                     &path,
