@@ -949,16 +949,12 @@ pub fn package_identity_sha256(
     let mut digest = sha2::Sha256::new();
     use sha2::Digest as _;
     digest.update(b"qcg-package-identity-v1\0");
-    let entry_count = u64::try_from(initial.len())
-        .map_err(|_| ServiceError::Invalid("package entry count overflowed".into()))?;
-    digest.update(entry_count.to_le_bytes());
+    digest.update((initial.len() as u64).to_le_bytes());
 
     let mut total_bytes = 0_u64;
     for entry in &initial {
         let path_bytes = entry.relative.as_bytes();
-        let path_len = u64::try_from(path_bytes.len())
-            .map_err(|_| ServiceError::Invalid("package path length overflowed".into()))?;
-        digest.update(path_len.to_le_bytes());
+        digest.update((path_bytes.len() as u64).to_le_bytes());
         digest.update(path_bytes);
         digest.update([if entry.is_dir { 1 } else { 0 }]);
         digest.update(explicit_source_mode(&entry.metadata, entry.is_dir).to_le_bytes());
@@ -993,8 +989,7 @@ pub fn package_identity_sha256(
             if read_len == 0 {
                 break;
             }
-            let read_bytes = u64::try_from(read_len)
-                .map_err(|_| ServiceError::Invalid("package byte count overflowed".into()))?;
+            let read_bytes = read_len as u64;
             file_bytes = file_bytes
                 .checked_add(read_bytes)
                 .ok_or_else(|| ServiceError::Invalid("package byte count overflowed".into()))?;
