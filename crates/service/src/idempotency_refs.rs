@@ -119,14 +119,14 @@ fn read_record(path: &Utf8Path) -> std::io::Result<Vec<u8>> {
 }
 
 #[cfg(not(windows))]
-fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<std::fs::File> {
     files::open_read_nofollow(path)
 }
 
 // Locks and records must refuse a reparse leaf on the *opened* handle,
 // not just in the general files reader's non-Unix pre-open probe.
 #[cfg(windows)]
-fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<std::fs::File> {
+pub(crate) fn open_read_nofollow(path: &Utf8Path) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
     use windows_sys::Win32::Storage::FileSystem::{
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,

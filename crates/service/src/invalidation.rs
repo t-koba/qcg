@@ -90,11 +90,6 @@ pub(crate) fn read_invalidation(
     Ok(Some(record))
 }
 
-#[cfg(not(windows))]
-fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
-    files::open_read_nofollow(path)
-}
-
 #[cfg(windows)]
 pub(crate) fn file_info(file: &std::fs::File) -> std::io::Result<(Option<(u64, u64)>, u32)> {
     use std::os::windows::io::AsRawHandle as _;
@@ -115,22 +110,10 @@ pub(crate) fn file_info(file: &std::fs::File) -> std::io::Result<(Option<(u64, u
     ))
 }
 
-#[cfg(windows)]
+/// The record must be a regular, unlinked file; Windows also refuses hard links.
 fn open_record(path: &Utf8Path) -> std::io::Result<std::fs::File> {
-    use std::os::windows::fs::{MetadataExt as _, OpenOptionsExt as _};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-    };
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() || metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-        return Err(std::io::Error::other(
-            "invalidation is not a regular, unlinked file",
-        ));
-    }
+    let file = crate::idempotency_refs::open_read_nofollow(path)?;
+    #[cfg(windows)]
     if file_info(&file)?.1 != 1 {
         return Err(std::io::Error::other("invalidation is hard-linked"));
     }
