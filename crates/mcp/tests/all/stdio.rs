@@ -204,6 +204,7 @@ async fn frozen_daemon_policy_reaches_normal_container_session_close() {
                 nonce: "invalid".into(),
                 boot_id: "boot".into(),
             }),
+            effects: None,
             commands: vec![McpCommandAccess {
                 argv: argv.clone(),
                 isolation: mcp::McpCommandIsolation::Container,

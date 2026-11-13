@@ -15,7 +15,7 @@ required-features = ["mcp-test-server"]
 
 [features]
 default = ["mcp-oauth"]
-mcp-oauth = ["dep:keyring-store", "dep:oauth2", "rmcp/auth"]
+mcp-oauth = ["dep:async-trait", "dep:keyring-store", "dep:oauth2", "rmcp/auth"]
 mcp-test-server = [
     "rmcp/server",
     "rmcp/transport-io",
@@ -23,7 +23,7 @@ mcp-test-server = [
 ]
 
 [dependencies]
-async-trait.workspace = true
+async-trait = { workspace = true, optional = true }
 bytes.workspace = true
 futures-util.workspace = true
 http.workspace = true
@@ -43,7 +43,7 @@ tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "r
 tokio-util.workspace = true
 tracing.workspace = true
 url.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
+uuid.workspace = true
 axum.workspace = true
