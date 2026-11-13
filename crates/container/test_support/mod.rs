@@ -90,7 +90,10 @@ case "$1" in
     ;;
   kill|stop|rm|delete)
     for last; do :; done
-    /bin/grep -vx -- "$last" "$root/instances" > "$root/instances.tmp"
+    : > "$root/instances.tmp"
+    while IFS= read -r line; do
+      [ "$line" = "$last" ] || printf '%s\n' "$line" >> "$root/instances.tmp"
+    done < "$root/instances"
     /bin/mv "$root/instances.tmp" "$root/instances"
     ;;
   profile) echo pool ;;
