@@ -26,6 +26,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
 
@@ -110,6 +111,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
           targets: wasm32-unknown-unknown
 
       - name: Cache cargo
@@ -165,6 +167,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
           targets: wasm32-unknown-unknown
 
       - name: Install pinned wasm-bindgen CLI
@@ -228,6 +231,8 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
 
       - name: Cache cargo
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
@@ -266,6 +271,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
         with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
           components: rustfmt, clippy
 
       - name: Cache cargo

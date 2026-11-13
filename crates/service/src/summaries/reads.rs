@@ -227,10 +227,7 @@ pub(crate) fn has_remote_cancel_request(run_dir: &Utf8Path) -> Result<bool, Serv
             return Ok(true);
         }
     }
-    if crate::run_dirs::has_pending_cancel_control(run_dir) {
-        return Ok(true);
-    }
-    Ok(false)
+    Ok(crate::run_dirs::has_pending_cancel_control(run_dir))
 }
 
 /// Durable records only. Status, HITL, queue order, and folding never need

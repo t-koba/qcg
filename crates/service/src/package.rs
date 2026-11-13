@@ -1118,15 +1118,12 @@ fn metadata_identity_matches(
     left: &std::fs::Metadata,
     right: &std::fs::Metadata,
 ) -> bool {
-    if left.is_dir() != is_dir
+    let differs = left.is_dir() != is_dir
         || right.is_dir() != is_dir
         || (!is_dir && (!left.is_file() || !right.is_file()))
         || explicit_source_mode(left, is_dir) != explicit_source_mode(right, is_dir)
         || (!is_dir && left.len() != right.len())
-        || left.modified().ok() != right.modified().ok()
-    {
-        return false;
-    }
+        || left.modified().ok() != right.modified().ok();
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -1138,7 +1135,7 @@ fn metadata_identity_matches(
             return false;
         }
     }
-    true
+    !differs
 }
 
 fn identity_metadata_matches(
