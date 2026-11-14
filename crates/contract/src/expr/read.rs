@@ -195,6 +195,12 @@ impl ReadRecorder {
         self.lock().clone()
     }
 
+    /// Whether additional bounded read evidence can still be retained.
+    pub fn is_recording(&self) -> bool {
+        let trace = self.lock();
+        !trace.overflow && !trace.poisoned
+    }
+
     /// Snapshot only a complete exact owner's reads, under one recorder lock.
     /// No unrelated owner payload is cloned at terminal outcome boundaries.
     pub fn complete_reads_for(&self, owner: &ReadOwner) -> Option<Vec<ReadDependency>> {
@@ -334,6 +340,7 @@ mod tests {
         let reads = ReadRecorder::new(1024).for_owner(ReadOwner::Node("node".into()));
         let path = vec!["inputs".into(), "name".into()];
         let identity = ReadIdentity::of(Some(&serde_json::json!("one")));
+        assert!(reads.is_recording());
         assert!(reads.record(&path, ReadKind::Lookup, identity.clone()));
         let bytes = reads.snapshot().retained_bytes;
         reads.set_byte_limit(bytes);
@@ -342,6 +349,7 @@ mod tests {
         assert!(!reads.record(&path, ReadKind::Collection, identity));
         let trace = reads.snapshot();
         assert!(trace.incomplete && trace.overflow);
+        assert!(!reads.is_recording());
         assert_eq!(trace.reads.len(), 1);
         assert_eq!(trace.retained_bytes, bytes);
         reads.set_byte_limit(0);

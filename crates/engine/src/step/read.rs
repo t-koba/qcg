@@ -2,22 +2,59 @@
 //! their lookup depends on the full scalar (including subsequent string indexes).
 use contract::{ReadIdentity, ReadKind, ReadRecorder};
 use minijinja::value::{Enumerator, Object, ObjectRepr, Value, ValueKind};
-use std::sync::Arc;
+use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 struct Tracked {
     value: Value,
     path: Vec<String>,
     reads: ReadRecorder,
+    collections: Arc<CollectionCache>,
+}
+
+/// Render-local memo for immutable collection paths; it is discarded with the context.
+#[derive(Debug, Default)]
+struct CollectionCache(Mutex<BTreeMap<Vec<String>, ReadIdentity>>);
+
+impl CollectionCache {
+    fn get_or_insert_with(
+        &self,
+        path: &[String],
+        build: impl FnOnce() -> ReadIdentity,
+    ) -> Option<ReadIdentity> {
+        let mut identities = self.0.lock().ok()?;
+        Some(
+            identities
+                .entry(path.to_vec())
+                .or_insert_with(build)
+                .clone(),
+        )
+    }
 }
 
 pub(super) fn context(value: Value, reads: ReadRecorder) -> Value {
-    wrap(value, Vec::new(), reads)
+    wrap(
+        value,
+        Vec::new(),
+        reads,
+        Arc::new(CollectionCache::default()),
+    )
 }
 
-fn wrap(value: Value, path: Vec<String>, reads: ReadRecorder) -> Value {
+fn wrap(
+    value: Value,
+    path: Vec<String>,
+    reads: ReadRecorder,
+    collections: Arc<CollectionCache>,
+) -> Value {
     if matches!(value.kind(), ValueKind::Map | ValueKind::Seq) {
-        Value::from_object(Tracked { value, path, reads })
+        Value::from_object(Tracked {
+            value,
+            path,
+            reads,
+            collections,
+        })
     } else {
         value
     }
@@ -51,11 +88,18 @@ impl Tracked {
     }
 
     fn collection(&self) {
-        self.reads.record(
-            &self.path,
-            ReadKind::Collection,
-            collection_identity(&self.value),
-        );
+        if !self.reads.is_recording() {
+            return;
+        }
+        let Some(identity) = self
+            .collections
+            .get_or_insert_with(&self.path, || collection_identity(&self.value))
+        else {
+            self.reads.unsupported();
+            return;
+        };
+        self.reads
+            .record(&self.path, ReadKind::Collection, identity);
     }
 }
 
@@ -91,7 +135,12 @@ impl Object for Tracked {
         if value.is_undefined() {
             None
         } else if retained {
-            Some(wrap(value, path, self.reads.clone()))
+            Some(wrap(
+                value,
+                path,
+                self.reads.clone(),
+                Arc::clone(&self.collections),
+            ))
         } else {
             // Once overflowed, do not retain more adapter paths either.
             Some(value)
@@ -135,6 +184,66 @@ mod tests {
         limits: &RuntimeLimits,
     ) -> Result<String, minijinja::Error> {
         TemplateService.render_bag_scoped(ReadOwner::Node("test".into()), source, bag, limits)
+    }
+
+    #[test]
+    fn collection_cache_builds_once_per_path() {
+        use std::cell::Cell;
+
+        let path = vec!["inputs".into(), "rows".into()];
+        let calls = Cell::new(0);
+        let cache = CollectionCache::default();
+        for _ in 0..2 {
+            assert_eq!(
+                cache.get_or_insert_with(&path, || {
+                    calls.set(calls.get() + 1);
+                    ReadIdentity::Digest([1; 32])
+                }),
+                Some(ReadIdentity::Digest([1; 32]))
+            );
+        }
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn overflow_skips_collection_identity_computation() {
+        let reads = ReadRecorder::new(0).for_owner(ReadOwner::Node("render".into()));
+        assert!(!reads.is_recording());
+        let collections = Arc::new(CollectionCache::default());
+        let tracked = Tracked {
+            value: Value::from_serialize(json!({"rows":[{"id":1}]})),
+            path: vec!["inputs".into(), "rows".into()],
+            reads,
+            collections: Arc::clone(&collections),
+        };
+
+        tracked.collection();
+
+        assert!(collections.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn collection_digest_cache_is_fresh_for_each_render_context() {
+        let mut bag = bag();
+        let limits = RuntimeLimits::default();
+        let source = "{% for _ in inputs.rows %}x{% endfor %}";
+        render_bag(source, &bag, &limits).unwrap();
+        let original = ReadIdentity::of(Some(&json!([{"a.b":"one"}, {"a.b":"two"}])));
+        assert!(bag.read_trace().reads.iter().any(|read| {
+            read.path == ["inputs", "rows"]
+                && read.kind == ReadKind::Collection
+                && read.identity == original
+        }));
+
+        let changed = json!([{"a.b":"changed"}]);
+        bag.patch_inputs(BTreeMap::from([("rows".into(), changed.clone())]));
+        assert_eq!(render_bag(source, &bag, &limits).unwrap(), "x");
+        let changed_identity = ReadIdentity::of(Some(&changed));
+        assert!(bag.read_trace().reads.iter().any(|read| {
+            read.path == ["inputs", "rows"]
+                && read.kind == ReadKind::Collection
+                && read.identity == changed_identity
+        }));
     }
 
     fn bag() -> ValueBag {
@@ -438,6 +547,7 @@ mod tests {
                 value: Value::from_serialize(json!({"x":1})),
                 path: vec!["inputs".into(), "map".into()],
                 reads: bag.read_recorder().for_owner(owner.clone()),
+                collections: Arc::new(CollectionCache::default()),
             });
             let native = tracked.value.get_item(&key).ok();
             let actual = tracked.get_value(&key);
