@@ -1129,10 +1129,16 @@ impl LocalService {
             .get(id)
             .map(|run| run.run_dir.clone());
         if let Some(run_dir) = memory {
+            if crate::run_dirs::fork_admission_pending(&run_dir).map_err(api_internal)? {
+                return Err(ApiError::not_found(format!("run `{id}` was not found")));
+            }
             return Ok(run_dir);
         }
         let run_dir = self.inner.runs_dir.join(id);
-        if !is_regular_file(&run_meta_dir(&run_dir).join("journal.jsonl")).map_err(api_internal)? {
+        if crate::run_dirs::fork_admission_pending(&run_dir).map_err(api_internal)?
+            || !is_regular_file(&run_meta_dir(&run_dir).join("journal.jsonl"))
+                .map_err(api_internal)?
+        {
             return Err(ApiError::not_found(format!("run `{id}` was not found")));
         }
         Ok(run_dir)

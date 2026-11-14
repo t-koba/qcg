@@ -17,6 +17,70 @@ use std::sync::Arc;
 use steps::deterministic_registry;
 use tokio_util::sync::CancellationToken;
 
+const FORK_ADMISSION_MARKER: &str = "fork-admission.pending";
+
+fn fork_admission_marker(run_dir: &Utf8Path) -> Utf8PathBuf {
+    run_meta_dir(run_dir).join(FORK_ADMISSION_MARKER)
+}
+
+/// A fresh fork is not a visible run until its own `run_queued` is durable.
+/// Readers check this marker while preparation copies the source journal.
+pub(crate) fn fork_admission_pending(run_dir: &Utf8Path) -> Result<bool, ServiceError> {
+    let metadata = run_meta_dir(run_dir);
+    match std::fs::symlink_metadata(&metadata) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(ServiceError::Invalid(format!(
+                "run metadata `{metadata}` is not a plain directory"
+            )));
+        }
+        Ok(_) => {}
+        Err(error) => return Err(ServiceError::Io(error)),
+    }
+    let marker = fork_admission_marker(run_dir);
+    match std::fs::symlink_metadata(&marker) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_file() => Err(ServiceError::Invalid(
+            format!("fork admission marker `{marker}` is not a plain file"),
+        )),
+        Ok(_) => Ok(true),
+        Err(error) => Err(ServiceError::Io(error)),
+    }
+}
+
+pub(crate) fn mark_fork_admission_pending(run_dir: &Utf8Path) -> Result<(), ServiceError> {
+    if fork_admission_pending(run_dir)? {
+        return Err(ServiceError::Invalid(
+            "fork admission marker already exists".into(),
+        ));
+    }
+    let marker = fork_admission_marker(run_dir);
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&marker)?;
+    file.sync_all()?;
+    sync_dir_entry(&run_meta_dir(run_dir))?;
+    Ok(())
+}
+
+pub(crate) fn clear_fork_admission_pending(run_dir: &Utf8Path) -> Result<(), ServiceError> {
+    if !fork_admission_pending(run_dir)? {
+        return Ok(());
+    }
+    let marker = fork_admission_marker(run_dir);
+    std::fs::remove_file(marker)?;
+    sync_dir_entry(&run_meta_dir(run_dir))?;
+    Ok(())
+}
+
+pub(crate) fn discard_pending_fork(run_dir: &Utf8Path) -> Result<(), ServiceError> {
+    if fork_admission_pending(run_dir)? {
+        wipe_incomplete_run_dir(run_dir)?;
+    }
+    Ok(())
+}
+
 fn journal_target(
     record: &RunRecord,
 ) -> Result<(String, Utf8PathBuf, JournalLimits), ServiceError> {
@@ -556,6 +620,9 @@ pub(crate) fn prepare_checkpoint_fork(
         Err(error) => return Err(ServiceError::Io(error)),
     };
     let result = prepare_api_run_directory(target_dir).and_then(|()| {
+        // The empty journal is ignored by list readers. Publish the marker
+        // before the first copied event can make this look like a live run.
+        mark_fork_admission_pending(target_dir)?;
         populate_checkpoint_fork(source_dir, source_id, target_dir, target_id, at_seq, patch)
     });
     if let Err(error) = result {
@@ -1289,16 +1356,18 @@ pub(crate) fn check_run_admission(
         .filter(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
         .filter_map(|event| event.get("seq").and_then(Value::as_u64))
         .max();
-    let initialized = events.iter().any(|event| {
-        event.get("t").and_then(Value::as_str) == Some("run_queued")
-            && event.get("run_id").and_then(Value::as_str) == Some(run_id)
-            && last_fork_seq.is_none_or(|fork_seq| {
-                event
-                    .get("seq")
-                    .and_then(Value::as_u64)
-                    .is_some_and(|seq| seq > fork_seq)
-            })
-    });
+    let pending_marker = fork_admission_pending(run_dir)?;
+    let initialized = (!pending_marker || last_fork_seq.is_some())
+        && events.iter().any(|event| {
+            event.get("t").and_then(Value::as_str) == Some("run_queued")
+                && event.get("run_id").and_then(Value::as_str) == Some(run_id)
+                && last_fork_seq.is_none_or(|fork_seq| {
+                    event
+                        .get("seq")
+                        .and_then(Value::as_u64)
+                        .is_some_and(|seq| seq > fork_seq)
+                })
+        });
     if !initialized {
         if let Some(fork_seq) = last_fork_seq {
             // Preparation writes only the fork marker and at most one pure
@@ -1325,6 +1394,12 @@ pub(crate) fn check_run_admission(
         // Under admission ownership, non-admission writers cannot change this verdict.
         wipe_incomplete_run_dir(run_dir)?;
         return Ok(false);
+    }
+    // A crash after the child's queue append but before marker removal leaves
+    // a complete, adoptable run. Clear visibility only after validating the
+    // same admission snapshot under the per-run lock.
+    if pending_marker {
+        clear_fork_admission_pending(run_dir)?;
     }
     Ok(true)
 }

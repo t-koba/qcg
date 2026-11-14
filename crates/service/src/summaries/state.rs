@@ -350,13 +350,20 @@ pub(crate) fn read_recovery_state(
 ) -> Result<Option<(Vec<Value>, RunState)>, ServiceError> {
     let meta_dir = run_meta_dir(run_dir);
     let journal_path = meta_dir.join("journal.jsonl");
-    if !is_regular_directory(run_dir)?
-        || !is_regular_directory(&meta_dir)?
-        || !is_regular_file(&journal_path)?
-    {
+    if !is_regular_directory(run_dir)? || !is_regular_directory(&meta_dir)? {
+        return Ok(None);
+    }
+    let pending_marker = crate::run_dirs::fork_admission_pending(run_dir)?;
+    if !is_regular_file(&journal_path)? {
+        if pending_marker {
+            crate::run_dirs::discard_pending_fork(run_dir)?;
+        }
         return Ok(None);
     }
     if journal_is_empty(&journal_path)? {
+        if pending_marker {
+            crate::run_dirs::discard_pending_fork(run_dir)?;
+        }
         return Ok(None);
     }
     // One bounded journal read serves the fold and every derivation
@@ -368,9 +375,10 @@ pub(crate) fn read_recovery_state(
         .file_name()
         .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
         .to_string();
-    if journal_values
-        .iter()
-        .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
+    if (pending_marker
+        || journal_values
+            .iter()
+            .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked")))
         && !crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state)?
     {
         // The shared admission gate wiped an incomplete fork while preserving

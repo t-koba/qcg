@@ -76,6 +76,11 @@ pub(crate) struct RunSelectorInfo {
 }
 
 pub(crate) fn run_selector_info(run_dir: &Utf8Path) -> Result<RunSelectorInfo, ServiceError> {
+    if crate::run_dirs::fork_admission_pending(run_dir)? {
+        return Err(ServiceError::Invalid(
+            "fork admission is not yet visible".into(),
+        ));
+    }
     let values = read_journal_events(run_dir)?;
     let state = engine::RunState::fold_values(&values).map_err(ServiceError::invalid)?;
     let events = values

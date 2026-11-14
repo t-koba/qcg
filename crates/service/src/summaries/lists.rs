@@ -28,7 +28,11 @@ pub fn list_run_summaries(
             ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
         })?;
         let journal_path = run_meta_dir(&path).join("journal.jsonl");
-        if !path.is_dir() || !journal_path.exists() || journal_is_empty(&journal_path)? {
+        if !path.is_dir()
+            || crate::run_dirs::fork_admission_pending(&path)?
+            || !journal_path.exists()
+            || journal_is_empty(&journal_path)?
+        {
             continue;
         }
         summaries.push(run_summary_with_seq(&path)?);
@@ -88,7 +92,10 @@ fn read_run(
 ) -> Result<Option<api::RunListItem>, ServiceError> {
     let path = runs_dir.join(name);
     let journal = run_meta_dir(&path).join("journal.jsonl");
-    if !is_regular_file(&journal)? || journal_is_empty(&journal)? {
+    if crate::run_dirs::fork_admission_pending(&path)?
+        || !is_regular_file(&journal)?
+        || journal_is_empty(&journal)?
+    {
         store.forget_view(&path);
         return Ok(None);
     }

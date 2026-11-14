@@ -77,6 +77,15 @@ impl LocalService {
             }
             return Err(api_internal(error));
         }
+        if is_fork
+            && fork_payload.is_some()
+            && let Err(error) = crate::run_dirs::clear_fork_admission_pending(&staged.run_dir)
+        {
+            Self::settle_refused_admission(&staged.run_dir).await;
+            return Err(api_internal(format!(
+                "fork queue was committed but its visibility marker could not be cleared: {error}"
+            )));
+        }
         if let Some(membership) = &mut membership {
             membership.admitted(&staged.run_dir);
         }

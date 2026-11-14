@@ -1725,6 +1725,7 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     // Exact crash window: transformed source queue + run_forked, and a
     // complete, loadable package, but no queue committed by the child.
     let admission = prepare();
+    assert!(crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap());
     let prefix = read_journal_events(&child.run_dir).unwrap();
     let folded = engine::RunState::fold_values(&prefix).unwrap();
     crate::run_package::load(&child.run_dir, &folded).unwrap();
@@ -1764,6 +1765,7 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     assert!(!recovered.contains_key("child"));
     assert_eq!(recovered["source"].state, RunStatus::Queued);
     assert!(!run_meta_dir(&child.run_dir).join("journal.jsonl").exists());
+    assert!(!crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap());
     assert!(!crate::run_package::package_dir(&child.run_dir).exists());
     assert_eq!(
         crate::run_dirs::list_pending_cancel_controls(&child.run_dir).unwrap()[0].0,
@@ -1803,6 +1805,10 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     assert_eq!(recovered["child"].state, RunStatus::Queued);
     assert_eq!(recovered["child"].priority, 7);
     assert_eq!(recovered["child"].parent_run_id.as_deref(), Some("source"));
+    assert!(
+        !crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap(),
+        "validated own admission clears the preparation marker"
+    );
     assert_eq!(read_journal_events(&child.run_dir).unwrap(), committed);
     assert_eq!(read_journal_events(&source.run_dir).unwrap(), source_before);
 }

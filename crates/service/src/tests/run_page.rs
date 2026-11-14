@@ -87,6 +87,62 @@ fn corrupt(runs: &Utf8Path, id: &str) {
 }
 
 #[tokio::test]
+async fn incomplete_fork_is_hidden_until_its_own_queue_is_committed() {
+    for mode in [RunStoreMode::Exclusive, RunStoreMode::SharedFilesystem] {
+        let root = temp_run_dir("run-page-incomplete-fork");
+        let _guard = TempGuard(root.clone());
+        let service = service_mode(&root, mode);
+        let run_dir = root.join("child");
+        let meta = run_dir.join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        crate::run_dirs::mark_fork_admission_pending(&run_dir).unwrap();
+        let journal =
+            engine::JournalWriter::create(&meta.join("journal.jsonl"), "child", false, None)
+                .unwrap();
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "demo@1.0.0", "generator_path": "demo",
+                    "contract_sha256": "test", "inputs": {}, "resource_hashes": [],
+                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                }),
+            )
+            .unwrap();
+        journal
+            .event(
+                "run_forked",
+                json!({"source_run_id": "source", "source_seq": 1}),
+            )
+            .unwrap();
+
+        // Force an authoritative directory census: even a partial journal
+        // that already looks like a running child is not a visible run.
+        service.inner.read_store.invalidate_index();
+        assert!(ids(&service, page(10)).await.is_empty());
+        assert!(service.run_dir_for("child").await.is_err());
+
+        journal
+            .event(
+                "run_queued",
+                json!({
+                    "generator": "demo@1.0.0", "generator_path": "demo",
+                    "contract_sha256": "test", "inputs": {},
+                    "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                    "priority": 0, "parent_run_id": "source",
+                }),
+            )
+            .unwrap();
+        crate::run_dirs::clear_fork_admission_pending(&run_dir).unwrap();
+        service.inner.read_store.invalidate_index();
+        assert_eq!(ids(&service, page(10)).await, ["child"]);
+        assert_eq!(service.run_dir_for("child").await.unwrap(), run_dir);
+    }
+}
+
+#[tokio::test]
 async fn a_page_validates_the_runs_it_examines_not_unrelated_history() {
     for mode in [RunStoreMode::Exclusive, RunStoreMode::SharedFilesystem] {
         let root = temp_run_dir("run-page-validation");
