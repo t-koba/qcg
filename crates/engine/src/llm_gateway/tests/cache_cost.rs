@@ -458,10 +458,10 @@ async fn unrepresentable_chat_charge_is_durable_and_blocks_after_reopen() {
     assert_eq!(marker["model"], "test");
     assert_eq!(marker["tokens"]["input"], 3_000_000_000_u64);
     assert_eq!(marker["liability"], "actual_cost_unrepresentable");
+    assert!(!super::super::complete::has_unresolved_reservation_for_test(&run_id));
 
     drop(gateway);
     drop(journal);
-    super::super::complete::clear_pending_for_test(&run_id);
     let replay = JournalWriter::create(&journal_path, &run_id, false, None).unwrap();
     assert!(replay.state().budget.unresolved_llm_cost);
     assert_eq!(replay.state().budget.tokens_input, 3_000_000_000);
@@ -586,6 +586,9 @@ async fn failed_liability_append_keeps_concurrent_admission_poisoned() {
     );
     assert!(!journal.state().budget.unresolved_llm_cost);
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(super::super::complete::has_unresolved_reservation_for_test(
+        &run_id
+    ));
 
     let node = test_node();
     let routes = [liability_pricing()];
@@ -602,6 +605,36 @@ async fn failed_liability_append_keeps_concurrent_admission_poisoned() {
                 .contains("unresolved LLM cost liability")
         );
     }
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(super::super::complete::has_unresolved_reservation_for_test(
+        &run_id
+    ));
+
+    drop(gateway);
+    drop(journal);
+    let terminal = JournalWriter::create(&dir.join("journal.jsonl"), &run_id, false, None).unwrap();
+    terminal
+        .event(
+            "run_finished",
+            json!({ "status": "failed", "failures": [], "metrics": model::RunMetrics::default() }),
+        )
+        .unwrap();
+    super::super::complete::release_terminal_reservations(&terminal);
+    assert!(!super::super::complete::has_unresolved_reservation_for_test(&run_id));
+
+    let terminal_gateway = LlmGateway::new(
+        provider.clone(),
+        &secrets,
+        &terminal,
+        CancellationToken::new(),
+        no_budget(),
+        vec![],
+    );
+    let terminal_error = terminal_gateway
+        .complete(&node, test_request(), &routes, |_| json!({}))
+        .await
+        .expect_err("terminal journals must not dispatch further work");
+    assert!(terminal_error.to_string().contains("run is terminal"));
     assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 

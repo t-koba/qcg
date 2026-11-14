@@ -21,6 +21,7 @@ pub use effects::JournalEffects;
 pub use engine::*;
 pub use gateway::*;
 pub use journal::*;
+pub(crate) use llm_gateway::release_terminal_reservations;
 pub use llm_gateway::*;
 pub use mcp_form::*;
 pub use resource::*;

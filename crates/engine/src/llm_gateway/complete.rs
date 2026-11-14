@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 struct PendingReservation {
     tokens: u64,
     cost_microusd: u64,
-    unresolved_cost: bool,
+    unresolved_cost_writes: u64,
+    unresolved_cost_poisoned: bool,
 }
 
 fn reservations() -> &'static Mutex<BTreeMap<String, PendingReservation>> {
@@ -28,11 +29,64 @@ fn reservations() -> &'static Mutex<BTreeMap<String, PendingReservation>> {
 }
 
 #[cfg(test)]
-pub(super) fn clear_pending_for_test(run_id: &str) {
+pub(super) fn has_unresolved_reservation_for_test(run_id: &str) -> bool {
     reservations()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .remove(run_id);
+        .get(run_id)
+        .is_some_and(|entry| entry.unresolved_cost_writes > 0 || entry.unresolved_cost_poisoned)
+}
+
+fn begin_unresolved_cost_write(run_id: &str) -> bool {
+    let mut map = reservations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = map.entry(run_id.to_owned()).or_default();
+    if let Some(count) = entry.unresolved_cost_writes.checked_add(1) {
+        entry.unresolved_cost_writes = count;
+        true
+    } else {
+        entry.unresolved_cost_poisoned = true;
+        false
+    }
+}
+
+fn finish_unresolved_cost_write(run_id: &str, tracked: bool, durable: bool) {
+    let mut map = reservations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(entry) = map.get_mut(run_id) else {
+        return;
+    };
+    if tracked {
+        if let Some(count) = entry.unresolved_cost_writes.checked_sub(1) {
+            entry.unresolved_cost_writes = count;
+        } else {
+            entry.unresolved_cost_poisoned = true;
+        }
+    }
+    if !durable {
+        entry.unresolved_cost_poisoned = true;
+    }
+    if entry.tokens == 0
+        && entry.cost_microusd == 0
+        && entry.unresolved_cost_writes == 0
+        && !entry.unresolved_cost_poisoned
+    {
+        map.remove(run_id);
+    }
+}
+
+pub(super) fn release_terminal_reservations(journal: &JournalWriter) {
+    let state = journal.state();
+    if state.terminal.is_some()
+        && let Some(run_id) = state.run_id
+    {
+        reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&run_id);
+    }
 }
 
 struct DecisionReservationGuard {
@@ -79,7 +133,11 @@ fn release_pending(run_id: &str, reservation: &PendingReservation) {
         entry.cost_microusd = entry
             .cost_microusd
             .saturating_sub(reservation.cost_microusd);
-        if entry.tokens == 0 && entry.cost_microusd == 0 && !entry.unresolved_cost {
+        if entry.tokens == 0
+            && entry.cost_microusd == 0
+            && entry.unresolved_cost_writes == 0
+            && !entry.unresolved_cost_poisoned
+        {
             map.remove(run_id);
         }
     }
@@ -170,7 +228,8 @@ impl<'a> LlmGateway<'a> {
         let reservation = PendingReservation {
             tokens,
             cost_microusd,
-            unresolved_cost: false,
+            unresolved_cost_writes: 0,
+            unresolved_cost_poisoned: false,
         };
         self.try_reserve(Some(reservation.clone()))?;
         let _guard = DecisionReservationGuard {
@@ -358,12 +417,33 @@ impl<'a> LlmGateway<'a> {
         Ok(bounded.then_some(PendingReservation {
             tokens,
             cost_microusd,
-            unresolved_cost: false,
+            unresolved_cost_writes: 0,
+            unresolved_cost_poisoned: false,
         }))
     }
 
     fn try_reserve(&self, reservation: Option<PendingReservation>) -> Result<(), StepError> {
+        let run_id = run_id_of(self.journal);
+        let mut map = reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = map.get(&run_id).cloned().unwrap_or_default();
+        if current.unresolved_cost_writes > 0 || current.unresolved_cost_poisoned {
+            return Err(StepError::failed(
+                "budget",
+                "run has unresolved LLM cost liability; refusing further spend",
+            ));
+        }
+        // Read the fold while holding the reservation lock: a marker can be
+        // durably appended and its transient poison cleared between an
+        // earlier state read and admission otherwise.
         let state = self.journal.state();
+        if state.terminal.is_some() {
+            return Err(StepError::failed(
+                "budget",
+                "run is terminal; refusing further LLM spend",
+            ));
+        }
         if state.budget.unresolved_llm_cost {
             return Err(StepError::failed(
                 "budget",
@@ -374,17 +454,6 @@ impl<'a> LlmGateway<'a> {
             return Err(StepError::failed(
                 "budget",
                 "run has unresolved hosted search cost; refusing blind spend",
-            ));
-        }
-        let run_id = run_id_of(self.journal);
-        let mut map = reservations()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = map.get(&run_id).cloned().unwrap_or_default();
-        if current.unresolved_cost {
-            return Err(StepError::failed(
-                "budget",
-                "run has unresolved LLM cost liability; refusing further spend",
             ));
         }
         let Some(reservation) = reservation else {
@@ -418,7 +487,8 @@ impl<'a> LlmGateway<'a> {
                 PendingReservation {
                     tokens: next_tokens,
                     cost_microusd: next_cost,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 },
             );
         }
@@ -627,13 +697,8 @@ impl<'a> LlmGateway<'a> {
         usage: &TokenUsage,
     ) -> Result<(), StepError> {
         let run_id = run_id_of(self.journal);
-        {
-            let mut map = reservations()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.entry(run_id).or_default().unresolved_cost = true;
-        }
-        if let Err(error) = self
+        let tracked = begin_unresolved_cost_write(&run_id);
+        let write_result = self
             .journal
             .event(
                 "llm_cost_unresolved",
@@ -645,8 +710,9 @@ impl<'a> LlmGateway<'a> {
                     "liability": "actual_cost_unrepresentable"
                 }),
             )
-            .step_err(&node.id)
-        {
+            .step_err(&node.id);
+        finish_unresolved_cost_write(&run_id, tracked, write_result.is_ok());
+        if let Err(error) = write_result {
             return Err(StepError::failed(
                 &node.id,
                 format!(
@@ -1248,7 +1314,8 @@ mod budget_overflow_tests {
                 .try_reserve(Some(PendingReservation {
                     tokens: 1,
                     cost_microusd: 0,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 }))
                 .is_err()
         );
@@ -1260,24 +1327,28 @@ mod budget_overflow_tests {
                 PendingReservation {
                     tokens: u64::MAX,
                     cost_microusd: 0,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 },
                 PendingReservation {
                     tokens: 1,
                     cost_microusd: 0,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 },
             ),
             (
                 PendingReservation {
                     tokens: 0,
                     cost_microusd: u64::MAX,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 },
                 PendingReservation {
                     tokens: 0,
                     cost_microusd: 1,
-                    unresolved_cost: false,
+                    unresolved_cost_writes: 0,
+                    unresolved_cost_poisoned: false,
                 },
             ),
         ] {

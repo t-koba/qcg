@@ -168,6 +168,7 @@ impl Engine {
                 )?;
             }
             cancellation.cancel();
+            crate::release_terminal_reservations(&journal);
         }
         result
     }
@@ -226,6 +227,7 @@ impl Engine {
                 )?;
             }
             cancellation.cancel();
+            crate::release_terminal_reservations(&journal);
         }
         result
     }
@@ -1424,6 +1426,7 @@ impl Engine {
                 "run_finished",
                 json!({ "status": "failed", "failures": failed }),
             )?;
+            crate::release_terminal_reservations(&journal);
             // Distinct execution errors keep their classification (E11)
             // after hooks observed the failure (F07-01): hooks ran, the
             // journal shows the failure, but the caller still sees the
@@ -1467,6 +1470,7 @@ impl Engine {
         }
         super::elapsed::close(&mut episode, &journal)?;
         journal.event("run_finished", json!({ "status": "success" }))?;
+        crate::release_terminal_reservations(&journal);
         Ok(outputs)
         }.await;
         // Bounded normal retirement: clean only this run's tree. Failures
