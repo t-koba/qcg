@@ -9,6 +9,11 @@ mod types;
 pub use reuse::ReuseSource;
 pub use types::*;
 
+/// Release in-process reservations once a run's terminal state is durable.
+pub(crate) fn release_terminal_reservations(journal: &crate::JournalWriter) {
+    complete::release_terminal_reservations(journal);
+}
+
 #[cfg(test)]
 mod tests {
     #[path = "cache_cost.rs"]
@@ -856,9 +861,4 @@ mod tests {
             params: Default::default(),
         }
     }
-}
-
-/// Release in-process reservations once a run's terminal state is durable.
-pub(crate) fn release_terminal_reservations(journal: &crate::JournalWriter) {
-    complete::release_terminal_reservations(journal);
 }
