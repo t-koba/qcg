@@ -699,9 +699,12 @@ Restart and bounded historical folds validate records against the durable
 outcome events, including when adopting `state.json`; the cache never stores
 or supplies trusted traces. Missing/legacy, malformed, unsupported, mismatched,
 overflowed, or over-limit evidence is incomplete, not an ordinary replay
-failure. Symlink and non-regular trace files are refused; Unix also refuses
-multiply linked files. Non-Unix leaf checks are best-effort. Private
-line/stream/count bounds reuse the configured journal limits
+failure. Trace files are owner-only: Unix creates mode `0600` and validates the
+current uid and single-link regular-file identity; Windows uses a protected
+DACL granting access only to the verified current owner. Symlink, reparse,
+hard-linked, permissive, or differently owned files are refused. Other targets
+without a verifiable owner-only access mechanism do not read or write trace
+evidence. Private line/stream/count bounds reuse the configured journal limits
 (and their defaults); retained validated traces additionally use the state
 byte bound. Trace I/O or bound failures disable further evidence writes for
 that writer without changing ordinary success/failure results. Historical

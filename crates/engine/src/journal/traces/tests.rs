@@ -448,6 +448,27 @@ fn concurrent_owners_and_foreach_iteration_bindings_are_not_lost_or_duplicated()
 
 #[cfg(unix)]
 #[test]
+fn permissive_trace_files_are_ignored_without_changing_run_outcomes() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let f = Fixture::new();
+    let writer = f.writer().with_read_recorder(reads("private")).unwrap();
+    finish(&writer, "private", "success");
+    drop(writer);
+
+    let trace = f.path.with_file_name(FILE_NAME);
+    let mut permissions = std::fs::metadata(&trace).unwrap().permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&trace, permissions).unwrap();
+
+    let state = f.fold();
+    assert_success(&state, "private");
+    assert!(state.dependency_traces.owners.is_empty());
+    assert!(f.writer().state().dependency_traces.owners.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
 fn private_evidence_cannot_alias_the_public_journal() {
     for symlink in [true, false] {
         let f = Fixture::new();

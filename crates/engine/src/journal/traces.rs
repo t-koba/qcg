@@ -8,7 +8,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::fs::OpenOptions;
+mod private_file;
+use private_file::{Access as TraceAccess, open as open_private_trace};
 use std::io::{Read, Seek, SeekFrom, Write};
 
 // Wire-format version, not a configurable policy limit.
@@ -295,14 +296,13 @@ impl TraceJournal {
         let path = path.with_file_name(FILE_NAME);
         // Unlike the public crash-repair reader, evidence must be newline
         // terminated. Never ignore a partial final record or append after it.
-        let mut file = match files::open_read_nofollow(&path) {
+        let mut file = match open_private_trace(&path, TraceAccess::Read) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 return Some((Vec::new(), JournalStats::default()));
             }
             Err(_) => return None,
         };
-        check_private_file(&file.metadata().ok()?).ok()?;
         if file.metadata().ok()?.len() > 0 {
             file.seek(SeekFrom::End(-1)).ok()?;
             let mut last = [0];
@@ -377,11 +377,8 @@ impl TraceJournal {
                 .as_mut()
                 .ok_or_else(|| std::io::Error::other("trace stream disabled"))?;
             let trace_path = path.with_file_name(FILE_NAME);
-            let len = match std::fs::metadata(&trace_path) {
-                Ok(metadata) => metadata.len(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
-                Err(error) => return Err(error.into()),
-            };
+            let mut file = open_private_trace(&trace_path, TraceAccess::Append)?;
+            let len = file.metadata()?.len();
             if len < stats.bytes as u64 {
                 return Err(std::io::Error::other("trace stream shrank").into());
             }
@@ -396,19 +393,6 @@ impl TraceJournal {
             // A private record must never become durable ahead of its outcome.
             // Failure of this extra sync only removes continuation evidence.
             durable_file.sync_data()?;
-            let mut options = OpenOptions::new();
-            options.create(true).append(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt as _;
-                options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-            }
-            #[cfg(not(unix))]
-            if let Ok(metadata) = std::fs::symlink_metadata(&trace_path) {
-                check_private_file(&metadata)?;
-            }
-            let mut file = options.open(&trace_path)?;
-            check_private_file(&file.metadata()?)?;
             super::append_serialized_json_line(&mut file, bytes, stats, limits)?;
             file.sync_data()?;
             super::writer::sync_parent_dir(&trace_path)?;
@@ -420,23 +404,6 @@ impl TraceJournal {
             self.stats = None;
             state.dependency_traces = OutcomeTraces::default();
         }
-    }
-}
-
-// Never let optional evidence alias a public journal (including hard links),
-// or block ordinary execution on a special file. Unix opens are no-follow and
-// nonblocking; other platforms use the existing best-effort leaf checks.
-fn check_private_file(metadata: &std::fs::Metadata) -> std::io::Result<()> {
-    let regular = metadata.file_type().is_file();
-    #[cfg(unix)]
-    let regular = {
-        use std::os::unix::fs::MetadataExt as _;
-        regular && metadata.nlink() == 1
-    };
-    if regular {
-        Ok(())
-    } else {
-        Err(std::io::Error::other("invalid private trace file"))
     }
 }
 
