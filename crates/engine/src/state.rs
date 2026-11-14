@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 9;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 10;
 
 fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
@@ -77,10 +77,15 @@ pub struct BudgetState {
     #[serde(deserialize_with = "required_presence")]
     pub elapsed: Option<api::ElapsedAccountedEventData>,
     pub steps_executed: usize,
-    /// Durable consumption (F13): `budget_charged` deltas shared by live/recovered
-    /// retry and foreach accounting; `steps_executed` only observes starts.
+    /// Durable charge deltas shared by live/recovered retry and foreach accounting.
     pub budget_charged: usize,
-    /// Resume from charged deltas when present, otherwise from observed starts.
+    /// Inherited legacy usage captured at a durable resume/fork boundary before new deltas.
+    #[serde(default)]
+    pub step_budget_seed: Option<usize>,
+    /// Legacy retries/foreach executions before the charge ledger have no exact charge proof.
+    #[serde(default)]
+    pub legacy_step_budget_unknown: bool,
+    /// True when at least one `budget_charged` delta has been recorded.
     pub has_budget_charges: bool,
     pub steps_succeeded: u64,
     pub steps_failed: u64,
@@ -100,6 +105,30 @@ pub struct BudgetState {
     pub unresolved_search_cost: bool,
     #[serde(deserialize_with = "required_presence")]
     pub started_at: Option<String>,
+}
+
+impl BudgetState {
+    fn seed_legacy_usage(&mut self) {
+        if self.step_budget_seed.is_none()
+            && !self.has_budget_charges
+            && !self.legacy_step_budget_unknown
+        {
+            self.step_budget_seed = Some(self.steps_executed);
+        }
+    }
+
+    pub(crate) fn step_budget_consumed(&self) -> Result<usize, &'static str> {
+        if self.legacy_step_budget_unknown {
+            return Err("legacy retry or foreach history has no exact step-budget charge proof");
+        }
+        let (seed, deltas) = match self.step_budget_seed {
+            Some(seed) => (seed, self.budget_charged),
+            None if self.has_budget_charges => (0, self.budget_charged),
+            None => (0, self.steps_executed),
+        };
+        seed.checked_add(deltas)
+            .ok_or("step-budget consumption overflowed")
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -630,6 +659,9 @@ impl RunState {
                         .get("parent_run_id")
                         .and_then(Value::as_str)
                         .map(str::to_string);
+                    if self.parent_run_id.is_some() {
+                        self.budget.seed_legacy_usage();
+                    }
                     // Requeue order survives restarts. Preemption may
                     // carry a preserved `queued_at` key; otherwise the actual
                     // event timestamp becomes the new key (C04).
@@ -665,6 +697,12 @@ impl RunState {
             }
             "run_resumed" => {
                 self.terminal = None;
+                self.budget.seed_legacy_usage();
+            }
+            "step_retry" | "foreach_iteration" => {
+                if !self.budget.has_budget_charges {
+                    self.budget.legacy_step_budget_unknown = true;
+                }
             }
             "step_started" => {
                 // Budget counters overflow fail closed: saturating would
@@ -738,7 +776,7 @@ impl RunState {
                     .ok_or_else(|| {
                         crate::JournalError::InvalidEvent("budget charge count overflowed".into())
                     })?;
-                self.budget.has_budget_charges = true;
+                self.budget.has_budget_charges = self.budget.budget_charged > 0;
             }
             "llm_call" => {
                 self.budget.llm_calls = self.budget.llm_calls.checked_add(1).ok_or_else(|| {
@@ -2066,6 +2104,122 @@ mod tests {
             error.to_string().contains("non-negative integer"),
             "{error}"
         );
+        let mut zero = RunState::default();
+        zero.apply(&json!({"t": "budget_charged", "seq": 1, "node": "a", "amount": 0}))
+            .expect("a zero delta is a no-op");
+        assert_eq!(zero.budget.budget_charged, 0);
+        assert!(!zero.budget.has_budget_charges);
+    }
+
+    #[test]
+    fn legacy_step_budget_seed_survives_new_deltas_and_a_second_resume() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({"t":"step_started", "seq":1, "node":"legacy"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"run_resumed", "seq":2, "run_id":"run"}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, Some(1));
+        assert_eq!(state.budget.step_budget_consumed(), Ok(1));
+
+        state
+            .apply(&json!({"t":"step_started", "seq":3, "node":"new-1"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":4, "node":"new-1", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(2));
+
+        state
+            .apply(&json!({"t":"run_resumed", "seq":5, "run_id":"run"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":6, "node":"new-2"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":7, "node":"new-2", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, Some(1));
+        assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+    }
+
+    #[test]
+    fn fork_inherits_legacy_step_budget_before_new_charges() {
+        let mut state = RunState {
+            run_id: Some("source".into()),
+            ..RunState::default()
+        };
+        state.budget.steps_executed = 4;
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":1, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .expect("fork admission should fold");
+        assert_eq!(state.budget.step_budget_seed, Some(4));
+        state
+            .apply(&json!({"t":"budget_charged", "seq":2, "node":"new", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(5));
+    }
+
+    #[test]
+    fn fork_with_charge_deltas_does_not_double_count_step_starts() {
+        let mut state = RunState {
+            run_id: Some("source".into()),
+            ..RunState::default()
+        };
+        state
+            .apply(&json!({"t":"step_started", "seq":1, "node":"prior-1"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":2, "node":"prior-2"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":3, "node":"prior", "amount":2}))
+            .unwrap();
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":4, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .expect("fork admission should fold");
+        assert_eq!(state.budget.step_budget_seed, None);
+        assert_eq!(state.budget.step_budget_consumed(), Ok(2));
+        state
+            .apply(&json!({"t":"budget_charged", "seq":5, "node":"new", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+    }
+
+    #[test]
+    fn legacy_retry_and_foreach_without_charges_refuse_a_seed() {
+        for event in [
+            json!({"t":"step_retry", "seq":2, "node":"legacy", "attempt":1}),
+            json!({"t":"foreach_iteration", "seq":2, "node":"legacy_each", "index":0}),
+        ] {
+            let mut state = RunState::default();
+            state
+                .apply(&json!({"t":"step_started", "seq":1, "node":"legacy"}))
+                .unwrap();
+            state.apply(&event).unwrap();
+            state
+                .apply(&json!({"t":"run_resumed", "seq":3, "run_id":"run"}))
+                .unwrap();
+            assert!(state.budget.legacy_step_budget_unknown);
+            assert!(state.budget.step_budget_seed.is_none());
+            assert!(state.budget.step_budget_consumed().is_err());
+        }
+    }
+
+    #[test]
+    fn step_budget_seed_addition_overflow_fails_closed() {
+        let mut state = RunState::default();
+        state.budget.step_budget_seed = Some(usize::MAX);
+        state.budget.budget_charged = 1;
+        state.budget.has_budget_charges = true;
+        assert!(state.budget.step_budget_consumed().is_err());
     }
 
     #[test]

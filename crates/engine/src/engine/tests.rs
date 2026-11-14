@@ -5330,6 +5330,8 @@ async fn foreach_single_charge_matches_live_and_fold() {
         state.budget.has_budget_charges,
         "resume must seed from the delta, not the six starts"
     );
+    assert_eq!(state.budget.step_budget_consumed(), Ok(1));
+    assert!(!state.budget.legacy_step_budget_unknown);
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
@@ -5383,6 +5385,85 @@ async fn budget_charges_match_attempts_live_and_after_fold() {
     assert!(
         state.budget.has_budget_charges,
         "new journals must seed from charges, not event counts"
+    );
+    assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+    assert!(!state.budget.legacy_step_budget_unknown);
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
+#[tokio::test]
+async fn legacy_retry_without_charge_ledger_refuses_resume_before_writing() {
+    let run_dir = temp_run_dir("legacy-budget-retry");
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(run_dir.join("meta").as_std_path()).unwrap();
+    let contract = test_contract(&run_dir, manifest(vec![node("next", "test.pass")]));
+    let run_id = "legacy-budget-retry";
+    let journal_path = run_dir.join("meta/journal.jsonl");
+    let journal = crate::JournalWriter::create(&journal_path, run_id, false, None)
+        .expect("legacy journal should open");
+    journal
+        .event(
+            "run_started",
+            json!({
+                "run_id": run_id,
+                "generator": "test@1.0.0",
+                "generator_path": contract.root,
+                "contract_sha256": contract.sha256,
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::default(),
+                "retention_days": contract.manifest.retention.days,
+            }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "step_started",
+            json!({ "node": "legacy", "type": "test.pass", "attempt": 1 }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "step_retry",
+            json!({ "node": "legacy", "attempt": 1, "max_attempts": 2, "error": "legacy failure" }),
+        )
+        .unwrap();
+    drop(journal);
+    // Older journals kept observations beside durable events; the current
+    // writer stores this retry in audit.jsonl, so reproduce the legacy layout.
+    let retry = std::fs::read(run_dir.join("meta/audit.jsonl")).unwrap();
+    use std::io::Write as _;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&journal_path)
+        .unwrap()
+        .write_all(&retry)
+        .unwrap();
+    let before = std::fs::read(&journal_path).unwrap();
+
+    let mut registry = StepRegistry::new();
+    registry.register(TestPassStep);
+    let error = Engine::new(registry)
+        .run_with_id(
+            run_id.into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("legacy retry charges cannot be proven");
+    assert!(
+        error
+            .to_string()
+            .contains("legacy retry or foreach history"),
+        "{error}"
+    );
+    assert_eq!(
+        std::fs::read(&journal_path).unwrap(),
+        before,
+        "refusal must not append a misleading resume marker"
     );
     let _ = std::fs::remove_dir_all(&run_dir);
 }

@@ -488,6 +488,20 @@ impl Engine {
             audit_limits,
         )?;
         let replay = JournalReplay::from_state(journal.state());
+        if replay.state.budget.legacy_step_budget_unknown {
+            return Err(EngineError::Failed(format!(
+                "cannot safely resume run `{requested_run_id}`: legacy retry or foreach history has no exact step-budget charge proof"
+            )));
+        }
+        let inherited_steps = replay
+            .state
+            .budget
+            .step_budget_consumed()
+            .map_err(|error| {
+                EngineError::Failed(format!(
+                    "cannot safely resume run `{requested_run_id}`: {error}"
+                ))
+            })?;
         replay
             .state
             .ensure_no_fail_closed_inflight_operations()
@@ -744,14 +758,7 @@ impl Engine {
             options
                 .max_total_steps
                 .min(context.contract.manifest.budget.max_steps),
-            // Durable budget seed (F13): journals with `budget_charged`
-            // deltas resume from the same consumption live execution saw;
-            // journals without the event seed from `steps_executed`.
-            if replay.state.budget.has_budget_charges {
-                replay.state.budget.budget_charged
-            } else {
-                replay.state.budget.steps_executed
-            },
+            inherited_steps,
         );
         let max_parallel_steps = options.max_parallel_steps.max(1);
         let mut states: BTreeMap<String, NodeState> = context
