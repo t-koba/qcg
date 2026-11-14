@@ -505,10 +505,10 @@ fn failed_history() -> Vec<Value> {
             "contract_sha256":"test", "inputs":{},
             "schema_version":api::JOURNAL_SCHEMA_VERSION, "elapsed_budget_mode":"wall_clock"}),
         json!({"t":"graph_resolved", "nodes":["a", "b"]}),
-        json!({"t":"step_started", "node":"a", "type":"check.schema", "attempt":1}),
+        json!({"t":"step_started", "node":"a", "type":"check.format", "attempt":1}),
         json!({"t":"budget_charged", "node":"a", "amount":1}),
         json!({"t":"step_finished", "node":"a", "status":"success"}),
-        json!({"t":"step_started", "node":"b", "type":"fail", "attempt":1, "parallel":false}),
+        json!({"t":"step_started", "node":"b", "type":"check.format", "attempt":1, "parallel":false}),
         json!({"t":"budget_charged", "node":"b", "amount":1}),
         json!({"t":"step_finished", "node":"b", "status":"failed", "parallel":false}),
         json!({"t":"elapsed_accounted", "active_nanoseconds":1, "active_started_at":null}),
@@ -679,6 +679,18 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
             "{kind}"
         );
     }
+    // This is a lifecycle proof, not executor authorization. A step type string
+    // alone does not establish read-only behavior; continuation must separately
+    // consult the current executor/contract safety gate before reusing any node.
+    for step_type in ["llm.generate", "command", "custom.unknown"] {
+        let mut events = failed_history();
+        events[2]["type"] = json!(step_type);
+        number_history(&mut events);
+        assert!(
+            history::proves_failed_history(&events, &traces, limits).is_some(),
+            "executor classification is outside the lifecycle proof: {step_type}"
+        );
+    }
     for (index, field, value) in [
         (0, "schema_version", json!(1)),
         (0, "parent_run_id", json!("parent")),
@@ -689,9 +701,6 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
         (2, "node", json!("each[0]/child")),
         (2, "node", json!("a@repair.check")),
         (2, "type", json!("foreach")),
-        (2, "type", json!("llm.generate")),
-        (2, "type", json!("command")),
-        (2, "type", json!("custom.unknown")),
         (3, "amount", json!(0)),
         (3, "amount", json!(2)),
         (3, "node", json!("b")),
