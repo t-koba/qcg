@@ -488,3 +488,291 @@ fn private_evidence_cannot_alias_the_public_journal() {
         assert!(f.writer().state().dependency_traces.owners.is_empty());
     }
 }
+
+fn number_history(events: &mut [Value]) {
+    for (index, event) in events.iter_mut().enumerate() {
+        event["seq"] = json!(index + 1);
+        event["ts"] = json!("2026-01-01T00:00:00Z");
+        event["run_id"] = json!("dependencies");
+        event["trace_id"] = json!(api::trace_id_for_run("dependencies"));
+        event["span_id"] = json!(api::span_id_for_seq((index + 1) as u64));
+    }
+}
+
+fn failed_history() -> Vec<Value> {
+    let mut events = vec![
+        json!({"t":"run_started", "generator":"test", "generator_path":"test",
+            "contract_sha256":"test", "inputs":{},
+            "schema_version":api::JOURNAL_SCHEMA_VERSION, "elapsed_budget_mode":"wall_clock"}),
+        json!({"t":"graph_resolved", "nodes":["a", "b"]}),
+        json!({"t":"step_started", "node":"a", "type":"check.schema", "attempt":1}),
+        json!({"t":"budget_charged", "node":"a", "amount":1}),
+        json!({"t":"step_finished", "node":"a", "status":"success"}),
+        json!({"t":"step_started", "node":"b", "type":"fail", "attempt":1, "parallel":false}),
+        json!({"t":"budget_charged", "node":"b", "amount":1}),
+        json!({"t":"step_finished", "node":"b", "status":"failed", "parallel":false}),
+        json!({"t":"elapsed_accounted", "active_nanoseconds":1, "active_started_at":null}),
+        // Summary counters deliberately do not prove execution or dependencies.
+        json!({"t":"run_finished", "status":"failed", "metrics":model::RunMetrics::default()}),
+    ];
+    number_history(&mut events);
+    events
+}
+
+fn retain_history(f: &Fixture, events: &[Value]) {
+    let text = events
+        .iter()
+        .map(|event| format!("{event}\n"))
+        .collect::<String>();
+    std::fs::write(&f.path, text).unwrap();
+    let records = events
+        .iter()
+        .filter_map(|event| {
+            let owner = trace_owner(event)?;
+            Record::capture(event, Some(&reads(&owner)))
+                .map(|record| serde_json::to_value(record).unwrap())
+        })
+        .collect::<Vec<_>>();
+    f.replace(&records);
+    crate::journal::writer::write_clean_shutdown_marker(&f.path).unwrap();
+}
+
+#[test]
+fn failed_restore_requires_history_without_changing_public_replay() {
+    for queued in [false, true] {
+        for run_error in [false, true] {
+            let f = Fixture::new();
+            let mut events = failed_history();
+            if queued {
+                let mut admission = events[0].clone();
+                admission["t"] = json!("run_queued");
+                events.insert(0, admission);
+            }
+            if run_error {
+                *events.last_mut().unwrap() = json!({"t":"run_error", "error":"failed"});
+            }
+            number_history(&mut events);
+            retain_history(&f, &events);
+            let state = f.fold();
+            assert_eq!(state.terminal, Some(crate::TerminalState::Failed));
+            assert_trace(&state, "a", 5 + u64::from(queued));
+            assert_trace(&state, "b", 8 + u64::from(queued));
+            assert_trace(&f.writer().state(), "b", 8 + u64::from(queued));
+        }
+    }
+    let f = Fixture::new();
+    let mut events = failed_history();
+    events.insert(
+        3,
+        json!({"t":"step_retry", "node":"a", "attempt":2,
+        "max_attempts":2, "error":"retry"}),
+    );
+    number_history(&mut events);
+    retain_history(&f, &events);
+    let before = std::fs::read(&f.path).unwrap();
+    let expected = serde_json::to_value(RunState::fold_values(&events).unwrap()).unwrap();
+    for state in [f.fold(), f.writer().state()] {
+        assert_eq!(serde_json::to_value(&state).unwrap(), expected);
+        assert!(state.dependency_traces.owners.is_empty());
+    }
+    assert_eq!(std::fs::read(&f.path).unwrap(), before);
+}
+
+#[test]
+fn failed_history_requires_clean_marker_and_newline_terminated_journal() {
+    let f = Fixture::new();
+    let events = failed_history();
+    retain_history(&f, &events);
+    assert_eq!(f.fold().dependency_traces.owners.len(), 2);
+
+    let mut bytes = std::fs::read(&f.path).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    std::fs::write(&f.path, &bytes).unwrap();
+    let unterminated = f.fold();
+    assert_eq!(unterminated.terminal, Some(crate::TerminalState::Failed));
+    assert!(unterminated.dependency_traces.owners.is_empty());
+    bytes.push(b'\n');
+    std::fs::write(&f.path, bytes).unwrap();
+
+    let marker = crate::journal::writer::clean_shutdown_marker_path(&f.path);
+    std::fs::remove_file(&marker).unwrap();
+    let without_marker = f.fold();
+    assert_eq!(without_marker.terminal, Some(crate::TerminalState::Failed));
+    assert!(without_marker.dependency_traces.owners.is_empty());
+
+    // Startup repair may complete valid JSON lacking its final newline. The
+    // missing terminal marker still prevents that repair from granting trace evidence.
+    let mut bytes = std::fs::read(&f.path).unwrap();
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    std::fs::write(&f.path, bytes).unwrap();
+    let repaired = f.writer().state();
+    assert_eq!(repaired.terminal, Some(crate::TerminalState::Failed));
+    assert!(repaired.dependency_traces.owners.is_empty());
+}
+
+#[test]
+fn canceled_and_interrupted_runs_never_retain_continuation_traces() {
+    for (kind, code) in [
+        ("run_canceled", "canceled"),
+        ("run_interrupted", "interrupted"),
+    ] {
+        let f = Fixture::new();
+        let mut events = failed_history();
+        *events.last_mut().unwrap() = json!({
+            "t":kind,
+            "reason":{"code":code, "message":"test"}
+        });
+        number_history(&mut events);
+        retain_history(&f, &events);
+        let state = f.fold();
+        let terminal = if kind == "run_canceled" {
+            crate::TerminalState::Canceled
+        } else {
+            crate::TerminalState::Interrupted
+        };
+        assert_eq!(state.terminal, Some(terminal));
+        assert!(state.dependency_traces.owners.is_empty());
+    }
+}
+
+#[test]
+fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
+    let limits = JournalLimits::default();
+    let traces = OutcomeTraces::default();
+    assert!(history::proves_failed_history(&failed_history(), &traces, limits).is_some());
+    // No special event vocabulary may silently become evidence. Some payloads
+    // are intentionally opaque: unrecognized/malformed records also fail shut.
+    for kind in [
+        "step_retry",
+        "step_skipped",
+        "step_interrupted",
+        "step_replayed",
+        "hook_failed",
+        "unknown_future_kind",
+        "side_effect",
+        "effect_intent",
+        "operation_started",
+        "tool_call",
+        "mcp_input_pending",
+        "llm_call",
+        "confirm_request",
+        "user_interaction",
+        "run_waiting",
+        "foreach_iteration",
+        "parallel_task_joined",
+        "repair_attempt_started",
+        "regenerate_attempt_started",
+        "run_resumed",
+        "run_forked",
+        "run_queued",
+        "run_started",
+        "run_canceled",
+        "run_interrupted",
+        "run_finished",
+        "run_error",
+    ] {
+        let mut events = failed_history();
+        events.insert(6, json!({"t":kind, "node":"b"}));
+        number_history(&mut events);
+        assert!(
+            history::proves_failed_history(&events, &traces, limits).is_none(),
+            "{kind}"
+        );
+    }
+    for (index, field, value) in [
+        (0, "schema_version", json!(1)),
+        (0, "parent_run_id", json!("parent")),
+        (0, "seq", json!(0)),
+        (2, "attempt", json!(2)),
+        (2, "parallel", json!(true)),
+        (2, "node", json!("hook.before")),
+        (2, "node", json!("each[0]/child")),
+        (2, "node", json!("a@repair.check")),
+        (2, "type", json!("foreach")),
+        (2, "type", json!("llm.generate")),
+        (2, "type", json!("command")),
+        (2, "type", json!("custom.unknown")),
+        (3, "amount", json!(0)),
+        (3, "amount", json!(2)),
+        (3, "node", json!("b")),
+        (4, "node", json!("b")),
+        (4, "parallel", json!(true)),
+        (4, "status", json!("regenerated")),
+        (7, "status", json!("needs_user")),
+        (7, "status", json!("success")),
+        (9, "status", json!("success")),
+        (4, "seq", json!(4)),
+        (7, "run_id", json!("foreign")),
+    ] {
+        let mut events = failed_history();
+        events[index][field] = value;
+        assert!(
+            history::proves_failed_history(&events, &traces, limits).is_none(),
+            "{index}/{field}"
+        );
+    }
+    let mut extra_budget_field = failed_history();
+    extra_budget_field[3]["external_effect"] = json!(true);
+    assert!(history::proves_failed_history(&extra_budget_field, &traces, limits).is_none());
+    let mut late_graph = failed_history();
+    late_graph.insert(7, json!({"t":"graph_resolved", "nodes":["a", "b"]}));
+    number_history(&mut late_graph);
+    assert!(history::proves_failed_history(&late_graph, &traces, limits).is_none());
+    for remove in [0, 3, 5, 7, 9] {
+        let mut events = failed_history();
+        events.remove(remove);
+        assert!(
+            history::proves_failed_history(&events, &traces, limits).is_none(),
+            "missing {remove}"
+        );
+    }
+    for duplicate in [0, 2, 3, 4, 9] {
+        let mut events = failed_history();
+        events.insert(duplicate, events[duplicate].clone());
+        number_history(&mut events);
+        assert!(
+            history::proves_failed_history(&events, &traces, limits).is_none(),
+            "duplicate {duplicate}"
+        );
+    }
+    let mut restarted = failed_history();
+    restarted.extend(failed_history());
+    number_history(&mut restarted);
+    assert!(history::proves_failed_history(&restarted, &traces, limits).is_none());
+}
+
+#[test]
+fn failed_history_binds_every_retained_trace_to_its_exact_settlement() {
+    let f = Fixture::new();
+    let events = failed_history();
+    retain_history(&f, &events);
+    let traces = f.fold().dependency_traces;
+    let limits = JournalLimits::default();
+    for change in ["seq", "digest", "owner", "incomplete"] {
+        let mut invalid = traces.clone();
+        match change {
+            "seq" => invalid.owners.get_mut("a").unwrap().seq += 1,
+            "digest" => invalid.owners.get_mut("a").unwrap().event_digest = [0; 32],
+            "owner" => {
+                let trace = invalid.owners.remove("a").unwrap();
+                invalid.owners.insert("unpaired".into(), trace);
+            }
+            _ => invalid.owners.get_mut("a").unwrap().trace = ReadRecorder::new(0).snapshot(),
+        }
+        assert!(
+            history::proves_failed_history(&events, &invalid, limits).is_none(),
+            "{change}"
+        );
+    }
+    assert!(
+        history::proves_failed_history(
+            &events,
+            &traces,
+            JournalLimits {
+                max_event_count: Some(events.len() - 1),
+                ..limits
+            }
+        )
+        .is_none()
+    );
+}

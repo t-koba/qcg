@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+mod history;
 mod private_file;
 use private_file::{Access as TraceAccess, open as open_private_trace};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -350,6 +351,19 @@ impl TraceJournal {
             if let Some(event) = latest.get(&record.owner) {
                 record.install(&mut state.dependency_traces, event, limits);
             }
+        }
+        match state.terminal.as_ref() {
+            Some(crate::TerminalState::Failed)
+                if !history::journal_is_cleanly_sealed(path)
+                    || history::proves_failed_history(events, &state.dependency_traces, limits)
+                        .is_none() =>
+            {
+                state.dependency_traces = OutcomeTraces::default();
+            }
+            Some(crate::TerminalState::Canceled | crate::TerminalState::Interrupted) => {
+                state.dependency_traces = OutcomeTraces::default();
+            }
+            _ => {}
         }
         Self { stats: Some(stats) }
     }

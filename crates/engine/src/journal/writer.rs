@@ -83,12 +83,53 @@ pub fn clean_shutdown_marker_path(journal_path: &Utf8Path) -> Utf8PathBuf {
 /// Content is checked on read; absence still reads as no marker (Q2).
 const CLEAN_SHUTDOWN_MAGIC: &[u8] = b"clean-shutdown-v1\n";
 
-fn write_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalError> {
+pub(crate) fn write_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalError> {
     std::fs::write(
         clean_shutdown_marker_path(journal_path),
         CLEAN_SHUTDOWN_MAGIC,
     )?;
     Ok(())
+}
+
+/// Reads only enough bytes to recognize the terminal marker. Missing or
+/// different content is not a shutdown claim; I/O and a symlink fail closed
+/// for callers that use the marker as evidence.
+pub(crate) fn clean_shutdown_marker_is_valid(
+    journal_path: &Utf8Path,
+) -> Result<bool, JournalError> {
+    let marker = clean_shutdown_marker_path(journal_path);
+    let metadata = match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(JournalError::Io(error)),
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(JournalError::InvalidEvent(
+            "clean-shutdown marker is a symbolic link; refusing repair as possible tampering"
+                .into(),
+        ));
+    }
+    if !metadata.is_file() {
+        return Err(JournalError::InvalidEvent(
+            "clean-shutdown marker is not a regular file; refusing to trust it".into(),
+        ));
+    }
+    if metadata.len() != CLEAN_SHUTDOWN_MAGIC.len() as u64 {
+        return Ok(false);
+    }
+    let mut file = File::open(&marker)?;
+    let opened = file.metadata()?;
+    if !opened.is_file() || opened.len() != CLEAN_SHUTDOWN_MAGIC.len() as u64 {
+        return Ok(false);
+    }
+    let mut bytes = [0_u8; CLEAN_SHUTDOWN_MAGIC.len()];
+    use std::io::Read as _;
+    file.read_exact(&mut bytes)?;
+    let mut extra = [0_u8; 1];
+    if file.read(&mut extra)? != 0 {
+        return Ok(false);
+    }
+    Ok(bytes == CLEAN_SHUTDOWN_MAGIC)
 }
 
 fn clear_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalError> {
@@ -1369,22 +1410,7 @@ fn repair_tail_at(path: &Utf8Path, tail: &[u8], tail_start: u64) -> Result<(), J
     // or its failure already surfaced. The truncated tail still repairs
     // conservatively (prior events survive, the fragment is dropped), never
     // by inventing events.
-    let clean_shutdown = match std::fs::read(clean_shutdown_marker_path(path)) {
-        Ok(bytes) => bytes == CLEAN_SHUTDOWN_MAGIC,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-        Err(error) => return Err(JournalError::Io(error)),
-    };
-    // A non-symlink check stays: a link at the marker path is damage, never
-    // a shutdown claim, even with magic content.
-    if clean_shutdown
-        && std::fs::symlink_metadata(clean_shutdown_marker_path(path))
-            .is_ok_and(|meta| meta.file_type().is_symlink())
-    {
-        return Err(JournalError::InvalidEvent(
-            "clean-shutdown marker is a symbolic link; refusing repair as possible tampering"
-                .into(),
-        ));
-    }
+    let clean_shutdown = clean_shutdown_marker_is_valid(path)?;
     if clean_shutdown {
         return Err(JournalError::InvalidEvent(
             "journal tail is truncated but a clean-shutdown marker is present; refusing repair as possible tampering".into(),
