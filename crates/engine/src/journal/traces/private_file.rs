@@ -153,6 +153,11 @@ mod windows {
             .collect())
     }
 
+    #[cfg(test)]
+    pub(super) fn owner_sddl_for_test(dacl: &str) -> io::Result<Vec<u16>> {
+        owner_sddl(&CurrentUser::load()?, dacl)
+    }
+
     pub(super) fn open(path: &Utf8Path, access: Access) -> io::Result<File> {
         let user = CurrentUser::load()?;
         let sddl = owner_sddl(&user, OWNER_ONLY_DACL)?;
@@ -319,6 +324,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(windows)]
 mod windows_tests {
+    use super::windows::owner_sddl_for_test;
     use super::*;
     use camino::Utf8PathBuf;
     use std::io::{Read as _, Write as _};
@@ -365,7 +371,7 @@ mod windows_tests {
         let dir = std::env::temp_dir().join(format!("qcg-trace-public-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.join("trace.jsonl")).unwrap();
-        let sddl = owner_sddl(&CurrentUser::load().unwrap(), "D:P(A;;FA;;;WD)").unwrap();
+        let sddl = owner_sddl_for_test("D:P(A;;FA;;;WD)").unwrap();
         let mut descriptor = null_mut();
         assert_ne!(
             unsafe {
