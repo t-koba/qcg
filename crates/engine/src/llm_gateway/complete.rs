@@ -19,11 +19,20 @@ use tokio_util::sync::CancellationToken;
 struct PendingReservation {
     tokens: u64,
     cost_microusd: u64,
+    unresolved_cost: bool,
 }
 
 fn reservations() -> &'static Mutex<BTreeMap<String, PendingReservation>> {
     static RESERVATIONS: OnceLock<Mutex<BTreeMap<String, PendingReservation>>> = OnceLock::new();
     RESERVATIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn clear_pending_for_test(run_id: &str) {
+    reservations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(run_id);
 }
 
 struct DecisionReservationGuard {
@@ -70,7 +79,7 @@ fn release_pending(run_id: &str, reservation: &PendingReservation) {
         entry.cost_microusd = entry
             .cost_microusd
             .saturating_sub(reservation.cost_microusd);
-        if entry.tokens == 0 && entry.cost_microusd == 0 {
+        if entry.tokens == 0 && entry.cost_microusd == 0 && !entry.unresolved_cost {
             map.remove(run_id);
         }
     }
@@ -161,6 +170,7 @@ impl<'a> LlmGateway<'a> {
         let reservation = PendingReservation {
             tokens,
             cost_microusd,
+            unresolved_cost: false,
         };
         self.try_reserve(Some(reservation.clone()))?;
         let _guard = DecisionReservationGuard {
@@ -185,7 +195,7 @@ impl<'a> LlmGateway<'a> {
             }
         };
         let usage = response.token_usage();
-        let cost_microusd = self.cost_microusd(
+        let cost_microusd = match self.cost_microusd(
             node,
             routes,
             &model.provider,
@@ -193,7 +203,14 @@ impl<'a> LlmGateway<'a> {
             &usage,
             None,
             None,
-        )?;
+        ) {
+            Ok(cost) => cost,
+            Err(super::cost::CostError::Invalid(error)) => return Err(error),
+            Err(super::cost::CostError::Unrepresentable(error)) => {
+                self.record_unrepresentable_liability(node, &model.provider, &model.model, &usage)?;
+                return Err(error);
+            }
+        };
         self.journal
             .event(
                 "llm_call",
@@ -341,31 +358,44 @@ impl<'a> LlmGateway<'a> {
         Ok(bounded.then_some(PendingReservation {
             tokens,
             cost_microusd,
+            unresolved_cost: false,
         }))
     }
 
     fn try_reserve(&self, reservation: Option<PendingReservation>) -> Result<(), StepError> {
         let state = self.journal.state();
+        if state.budget.unresolved_llm_cost {
+            return Err(StepError::failed(
+                "budget",
+                "run has unresolved LLM cost liability; refusing further spend",
+            ));
+        }
         if self.budget.require_pricing && state.budget.unresolved_search_cost {
             return Err(StepError::failed(
                 "budget",
                 "run has unresolved hosted search cost; refusing blind spend",
             ));
         }
+        let run_id = run_id_of(self.journal);
+        let mut map = reservations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = map.get(&run_id).cloned().unwrap_or_default();
+        if current.unresolved_cost {
+            return Err(StepError::failed(
+                "budget",
+                "run has unresolved LLM cost liability; refusing further spend",
+            ));
+        }
         let Some(reservation) = reservation else {
             return Ok(());
         };
-        let run_id = run_id_of(self.journal);
         let spent_tokens = checked_budget_add(
             "settled token usage",
             state.budget.tokens_input,
             state.budget.tokens_output,
         )?;
         let spent_cost = state.budget.cost_microusd;
-        let mut map = reservations()
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let current = map.get(&run_id).cloned().unwrap_or_default();
         let next_tokens = checked_budget_add(
             "pending token reservations",
             current.tokens,
@@ -388,6 +418,7 @@ impl<'a> LlmGateway<'a> {
                 PendingReservation {
                     tokens: next_tokens,
                     cost_microusd: next_cost,
+                    unresolved_cost: false,
                 },
             );
         }
@@ -497,7 +528,7 @@ impl<'a> LlmGateway<'a> {
         let web_search_calls = web_search.as_ref().and_then(|outcome| outcome.calls);
         let search_cost =
             self.web_search_cost_microusd(routes, &provider_id, &model_id, web_search_calls);
-        let cost_microusd = self.cost_microusd(
+        let cost_microusd = match self.cost_microusd(
             node,
             routes,
             &provider_id,
@@ -505,7 +536,14 @@ impl<'a> LlmGateway<'a> {
             &usage,
             request.cache_retention,
             web_search_calls,
-        )?;
+        ) {
+            Ok(cost) => cost,
+            Err(super::cost::CostError::Invalid(error)) => return Err(error),
+            Err(super::cost::CostError::Unrepresentable(error)) => {
+                self.record_unrepresentable_liability(node, &provider_id, &model_id, &usage)?;
+                return Err(error);
+            }
+        };
         let mut event = json!({
             "node": node.id,
             "provider": provider_id,
@@ -579,6 +617,44 @@ impl<'a> LlmGateway<'a> {
             });
         }
         Ok(response)
+    }
+
+    fn record_unrepresentable_liability(
+        &self,
+        node: &NodeDef,
+        provider: &str,
+        model: &str,
+        usage: &TokenUsage,
+    ) -> Result<(), StepError> {
+        let run_id = run_id_of(self.journal);
+        {
+            let mut map = reservations()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            map.entry(run_id).or_default().unresolved_cost = true;
+        }
+        if let Err(error) = self
+            .journal
+            .event(
+                "llm_cost_unresolved",
+                json!({
+                    "node": node.id,
+                    "provider": provider,
+                    "model": model,
+                    "tokens": usage,
+                    "liability": "actual_cost_unrepresentable"
+                }),
+            )
+            .step_err(&node.id)
+        {
+            return Err(StepError::failed(
+                &node.id,
+                format!(
+                    "reported LLM usage has an unrepresentable actual charge; unable to durably record unknown-cost liability: {error}"
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn check_budget(&self) -> Result<(), StepError> {
@@ -1172,6 +1248,7 @@ mod budget_overflow_tests {
                 .try_reserve(Some(PendingReservation {
                     tokens: 1,
                     cost_microusd: 0,
+                    unresolved_cost: false,
                 }))
                 .is_err()
         );
@@ -1183,20 +1260,24 @@ mod budget_overflow_tests {
                 PendingReservation {
                     tokens: u64::MAX,
                     cost_microusd: 0,
+                    unresolved_cost: false,
                 },
                 PendingReservation {
                     tokens: 1,
                     cost_microusd: 0,
+                    unresolved_cost: false,
                 },
             ),
             (
                 PendingReservation {
                     tokens: 0,
                     cost_microusd: u64::MAX,
+                    unresolved_cost: false,
                 },
                 PendingReservation {
                     tokens: 0,
                     cost_microusd: 1,
+                    unresolved_cost: false,
                 },
             ),
         ] {

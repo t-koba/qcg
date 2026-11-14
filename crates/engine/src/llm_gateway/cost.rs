@@ -4,6 +4,26 @@ use llm::{CacheRetention, PromptCacheRetention, TokenUsage};
 
 use super::types::LlmGateway;
 
+#[derive(Debug)]
+pub(super) enum CostError {
+    Invalid(StepError),
+    Unrepresentable(StepError),
+}
+
+impl From<StepError> for CostError {
+    fn from(error: StepError) -> Self {
+        Self::Invalid(error)
+    }
+}
+
+impl From<CostError> for StepError {
+    fn from(error: CostError) -> Self {
+        match error {
+            CostError::Invalid(error) | CostError::Unrepresentable(error) => error,
+        }
+    }
+}
+
 fn bounded_microusd(amount: f64, round_up: bool) -> Option<u64> {
     if !amount.is_finite() || amount < 0.0 {
         return None;
@@ -96,7 +116,7 @@ impl<'a> LlmGateway<'a> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn cost_microusd(
+    pub(super) fn cost_microusd(
         &self,
         node: &NodeDef,
         routes: &[ModelRef],
@@ -105,7 +125,7 @@ impl<'a> LlmGateway<'a> {
         usage: &TokenUsage,
         retention: Option<CacheRetention>,
         web_search_calls: Option<u64>,
-    ) -> Result<u64, StepError> {
+    ) -> Result<u64, CostError> {
         let ordinary_input = usage
             .ordinary_input()
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
@@ -114,7 +134,8 @@ impl<'a> LlmGateway<'a> {
                 return Err(StepError::failed(
                     &node.id,
                     format!("model `{provider}/{model}` has no pricing for the run cost budget"),
-                ));
+                )
+                .into());
             }
             return Ok(0);
         };
@@ -140,10 +161,11 @@ impl<'a> LlmGateway<'a> {
                 format!(
                     "model `{provider}/{model}` has incomplete pricing for the run cost budget"
                 ),
-            ));
+            )
+            .into());
         }
         if rates.invalid_rate().is_some() {
-            return Err(StepError::failed(&node.id, "invalid model pricing"));
+            return Err(StepError::failed(&node.id, "invalid model pricing").into());
         }
         let input = rates.input.unwrap_or_default();
         let output = rates.output.unwrap_or_default();
@@ -160,10 +182,15 @@ impl<'a> LlmGateway<'a> {
             && let Some(price) = route.web_search_call_cost_usd
         {
             if !price.is_finite() || price < 0.0 {
-                return Err(StepError::failed(&node.id, "invalid model pricing"));
+                return Err(StepError::failed(&node.id, "invalid model pricing").into());
             }
             microusd += calls as f64 * price * 1_000_000.0;
         }
-        checked_microusd(node, microusd, false)
+        bounded_microusd(microusd, false).ok_or_else(|| {
+            CostError::Unrepresentable(StepError::failed(
+                &node.id,
+                "model cost is not representable in microusd",
+            ))
+        })
     }
 }

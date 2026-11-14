@@ -34,6 +34,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "hook_failed",
     "hook_replayed",
     "hook_skipped",
+    "llm_cost_unresolved",
     "mcp_authorization_required",
     "mcp_continuation_consumed",
     "mcp_continuation_resumed",

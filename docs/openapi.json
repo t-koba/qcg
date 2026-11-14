@@ -3130,6 +3130,7 @@
               "hook_skipped",
               "lagged",
               "llm_call",
+              "llm_cost_unresolved",
               "llm_delta",
               "llm_memo",
               "llm_route_failed",

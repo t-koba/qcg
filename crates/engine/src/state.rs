@@ -109,6 +109,9 @@ pub struct BudgetState {
     /// At least one hosted search has an unknown/unpriced charge or unsettled liability.
     #[serde(default)]
     pub unresolved_search_cost: bool,
+    /// A provider billed a response whose actual charge cannot be represented.
+    #[serde(default)]
+    pub unresolved_llm_cost: bool,
     #[serde(deserialize_with = "required_presence")]
     pub started_at: Option<String>,
 }
@@ -521,6 +524,80 @@ impl RunState {
         Ok(())
     }
 
+    fn fold_llm_usage(
+        &mut self,
+        event: &Value,
+        require_usage: bool,
+    ) -> Result<(), crate::JournalError> {
+        self.budget.llm_calls =
+            self.budget.llm_calls.checked_add(1).ok_or_else(|| {
+                crate::JournalError::InvalidEvent("LLM call count overflowed".into())
+            })?;
+        let event_kind = if require_usage {
+            "llm_cost_unresolved"
+        } else {
+            "llm_call"
+        };
+        let Some(tokens) = event.get("tokens").and_then(Value::as_object) else {
+            if require_usage {
+                return Err(crate::JournalError::InvalidEvent(
+                    "unresolved LLM cost event requires token usage".into(),
+                ));
+            }
+            return Ok(());
+        };
+        let counter = |name: &str| -> Result<u64, crate::JournalError> {
+            tokens
+                .get(name)
+                .ok_or_else(|| {
+                    crate::JournalError::InvalidEvent(format!(
+                        "{event_kind} event is missing token count `{name}`"
+                    ))
+                })?
+                .as_u64()
+                .ok_or_else(|| {
+                    crate::JournalError::InvalidEvent(format!(
+                        "invalid token count `{name}` in {event_kind}"
+                    ))
+                })
+        };
+        self.budget.tokens_input = self
+            .budget
+            .tokens_input
+            .checked_add(counter("input")?)
+            .ok_or_else(|| {
+                crate::JournalError::InvalidEvent("input token count overflowed".into())
+            })?;
+        self.budget.tokens_output = self
+            .budget
+            .tokens_output
+            .checked_add(counter("output")?)
+            .ok_or_else(|| {
+                crate::JournalError::InvalidEvent("output token count overflowed".into())
+            })?;
+        self.budget.tokens_cached_input = self
+            .budget
+            .tokens_cached_input
+            .checked_add(counter("cached_input")?)
+            .ok_or_else(|| {
+                crate::JournalError::InvalidEvent("cached input token count overflowed".into())
+            })?;
+        self.budget.tokens_cache_creation_input = self
+            .budget
+            .tokens_cache_creation_input
+            .checked_add(if tokens.contains_key("cache_creation_input") {
+                counter("cache_creation_input")?
+            } else {
+                0
+            })
+            .ok_or_else(|| {
+                crate::JournalError::InvalidEvent(
+                    "cache creation input token count overflowed".into(),
+                )
+            })?;
+        Ok(())
+    }
+
     pub fn apply(&mut self, event: &Value) -> Result<(), crate::JournalError> {
         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
             // Strict monotonicity: duplicate or rewound seq values indicate
@@ -867,67 +944,7 @@ impl RunState {
                 self.budget.has_budget_charges = self.budget.budget_charged > 0;
             }
             "llm_call" => {
-                self.budget.llm_calls = self.budget.llm_calls.checked_add(1).ok_or_else(|| {
-                    crate::JournalError::InvalidEvent("LLM call count overflowed".into())
-                })?;
-                if let Some(tokens) = event.get("tokens").and_then(Value::as_object) {
-                    // Ordinary input/output and cache-read counters are required.
-                    // Cache creation is optional with a zero default; present
-                    // malformed counters always fail closed.
-                    let counter = |name: &str| -> Result<u64, crate::JournalError> {
-                        tokens
-                            .get(name)
-                            .ok_or_else(|| {
-                                crate::JournalError::InvalidEvent(format!(
-                                    "llm_call event is missing token count `{name}`"
-                                ))
-                            })?
-                            .as_u64()
-                            .ok_or_else(|| {
-                                crate::JournalError::InvalidEvent(format!(
-                                    "invalid token count `{name}`"
-                                ))
-                            })
-                    };
-                    self.budget.tokens_input = self
-                        .budget
-                        .tokens_input
-                        .checked_add(counter("input")?)
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent("input token count overflowed".into())
-                        })?;
-                    self.budget.tokens_output = self
-                        .budget
-                        .tokens_output
-                        .checked_add(counter("output")?)
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent(
-                                "output token count overflowed".into(),
-                            )
-                        })?;
-                    self.budget.tokens_cached_input = self
-                        .budget
-                        .tokens_cached_input
-                        .checked_add(counter("cached_input")?)
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent(
-                                "cached input token count overflowed".into(),
-                            )
-                        })?;
-                    self.budget.tokens_cache_creation_input = self
-                        .budget
-                        .tokens_cache_creation_input
-                        .checked_add(if tokens.contains_key("cache_creation_input") {
-                            counter("cache_creation_input")?
-                        } else {
-                            0
-                        })
-                        .ok_or_else(|| {
-                            crate::JournalError::InvalidEvent(
-                                "cache creation input token count overflowed".into(),
-                            )
-                        })?;
-                }
+                self.fold_llm_usage(event, false)?;
                 self.budget.cost_microusd = self
                     .budget
                     .cost_microusd
@@ -947,6 +964,28 @@ impl RunState {
                     .ok_or_else(|| {
                         crate::JournalError::InvalidEvent("cost counter overflowed".into())
                     })?;
+            }
+            "llm_cost_unresolved" => {
+                for field in ["node", "provider", "model"] {
+                    if event
+                        .get(field)
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                    {
+                        return Err(crate::JournalError::InvalidEvent(format!(
+                            "unresolved LLM cost event requires `{field}`"
+                        )));
+                    }
+                }
+                if event.get("liability").and_then(Value::as_str)
+                    != Some("actual_cost_unrepresentable")
+                {
+                    return Err(crate::JournalError::InvalidEvent(
+                        "unresolved LLM cost event has an invalid liability marker".into(),
+                    ));
+                }
+                self.fold_llm_usage(event, true)?;
+                self.budget.unresolved_llm_cost = true;
             }
             "agent_file_changes" => {
                 let parsed =

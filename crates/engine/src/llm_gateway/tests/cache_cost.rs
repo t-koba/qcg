@@ -363,6 +363,246 @@ impl LlmProvider for CountingCacheProvider {
         response.usage = self.usage.clone();
         Ok(response)
     }
+
+    async fn decide(
+        &self,
+        request: llm::DecisionRequest,
+    ) -> Result<llm::DecisionResponse, LlmError> {
+        self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(llm::DecisionResponse {
+            model: request.model,
+            answers: BTreeMap::from([("accept".into(), llm::DecisionAnswer::Noul { noul: 0.5 })]),
+            usage: llm::DecisionUsage {
+                input_tokens: self.usage.input,
+                output_tokens: self.usage.output,
+            },
+        })
+    }
+}
+
+fn unrepresentable_usage() -> TokenUsage {
+    TokenUsage {
+        input: 3_000_000_000,
+        ..TokenUsage::default()
+    }
+}
+
+fn liability_pricing() -> ModelRef {
+    let mut pricing = cache_pricing(Some(0.0), Some(0.0));
+    pricing.input_cost_per_million_usd = Some(10_000_000_000.0);
+    pricing.output_cost_per_million_usd = Some(0.0);
+    pricing
+}
+
+fn no_budget() -> LlmCostBudget {
+    LlmCostBudget {
+        max_tokens: None,
+        max_cost_microusd: None,
+        require_pricing: false,
+    }
+}
+
+fn wide_budget() -> LlmCostBudget {
+    LlmCostBudget {
+        max_tokens: None,
+        max_cost_microusd: Some(u64::MAX),
+        require_pricing: false,
+    }
+}
+
+#[tokio::test]
+async fn unrepresentable_chat_charge_is_durable_and_blocks_after_reopen() {
+    let dir = test_dir("unrepresentable-chat-actual");
+    let run_id = format!("unrepresentable-chat-{}", uuid::Uuid::now_v7());
+    let journal_path = dir.join("journal.jsonl");
+    let journal = JournalWriter::create(&journal_path, &run_id, false, None).unwrap();
+    let secrets = SecretStore::default();
+    let provider = Arc::new(CountingCacheProvider {
+        calls: Default::default(),
+        usage: unrepresentable_usage(),
+    });
+    let gateway = LlmGateway::new(
+        provider.clone(),
+        &secrets,
+        &journal,
+        CancellationToken::new(),
+        wide_budget(),
+        vec![],
+    );
+    let mut request = test_request();
+    request.provider = "cache-metered".into();
+    let error = gateway
+        .complete(
+            &test_node(),
+            request.clone(),
+            &[liability_pricing()],
+            |_| json!({}),
+        )
+        .await
+        .expect_err("billed but unrepresentable actual cost must fail");
+    assert!(error.to_string().contains("not representable in microusd"));
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(journal.state().budget.unresolved_llm_cost);
+    assert_eq!(journal.state().budget.llm_calls, 1);
+    assert_eq!(journal.state().budget.tokens_input, 3_000_000_000);
+    assert_eq!(journal.state().budget.cost_microusd, 0);
+    let recorded: Vec<serde_json::Value> = persisted_text(&dir)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let marker = recorded
+        .iter()
+        .find(|event| event["t"] == "llm_cost_unresolved")
+        .expect("unknown-cost liability must be journaled");
+    assert_eq!(marker["provider"], "cache-metered");
+    assert_eq!(marker["model"], "test");
+    assert_eq!(marker["tokens"]["input"], 3_000_000_000_u64);
+    assert_eq!(marker["liability"], "actual_cost_unrepresentable");
+
+    drop(gateway);
+    drop(journal);
+    super::super::complete::clear_pending_for_test(&run_id);
+    let replay = JournalWriter::create(&journal_path, &run_id, false, None).unwrap();
+    assert!(replay.state().budget.unresolved_llm_cost);
+    assert_eq!(replay.state().budget.tokens_input, 3_000_000_000);
+    let retry_provider = Arc::new(CountingCacheProvider {
+        calls: Default::default(),
+        usage: TokenUsage::default(),
+    });
+    let retry = LlmGateway::new(
+        retry_provider.clone(),
+        &secrets,
+        &replay,
+        CancellationToken::new(),
+        wide_budget(),
+        vec![],
+    );
+    let refused = retry
+        .complete(&test_node(), request, &[liability_pricing()], |_| json!({}))
+        .await
+        .expect_err("replayed unknown cost must refuse admission");
+    assert!(
+        refused
+            .to_string()
+            .contains("unresolved LLM cost liability")
+    );
+    assert_eq!(
+        retry_provider
+            .calls
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+}
+
+#[tokio::test]
+async fn unrepresentable_decision_charge_is_recorded_and_restores_unknown_budget() {
+    let dir = test_dir("unrepresentable-decision-actual");
+    let run_id = format!("unrepresentable-decision-{}", uuid::Uuid::now_v7());
+    let journal_path = dir.join("journal.jsonl");
+    let journal = JournalWriter::create(&journal_path, &run_id, false, None).unwrap();
+    let secrets = SecretStore::default();
+    let provider = Arc::new(CountingCacheProvider {
+        calls: Default::default(),
+        usage: unrepresentable_usage(),
+    });
+    let gateway = LlmGateway::new(
+        provider.clone(),
+        &secrets,
+        &journal,
+        CancellationToken::new(),
+        wide_budget(),
+        vec![],
+    );
+    let request = serde_json::from_value(json!({
+        "provider": "cache-metered",
+        "model": "test",
+        "state": {},
+        "questions": {"accept": {"type": "noul", "instructions": "Accept?"}}
+    }))
+    .unwrap();
+    let error = gateway
+        .decide(&test_node(), request, &liability_pricing(), 1)
+        .await
+        .expect_err("billed decision with unrepresentable charge must fail");
+    assert!(error.to_string().contains("not representable in microusd"));
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    assert!(journal.state().budget.unresolved_llm_cost);
+    assert_eq!(journal.state().budget.llm_calls, 1);
+    assert_eq!(journal.state().budget.tokens_input, 3_000_000_000);
+    drop(gateway);
+    drop(journal);
+
+    let replayed = crate::RunState::fold_journal(&journal_path).unwrap();
+    assert!(replayed.budget.unresolved_llm_cost);
+    assert_eq!(replayed.budget.tokens_input, 3_000_000_000);
+}
+
+#[tokio::test]
+async fn failed_liability_append_keeps_concurrent_admission_poisoned() {
+    let dir = test_dir("unrepresentable-marker-write-failure");
+    let run_id = format!("unrepresentable-marker-failure-{}", uuid::Uuid::now_v7());
+    let journal = JournalWriter::create_with_limits(
+        &dir.join("journal.jsonl"),
+        &run_id,
+        false,
+        None,
+        crate::JournalLimits {
+            max_event_bytes: Some(1),
+            max_total_bytes: None,
+            max_event_count: None,
+            max_state_bytes: None,
+            scan_window_bytes: None,
+        },
+    )
+    .unwrap();
+    let secrets = SecretStore::default();
+    let provider = Arc::new(CountingCacheProvider {
+        calls: Default::default(),
+        usage: unrepresentable_usage(),
+    });
+    let gateway = LlmGateway::new(
+        provider.clone(),
+        &secrets,
+        &journal,
+        CancellationToken::new(),
+        no_budget(),
+        vec![],
+    );
+    let mut request = test_request();
+    request.provider = "cache-metered".into();
+    let error = gateway
+        .complete(
+            &test_node(),
+            request.clone(),
+            &[liability_pricing()],
+            |_| json!({}),
+        )
+        .await
+        .expect_err("failure to write the liability marker must surface");
+    assert!(
+        error
+            .to_string()
+            .contains("unable to durably record unknown-cost liability")
+    );
+    assert!(!journal.state().budget.unresolved_llm_cost);
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+    let node = test_node();
+    let routes = [liability_pricing()];
+    let (first, second, third) = tokio::join!(
+        gateway.complete(&node, request.clone(), &routes, |_| json!({})),
+        gateway.complete(&node, request.clone(), &routes, |_| json!({})),
+        gateway.complete(&node, request, &routes, |_| json!({})),
+    );
+    for refused in [first, second, third] {
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("unresolved LLM cost liability")
+        );
+    }
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
 }
 
 fn tier_without_base_input_pricing() -> ModelRef {

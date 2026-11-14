@@ -318,6 +318,7 @@ mod tests {
             "step_finished",
             "step_skipped",
             "llm_call",
+            "llm_cost_unresolved",
             "agent_checkpoint",
             "agent_file_changes",
             "resource",
