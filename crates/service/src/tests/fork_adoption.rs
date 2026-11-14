@@ -1366,10 +1366,39 @@ async fn fork_copies_every_referenced_checkpoint_revision() {
             "fork must carry blob {digest}"
         );
     }
+    let fork_workspace = run_workspace_dir(&fork_dir);
     assert_eq!(
-        std::fs::read(run_workspace_dir(&fork_dir).join("out.txt")).expect("fork workspace"),
+        std::fs::read(fork_workspace.join("out.txt")).expect("fork workspace"),
         v2,
         "only a successful step projects the fork workspace revision"
+    );
+    // A future fork optimization must not turn copied files into mutable
+    // cross-run aliases: child writes and per-run removal leave the source intact.
+    std::fs::write(fork_workspace.join("out.txt"), b"child workspace mutation")
+        .expect("mutate child workspace copy");
+    let v2_digest = sha(v2);
+    std::fs::write(fork_blobs.join(&v2_digest), b"child blob mutation")
+        .expect("mutate child checkpoint-blob copy");
+    assert_eq!(
+        std::fs::read(run_workspace_dir(&source_dir).join("out.txt"))
+            .expect("source workspace should remain independent"),
+        v2
+    );
+    assert_eq!(
+        std::fs::read(source_meta.join("checkpoint-blobs").join(v2_digest))
+            .expect("source checkpoint blob should remain independent"),
+        v2
+    );
+    std::fs::remove_dir_all(&fork_dir).expect("child run directory should be removable");
+    assert_eq!(
+        std::fs::read(run_workspace_dir(&source_dir).join("out.txt"))
+            .expect("source workspace should survive child removal"),
+        v2
+    );
+    assert_eq!(
+        std::fs::read(source_meta.join("checkpoint-blobs").join(sha(v2)))
+            .expect("source checkpoint blob should survive child removal"),
+        v2
     );
     let _ = std::fs::remove_dir_all(&runs);
 }

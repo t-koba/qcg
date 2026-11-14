@@ -2039,6 +2039,11 @@ mod tests {
         crate::run_package::verify(&target, &expected).expect("snapshot identity must match");
 
         std::fs::write(target.join("templates/nested/page.j2"), b"other").expect("tamper");
+        assert_eq!(
+            std::fs::read(source.join("templates/nested/page.j2")).expect("source template"),
+            b"hello",
+            "materialized package files must not alias mutable source files"
+        );
         let error = crate::run_package::verify(&target, &expected)
             .expect_err("changed snapshot must fail closed");
         assert!(error.to_string().contains("identity mismatch"), "{error}");

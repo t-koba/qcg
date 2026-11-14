@@ -666,5 +666,10 @@ mod tests {
         ] {
             assert!(resolve_source_run(&runs_dir, &Some(selector)).is_err());
         }
+        std::fs::remove_dir_all(runs_dir.join("newer")).expect("source run should be removed");
+        let loaded = load_persisted(&metadata, &[("source", &resource)])
+            .unwrap()
+            .expect("consumer copy should survive source-run removal");
+        assert_eq!(loaded["source"].bytes, b"saved");
     }
 }
