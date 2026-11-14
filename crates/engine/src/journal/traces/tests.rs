@@ -20,6 +20,14 @@ impl Fixture {
     fn fold(&self) -> RunState {
         RunState::fold_journal(&self.path).unwrap()
     }
+    fn restore_traces(&self) -> RunState {
+        let mut state = self.fold();
+        let events = read_journal_values(&self.path, JournalLimits::default())
+            .unwrap()
+            .events;
+        TraceJournal::restore(&mut state, &events, &self.path, JournalLimits::default());
+        state
+    }
     fn records(&self) -> Vec<Value> {
         read_journal_values(
             &self.path.with_file_name(FILE_NAME),
@@ -29,11 +37,18 @@ impl Fixture {
         .events
     }
     fn replace(&self, records: &[Value]) {
-        let mut text = String::new();
-        for record in records {
-            text.push_str(&format!("{record}\n"));
+        use std::io::Write as _;
+
+        let path = self.path.with_file_name(FILE_NAME);
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => panic!("remove private trace fixture: {error}"),
         }
-        std::fs::write(self.path.with_file_name(FILE_NAME), text).unwrap();
+        let mut file = open_private_trace(&path, TraceAccess::Append).unwrap();
+        for record in records {
+            writeln!(file, "{record}").unwrap();
+        }
     }
 }
 impl Drop for Fixture {
@@ -503,7 +518,11 @@ fn failed_history() -> Vec<Value> {
     let mut events = vec![
         json!({"t":"run_started", "generator":"test", "generator_path":"test",
             "contract_sha256":"test", "inputs":{},
-            "schema_version":api::JOURNAL_SCHEMA_VERSION, "elapsed_budget_mode":"wall_clock"}),
+            "schema_version":api::JOURNAL_SCHEMA_VERSION, "elapsed_budget_mode":"active_execution",
+            "step_budget_baseline":{"version":api::STEP_BUDGET_BASELINE_VERSION,
+                "used":0, "charged":0}}),
+        json!({"t":"elapsed_accounted", "active_nanoseconds":0,
+            "active_started_at":"2026-01-01T00:00:00Z"}),
         json!({"t":"graph_resolved", "nodes":["a", "b"]}),
         json!({"t":"step_started", "node":"a", "type":"check.format", "attempt":1}),
         json!({"t":"budget_charged", "node":"a", "amount":1}),
@@ -546,6 +565,10 @@ fn failed_restore_requires_history_without_changing_public_replay() {
             if queued {
                 let mut admission = events[0].clone();
                 admission["t"] = json!("run_queued");
+                admission
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("step_budget_baseline");
                 events.insert(0, admission);
             }
             if run_error {
@@ -553,17 +576,17 @@ fn failed_restore_requires_history_without_changing_public_replay() {
             }
             number_history(&mut events);
             retain_history(&f, &events);
-            let state = f.fold();
+            let state = f.restore_traces();
             assert_eq!(state.terminal, Some(crate::TerminalState::Failed));
-            assert_trace(&state, "a", 5 + u64::from(queued));
-            assert_trace(&state, "b", 8 + u64::from(queued));
-            assert_trace(&f.writer().state(), "b", 8 + u64::from(queued));
+            assert_trace(&state, "a", 6 + u64::from(queued));
+            assert_trace(&state, "b", 9 + u64::from(queued));
+            assert_trace(&f.writer().state(), "b", 9 + u64::from(queued));
         }
     }
     let f = Fixture::new();
     let mut events = failed_history();
     events.insert(
-        3,
+        4,
         json!({"t":"step_retry", "node":"a", "attempt":2,
         "max_attempts":2, "error":"retry"}),
     );
@@ -583,12 +606,13 @@ fn failed_history_requires_clean_marker_and_newline_terminated_journal() {
     let f = Fixture::new();
     let events = failed_history();
     retain_history(&f, &events);
-    assert_eq!(f.fold().dependency_traces.owners.len(), 2);
+    let restored = f.restore_traces();
+    assert_eq!(restored.dependency_traces.owners.len(), 2);
 
     let mut bytes = std::fs::read(&f.path).unwrap();
     assert_eq!(bytes.pop(), Some(b'\n'));
     std::fs::write(&f.path, &bytes).unwrap();
-    let unterminated = f.fold();
+    let unterminated = f.restore_traces();
     assert_eq!(unterminated.terminal, Some(crate::TerminalState::Failed));
     assert!(unterminated.dependency_traces.owners.is_empty());
     bytes.push(b'\n');
@@ -596,7 +620,7 @@ fn failed_history_requires_clean_marker_and_newline_terminated_journal() {
 
     let marker = crate::journal::writer::clean_shutdown_marker_path(&f.path);
     std::fs::remove_file(&marker).unwrap();
-    let without_marker = f.fold();
+    let without_marker = f.restore_traces();
     assert_eq!(without_marker.terminal, Some(crate::TerminalState::Failed));
     assert!(without_marker.dependency_traces.owners.is_empty());
 
@@ -624,7 +648,7 @@ fn canceled_and_interrupted_runs_never_retain_continuation_traces() {
         });
         number_history(&mut events);
         retain_history(&f, &events);
-        let state = f.fold();
+        let state = f.restore_traces();
         let terminal = if kind == "run_canceled" {
             crate::TerminalState::Canceled
         } else {
@@ -672,7 +696,7 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
         "run_error",
     ] {
         let mut events = failed_history();
-        events.insert(6, json!({"t":kind, "node":"b"}));
+        events.insert(7, json!({"t":kind, "node":"b"}));
         number_history(&mut events);
         assert!(
             history::proves_failed_history(&events, &traces, limits).is_none(),
@@ -684,7 +708,7 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
     // consult the current executor/contract safety gate before reusing any node.
     for step_type in ["llm.generate", "command", "custom.unknown"] {
         let mut events = failed_history();
-        events[2]["type"] = json!(step_type);
+        events[3]["type"] = json!(step_type);
         number_history(&mut events);
         assert!(
             history::proves_failed_history(&events, &traces, limits).is_some(),
@@ -695,23 +719,23 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
         (0, "schema_version", json!(1)),
         (0, "parent_run_id", json!("parent")),
         (0, "seq", json!(0)),
-        (2, "attempt", json!(2)),
-        (2, "parallel", json!(true)),
-        (2, "node", json!("hook.before")),
-        (2, "node", json!("each[0]/child")),
-        (2, "node", json!("a@repair.check")),
-        (2, "type", json!("foreach")),
-        (3, "amount", json!(0)),
-        (3, "amount", json!(2)),
-        (3, "node", json!("b")),
+        (3, "attempt", json!(2)),
+        (3, "parallel", json!(true)),
+        (3, "node", json!("hook.before")),
+        (3, "node", json!("each[0]/child")),
+        (3, "node", json!("a@repair.check")),
+        (3, "type", json!("foreach")),
+        (4, "amount", json!(0)),
+        (4, "amount", json!(2)),
+        (5, "node", json!("b")),
         (4, "node", json!("b")),
-        (4, "parallel", json!(true)),
-        (4, "status", json!("regenerated")),
-        (7, "status", json!("needs_user")),
-        (7, "status", json!("success")),
-        (9, "status", json!("success")),
-        (4, "seq", json!(4)),
-        (7, "run_id", json!("foreign")),
+        (5, "parallel", json!(true)),
+        (5, "status", json!("regenerated")),
+        (8, "status", json!("needs_user")),
+        (8, "status", json!("success")),
+        (10, "status", json!("success")),
+        (5, "seq", json!(4)),
+        (8, "run_id", json!("foreign")),
     ] {
         let mut events = failed_history();
         events[index][field] = value;
@@ -721,13 +745,13 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
         );
     }
     let mut extra_budget_field = failed_history();
-    extra_budget_field[3]["external_effect"] = json!(true);
+    extra_budget_field[4]["external_effect"] = json!(true);
     assert!(history::proves_failed_history(&extra_budget_field, &traces, limits).is_none());
     let mut late_graph = failed_history();
-    late_graph.insert(7, json!({"t":"graph_resolved", "nodes":["a", "b"]}));
+    late_graph.insert(8, json!({"t":"graph_resolved", "nodes":["a", "b"]}));
     number_history(&mut late_graph);
     assert!(history::proves_failed_history(&late_graph, &traces, limits).is_none());
-    for remove in [0, 3, 5, 7, 9] {
+    for remove in [0, 4, 6, 8, 10] {
         let mut events = failed_history();
         events.remove(remove);
         assert!(
@@ -735,7 +759,7 @@ fn failed_history_is_a_positive_allowlist_with_serial_settlement() {
             "missing {remove}"
         );
     }
-    for duplicate in [0, 2, 3, 4, 9] {
+    for duplicate in [0, 3, 4, 5, 10] {
         let mut events = failed_history();
         events.insert(duplicate, events[duplicate].clone());
         number_history(&mut events);
@@ -755,7 +779,7 @@ fn failed_history_binds_every_retained_trace_to_its_exact_settlement() {
     let f = Fixture::new();
     let events = failed_history();
     retain_history(&f, &events);
-    let traces = f.fold().dependency_traces;
+    let traces = f.restore_traces().dependency_traces;
     let limits = JournalLimits::default();
     for change in ["seq", "digest", "owner", "incomplete"] {
         let mut invalid = traces.clone();
