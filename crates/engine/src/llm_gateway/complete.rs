@@ -87,6 +87,15 @@ use super::merge::merge_event_extra;
 use super::retry::RetryTrace;
 use super::types::{LLM_STREAM_CHANNEL_CAPACITY, LlmGateway};
 
+fn checked_budget_add(resource: &str, left: u64, right: u64) -> Result<u64, StepError> {
+    left.checked_add(right).ok_or_else(|| {
+        StepError::failed(
+            "budget",
+            format!("{resource} accounting overflowed; refusing further spend"),
+        )
+    })
+}
+
 impl<'a> LlmGateway<'a> {
     pub fn new(
         provider: Arc<dyn LlmProvider>,
@@ -195,7 +204,7 @@ impl<'a> LlmGateway<'a> {
                 }),
             )
             .step_err(&node.id)?;
-        let used = usage.input.saturating_add(usage.output);
+        let used = checked_budget_add("completion token usage", usage.input, usage.output)?;
         if used > tokens {
             return Err(StepError::BudgetExceeded {
                 resource: "tokens",
@@ -273,7 +282,7 @@ impl<'a> LlmGateway<'a> {
             })?;
         let input_est = (prompt_bytes as u64).div_ceil(4);
         let max_output = u64::from(request.max_tokens);
-        let tokens = input_est.saturating_add(max_output);
+        let tokens = checked_budget_add("estimated token reservation", input_est, max_output)?;
         let mut cost_microusd = 0;
         // Required cache completeness is independent of reservation limits.
         if self.budget.require_pricing || self.budget.max_cost_microusd.is_some() {
@@ -343,26 +352,41 @@ impl<'a> LlmGateway<'a> {
             return Ok(());
         };
         let run_id = run_id_of(self.journal);
-        let spent_tokens = state
-            .budget
-            .tokens_input
-            .saturating_add(state.budget.tokens_output);
+        let spent_tokens = checked_budget_add(
+            "settled token usage",
+            state.budget.tokens_input,
+            state.budget.tokens_output,
+        )?;
         let spent_cost = state.budget.cost_microusd;
         let mut map = reservations()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let entry = map.entry(run_id).or_default();
-        let projected_tokens = spent_tokens
-            .saturating_add(entry.tokens)
-            .saturating_add(reservation.tokens);
-        let projected_cost = spent_cost
-            .saturating_add(entry.cost_microusd)
-            .saturating_add(reservation.cost_microusd);
+        let current = map.get(&run_id).cloned().unwrap_or_default();
+        let next_tokens = checked_budget_add(
+            "pending token reservations",
+            current.tokens,
+            reservation.tokens,
+        )?;
+        let next_cost = checked_budget_add(
+            "pending cost reservations",
+            current.cost_microusd,
+            reservation.cost_microusd,
+        )?;
+        let projected_tokens =
+            checked_budget_add("projected token usage", spent_tokens, next_tokens)?;
+        let projected_cost = checked_budget_add("projected cost usage", spent_cost, next_cost)?;
         self.check_budget_values(projected_tokens, projected_cost)?;
-        entry.tokens = entry.tokens.saturating_add(reservation.tokens);
-        entry.cost_microusd = entry
-            .cost_microusd
-            .saturating_add(reservation.cost_microusd);
+        if next_tokens == 0 && next_cost == 0 {
+            map.remove(&run_id);
+        } else {
+            map.insert(
+                run_id,
+                PendingReservation {
+                    tokens: next_tokens,
+                    cost_microusd: next_cost,
+                },
+            );
+        }
         Ok(())
     }
 
@@ -555,10 +579,11 @@ impl<'a> LlmGateway<'a> {
 
     fn check_budget(&self) -> Result<(), StepError> {
         let state = self.journal.state();
-        let used = state
-            .budget
-            .tokens_input
-            .saturating_add(state.budget.tokens_output);
+        let used = checked_budget_add(
+            "settled token usage",
+            state.budget.tokens_input,
+            state.budget.tokens_output,
+        )?;
         self.check_budget_values(used, state.budget.cost_microusd)
     }
 
@@ -1081,5 +1106,106 @@ api_key_env = "{credential_env}"
             ),
             (0, 0, 0)
         );
+    }
+}
+
+#[cfg(test)]
+mod budget_overflow_tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+
+    struct UnusedProvider;
+
+    #[async_trait::async_trait]
+    impl LlmProvider for UnusedProvider {
+        fn id(&self) -> &str {
+            "unused-budget-test"
+        }
+
+        fn capabilities(&self) -> llm::Capabilities {
+            Default::default()
+        }
+
+        async fn complete(&self, _request: ChatRequest) -> Result<ChatResponse, LlmError> {
+            unreachable!("budget accounting tests do not invoke the provider")
+        }
+    }
+
+    #[test]
+    fn settled_and_pending_budget_overflow_fail_closed() {
+        let run_id = format!("budget-overflow-{}", uuid::Uuid::now_v7());
+        let root = Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("llm-{run_id}-{}", std::process::id())),
+        )
+        .expect("temporary path must be UTF-8");
+        let journal = JournalWriter::create(&root.join("journal.jsonl"), &run_id, false, None)
+            .expect("test journal should open");
+        journal.state.lock().unwrap().run_id = Some(run_id.clone());
+        let secrets = SecretStore::default();
+        let gateway = LlmGateway::new(
+            Arc::new(UnusedProvider),
+            &secrets,
+            &journal,
+            CancellationToken::new(),
+            LlmCostBudget {
+                max_tokens: Some(u64::MAX),
+                max_cost_microusd: Some(u64::MAX),
+                require_pricing: false,
+            },
+            Vec::new(),
+        );
+
+        {
+            let mut state = journal.state.lock().unwrap();
+            state.budget.tokens_input = u64::MAX;
+            state.budget.tokens_output = 1;
+        }
+        assert!(gateway.check_budget().is_err());
+
+        journal.state.lock().unwrap().budget.tokens_output = 0;
+        assert!(
+            gateway
+                .try_reserve(Some(PendingReservation {
+                    tokens: 1,
+                    cost_microusd: 0,
+                }))
+                .is_err()
+        );
+        assert!(!reservations().lock().unwrap().contains_key(&run_id));
+        journal.state.lock().unwrap().budget.tokens_input = 0;
+
+        for (first, second) in [
+            (
+                PendingReservation {
+                    tokens: u64::MAX,
+                    cost_microusd: 0,
+                },
+                PendingReservation {
+                    tokens: 1,
+                    cost_microusd: 0,
+                },
+            ),
+            (
+                PendingReservation {
+                    tokens: 0,
+                    cost_microusd: u64::MAX,
+                },
+                PendingReservation {
+                    tokens: 0,
+                    cost_microusd: 1,
+                },
+            ),
+        ] {
+            gateway
+                .try_reserve(Some(first.clone()))
+                .expect("exactly representable cap is allowed");
+            assert!(gateway.try_reserve(Some(second)).is_err());
+            gateway.release_reservation(Some(first));
+            assert!(!reservations().lock().unwrap().contains_key(&run_id));
+        }
+
+        drop(gateway);
+        drop(journal);
+        let _ = std::fs::remove_dir_all(root);
     }
 }
