@@ -21,10 +21,14 @@ fn resync_durable_state(
     if let Ok(bytes) = std::fs::read(state_path) {
         // Reject newer schemas; older or malformed caches are refolded from the journal.
         ensure_supported_state_schema(&bytes)?;
-        if let Ok(persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
+        if let Ok(mut persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
             && persisted.schema_version == crate::RUN_STATE_SCHEMA_VERSION
             && persisted.last_seq == durable_seq
         {
+            // Cache fields cannot grant trace authority: bind private records
+            // to the actual bounded durable events, even on cache adoption.
+            let events = read_journal_values(journal_path, limits)?.events;
+            super::traces::TraceJournal::restore(&mut persisted, &events, journal_path, limits);
             return Ok(persisted);
         }
     }
@@ -103,7 +107,7 @@ fn clear_clean_shutdown_marker(journal_path: &Utf8Path) -> Result<(), JournalErr
 /// (file plus parent directory sync). Unix opens the directory and syncs;
 /// non-Unix has no directory handle and relies on the file sync (best
 /// effort, documented).
-fn sync_parent_dir(journal_path: &Utf8Path) -> Result<(), JournalError> {
+pub(super) fn sync_parent_dir(journal_path: &Utf8Path) -> Result<(), JournalError> {
     // The path feeds only the Unix directory sync below.
     #[cfg(not(unix))]
     let _ = journal_path;
@@ -510,8 +514,12 @@ impl JournalWriter {
                 }
             };
         state.audit_seq = audit_tail;
+        let trace_journal =
+            super::traces::TraceJournal::restore(&mut state, &scan.events, path, limits);
         state.persist_atomic_with_limits(&state_path, limits.max_state_bytes)?;
         Ok(Self {
+            trace_journal: Arc::new(Mutex::new(trace_journal)),
+            read_recorder: None,
             run_id,
             journal_path: path.to_owned(),
             file: Arc::new(Mutex::new(file)),
@@ -852,6 +860,17 @@ impl JournalWriter {
             }
             *state = next_state;
             crate::RunState::persist_serialized_atomic(&self.state_path, &state_bytes)?;
+            self.trace_journal
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .persist(
+                    &mut state,
+                    &value,
+                    self.read_recorder.as_ref(),
+                    &self.journal_path,
+                    self.limits,
+                    &file,
+                );
             // Advance the truncation checkpoint only after the append and
             // its state persist both succeeded: this length is the new
             // floor every future resync must meet or exceed. The length is
@@ -1124,8 +1143,19 @@ impl JournalWriter {
         Ok(appended)
     }
 
+    pub(crate) fn with_read_recorder(
+        &self,
+        recorder: contract::ReadRecorder,
+    ) -> Result<Self, JournalError> {
+        let mut writer = self.clone_for_parallel()?;
+        writer.read_recorder = Some(recorder);
+        Ok(writer)
+    }
+
     pub fn clone_for_parallel(&self) -> Result<Self, JournalError> {
         Ok(Self {
+            trace_journal: Arc::clone(&self.trace_journal),
+            read_recorder: self.read_recorder.clone(),
             run_id: self.run_id.clone(),
             journal_path: self.journal_path.clone(),
             file: Arc::clone(&self.file),

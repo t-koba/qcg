@@ -25,7 +25,7 @@ pub(crate) struct ContainerOutput {
 
 pub(crate) fn build_tool_backend_candidate(
     ctx: &StepContext<'_>,
-    _node: &NodeDef,
+    node: &NodeDef,
     tool: &ToolDef,
     backend: &ToolBackendKind,
     input: &str,
@@ -40,13 +40,15 @@ pub(crate) fn build_tool_backend_candidate(
             let bin = ctx
                 .run
                 .templates
-                .render_inline(
+                .render_context_scoped(
+                    contract::ReadOwner::Node(node.id.clone()),
                     &backend.bin,
                     json!({
                         "os": current_os(),
                         "arch": current_arch(),
                     }),
                     &ctx.run.contract.manifest.runtime,
+                    ctx.vars.read_recorder(),
                 )
                 .map_err(|error| format!("failed to render bundled bin: {error}"))?;
             let path = ctx

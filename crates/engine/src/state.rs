@@ -104,6 +104,8 @@ pub struct BudgetState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
+    #[serde(skip)]
+    pub(crate) dependency_traces: crate::journal::traces::OutcomeTraces,
     pub schema_version: u32,
     #[serde(deserialize_with = "required_presence")]
     pub run_id: Option<String>,
@@ -213,6 +215,7 @@ pub struct RunState {
 impl Default for RunState {
     fn default() -> Self {
         Self {
+            dependency_traces: Default::default(),
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run_id: None,
             contract_sha256: None,
@@ -403,15 +406,17 @@ impl RunState {
         limits: JournalLimits,
     ) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
-        for event in read_journal_values_through(path, through_seq, limits)?.events {
-            let parsed = api::RunEvent::from_flat(&event).map_err(|message| {
+        let events = read_journal_values_through(path, through_seq, limits)?.events;
+        for event in &events {
+            let parsed = api::RunEvent::from_flat(event).map_err(|message| {
                 crate::JournalError::InvalidEvent(format!("invalid journal event: {message}"))
             })?;
             if through_seq.is_some_and(|limit| parsed.seq > limit) {
                 break;
             }
-            state.apply(&event)?;
+            state.apply(event)?;
         }
+        crate::journal::traces::TraceJournal::restore(&mut state, &events, path, limits);
         Ok(state)
     }
 
@@ -1281,6 +1286,9 @@ impl RunState {
                 // Internal diagnostics have no folded state unless an earlier arm consumes them.
             }
             _ => {}
+        }
+        if let Some(owner) = crate::journal::traces::trace_owner(event) {
+            self.dependency_traces.remove(&owner);
         }
         Ok(())
     }

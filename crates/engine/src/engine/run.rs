@@ -735,6 +735,11 @@ impl Engine {
         } else {
             ValueBag::with_inputs(materialized_inputs)
         };
+        vars.read_recorder().set_byte_limit(
+            context.contract.manifest.runtime.journal_event_limit_bytes
+                .unwrap_or(policy::DEFAULT_MAX_JOURNAL_EVENT_BYTES),
+        );
+        let journal = journal.with_read_recorder(vars.read_recorder())?;
         let mut budget = BudgetTracker::new(
             options
                 .max_total_steps
@@ -843,7 +848,7 @@ impl Engine {
                 }
                 sync_live_outcomes(&mut vars, &journal);
                 let when =
-                    vars.eval_bool(node.when.as_ref())
+                    vars.eval_bool_scoped(contract::ReadOwner::Node(node.id.clone()), node.when.as_ref())
                         .map_err(|message| EngineError::Expr {
                             node: id.clone(),
                             message,

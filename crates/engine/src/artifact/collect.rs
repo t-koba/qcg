@@ -32,7 +32,12 @@ pub fn collect_outputs(
             ))
         })?;
         let path = templates
-            .render_inline(template, vars.to_json(), &manifest.runtime)
+            .render_bag_scoped(
+                contract::ReadOwner::Node(node.id.clone()),
+                template,
+                vars,
+                &manifest.runtime,
+            )
             .map_err(std::io::Error::other)?;
         collect_exact(
             workspace,
@@ -51,7 +56,12 @@ pub fn collect_outputs(
     }
     for extra in &manifest.outputs.extras {
         let pattern = templates
-            .render_inline(&extra.glob, vars.to_json(), &manifest.runtime)
+            .render_bag_scoped(
+                contract::ReadOwner::Node("@outputs".into()),
+                &extra.glob,
+                vars,
+                &manifest.runtime,
+            )
             .map_err(std::io::Error::other)?;
         let matches = matching_files(
             workspace,

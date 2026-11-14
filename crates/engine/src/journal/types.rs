@@ -97,6 +97,8 @@ pub enum JournalError {
 }
 
 pub struct JournalWriter {
+    pub(crate) trace_journal: Arc<Mutex<super::traces::TraceJournal>>,
+    pub(crate) read_recorder: Option<contract::ReadRecorder>,
     pub(crate) run_id: String,
     pub(crate) journal_path: Utf8PathBuf,
     pub(crate) file: Arc<Mutex<File>>,

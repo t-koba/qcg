@@ -3,11 +3,13 @@ mod error;
 mod eval;
 mod lexer;
 mod parser;
+mod read;
 
 use serde_json::{Value, json};
 
 pub use bag::*;
 pub use error::*;
+pub use read::*;
 
 /// The shared expression corpus, parsed with the same TOML reader the native
 /// evaluator's own test uses, so the frontend corpus test and the Rust corpus

@@ -26,7 +26,16 @@ pub fn read_journal_values_through(
             stats: JournalStats::default(),
         });
     }
-    let file = File::open(path)?;
+    read_journal_file(File::open(path)?, through_seq, limits)
+}
+
+/// Shared bounded scanner for a caller that already validated its file handle.
+pub(super) fn read_journal_file(
+    file: File,
+    through_seq: Option<u64>,
+    limits: JournalLimits,
+) -> Result<JournalScan, JournalError> {
+    validate_limits(limits)?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut line_number = 0_usize;

@@ -1,3 +1,5 @@
+mod read;
+
 use api::{ConfirmSpec, FormSpec};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
@@ -566,9 +568,10 @@ impl StepContext<'_> {
     pub fn render_inline(&self, node: &NodeDef, source: &str) -> Result<String, StepError> {
         self.run
             .templates
-            .render_inline(
+            .render_bag_scoped(
+                contract::ReadOwner::Node(node.id.clone()),
                 source,
-                self.vars.to_json(),
+                self.vars,
                 &self.run.contract.manifest.runtime,
             )
             .step_err(&node.id)
@@ -589,6 +592,52 @@ impl TemplateService {
         context: Value,
         limits: &RuntimeLimits,
     ) -> Result<String, minijinja::Error> {
+        self.render_context(source, context, limits, None)
+    }
+
+    pub fn render_bag_scoped(
+        &self,
+        owner: contract::ReadOwner,
+        source: &str,
+        bag: &contract::ValueBag,
+        limits: &RuntimeLimits,
+    ) -> Result<String, minijinja::Error> {
+        self.render_context_scoped(
+            owner,
+            source,
+            bag.template_snapshot(),
+            limits,
+            bag.read_recorder(),
+        )
+    }
+
+    /// Renders a detached JSON context while retaining actual reads in the
+    /// owning execution trace. Use for runtime-derived contexts such as host
+    /// metadata or retry-local values that are not part of ValueBag.
+    pub fn render_context_scoped(
+        &self,
+        owner: contract::ReadOwner,
+        source: &str,
+        context: Value,
+        limits: &RuntimeLimits,
+        recorder: contract::ReadRecorder,
+    ) -> Result<String, minijinja::Error> {
+        let reads = recorder.for_owner(owner);
+        reads.set_byte_limit(
+            limits
+                .journal_event_limit_bytes
+                .unwrap_or(policy::DEFAULT_MAX_JOURNAL_EVENT_BYTES),
+        );
+        self.render_context(source, context, limits, Some(reads))
+    }
+
+    fn render_context(
+        &self,
+        source: &str,
+        context: Value,
+        limits: &RuntimeLimits,
+        reads: Option<contract::ReadRecorder>,
+    ) -> Result<String, minijinja::Error> {
         validate_template_limits(limits)?;
         if let Some(limit) = limits.template_source_limit_bytes
             && source.len() > limit
@@ -606,6 +655,11 @@ impl TemplateService {
         let mut writer = BoundedTemplateWriter {
             bytes: Vec::new(),
             limit: limits.template_output_limit_bytes,
+        };
+        let context = minijinja::Value::from_serialize(context);
+        let context = match reads {
+            Some(reads) => read::context(context, reads),
+            None => context,
         };
         let captured = template
             .render_captured_to(context, &mut writer)

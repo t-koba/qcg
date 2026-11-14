@@ -1,6 +1,7 @@
 mod counters;
 mod read;
 mod serialize;
+pub(crate) mod traces;
 mod types;
 mod writer;
 

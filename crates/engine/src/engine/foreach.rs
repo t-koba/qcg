@@ -25,6 +25,10 @@ impl Engine {
         budget: &mut BudgetTracker,
         node: &NodeDef,
     ) -> Result<StepOutcome, EngineError> {
+        let mut read_scope = vars.read_scope(contract::ReadOwner::Node(node.id.clone()));
+        let vars = &mut *read_scope;
+        let scoped_journal = journal.with_read_recorder(vars.read_recorder())?;
+        let journal = &scoped_journal;
         let params: ForeachControlParams = crate::step_params(node, "foreach")?;
         for (field, value) in [("items", &params.items), ("subflow", &params.subflow)] {
             crate::require_field(node, Some(value.trim()), &format!("foreach {field}"))?;
@@ -130,6 +134,7 @@ impl Engine {
             journal,
             node: &node.id,
             workspace: &context.workspace,
+            traces: HashMap::new(),
         };
         let context = Arc::new(context.clone());
         let journal = Arc::new(journal.clone_for_parallel()?);
@@ -150,6 +155,9 @@ impl Engine {
                 let journal = Arc::clone(&journal);
                 let block = Arc::clone(&block);
                 let mut iteration_vars = reporter.vars.clone();
+                reporter
+                    .traces
+                    .insert(index, iteration_vars.read_recorder());
                 iteration_vars.clear_step_outcome_subtree(&node.id);
                 let mut iteration_budget = budget.clone();
                 let foreach_node = node.clone();
@@ -244,6 +252,11 @@ impl Engine {
             index,
             item,
         } = iteration;
+        let mut read_scope =
+            vars.read_scope(contract::ReadOwner::Node(format!("{}[{index}]", node.id)));
+        let vars = &mut *read_scope;
+        let scoped_journal = journal.with_read_recorder(vars.read_recorder())?;
+        let journal = &scoped_journal;
         let mut files = Vec::new();
         context.run_checkpoint()?;
         let parent_item = vars.item().cloned();
@@ -263,7 +276,10 @@ impl Engine {
             addressed_node.id = block_path.to_string();
             addressed_node.output = None;
             if !vars
-                .eval_bool(block_node.when.as_ref())
+                .eval_bool_scoped(
+                    contract::ReadOwner::Node(block_path.to_string()),
+                    block_node.when.as_ref(),
+                )
                 .map_err(|message| EngineError::Expr {
                     node: block_path.to_string(),
                     message,
@@ -401,6 +417,8 @@ struct ForeachReporter<'a> {
     journal: &'a JournalWriter,
     node: &'a str,
     workspace: &'a camino::Utf8Path,
+    // Retain only active task logs; remove and merge at every normal/drained join.
+    traces: HashMap<usize, contract::ReadRecorder>,
 }
 impl ForeachReporter<'_> {
     fn record(
@@ -417,10 +435,23 @@ impl ForeachReporter<'_> {
             "fail_fast"
         };
         let mut record = json!({"node": node, "index": index, "iteration": format!("{node}[{index}]"), "drain_cause": cause});
+        let reads = self.traces.remove(&index);
+        if result.is_err() {
+            if let Some(reads) = reads {
+                self.vars.read_recorder().merge(&reads);
+            }
+            self.vars
+                .read_recorder()
+                .for_owner(contract::ReadOwner::Node(format!("{node}[{index}]")))
+                .unsupported();
+        }
         let result = match result {
             Ok((reported, owner, iteration_vars, result)) => {
                 debug_assert_eq!(index, reported);
                 record["owner"] = json!(owner);
+                self.vars
+                    .read_recorder()
+                    .merge(&iteration_vars.read_recorder());
                 match &result {
                     Ok((iteration_files, outcome)) => {
                         self.files.extend(iteration_files.iter().cloned());
@@ -578,6 +609,7 @@ mod tests {
             journal,
             node,
             workspace: camino::Utf8Path::new("."),
+            traces: HashMap::new(),
         }
         .drain(tasks, indices, canceled)
         .await
@@ -651,6 +683,9 @@ mod tests {
         let mut scope = ValueBag::default();
         scope.set_item(Some(json!("identical user item")));
         scope.set_step_output("each[2]/child", json!({"value": "ok"}));
+        scope
+            .eval_value_scoped(contract::ReadOwner::Node("each[2]/child".into()), "item")
+            .unwrap();
         let success = tasks.spawn(async move {
             (
                 2,
@@ -664,6 +699,9 @@ mod tests {
             let mut scope = ValueBag::default();
             scope.set_item(Some(json!("identical user item")));
             scope.set_step_output("must_not_merge", json!(true));
+            scope
+                .eval_value_scoped(contract::ReadOwner::Node("each[7]/child".into()), "item")
+                .unwrap();
             (
                 7,
                 "each[7]/child".into(),
@@ -712,6 +750,18 @@ mod tests {
             first_outcome,
             Ok((_, Some(StepOutcome::CheckFailed { .. })))
         ));
+        let trace = vars.read_trace();
+        for owner in ["each[2]/child", "each[7]/child"] {
+            let owner = contract::ReadOwner::Node(owner.into());
+            assert!(trace.complete_for(&owner));
+            assert!(
+                trace
+                    .reads
+                    .iter()
+                    .any(|r| r.owner == owner && r.path == ["item"])
+            );
+        }
+        assert!(!trace.complete_for(&contract::ReadOwner::Node("each[19]/child".into())));
         assert_eq!(
             vars.get_path("steps.each[2]/child.output.value"),
             Some(&json!("ok"))

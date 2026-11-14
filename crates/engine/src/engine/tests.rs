@@ -660,6 +660,14 @@ async fn parallel_wave_statuses_are_visible_to_following_when() {
         .expect("the following when predicate should observe both durable outcomes");
     let events = journal_events(&run_dir);
     assert!(has_event(&events, "step_finished", "observe"));
+    let replay = RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).unwrap();
+    for owner in ["fast", "slow", "observe"] {
+        assert!(
+            replay.dependency_traces.owners[owner]
+                .trace
+                .complete_for(&contract::ReadOwner::Node(owner.into()))
+        );
+    }
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
@@ -1807,9 +1815,14 @@ async fn foreach_parallel_merges_child_outputs_into_the_parent_scope() {
         },
     ]);
     manifest.inputs = foreach_items_input();
-    manifest
-        .blocks
-        .insert("each_body".into(), vec![node("child", "test.output_stamp")]);
+    manifest.blocks.insert(
+        "each_body".into(),
+        vec![{
+            let mut child = node("child", "test.output_stamp");
+            child.when = Some(contract::Expr("item == \"a\" || item == \"b\"".into()));
+            child
+        }],
+    );
     let run_dir = temp_run_dir("foreach-parallel-vars");
     let mut registry = StepRegistry::new();
     registry.register(TestForeachStep);
@@ -1824,6 +1837,46 @@ async fn foreach_parallel_merges_child_outputs_into_the_parent_scope() {
     )
     .await
     .expect("parallel child outputs must be visible to later nodes");
+    let replay = RunState::fold_journal(&run_dir.join("meta/journal.jsonl")).unwrap();
+    let events = journal_events(&run_dir);
+    for owner in [
+        "each",
+        "each[0]",
+        "each[1]",
+        "each[0]/child",
+        "each[1]/child",
+    ] {
+        let evidence = &replay.dependency_traces.owners[owner];
+        let event = events
+            .iter()
+            .find(|event| event["seq"] == evidence.seq)
+            .unwrap();
+        assert_eq!(
+            crate::journal::traces::trace_owner(event).as_deref(),
+            Some(owner)
+        );
+        assert!(
+            evidence
+                .trace
+                .complete_for(&contract::ReadOwner::Node(owner.into()))
+        );
+        if owner.ends_with("/child") {
+            assert!(
+                evidence
+                    .trace
+                    .reads
+                    .iter()
+                    .any(|read| read.path == ["item"])
+            );
+            assert!(
+                evidence
+                    .trace
+                    .reads
+                    .iter()
+                    .all(|read| read.owner == contract::ReadOwner::Node(owner.into()))
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 

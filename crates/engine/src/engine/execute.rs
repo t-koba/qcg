@@ -214,6 +214,7 @@ impl Engine {
         let mut abort_on_settle = false;
         let mut parent_cancelled = false;
         let mut start_error = None;
+        let mut child_reads = Vec::new();
         let mut started_count = 0usize;
         for node in &nodes {
             // Check elapsed before start (E11); charge attempts in the retry wrapper (E10).
@@ -251,6 +252,7 @@ impl Engine {
             let journal = Arc::clone(&journal);
             let node = node.clone();
             let mut vars_snapshot = vars.clone();
+            child_reads.push((node.id.clone(), vars_snapshot.read_recorder()));
             let mut task_budget = budget.clone();
             let node_id = node.id.clone();
             let task = tasks.spawn(async move {
@@ -332,6 +334,14 @@ impl Engine {
             }
         }
 
+        for (owner, reads) in child_reads {
+            if !outcomes.contains_key(&owner) {
+                reads
+                    .for_owner(contract::ReadOwner::Node(owner))
+                    .unsupported();
+            }
+            vars.read_recorder().merge(&reads);
+        }
         fact_result?;
         let mut terminal_errors: Vec<EngineError> = join_errors;
         // Reported cancellations accompanying an interaction remain interruptions.
@@ -464,6 +474,10 @@ impl Engine {
         node: &'a NodeDef,
         charge: bool,
     ) -> Result<StepOutcome, EngineError> {
+        let mut read_scope = vars.read_scope(contract::ReadOwner::Node(node.id.clone()));
+        let vars = &mut *read_scope;
+        let scoped_journal = journal.with_read_recorder(vars.read_recorder())?;
+        let journal = &scoped_journal;
         let retry: RetryPolicy = node.retry.clone().unwrap_or_default();
         // Reject invalid programmatic bounds; never rewrite zero to one (E10).
         if retry.max_attempts == 0 || retry.max_attempts > policy::MAX_RETRY_ATTEMPTS {

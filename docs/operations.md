@@ -679,13 +679,36 @@ file. qcg applies this to run metadata (`state.json` atomic replace plus
 parent directory sync in `persist_serialized_atomic`), workspace atomic
 replacements and removals, idempotency records, fork journals and blobs, and
 large operation-result sidecars (file plus parent directory sync);
-journal line appends rely on terminal-only fsync plus repair (next table),
-not on a per-append directory fsync. Host power loss and storage-media
+journal line appends synchronize at the boundaries in the next table plus
+repair, not on a per-append directory fsync. Host power loss and storage-media
 failure stay outside the guaranteed boundary as stated above, so no test
 fault-injects them: the table below pins the process-crash contract that
 native tests do cover.
 
-Terminal-only fsync mapping (`crates/engine/src/journal/writer.rs`):
+Runtime dependency evidence is private run metadata in
+`meta/.dependency-traces.jsonl`, not a public event stream or an API field.
+Versioned records contain exact owner paths and read identities (not read
+values), bound to each terminal node/foreach-iteration outcome by its durable
+sequence and canonical JSON SHA-256. A separate checksum covers each private
+record so malformed or accidentally altered trace content is rejected. The
+journal lock orders both writes;
+the outcome is synchronized before the trace, followed by trace file and
+parent-directory sync. A crash between writes leaves incomplete evidence.
+
+Restart and bounded historical folds validate records against the durable
+outcome events, including when adopting `state.json`; the cache never stores
+or supplies trusted traces. Missing/legacy, malformed, unsupported, mismatched,
+overflowed, or over-limit evidence is incomplete, not an ordinary replay
+failure. Symlink and non-regular trace files are refused; Unix also refuses
+multiply linked files. Non-Unix leaf checks are best-effort. Private
+line/stream/count bounds reuse the configured journal limits
+(and their defaults); retained validated traces additionally use the state
+byte bound. Trace I/O or bound failures disable further evidence writes for
+that writer without changing ordinary success/failure results. Historical
+records remain bound to their outcomes until the run metadata is deleted.
+This evidence does not enable continuation or reset.
+
+Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):
 
 | path | what is fsynced | when |
 |---|---|---|
@@ -693,6 +716,7 @@ Terminal-only fsync mapping (`crates/engine/src/journal/writer.rs`):
 | `append_events_if` batch path | `file.sync_data()` on the journal file plus parent directory sync | when the batch contains a terminal or operation event (`needs_sync`) |
 | torn-tail repair `truncate_to` / newline commit | `sync_data()` after truncate or newline commit | every repair |
 | `state.json` persist | atomic write + replace via `persist_serialized_atomic` | every append (state always follows the journal) |
+| private dependency trace capture | outcome journal `sync_data()`, then private trace file and parent directory sync | terminal node/iteration outcomes with runtime read recorders; evidence failures are nonfatal |
 | `.clean_shutdown` marker | plain `write` / `remove_file`, no fsync | best-effort I/O, failures propagate (a failed terminal marker fails the operation; see repair marker below) |
 
 Cancel mailbox (`request_remote_cancel` in `crates/service/src/run_dirs.rs`):
@@ -707,7 +731,7 @@ failure is likewise warn-only (the staged file is `sync_all` durable); a
 power-loss entry loss resurrects the key as unclaimed and a retry re-commits
 the same mapping instead of minting a duplicate. Duplicate execution under
 power loss is accepted there (E02/Q2).
-Non-terminal appends are not individually fsynced; they rely on the next
+Other non-terminal appends are not individually fsynced; they rely on the next
 terminal sync or clean shutdown for media durability. A crash-truncated tail
 without a trailing newline is repaired on the next open under the journal
 lock: complete JSON without its newline gains the newline; torn JSON or a

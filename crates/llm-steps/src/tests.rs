@@ -4,7 +4,7 @@ use api::{GuardrailErrorKind, ToolCallError, ToolCallErrorCode, ToolCallPhase, T
 use camino::Utf8PathBuf;
 use contract::{
     AgentFailureAction, AgentFailureCode, Contract, LlmRequestControl, LlmRequestPolicy, NodeDef,
-    ToolDecl,
+    ReadIdentity, ToolDecl,
 };
 use contract::{Permissions, SecretRef, StepType};
 use engine::{
@@ -2285,6 +2285,39 @@ fn with_test_context<R>(
         llm: None,
     };
     operation(&ctx)
+}
+
+#[test]
+fn retry_local_prompt_records_its_owner_dependencies() {
+    let root = std::env::temp_dir().join(format!("retry-read-trace-{}", uuid_suffix()));
+    let contract = contract_with_provider_web_search(&root, "responses");
+    let node = &contract.manifest.flow[0];
+    with_test_context(&contract, &root, |ctx| {
+        let other = contract::ReadOwner::Node("other".into());
+        ctx.vars.read_recorder().for_owner(other.clone());
+        let prompt = crate::context::retry_prompt(ctx, node, "base", 2, Some("invalid")).unwrap();
+        assert!(prompt.starts_with("base\n\nRETRY_ATTEMPT: 2\n"));
+        let trace = ctx.vars.read_trace();
+        let owner = contract::ReadOwner::Node(node.id.clone());
+        assert!(trace.complete_for(&owner));
+        assert!(trace.complete_for(&other));
+        assert!(trace.reads.iter().any(|read| {
+            read.owner == owner
+                && read.path == ["retry", "attempt"]
+                && read.identity == ReadIdentity::of(Some(&json!(2)))
+        }));
+        assert!(trace.reads.iter().any(|read| {
+            read.owner == owner
+                && read.path == ["retry", "error"]
+                && read.identity == ReadIdentity::of(Some(&json!("invalid")))
+        }));
+        assert!(trace.reads.iter().any(|read| {
+            read.owner == owner
+                && read.path == ["error"]
+                && read.identity == ReadIdentity::of(Some(&json!("invalid")))
+        }));
+    });
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 /// The request a node builds, with the context the step executor would use.

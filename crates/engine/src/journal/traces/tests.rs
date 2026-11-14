@@ -1,0 +1,469 @@
+use super::*;
+use crate::{JournalWriter, NodeOutcome, RunState, read_journal_values};
+use camino::Utf8PathBuf;
+use serde_json::json;
+
+struct Fixture {
+    path: Utf8PathBuf,
+}
+impl Fixture {
+    fn new() -> Self {
+        let dir = std::env::temp_dir().join(format!("qcg-dependencies-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        Self {
+            path: Utf8PathBuf::from_path_buf(dir.join("journal.jsonl")).unwrap(),
+        }
+    }
+    fn writer(&self) -> JournalWriter {
+        JournalWriter::create(&self.path, "dependencies", false, None).unwrap()
+    }
+    fn fold(&self) -> RunState {
+        RunState::fold_journal(&self.path).unwrap()
+    }
+    fn records(&self) -> Vec<Value> {
+        read_journal_values(
+            &self.path.with_file_name(FILE_NAME),
+            JournalLimits::default(),
+        )
+        .unwrap()
+        .events
+    }
+    fn replace(&self, records: &[Value]) {
+        let mut text = String::new();
+        for record in records {
+            text.push_str(&format!("{record}\n"));
+        }
+        std::fs::write(self.path.with_file_name(FILE_NAME), text).unwrap();
+    }
+}
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        std::fs::remove_dir_all(self.path.parent().unwrap()).unwrap();
+    }
+}
+
+fn reads(owner: &str) -> ReadRecorder {
+    let recorder = ReadRecorder::new(policy::DEFAULT_MAX_JOURNAL_EVENT_BYTES)
+        .for_owner(ReadOwner::Node(owner.into()));
+    recorder.record(
+        &["inputs".into(), format!("private-{owner}")],
+        ReadKind::Lookup,
+        ReadIdentity::of(Some(&json!("never-store-this-value"))),
+    );
+    recorder
+}
+fn finish(writer: &JournalWriter, owner: &str, status: &str) {
+    writer
+        .event("step_finished", json!({"node": owner, "status": status}))
+        .unwrap();
+}
+fn assert_success(state: &RunState, owner: &str) {
+    assert!(matches!(
+        state.nodes.get(&model::NodePath::root(owner)),
+        Some(NodeOutcome::Success { .. })
+    ));
+}
+fn assert_trace(state: &RunState, owner: &str, seq: u64) {
+    let evidence = &state.dependency_traces.owners[owner];
+    assert_eq!(evidence.seq, seq);
+    assert!(evidence.trace.complete_for(&ReadOwner::Node(owner.into())));
+    assert_eq!(evidence.trace.reads.len(), 1);
+    assert!(
+        evidence
+            .trace
+            .reads
+            .iter()
+            .all(|read| read.owner == ReadOwner::Node(owner.into())
+                && read.path == ["inputs".to_string(), format!("private-{owner}")])
+    );
+}
+
+#[test]
+fn durable_restart_cache_and_public_output_are_separate() {
+    let f = Fixture::new();
+    let (sender, mut receiver) = tokio::sync::broadcast::channel(8);
+    let writer = JournalWriter::create(&f.path, "dependencies", false, Some(sender))
+        .unwrap()
+        .with_read_recorder(reads("node"))
+        .unwrap();
+    finish(&writer, "node", "success");
+    assert_trace(&writer.state(), "node", 1);
+    let public = std::fs::read_to_string(&f.path).unwrap();
+    let api = serde_json::to_string(&receiver.try_recv().unwrap()).unwrap();
+    assert!(receiver.try_recv().is_err());
+    let cache = std::fs::read_to_string(f.path.with_file_name("state.json")).unwrap();
+    for output in [&public, &api, &cache] {
+        for private in [
+            "private-node",
+            "never-store-this-value",
+            "dependency_traces",
+            "event_digest",
+            "reads",
+        ] {
+            assert!(!output.contains(private), "leaked {private}");
+        }
+    }
+    assert!(
+        !std::fs::read_to_string(f.path.with_file_name(FILE_NAME))
+            .unwrap()
+            .contains("never-store-this-value")
+    );
+    let event = read_journal_values(&f.path, JournalLimits::default())
+        .unwrap()
+        .events
+        .remove(0);
+    assert_eq!(
+        f.records()[0]["event_digest"],
+        json!(digest(&event).unwrap())
+    );
+    assert_trace(&f.fold(), "node", 1);
+    assert_trace(&f.writer().state(), "node", 1);
+    // Canonical event binding is independent of public object key order.
+    let reversed = event
+        .as_object()
+        .unwrap()
+        .iter()
+        .rev()
+        .map(|(key, value)| format!("{key:?}:{value}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    std::fs::write(&f.path, format!("{{{reversed}}}\n")).unwrap();
+    assert_trace(&f.fold(), "node", 1);
+    // Plain cache deserialization and value-only folds cannot grant authority.
+    let cached: RunState = serde_json::from_str(&cache).unwrap();
+    assert!(cached.dependency_traces.owners.is_empty());
+    assert!(
+        RunState::fold_values(&[event])
+            .unwrap()
+            .dependency_traces
+            .owners
+            .is_empty()
+    );
+    // A present, up-to-date state cache must not hide a missing private stream.
+    std::fs::remove_file(f.path.with_file_name(FILE_NAME)).unwrap();
+    let mut forged_cache: Value = serde_json::from_str(&cache).unwrap();
+    forged_cache["dependency_traces"] = json!({"owners":{"node":{"complete":true}}});
+    std::fs::write(
+        f.path.with_file_name("state.json"),
+        forged_cache.to_string(),
+    )
+    .unwrap();
+    let restarted = f.writer().state();
+    assert_success(&restarted, "node");
+    assert!(restarted.dependency_traces.owners.is_empty());
+}
+
+#[test]
+fn exact_owner_seq_digest_version_and_supported_identity_are_required() {
+    let f = Fixture::new();
+    let writer = f.writer().with_read_recorder(reads("a")).unwrap();
+    finish(&writer, "a", "success");
+    let original = f.records();
+    for (field, bad) in [
+        ("owner", json!("a/child")),
+        ("seq", json!(2)),
+        ("event_digest", json!(vec![0_u8; 32])),
+        ("version", json!(0)),
+        ("version", json!(VERSION + 1)),
+        ("complete", json!(false)),
+    ] {
+        let mut records = original.clone();
+        records[0][field] = bad;
+        f.replace(&records);
+        let state = f.fold();
+        assert_success(&state, "a");
+        assert!(
+            state.dependency_traces.owners.is_empty(),
+            "accepted {field}"
+        );
+    }
+    let mut records = original.clone();
+    records[0]["reads"][0]["path"][1] = json!("different-but-valid-path");
+    f.replace(&records);
+    assert!(f.fold().dependency_traces.owners.is_empty());
+    let mut records = original.clone();
+    records[0]["reads"][0]["identity"] = json!("unsupported");
+    f.replace(&records);
+    assert!(f.fold().dependency_traces.owners.is_empty());
+    f.replace(&[original[0].clone(), original[0].clone()]);
+    assert!(f.fold().dependency_traces.owners.is_empty());
+    f.replace(&original);
+    // Alter a durable event without altering seq or owner: old trace cannot bind.
+    let mut event = read_journal_values(&f.path, JournalLimits::default())
+        .unwrap()
+        .events
+        .remove(0);
+    event["status"] = json!("failed");
+    std::fs::write(&f.path, format!("{event}\n")).unwrap();
+    let state = f.fold();
+    assert!(matches!(
+        state.nodes.get(&model::NodePath::root("a")),
+        Some(NodeOutcome::Failed { .. })
+    ));
+    assert!(state.dependency_traces.owners.is_empty());
+}
+
+#[test]
+fn corruption_legacy_and_private_limits_never_break_ordinary_replay() {
+    let f = Fixture::new();
+    let writer = f.writer().with_read_recorder(reads("a")).unwrap();
+    finish(&writer, "a", "success");
+    let original = f.records();
+    for text in ["{bad}\n", "{\"version\":1", "{}\n", "{\"reads\":[]}\n"] {
+        std::fs::write(f.path.with_file_name(FILE_NAME), text).unwrap();
+        let state = f.fold();
+        assert_success(&state, "a");
+        assert!(state.dependency_traces.owners.is_empty());
+        assert_success(&f.writer().state(), "a");
+    }
+    f.replace(&original);
+    // Private lines are larger than the minimal public outcome. The same
+    // configured line/total/count bounds apply independently to each stream.
+    let public_bytes = std::fs::metadata(&f.path).unwrap().len() as usize;
+    let private_bytes = std::fs::metadata(f.path.with_file_name(FILE_NAME))
+        .unwrap()
+        .len() as usize;
+    assert!(private_bytes > public_bytes);
+    for limits in [
+        JournalLimits {
+            max_event_bytes: Some(public_bytes),
+            ..JournalLimits::default()
+        },
+        JournalLimits {
+            max_total_bytes: Some(public_bytes),
+            ..JournalLimits::default()
+        },
+    ] {
+        let state = RunState::fold_journal_with_limits(&f.path, limits).unwrap();
+        assert_success(&state, "a");
+        assert!(state.dependency_traces.owners.is_empty());
+    }
+    let mut extra = original[0].clone();
+    extra["seq"] = json!(2);
+    f.replace(&[original[0].clone(), extra]);
+    let state = RunState::fold_journal_with_limits(
+        &f.path,
+        JournalLimits {
+            max_event_count: Some(1),
+            ..JournalLimits::default()
+        },
+    )
+    .unwrap();
+    assert_success(&state, "a");
+    assert!(state.dependency_traces.owners.is_empty());
+    f.replace(&original);
+    let mut state = f.fold();
+    let events = read_journal_values(&f.path, JournalLimits::default())
+        .unwrap()
+        .events;
+    TraceJournal::restore(
+        &mut state,
+        &events,
+        &f.path,
+        JournalLimits {
+            max_state_bytes: Some(1),
+            ..JournalLimits::default()
+        },
+    );
+    assert_success(&state, "a");
+    assert!(state.dependency_traces.owners.is_empty());
+    f.replace(&[]);
+    assert!(f.fold().dependency_traces.owners.is_empty());
+}
+
+#[test]
+fn capture_overflow_unsupported_and_io_failure_do_not_change_outcomes() {
+    for (mode, status) in ["success", "failed"].into_iter().flat_map(|status| {
+        ["overflow", "unsupported", "io", "wire_limit"].map(|mode| (mode, status))
+    }) {
+        let f = Fixture::new();
+        let recorder = reads("a");
+        match mode {
+            "overflow" => recorder.set_byte_limit(1),
+            "unsupported" => recorder.unsupported(),
+            "io" => std::fs::create_dir(f.path.with_file_name(FILE_NAME)).unwrap(),
+            _ => {}
+        }
+        let writer = f.writer().with_read_recorder(recorder).unwrap();
+        let writer = if mode == "wire_limit" {
+            // Event fits, but its private record does not.
+            let limits = JournalLimits {
+                max_event_bytes: Some(400),
+                ..JournalLimits::default()
+            };
+            let large = reads("a");
+            large.record(
+                &["private-only-limit".repeat(32)],
+                ReadKind::Lookup,
+                ReadIdentity::Missing,
+            );
+            JournalWriter::create_with_limits(&f.path, "dependencies", false, None, limits)
+                .unwrap()
+                .with_read_recorder(large)
+                .unwrap()
+        } else {
+            writer
+        };
+        finish(&writer, "a", status);
+        assert_eq!(
+            read_journal_values(&f.path, JournalLimits::default())
+                .unwrap()
+                .events
+                .len(),
+            1
+        );
+        assert_eq!(
+            matches!(
+                writer.state().nodes[&model::NodePath::root("a")],
+                NodeOutcome::Success { .. }
+            ),
+            status == "success"
+        );
+        assert!(writer.state().dependency_traces.owners.is_empty(), "{mode}");
+        let state = f.fold();
+        assert_eq!(
+            matches!(
+                state.nodes[&model::NodePath::root("a")],
+                NodeOutcome::Success { .. }
+            ),
+            status == "success"
+        );
+        assert!(state.dependency_traces.owners.is_empty(), "{mode}");
+    }
+}
+
+#[test]
+fn replay_recharges_dependencies_and_rejects_memory_overflow() {
+    let f = Fixture::new();
+    finish(
+        &f.writer().with_read_recorder(reads("a")).unwrap(),
+        "a",
+        "success",
+    );
+    let mut record = f.records().remove(0);
+    record["reads"] = json!(
+        (0..40)
+            .map(|n| json!({"path":[n.to_string()],
+        "kind":"lookup", "identity":"missing"}))
+            .collect::<Vec<_>>()
+    );
+    let wire_bytes = serde_json::to_vec(&record).unwrap().len();
+    f.replace(&[record]);
+    let state = RunState::fold_journal_with_limits(
+        &f.path,
+        JournalLimits {
+            max_event_bytes: Some(wire_bytes),
+            ..JournalLimits::default()
+        },
+    )
+    .unwrap();
+    assert_success(&state, "a");
+    assert!(state.dependency_traces.owners.is_empty());
+}
+
+#[test]
+fn latest_outcome_missing_evidence_and_starts_cannot_reuse_old_trace() {
+    let f = Fixture::new();
+    let writer = f.writer().with_read_recorder(reads("a")).unwrap();
+    finish(&writer, "a", "success");
+    writer
+        .event(
+            "step_started",
+            json!({"node":"a", "type":"test", "attempt":2}),
+        )
+        .unwrap();
+    assert!(f.fold().dependency_traces.owners.is_empty());
+    finish(&f.writer(), "a", "failed");
+    assert!(f.fold().dependency_traces.owners.is_empty());
+    // Bounded historical folds bind to the earlier actual outcome, not the tail.
+    let state = RunState::fold_journal_through(&f.path, Some(1)).unwrap();
+    assert_trace(&state, "a", 1);
+}
+
+#[test]
+fn concurrent_owners_and_foreach_iteration_bindings_are_not_lost_or_duplicated() {
+    let f = Fixture::new();
+    let writer = f.writer();
+    std::thread::scope(|scope| {
+        for owner in ["each[0]/child", "each[1]/child"] {
+            let writer = writer
+                .clone_for_parallel()
+                .unwrap()
+                .with_read_recorder(reads(owner))
+                .unwrap();
+            scope.spawn(move || finish(&writer, owner, "success"));
+        }
+    });
+    let recorder = reads("each[0]");
+    recorder.merge(&reads("each[1]"));
+    let writer = writer.with_read_recorder(recorder).unwrap();
+    for index in [0, 1] {
+        writer
+            .event(
+                "foreach_iteration_settled",
+                json!({"node":"each", "index":index,
+            "iteration":format!("each[{index}]"), "owner":format!("each[{index}]/child"),
+            "classification":"completed_success", "drain_cause":"completed", "files":[]}),
+            )
+            .unwrap();
+    }
+    let records = f.records();
+    assert_eq!(records.len(), 4);
+    let events = read_journal_values(&f.path, JournalLimits::default())
+        .unwrap()
+        .events;
+    let restarted = f.writer().state();
+    for record in records {
+        let seq = record["seq"].as_u64().unwrap();
+        let event = &events[seq as usize - 1];
+        let owner = record["owner"].as_str().unwrap();
+        assert_eq!(trace_owner(event).as_deref(), Some(owner));
+        assert_trace(&restarted, owner, seq);
+    }
+    // A second process/writer must resync private evidence even with a cache.
+    let stale = f.writer();
+    finish(
+        &writer.with_read_recorder(reads("later")).unwrap(),
+        "later",
+        "success",
+    );
+    finish(
+        &stale.with_read_recorder(reads("last")).unwrap(),
+        "last",
+        "success",
+    );
+    assert_eq!(f.fold().dependency_traces.owners.len(), 6);
+    assert_eq!(stale.state().dependency_traces.owners.len(), 6);
+    // Cache adoption after evidence disappears must not retain peer traces.
+    std::fs::remove_file(f.path.with_file_name(FILE_NAME)).unwrap();
+    finish(&f.writer(), "no-evidence", "success");
+    finish(
+        &stale.with_read_recorder(reads("after-loss")).unwrap(),
+        "after-loss",
+        "success",
+    );
+    assert_success(&stale.state(), "after-loss");
+    assert!(stale.state().dependency_traces.owners.is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_evidence_cannot_alias_the_public_journal() {
+    for symlink in [true, false] {
+        let f = Fixture::new();
+        let writer = f.writer().with_read_recorder(reads("a")).unwrap();
+        let trace = f.path.with_file_name(FILE_NAME);
+        if symlink {
+            std::os::unix::fs::symlink(&f.path, &trace).unwrap();
+        } else {
+            std::fs::hard_link(&f.path, &trace).unwrap();
+        }
+        finish(&writer, "a", "success");
+        let scan = read_journal_values(&f.path, JournalLimits::default()).unwrap();
+        assert_eq!(scan.events.len(), 1);
+        assert_eq!(scan.events[0]["t"], "step_finished");
+        assert_success(&f.fold(), "a");
+        assert!(f.fold().dependency_traces.owners.is_empty());
+        assert!(f.writer().state().dependency_traces.owners.is_empty());
+    }
+}

@@ -281,13 +281,31 @@ pub(crate) fn retry_prompt(
             .retry_prompt
             .as_deref()
             .unwrap_or(DEFAULT_RETRY_PROMPT);
+        let reads = ctx
+            .vars
+            .read_recorder()
+            .for_owner(contract::ReadOwner::Node(node.id.clone()));
+        let attempt_value = json!(attempt);
+        let error_value = json!(error);
+        reads.record(
+            &["retry".into(), "attempt".into()],
+            contract::ReadKind::Lookup,
+            contract::ReadIdentity::of(Some(&attempt_value)),
+        );
+        reads.record(
+            &["retry".into(), "error".into()],
+            contract::ReadKind::Lookup,
+            contract::ReadIdentity::of(Some(&error_value)),
+        );
         let rendered = ctx
             .run
             .templates
-            .render_inline(
+            .render_context_scoped(
+                contract::ReadOwner::Node(node.id.clone()),
                 template,
                 json!({ "error": error, "attempt": attempt }),
                 &ctx.run.contract.manifest.runtime,
+                ctx.vars.read_recorder(),
             )
             .map_err(|render_error| {
                 StepError::failed(

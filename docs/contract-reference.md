@@ -4899,6 +4899,20 @@ fields are rejected when their structs define a closed schema.
    (excluding file content) and accepts 1 through 262144.
    `journal_event_limit_bytes` defaults to 8388608 bytes (8 MiB), and
    `journal_total_limit_bytes` to 67108864 bytes (64 MiB).
+   The event byte limit also bounds charged in-memory read-trace metadata
+   (owners, entries and path storage, plus allocator/tree overhead). Expression
+   and template reads record a canonical node/iteration owner and path. Leaf
+   values and whole-collection use carry SHA-256 identities; traversed collection
+   ancestors record presence only, so unrelated siblings do not become
+   dependencies. Missing and unsupported reads are explicit. Collection
+   traversal and direct `inputs()`, `item()` and `to_json()` access depend on the
+   full collection. File templates, artifact paths, host-derived template
+   contexts and retry-local prompt values use scoped renderers. Unsupported
+   operations invalidate the owning subtree; unscoped reads, overflow and mutex
+   poison fail closed. Clones have independent logs; joins explicitly merge them
+   without changing owners, even on task failure. Read values are never retained.
+   Recorder state expires with the bag; bounded dependency evidence is persisted
+   only in private run metadata, never in public results or events.
    `journal_event_count_limit` defaults to 1000000 events; `state_limit_bytes`
    defaults to 16777216 bytes (16 MiB) and also bounds operation-result
    sidecars. Explicit values override these defaults. Remaining optional

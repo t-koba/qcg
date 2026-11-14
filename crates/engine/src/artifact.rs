@@ -10,6 +10,51 @@ pub use resolve::*;
 mod tests {
     use super::*;
 
+    #[test]
+    fn artifact_templates_record_node_and_output_scope_dependencies() {
+        let root = temp_workspace().join(format!("read-trace-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("node.txt"), "node").unwrap();
+        std::fs::write(root.join("extra.txt"), "extra").unwrap();
+        let manifest: contract::Manifest = toml::from_str(
+            r#"
+[generator]
+id = "trace"
+name = "Trace"
+version = "0.1.0"
+[[flow]]
+id = "render"
+type = "render"
+artifact = { label = "node" }
+params = { template = "source.j2", output_file = "{{ inputs.file }}" }
+[[outputs.extras]]
+glob = "{{ inputs.extra }}"
+label = "extra"
+required = true
+"#,
+        )
+        .unwrap();
+        let vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::from([
+            ("file".into(), serde_json::json!("node.txt")),
+            ("extra".into(), serde_json::json!("extra.txt")),
+        ]));
+        let outputs = collect_outputs(&root, &manifest, &vars, &crate::TemplateService).unwrap();
+        assert_eq!(outputs.artifacts.len(), 2);
+        let trace = vars.read_trace();
+        for (owner, field) in [("render", "file"), ("@outputs", "extra")] {
+            let owner = contract::ReadOwner::Node(owner.into());
+            assert!(trace.complete_for(&owner));
+            assert!(
+                trace
+                    .reads
+                    .iter()
+                    .any(|r| r.owner == owner && r.path == ["inputs", field])
+            );
+        }
+        assert!(!trace.owners.contains(&contract::ReadOwner::Unscoped));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn collision_manifest(paths: &[&str]) -> OutputManifest {
         serde_json::from_value(serde_json::json!({"artifacts": paths.iter().map(|p|
             serde_json::json!({"path": p, "sha256": "unused", "bytes": 1, "label": p,

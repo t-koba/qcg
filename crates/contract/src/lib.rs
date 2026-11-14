@@ -7,7 +7,9 @@ mod schema;
 mod skill;
 
 pub use agent::{AgentFailureAction, AgentFailureCode, RecoverableAgentFailureCode};
-pub use expr::{Expr, ValueBag};
+pub use expr::{
+    Expr, ReadDependency, ReadIdentity, ReadKind, ReadOwner, ReadRecorder, ReadTrace, ValueBag,
+};
 pub use graph::{Graph, NodeState};
 pub use manifest::*;
 pub use path::*;

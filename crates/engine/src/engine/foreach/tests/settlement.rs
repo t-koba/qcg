@@ -196,6 +196,7 @@ async fn mixed_case(
         journal: &journal,
         node: &owner,
         workspace: &workspace,
+        traces: HashMap::new(),
     };
     let first = reporter
         .record(Ok(report), first_index, false, false)
@@ -218,6 +219,7 @@ async fn mixed_case(
             journal: &journal,
             node: "outer",
             workspace: &workspace,
+            traces: HashMap::new(),
         };
         root_reporter
             .record(
