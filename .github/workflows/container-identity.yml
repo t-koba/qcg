@@ -34,3 +34,37 @@ jobs:
           name: container-identity-${{ matrix.backend }}
           path: identity.json
           if-no-files-found: error
+
+  incus-identity:
+    name: Identity probe (Incus, not cleanup certification)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Check Incus diagnostic guards
+        run: python3 scripts/test-probe-incus-identity.py
+      # Only the hosted ephemeral runner's local daemon. No image or remote.
+      # Suppress setup/daemon output as it can contain paths and endpoints.
+      - name: Set up and probe local Incus
+        timeout-minutes: 8
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' '{"backend":"incus","outcome":"inconclusive","inconclusive_at":"runner_setup_or_whole_probe_timeout","crash_cleanup_certified":false,"qcg_crash_recovery_test":false,"resources_retired":false}' > incus-identity.json
+          if timeout --kill-after=5s 120s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -qq update >/dev/null 2>&1 &&
+             timeout --kill-after=5s 120s sudo -n env DEBIAN_FRONTEND=noninteractive apt-get -qq install -y incus incus-client >/dev/null 2>&1 &&
+             timeout --kill-after=5s 45s sudo -n incus admin init --minimal >/dev/null 2>&1; then
+            if timeout --kill-after=5s 120s sudo -n python3 scripts/probe-incus-identity.py \
+                --socket /var/lib/incus/unix.socket --command-timeout 15 \
+                --api-response-limit 1048576 > incus-result.json 2>/dev/null; then
+              mv incus-result.json incus-identity.json
+            fi
+          fi
+          cat incus-identity.json
+      - name: Retain Incus observation (not qcg crash recovery)
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-identity-incus
+          path: incus-identity.json
+          if-no-files-found: error

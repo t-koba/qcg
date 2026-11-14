@@ -27,9 +27,38 @@ absent full container ID can resolve to a different container deliberately
 created with that ID-shaped name, and removal by that stale reference can
 remove the replacement. This is evidence that those interfaces do not provide
 a strict ID-only reference in that case; the diagnostic did not exercise qcg
-crash recovery and is not cleanup certification. Incus/LXD have no equivalent
-real-daemon identity probe here; their current CLI plans also address
-instances by name.
+crash recovery and is not cleanup certification. Incus/LXD's current CLI
+plans also address instances by name.
+
+The manually dispatched `Container identity diagnostic` workflow also offers an
+Incus-only probe on an ephemeral Ubuntu 24.04 runner. It installs the distro
+Incus packages and initializes a local daemon with `incus admin init --minimal`.
+`scripts/probe-incus-identity.py` creates a unique run-scoped project and a stopped
+`create --empty --storage default` container, verifies its ownership and `volatile.uuid`, removes
+it, and creates a verified replacement under the same name with a different
+UUID. It then observes lookup and deletion through the stale name via the local
+Unix API. No instance is started and no image is fetched. The
+`container-identity-incus` artifact contains only sanitized observations, always
+`crash_cleanup_certified:false` and `qcg_crash_recovery_test:false`.
+
+This is a diagnostic to run, not an Incus result already established here, and
+it provides no LXD evidence. Setup assumes Ubuntu's Incus packages, local socket,
+the initialized `default` storage pool, and API/`volatile.uuid` support. The
+project shares the default project's profiles (`features.profiles=false`);
+explicit storage selection supplies the root disk without relying on an
+inherited root-device setting. An unavailable pool makes creation
+inconclusive with no fallback storage or cleanup. Setup failure,
+command or API timeout, schema mismatch, or uncertain ownership yields
+`inconclusive`, never a cleanup-safety claim. The job is bounded to 10 minutes,
+setup commands to 120/120/45 seconds, the whole probe to 120 seconds, and each
+probe command/API request to 15 seconds (outer `timeout` commands force-kill
+after an additional 5-second grace). CLI calls are forced local and pinned
+to the same socket as the API. Only successfully created and verified resources
+are deleted, under the disposable, quiescent-daemon precondition; the checks are
+not atomic compare-and-delete. After ambiguity there is no destructive retry or
+fallback cleanup; any remaining resources expire with the runner. On success
+the probe verifies instance absence and retires its empty project. This does
+not exercise qcg process death, late creates, continuation, or reset.
 
 The settle check is finite. A create that completes after the last absence
 check can be left behind after the intent is closed. A successful name-based
