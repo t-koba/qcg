@@ -128,11 +128,13 @@ for recovery. No host-process SIGKILL cleanup guarantee is claimed; see
 ## Container crash boundary
 
 The container/MCP cleanup tests cover the live-process lifecycle and daemon
-operation timeouts, not identity-safe reclamation after qcg is killed. CLI
-doubles can demonstrate late creation after client death, but cannot establish
-a real daemon's deletion identity or creation-fencing semantics. No Docker,
-Podman, or Incus SIGKILL cleanup guarantee is claimed; see
-[container crash-recovery limits](container-crash-recovery.md).
+operation timeouts, not identity-safe reclamation after qcg is killed. A
+bounded real-daemon Docker and rootless Podman probe found that a stale full ID
+can resolve to, and remove, a replacement named with that ID; this probes
+reference semantics only, not qcg recovery or safe deletion. Incus/LXD and
+create-completion fencing remain unproven. No Docker, Podman, runsc, Incus, or
+LXD SIGKILL cleanup guarantee is claimed; see
+[container recovery limits](container-crash-recovery.md).
 
 ## Measured timing bounds
 
