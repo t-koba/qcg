@@ -1250,6 +1250,26 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     // Reuse one read for folding and admission identity.
     let events = read_events_from_meta(&run_meta_dir(run_dir))?;
     let state = RunState::fold_values(&events).map_err(ServiceError::invalid)?;
+    if !check_run_admission(run_dir, run_id, &events, &state)? {
+        return Ok(AdoptSnapshot::empty());
+    }
+    Ok(AdoptSnapshot {
+        adopted: true,
+        events,
+        state: Some(state),
+    })
+}
+
+/// Check a single admission snapshot under the per-run admission lease.
+/// Callers must verify plain run/meta directories before permitting cleanup.
+/// Recovery applies this gate to forks only: ordinary crash recovery retains
+/// its existing handling of journals without a service admission marker.
+pub(crate) fn check_run_admission(
+    run_dir: &Utf8Path,
+    run_id: &str,
+    events: &[Value],
+    state: &RunState,
+) -> Result<bool, ServiceError> {
     match state.run_id.as_deref() {
         Some(existing) if existing == run_id => {}
         Some(_) => {
@@ -1280,15 +1300,33 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
             })
     });
     if !initialized {
+        if let Some(fork_seq) = last_fork_seq {
+            // Preparation writes only the fork marker and at most one pure
+            // state patch before the child's admission marker. Older buggy
+            // recovery may have executed an incomplete fork; preserve every
+            // unexpected post-marker event as evidence, especially effects.
+            let mut state_patches = 0;
+            for event in events
+                .iter()
+                .filter(|event| event["seq"].as_u64().is_some_and(|seq| seq > fork_seq))
+            {
+                if event["t"] == "state_patched"
+                    && state_patches == 0
+                    && fork_seq.checked_add(1) == event["seq"].as_u64()
+                {
+                    state_patches += 1;
+                } else {
+                    return Err(ServiceError::Invalid(format!(
+                        "incomplete fork `{run_id}` has unexpected post-marker history; refusing cleanup"
+                    )));
+                }
+            }
+        }
         // Under admission ownership, non-admission writers cannot change this verdict.
         wipe_incomplete_run_dir(run_dir)?;
-        return Ok(AdoptSnapshot::empty());
+        return Ok(false);
     }
-    Ok(AdoptSnapshot {
-        adopted: true,
-        events,
-        state: Some(state),
-    })
+    Ok(true)
 }
 
 /// Rejects absolute paths, parent traversal, and terminal symlinks while

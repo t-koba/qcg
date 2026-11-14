@@ -111,6 +111,7 @@ pub(crate) fn status_from_journal(status: &str) -> Result<RunStatus, ServiceErro
 }
 
 /// Strict construction-time recovery: any unreadable entry refuses startup.
+/// Busy admission shards are skipped without waiting; a later scan can recover them.
 pub(crate) fn rehydrate_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
@@ -217,8 +218,17 @@ fn rehydrate_run(
     nonterminal_runs: &mut usize,
     effects: &mut Vec<Utf8PathBuf>,
 ) -> Result<Option<(String, RunRecord)>, ServiceError> {
-    let journal_path = run_meta_dir(run_dir).join("journal.jsonl");
-    if !is_regular_directory(run_dir)? || !is_regular_file(&journal_path)? {
+    // Serialize with preparation before even probing the journal. Contention
+    // (including a shard collision) skips this entry, never a half-built prefix.
+    let Some(_admission) = crate::run_dirs::try_lock_run_admission(run_dir)? else {
+        return Ok(None);
+    };
+    let meta_dir = run_meta_dir(run_dir);
+    let journal_path = meta_dir.join("journal.jsonl");
+    if !is_regular_directory(run_dir)?
+        || !is_regular_directory(&meta_dir)?
+        || !is_regular_file(&journal_path)?
+    {
         return Ok(None);
     }
     if journal_is_empty(&journal_path)? {
@@ -229,6 +239,19 @@ fn rehydrate_run(
     // never pays a scan per field per run.
     let journal_values = read_journal_events(run_dir)?;
     let state = RunState::fold_values(&journal_values).map_err(ServiceError::invalid)?;
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
+        .to_string();
+    if journal_values
+        .iter()
+        .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
+        && !crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state)?
+    {
+        // The shared admission gate wiped an incomplete fork while preserving
+        // its cancel mailbox. Refused cleanup propagates an error, not a record.
+        return Ok(None);
+    }
     if !state.effects.is_empty() {
         effects.push(run_dir.to_owned());
     }
@@ -242,10 +265,6 @@ fn rehydrate_run(
         return Ok(None);
     }
     *nonterminal_runs = nonterminal_runs.saturating_add(1);
-    let run_id = run_dir
-        .file_name()
-        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
-        .to_string();
     let (record_state, question, confirm) = match state.settled_pending().cloned() {
         Some(Interaction::Question { question }) => (RunStatus::Waiting, Some(question), None),
         Some(Interaction::Confirmation { confirm }) => (RunStatus::Confirming, None, Some(confirm)),

@@ -1643,6 +1643,215 @@ fn confirmation_file_revision_is_restored_in_fork_without_pending_prompt() {
     assert_eq!(state.latest_file_pins.get("asked.txt"), Some(&asked_digest));
 }
 
+#[test]
+fn ordinary_crash_recovery_does_not_require_a_queue_marker() {
+    let root = temp_run_dir("ordinary-recovery-no-queue");
+    let _guard = TempGuard(root.clone());
+    let record = synthetic_hitl_record(&root, "ordinary");
+    // Model an ordinary engine crash journal initialized with run_started,
+    // not a service admission. The fork-only gate must not wipe or reject it.
+    let mut started = read_journal_events(&record.run_dir).unwrap().remove(0);
+    started["t"] = json!("run_started");
+    std::fs::write(
+        run_meta_dir(&record.run_dir).join("journal.jsonl"),
+        format!("{started}\n"),
+    )
+    .unwrap();
+    let recovered = crate::summaries::rehydrate_runs(&root.join("runs"), 8, 8).unwrap();
+    assert_eq!(recovered["ordinary"].state, RunStatus::Queued);
+    assert_eq!(read_journal_events(&record.run_dir).unwrap(), vec![started]);
+}
+
+#[test]
+fn fork_recovery_requires_own_queue_after_complete_package_copy() {
+    let root = temp_run_dir("fork-recovery-admission");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let source = synthetic_hitl_record(&root, "source");
+    let source_before = read_journal_events(&source.run_dir).unwrap();
+    let mut child = source.clone();
+    child.run_dir = runs.join("child");
+    child.parent_run_id = Some("source".into());
+    let prepare = || {
+        let admission = crate::run_dirs::try_lock_run_admission(&child.run_dir)
+            .unwrap()
+            .unwrap();
+        crate::run_dirs::prepare_checkpoint_fork(
+            &source.run_dir,
+            "source",
+            &child.run_dir,
+            "child",
+            1,
+            &ForkStatePatch::default(),
+        )
+        .unwrap();
+        crate::run_package::copy(
+            &crate::run_package::package_dir(&source.run_dir),
+            &child.run_dir,
+            source.package_sha256.as_deref().unwrap(),
+        )
+        .unwrap();
+        admission
+    };
+    // Exact crash window: transformed source queue + run_forked, and a
+    // complete, loadable package, but no queue committed by the child.
+    let admission = prepare();
+    let prefix = read_journal_events(&child.run_dir).unwrap();
+    let folded = engine::RunState::fold_values(&prefix).unwrap();
+    crate::run_package::load(&child.run_dir, &folded).unwrap();
+    assert_eq!(prefix.last().unwrap()["t"], "run_forked");
+    assert!(
+        !crate::summaries::rehydrate_runs(&runs, 8, 8)
+            .unwrap()
+            .contains_key("child"),
+        "recovery must skip a busy admission, even with a complete package"
+    );
+    assert_eq!(read_journal_events(&child.run_dir).unwrap(), prefix);
+    drop(admission);
+
+    // Unsafe cleanup refuses startup; periodic recovery isolates the entry,
+    // never schedules it, and leaves all evidence for exclusive reconciliation.
+    let binding = engine::host_cgroup::binding_path(&run_meta_dir(&child.run_dir));
+    std::fs::write(&binding, b"unreconciled host evidence").unwrap();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    assert!(
+        error.to_string().contains("host-cgroup evidence"),
+        "{error}"
+    );
+    let (recovered, failures) = crate::summaries::refresh_runs(&runs, 8, 8).unwrap();
+    assert_eq!(failures, 1);
+    assert!(!recovered.contains_key("child"));
+    assert_eq!(read_journal_events(&child.run_dir).unwrap(), prefix);
+    std::fs::remove_file(binding).unwrap();
+
+    let cancel = crate::run_dirs::request_remote_cancel(
+        &child.run_dir,
+        "child",
+        "recovery-test",
+        engine::JournalLimits::default(),
+    )
+    .unwrap();
+    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
+    assert!(!recovered.contains_key("child"));
+    assert_eq!(recovered["source"].state, RunStatus::Queued);
+    assert!(!run_meta_dir(&child.run_dir).join("journal.jsonl").exists());
+    assert!(!crate::run_package::package_dir(&child.run_dir).exists());
+    assert_eq!(
+        crate::run_dirs::list_pending_cancel_controls(&child.run_dir).unwrap()[0].0,
+        cancel,
+        "incomplete-fork cleanup must preserve the cancel mailbox"
+    );
+    assert!(crate::run_dirs::consume_cancel_control(
+        &child.run_dir,
+        &cancel
+    ));
+
+    // A redo with the child's own post-fork queue is recoverable, with no
+    // source edits and no engine task or scheduling race needed in this test.
+    let admission = prepare();
+    write_run_event(
+        &child,
+        "run_queued",
+        json!({
+            "run_id": "child",
+            "generator": "ask-user@0.1.0",
+            "generator_path": child.contract.root,
+            "contract_sha256": child.contract_sha256,
+            "package_sha256": child.package_sha256,
+            "inputs": {},
+            "answers": {},
+            "confirmations": {},
+            "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            "priority": 7,
+            "parent_run_id": "source",
+        }),
+    )
+    .unwrap();
+    drop(admission);
+    let committed = read_journal_events(&child.run_dir).unwrap();
+    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
+    assert_eq!(recovered["child"].state, RunStatus::Queued);
+    assert_eq!(recovered["child"].priority, 7);
+    assert_eq!(recovered["child"].parent_run_id.as_deref(), Some("source"));
+    assert_eq!(read_journal_events(&child.run_dir).unwrap(), committed);
+    assert_eq!(read_journal_events(&source.run_dir).unwrap(), source_before);
+}
+
+#[test]
+fn incomplete_fork_with_post_marker_effect_evidence_is_preserved() {
+    let root = temp_run_dir("fork-recovery-preserves-post-marker-effects");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let source = synthetic_hitl_record(&root, "source");
+    let child_dir = runs.join("child");
+    let admission = crate::run_dirs::try_lock_run_admission(&child_dir)
+        .unwrap()
+        .unwrap();
+    crate::run_dirs::prepare_checkpoint_fork(
+        &source.run_dir,
+        "source",
+        &child_dir,
+        "child",
+        1,
+        &ForkStatePatch::default(),
+    )
+    .unwrap();
+    crate::run_package::copy(
+        &crate::run_package::package_dir(&source.run_dir),
+        &child_dir,
+        source.package_sha256.as_deref().unwrap(),
+    )
+    .unwrap();
+    let journal_path = run_meta_dir(&child_dir).join("journal.jsonl");
+    let writer = engine::JournalWriter::create(&journal_path, "child", false, None).unwrap();
+    writer
+        .event(
+            "operation_started",
+            json!({
+                "operation_id": "unresolved-fork-operation",
+                "operation_digest": "digest",
+                "invocation_id": "invocation",
+                "node": "external",
+                "kind": "command",
+                "target": "fixture",
+                "on_indeterminate": "fail",
+            }),
+        )
+        .unwrap();
+    drop(writer);
+    drop(admission);
+    let before = read_journal_events(&child_dir).unwrap();
+    let cancel = crate::run_dirs::request_remote_cancel(
+        &child_dir,
+        "child",
+        "recovery-test",
+        engine::JournalLimits::default(),
+    )
+    .unwrap();
+
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    assert!(error.to_string().contains("post-marker history"), "{error}");
+    assert_eq!(read_journal_events(&child_dir).unwrap(), before);
+    assert!(crate::run_package::package_dir(&child_dir).exists());
+    assert!(
+        engine::RunState::fold_values(&before)
+            .unwrap()
+            .ensure_no_fail_closed_inflight_operations()
+            .is_err(),
+        "the unresolved operation record must remain available"
+    );
+    assert_eq!(
+        crate::run_dirs::list_pending_cancel_controls(&child_dir).unwrap()[0].0,
+        cancel,
+        "refusing cleanup must preserve the cancel mailbox"
+    );
+    let (recovered, failures) = crate::summaries::refresh_runs(&runs, 8, 8).unwrap();
+    assert_eq!(failures, 1);
+    assert!(!recovered.contains_key("child"));
+    assert_eq!(read_journal_events(&child_dir).unwrap(), before);
+}
+
 #[tokio::test]
 async fn partial_fork_is_not_mistaken_for_completed_admission() {
     // A03: a crash between checkpoint copy and the fork's own
