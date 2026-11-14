@@ -111,7 +111,11 @@ pub(crate) fn status_from_journal(status: &str) -> Result<RunStatus, ServiceErro
 }
 
 /// Strict construction-time recovery: any unreadable entry refuses startup.
-/// Busy admission shards are skipped without waiting; a later scan can recover them.
+/// Busy shards are skipped for this snapshot and returned as candidates to revalidate.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Recovery wrapper without effect discovery")
+)]
 pub(crate) fn rehydrate_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
@@ -122,7 +126,7 @@ pub(crate) fn rehydrate_runs(
 
 /// Startup recovery: also reports every run directory (terminal or direct
 /// included) whose folded journal still holds an unconfirmed container
-/// effect, so the one scan seeds effect reconciliation too.
+/// effect, or whose admission shard was busy. Candidates must be revalidated.
 pub(crate) fn rehydrate_runs_with_effects(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
@@ -141,18 +145,45 @@ pub(crate) fn rehydrate_runs_with_effects(
 
 /// Periodic recovery isolates entry failures, but never suppresses directory
 /// traversal or configured scan/cap errors. The count reports degraded scans.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "Recovery wrapper without effect discovery")
+)]
 pub(crate) fn refresh_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
+    refresh_runs_with_effects(runs_dir, max_tracked_runs, max_scan_entries)
+        .map(|scan| (scan.runs, scan.failures))
+}
+
+pub(crate) struct RefreshedRuns {
+    pub(crate) runs: BTreeMap<String, RunRecord>,
+    pub(crate) failures: usize,
+    pub(crate) effects: Vec<Utf8PathBuf>,
+}
+
+/// Periodic recovery also preserves unverified effect-discovery candidates,
+/// including busy shards and entries whose evidence could not be read.
+pub(crate) fn refresh_runs_with_effects(
+    runs_dir: &Utf8Path,
+    max_tracked_runs: usize,
+    max_scan_entries: usize,
+) -> Result<RefreshedRuns, ServiceError> {
+    let mut effects = Vec::new();
     scan_runs(
         runs_dir,
         max_tracked_runs,
         max_scan_entries,
         true,
-        &mut Vec::new(),
+        &mut effects,
     )
+    .map(|(runs, failures)| RefreshedRuns {
+        runs,
+        failures,
+        effects,
+    })
 }
 
 fn scan_runs(
@@ -189,7 +220,13 @@ fn scan_runs(
             .map_err(|path| {
                 ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
             })
-            .and_then(|run_dir| rehydrate_run(&run_dir, &mut nonterminal_runs, effects));
+            .and_then(|run_dir| {
+                let recovered = rehydrate_run(&run_dir, &mut nonterminal_runs, effects);
+                if recovered.is_err() {
+                    effects.push(run_dir);
+                }
+                recovered
+            });
         // Count validated non-terminal journals even if their package or
         // manifest could not be loaded; isolation must not bypass the cap.
         if nonterminal_runs > max_tracked_runs {
@@ -221,37 +258,16 @@ fn rehydrate_run(
     // Serialize with preparation before even probing the journal. Contention
     // (including a shard collision) skips this entry, never a half-built prefix.
     let Some(_admission) = crate::run_dirs::try_lock_run_admission(run_dir)? else {
+        effects.push(run_dir.to_owned());
         return Ok(None);
     };
-    let meta_dir = run_meta_dir(run_dir);
-    let journal_path = meta_dir.join("journal.jsonl");
-    if !is_regular_directory(run_dir)?
-        || !is_regular_directory(&meta_dir)?
-        || !is_regular_file(&journal_path)?
-    {
+    let Some((journal_values, state)) = read_recovery_state(run_dir)? else {
         return Ok(None);
-    }
-    if journal_is_empty(&journal_path)? {
-        return Ok(None);
-    }
-    // One bounded journal read serves the fold and every derivation
-    // below (identity, scheduling, HITL maps, queue key): a restart
-    // never pays a scan per field per run.
-    let journal_values = read_journal_events(run_dir)?;
-    let state = RunState::fold_values(&journal_values).map_err(ServiceError::invalid)?;
+    };
     let run_id = run_dir
         .file_name()
         .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
-        .to_string();
-    if journal_values
-        .iter()
-        .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
-        && !crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state)?
-    {
-        // The shared admission gate wiped an incomplete fork while preserving
-        // its cancel mailbox. Refused cleanup propagates an error, not a record.
-        return Ok(None);
-    }
+        .to_owned();
     if !state.effects.is_empty() {
         effects.push(run_dir.to_owned());
     }
@@ -322,6 +338,43 @@ fn rehydrate_run(
             ephemeral: false,
         },
     )))
+}
+
+/// Read and gate a recovery snapshot under admission ownership. In particular,
+/// an incomplete fork must never lend its copied effects to cleanup.
+pub(crate) fn read_recovery_state(
+    run_dir: &Utf8Path,
+) -> Result<Option<(Vec<Value>, RunState)>, ServiceError> {
+    let meta_dir = run_meta_dir(run_dir);
+    let journal_path = meta_dir.join("journal.jsonl");
+    if !is_regular_directory(run_dir)?
+        || !is_regular_directory(&meta_dir)?
+        || !is_regular_file(&journal_path)?
+    {
+        return Ok(None);
+    }
+    if journal_is_empty(&journal_path)? {
+        return Ok(None);
+    }
+    // One bounded journal read serves the fold and every derivation
+    // below (identity, scheduling, HITL maps, queue key): a restart
+    // never pays a scan per field per run.
+    let journal_values = read_journal_events(run_dir)?;
+    let state = RunState::fold_values(&journal_values).map_err(ServiceError::invalid)?;
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
+        .to_string();
+    if journal_values
+        .iter()
+        .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked"))
+        && !crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state)?
+    {
+        // The shared admission gate wiped an incomplete fork while preserving
+        // its cancel mailbox. Refused cleanup propagates an error, not a record.
+        return Ok(None);
+    }
+    Ok(Some((journal_values, state)))
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use camino::Utf8PathBuf;
 use contract::Contract;
 use model::OutputManifest;
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{RwLock, broadcast};
 use tokio::task::JoinHandle;
@@ -190,9 +190,10 @@ pub(crate) struct LocalServiceInner {
     pub(crate) generator_roots: Vec<Utf8PathBuf>,
     pub(crate) runs_dir: Utf8PathBuf,
     pub(crate) runs: RwLock<BTreeMap<String, RunRecord>>,
-    /// Run directories whose open container effects the construction scan
-    /// found; drained once by startup recovery.
-    pub(crate) unreconciled_effects: Mutex<Vec<Utf8PathBuf>>,
+    /// Unverified effect-discovery paths from bounded recovery scans. Busy or
+    /// failed candidates stay deduplicated until a later pass settles them;
+    /// deleted and no-longer-effectful paths are removed on revalidation.
+    pub(crate) unreconciled_effects: Mutex<BTreeSet<Utf8PathBuf>>,
     pub(crate) llm_runtime: Arc<llm::LlmRuntime>,
     pub(crate) execution_permits: Arc<PriorityPermits>,
     pub(crate) max_active_runs: usize,

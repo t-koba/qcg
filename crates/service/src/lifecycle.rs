@@ -9,8 +9,8 @@ use crate::run_dirs::{
 };
 use crate::summaries::{
     fold_run_state, has_remote_cancel_request, read_merged_events_from_meta,
-    read_optional_output_manifest, refresh_runs, rehydrate_runs_with_effects, run_meta_dir,
-    run_workspace_dir,
+    read_optional_output_manifest, refresh_runs_with_effects, rehydrate_runs_with_effects,
+    run_meta_dir, run_workspace_dir,
 };
 use crate::types::{
     DirectRun, DirectRunEvents, FinishTransition, LocalService, LocalServiceInner, RunRecord,
@@ -175,7 +175,7 @@ impl LocalService {
                 generator_roots: roots,
                 runs_dir,
                 runs: RwLock::new(runs),
-                unreconciled_effects: Mutex::new(effects),
+                unreconciled_effects: Mutex::new(effects.into_iter().collect()),
                 llm_runtime,
                 execution_permits: Arc::new(PriorityPermits::new(max_active_runs)),
                 max_active_runs,
@@ -466,7 +466,11 @@ impl LocalService {
     }
 
     pub(crate) async fn refresh_shared_runs(&self) -> Result<(), ServiceError> {
-        let (recovered, mut failures) = match refresh_runs(
+        let crate::summaries::RefreshedRuns {
+            runs: recovered,
+            mut failures,
+            effects,
+        } = match refresh_runs_with_effects(
             &self.inner.runs_dir,
             self.inner.max_tracked_runs,
             self.inner.deployment_policy.max_directory_scan_entries,
@@ -477,6 +481,7 @@ impl LocalService {
                 return Err(error);
             }
         };
+        self.merge_effect_candidates(effects);
         {
             let mut runs = self.inner.runs.write().await;
             runs.retain(|_, record| !record.state.is_terminal());
@@ -883,12 +888,13 @@ impl LocalService {
                 { self.inner.runs.read().await.keys().cloned().collect() };
             // Reuse the construction-time rehydration (bounded, single read
             // per run) and merge only untracked Queued orphans.
-            match crate::summaries::rehydrate_runs(
+            match rehydrate_runs_with_effects(
                 &self.inner.runs_dir,
                 self.inner.max_tracked_runs,
                 self.inner.deployment_policy.max_directory_scan_entries,
             ) {
-                Ok(disk) => {
+                Ok((disk, effects)) => {
+                    self.merge_effect_candidates(effects);
                     let mut runs = self.inner.runs.write().await;
                     for (run_id, record) in disk {
                         if known.contains(&run_id) || runs.contains_key(&run_id) {
