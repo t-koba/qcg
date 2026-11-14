@@ -307,7 +307,7 @@ impl TraceJournal {
             file.seek(SeekFrom::End(-1)).ok()?;
             let mut last = [0];
             file.read_exact(&mut last).ok()?;
-            if last != [b'\n'] {
+            if last != *b"\n" {
                 return None;
             }
         }

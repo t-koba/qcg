@@ -158,7 +158,7 @@ mod windows {
         owner_sddl(&CurrentUser::load()?, dacl)
     }
 
-    pub(super) fn open(path: &Utf8Path, access: Access) -> io::Result<File> {
+    pub fn open(path: &Utf8Path, access: Access) -> io::Result<File> {
         let user = CurrentUser::load()?;
         let sddl = owner_sddl(&user, OWNER_ONLY_DACL)?;
         let mut descriptor = null_mut();
