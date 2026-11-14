@@ -1,5 +1,6 @@
 use super::super::run_dirs::{is_regular_directory, is_regular_file, journal_is_empty};
 use super::super::types::{RunRecord, ServiceError};
+use crate::effects::{EffectCandidates, EffectProvenance};
 use api::{RunEvent, RunStatus};
 use camino::{Utf8Path, Utf8PathBuf};
 use engine::{Interaction, RunState, read_output_manifest};
@@ -131,8 +132,8 @@ pub(crate) fn rehydrate_runs_with_effects(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
-) -> Result<(BTreeMap<String, RunRecord>, Vec<Utf8PathBuf>), ServiceError> {
-    let mut effects = Vec::new();
+) -> Result<(BTreeMap<String, RunRecord>, EffectCandidates), ServiceError> {
+    let mut effects = EffectCandidates::new();
     scan_runs(
         runs_dir,
         max_tracked_runs,
@@ -161,7 +162,7 @@ pub(crate) fn refresh_runs(
 pub(crate) struct RefreshedRuns {
     pub(crate) runs: BTreeMap<String, RunRecord>,
     pub(crate) failures: usize,
-    pub(crate) effects: Vec<Utf8PathBuf>,
+    pub(crate) effects: EffectCandidates,
 }
 
 /// Periodic recovery also preserves unverified effect-discovery candidates,
@@ -171,7 +172,7 @@ pub(crate) fn refresh_runs_with_effects(
     max_tracked_runs: usize,
     max_scan_entries: usize,
 ) -> Result<RefreshedRuns, ServiceError> {
-    let mut effects = Vec::new();
+    let mut effects = EffectCandidates::new();
     scan_runs(
         runs_dir,
         max_tracked_runs,
@@ -191,7 +192,7 @@ fn scan_runs(
     max_tracked_runs: usize,
     max_scan_entries: usize,
     tolerate_entry_errors: bool,
-    effects: &mut Vec<Utf8PathBuf>,
+    effects: &mut EffectCandidates,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
     let mut records = BTreeMap::new();
     let mut failures = 0;
@@ -223,7 +224,9 @@ fn scan_runs(
             .and_then(|run_dir| {
                 let recovered = rehydrate_run(&run_dir, &mut nonterminal_runs, effects);
                 if recovered.is_err() {
-                    effects.push(run_dir);
+                    effects
+                        .entry(run_dir)
+                        .or_insert(EffectProvenance::PreserveEvidence);
                 }
                 recovered
             });
@@ -253,12 +256,12 @@ fn scan_runs(
 fn rehydrate_run(
     run_dir: &Utf8Path,
     nonterminal_runs: &mut usize,
-    effects: &mut Vec<Utf8PathBuf>,
+    effects: &mut EffectCandidates,
 ) -> Result<Option<(String, RunRecord)>, ServiceError> {
     // Serialize with preparation before even probing the journal. Contention
     // (including a shard collision) skips this entry, never a half-built prefix.
     let Some(_admission) = crate::run_dirs::try_lock_run_admission(run_dir)? else {
-        effects.push(run_dir.to_owned());
+        effects.insert(run_dir.to_owned(), EffectProvenance::ScanHint);
         return Ok(None);
     };
     let Some((journal_values, state)) = read_recovery_state(run_dir)? else {
@@ -269,7 +272,7 @@ fn rehydrate_run(
         .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
         .to_owned();
     if !state.effects.is_empty() {
-        effects.push(run_dir.to_owned());
+        effects.insert(run_dir.to_owned(), EffectProvenance::ConfirmedEffects);
     }
     if state.terminal.is_some() {
         return Ok(None);

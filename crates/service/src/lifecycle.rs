@@ -175,7 +175,7 @@ impl LocalService {
                 generator_roots: roots,
                 runs_dir,
                 runs: RwLock::new(runs),
-                unreconciled_effects: Mutex::new(effects.into_iter().collect()),
+                unreconciled_effects: Mutex::new(effects),
                 llm_runtime,
                 execution_permits: Arc::new(PriorityPermits::new(max_active_runs)),
                 max_active_runs,
