@@ -60,6 +60,10 @@ impl LocalService {
         } else {
             None
         };
+        // Fence only the durable membership append, not preparation or
+        // idempotent/rejected admissions that never write a new identity.
+        let mut membership = (self.inner.run_store_mode == RunStoreMode::Exclusive)
+            .then(|| self.inner.read_store.membership_write());
         if let Some(payload) = queued_payload
             && let Err(error) = write_run_event(&staged, "run_queued", payload)
         {
@@ -72,6 +76,9 @@ impl LocalService {
                 )));
             }
             return Err(api_internal(error));
+        }
+        if let Some(membership) = &mut membership {
+            membership.admitted(&staged.run_dir);
         }
         // Registration clones the staged values for the map; the originals
         // below are handed to the engine with the same shared channel/slot.

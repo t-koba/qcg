@@ -18,7 +18,7 @@ use camino::{Utf8Path, Utf8PathBuf};
 use engine::RunState;
 use serde_json::Value;
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::File,
     io::{BufRead, BufReader, Read, Seek},
     sync::{Arc, Mutex},
@@ -126,6 +126,13 @@ struct Cache {
     recency: BTreeMap<(Instant, Utf8PathBuf), ()>,
     bytes: usize,
     full_count: usize,
+    facts: BTreeMap<String, (String, String)>,
+    order: BTreeSet<(String, String)>,
+    index_bytes: usize,
+    complete: bool,
+    disabled: bool,
+    writers: usize,
+    revision: u64,
 }
 impl Cache {
     fn remove(&mut self, path: &Utf8Path) -> Option<Entry> {
@@ -139,9 +146,6 @@ impl Cache {
 #[derive(Debug)]
 pub(crate) struct ReadStore {
     entries: Mutex<Cache>,
-    /// Immutable ordering facts per run directory name: the identity event's
-    /// `started_at` and `generator_id`. Memory only; learned lazily.
-    facts: Mutex<BTreeMap<String, (String, String)>>,
     shards: [Mutex<()>; 64],
     max_entries: usize,
     max_bytes: usize,
@@ -150,6 +154,10 @@ pub(crate) struct ReadStore {
     pub bytes_read: std::sync::atomic::AtomicU64,
     #[cfg(test)]
     pub applied: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub enumerated: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub list_reads: std::sync::atomic::AtomicU64,
 }
 impl ReadStore {
     fn lock(&self) -> std::sync::MutexGuard<'_, Cache> {
@@ -160,7 +168,6 @@ impl ReadStore {
     pub fn new(max_entries: usize, max_bytes: usize) -> Self {
         Self {
             entries: Mutex::new(Cache::default()),
-            facts: Mutex::default(),
             shards: std::array::from_fn(|_| Mutex::new(())),
             max_entries,
             max_bytes,
@@ -169,6 +176,10 @@ impl ReadStore {
             bytes_read: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             applied: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            enumerated: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            list_reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
     pub fn read(&self, directory: &Utf8Path) -> Result<Arc<RunReadView>, ServiceError> {
@@ -178,46 +189,145 @@ impl ReadStore {
         }
     }
     pub fn list_item(&self, directory: &Utf8Path) -> Result<api::RunListItem, ServiceError> {
+        #[cfg(test)]
+        self.list_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut item = self.read_cached(directory, true)?.list(directory)?;
         item.invalidation = crate::invalidation::read_invalidation(directory)?;
         Ok(item)
     }
-    fn facts(&self) -> std::sync::MutexGuard<'_, BTreeMap<String, (String, String)>> {
-        self.facts
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    pub fn invalidate_index(&self) {
+        let mut cache = self.lock();
+        cache.complete = false;
+        cache.facts.clear();
+        cache.order.clear();
+        cache.index_bytes = 0;
+        cache.revision = cache.revision.wrapping_add(1);
     }
-    pub fn remember(&self, item: &api::RunListItem) {
-        self.facts().insert(
-            item.run_id.clone(),
-            (item.started_at.clone(), item.generator_id.clone()),
-        );
+    /// Untracked writers may outlive their caller; only a restart re-enables
+    /// membership after rebuilding from authoritative journals.
+    pub fn disable_index(&self) {
+        let mut cache = self.lock();
+        cache.complete = false;
+        cache.disabled = true;
+        cache.facts.clear();
+        cache.order.clear();
+        cache.index_bytes = 0;
+        cache.revision = cache.revision.wrapping_add(1);
     }
-    /// Drops everything remembered about a directory that is no longer a run.
-    pub fn forget(&self, directory: &Utf8Path) {
-        self.facts().remove(directory.file_name().unwrap());
+    pub fn membership_write(self: &Arc<Self>) -> MembershipWrite {
+        let mut cache = self.lock();
+        cache.writers += 1;
+        cache.revision = cache.revision.wrapping_add(1);
+        MembershipWrite(self.clone(), false)
+    }
+    #[cfg(test)]
+    pub fn retained_bytes(&self) -> usize {
+        let cache = self.lock();
+        cache.bytes + cache.index_bytes
+    }
+    pub fn index_revision(&self) -> u64 {
+        self.lock().revision
+    }
+    pub fn has_complete_index(&self) -> bool {
+        let cache = self.lock();
+        cache.complete && !cache.disabled
+    }
+    pub fn known_facts(&self) -> BTreeMap<String, (String, String)> {
+        self.lock().facts.clone()
+    }
+    /// Clone only limit+1 keys using a tree range, never a history scan.
+    pub fn candidates(&self, page: &crate::summaries::RunPage) -> Option<Vec<(String, String)>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        let cache = self.entries.try_lock().ok()?;
+        if !cache.complete || cache.disabled || cache.writers != 0 {
+            return None;
+        }
+        let count = page.limit.saturating_add(1);
+        Some(match (&page.cursor, page.descending) {
+            (Some(cursor), false) => cache
+                .order
+                .range((Excluded(cursor), Unbounded))
+                .take(count)
+                .cloned()
+                .collect(),
+            (Some(cursor), true) => cache
+                .order
+                .range((Unbounded, Excluded(cursor)))
+                .rev()
+                .take(count)
+                .cloned()
+                .collect(),
+            (None, false) => cache.order.iter().take(count).cloned().collect(),
+            (None, true) => cache.order.iter().rev().take(count).cloned().collect(),
+        })
+    }
+    fn retain_fact(&self, cache: &mut Cache, name: String, fact: (String, String)) -> bool {
+        if let Some((old_name, (started, generator))) = cache.facts.remove_entry(&name) {
+            cache.order.remove(&(started.clone(), old_name.clone()));
+            cache.index_bytes -= Self::fact_bytes(&old_name, &started, &generator);
+        }
+        let bytes = Self::fact_bytes(&name, &fact.0, &fact.1);
+        if cache.index_bytes.saturating_add(bytes) > self.max_bytes {
+            cache.facts.clear();
+            cache.order.clear();
+            cache.index_bytes = 0;
+            cache.complete = false;
+            return false;
+        }
+        while cache
+            .bytes
+            .saturating_add(cache.index_bytes)
+            .saturating_add(bytes)
+            > self.max_bytes
+        {
+            let ((_, oldest), _) = cache.recency.pop_first().unwrap();
+            cache.remove(&oldest);
+        }
+        cache.index_bytes += bytes;
+        cache.order.insert((fact.0.clone(), name.clone()));
+        cache.facts.insert(name, fact);
+        true
+    }
+    fn fact_bytes(name: &String, started: &String, generator: &String) -> usize {
+        // Duplicated strings plus a conservative allowance for both tree nodes,
+        // including sparsely occupied roots and allocation overhead.
+        name.capacity()
+            + started.capacity()
+            + generator.capacity()
+            + name.len()
+            + started.len()
+            + 2048
+    }
+    pub fn rebuild_index(
+        &self,
+        facts: BTreeMap<String, (String, String)>,
+        revision: u64,
+        complete: bool,
+    ) {
+        let Ok(mut cache) = self.entries.try_lock() else {
+            return;
+        };
+        if cache.revision != revision || cache.writers != 0 {
+            return;
+        }
+        cache.complete = false;
+        cache.facts.clear();
+        cache.order.clear();
+        cache.index_bytes = 0;
+        for (name, fact) in facts {
+            if !self.retain_fact(&mut cache, name, fact) {
+                return;
+            }
+        }
+        cache.complete = complete && !cache.disabled;
+    }
+    pub fn forget_view(&self, directory: &Utf8Path) {
         self.lock()
             .remove(&run_meta_dir(directory).join("journal.jsonl"));
     }
-    pub fn is_known(&self, name: &str) -> bool {
-        self.facts().contains_key(name)
-    }
-    /// Known `(started_at, run_id, generator_id)` rows accepted by `keep`,
-    /// ascending by `(started_at, run_id)`.
-    pub fn ordered(
-        &self,
-        keep: impl Fn(&str, &str, &str) -> bool,
-    ) -> Vec<(String, String, String)> {
-        let mut rows: Vec<_> = (self.facts().iter())
-            .filter(|(name, (started, generator))| keep(started, name, generator))
-            .map(|(name, (started, generator))| (started.clone(), name.clone(), generator.clone()))
-            .collect();
-        rows.sort();
-        rows
-    }
-    // Prune only after a complete successful enumeration; concurrent readers lose at most a reusable entry.
-    pub fn prune(&self, root: &Utf8Path, live: &std::collections::BTreeSet<&str>) {
-        self.facts().retain(|name, _| live.contains(name.as_str()));
+    // Prune only after a complete successful enumeration.
+    pub fn prune(&self, root: &Utf8Path, live: &BTreeSet<&str>) {
         let mut entries = self.lock();
         let dead: Vec<_> = entries
             .views
@@ -429,10 +539,22 @@ impl ReadStore {
             let mut entries = self.lock();
             while !entries.views.is_empty()
                 && ((!list && entries.full_count >= self.max_entries)
-                    || entries.bytes.saturating_add(bytes) > self.max_bytes)
+                    || entries
+                        .bytes
+                        .saturating_add(entries.index_bytes)
+                        .saturating_add(bytes)
+                        > self.max_bytes)
             {
                 let ((_, oldest), _) = entries.recency.pop_first().unwrap();
                 entries.remove(&oldest);
+            }
+            if entries
+                .bytes
+                .saturating_add(entries.index_bytes)
+                .saturating_add(bytes)
+                > self.max_bytes
+            {
+                return Ok(view);
             }
             let used = Instant::now();
             entries.bytes += bytes;
@@ -450,6 +572,36 @@ impl ReadStore {
             );
         }
         Ok(view)
+    }
+}
+
+/// Admission membership barrier spanning async preparation and cancellation.
+/// Dropping an unfinished writer invalidates any previous complete index.
+pub(crate) struct MembershipWrite(Arc<ReadStore>, bool);
+impl MembershipWrite {
+    pub fn admitted(&mut self, directory: &Utf8Path) {
+        match self.0.list_item(directory) {
+            Ok(item) => {
+                let mut cache = self.0.lock();
+                self.0.retain_fact(
+                    &mut cache,
+                    item.run_id,
+                    (item.started_at, item.generator_id),
+                );
+                self.1 = true;
+            }
+            Err(_) => self.0.invalidate_index(),
+        }
+    }
+}
+impl Drop for MembershipWrite {
+    fn drop(&mut self) {
+        let mut cache = self.0.lock();
+        cache.writers -= 1;
+        if !self.1 {
+            cache.complete = false;
+        }
+        cache.revision = cache.revision.wrapping_add(1);
     }
 }
 

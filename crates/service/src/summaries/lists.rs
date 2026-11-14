@@ -46,7 +46,12 @@ pub fn list_run_summaries(
 
 /// Names of run-candidate directories, bounded by the scan cap. Names alone
 /// are enumerated; no per-run file is touched.
-fn run_dir_names(runs_dir: &Utf8Path, cap: usize) -> Result<BTreeSet<String>, ServiceError> {
+fn run_dir_names(
+    runs_dir: &Utf8Path,
+    cap: usize,
+    store: &crate::read_store::ReadStore,
+) -> Result<BTreeSet<String>, ServiceError> {
+    let _ = store;
     let entries = match std::fs::read_dir(runs_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
@@ -59,6 +64,10 @@ fn run_dir_names(runs_dir: &Utf8Path, cap: usize) -> Result<BTreeSet<String>, Se
             continue;
         }
         crate::run_dirs::bump_scan_count(&mut scanned, cap)?;
+        #[cfg(test)]
+        store
+            .enumerated
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let name = entry
             .file_name()
             .into_string()
@@ -80,6 +89,7 @@ fn read_run(
     let path = runs_dir.join(name);
     let journal = run_meta_dir(&path).join("journal.jsonl");
     if !is_regular_file(&journal)? || journal_is_empty(&journal)? {
+        store.forget_view(&path);
         return Ok(None);
     }
     store.list_item(&path).map(Some)
@@ -106,28 +116,101 @@ pub(crate) fn list_items_page(
     store: &crate::read_store::ReadStore,
     page: &RunPage,
 ) -> Result<api::RunListResponse, ServiceError> {
-    let names = run_dir_names(runs_dir, cap)?;
+    census_page(runs_dir, cap, store, page, false)
+}
+
+/// Exclusive, unfiltered pages may use bounded membership, but every candidate
+/// still passes the normal fresh read, including the lookahead row.
+pub(crate) fn indexed_items_page(
+    runs_dir: &Utf8Path,
+    cap: usize,
+    store: &crate::read_store::ReadStore,
+    page: &RunPage,
+) -> Result<api::RunListResponse, ServiceError> {
+    let lease = crate::run_dirs::try_lock_store_maintenance(runs_dir)?;
+    if lease.is_none() {
+        store.invalidate_index();
+        return census_page(runs_dir, cap, store, page, false);
+    }
+    if let Some(keys) = store.candidates(page) {
+        let mut items = Vec::new();
+        let mut valid = true;
+        for (started, name) in keys {
+            match read_run(runs_dir, &name, store) {
+                Ok(Some(item))
+                    if (item.started_at.as_str(), item.run_id.as_str())
+                        == (started.as_str(), name.as_str()) =>
+                {
+                    items.push(item)
+                }
+                Ok(_) => {
+                    valid = false;
+                    break;
+                }
+                Err(ServiceError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    valid = false;
+                    break;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if valid {
+            return Ok(response(items, page.limit));
+        }
+        store.invalidate_index();
+        // Replacements must not supply stale ordering facts to the rebuild.
+    }
+    census_page(runs_dir, cap, store, page, true)
+}
+
+fn response(mut items: Vec<api::RunListItem>, limit: usize) -> api::RunListResponse {
+    let next_cursor = (items.len() > limit && limit > 0).then(|| {
+        let last = &items[limit - 1];
+        format!("{}|{}", last.started_at, last.run_id)
+    });
+    items.truncate(limit);
+    api::RunListResponse { items, next_cursor }
+}
+
+fn census_page(
+    runs_dir: &Utf8Path,
+    cap: usize,
+    store: &crate::read_store::ReadStore,
+    page: &RunPage,
+    rebuild: bool,
+) -> Result<api::RunListResponse, ServiceError> {
+    let revision = store.index_revision();
+    let names = run_dir_names(runs_dir, cap, store)?;
     store.prune(runs_dir, &names.iter().map(String::as_str).collect());
-    for name in names.iter().filter(|name| !store.is_known(name)) {
-        if let Some(item) = read_run(runs_dir, name, store)? {
-            store.remember(&item);
+    let mut facts = store.known_facts();
+    facts.retain(|name, _| names.contains(name));
+    for name in &names {
+        if !facts.contains_key(name)
+            && let Some(item) = read_run(runs_dir, name, store)?
+        {
+            facts.insert(item.run_id, (item.started_at, item.generator_id));
         }
     }
     'order: loop {
-        let mut ordered = store.ordered(|started, name, generator| {
-            page.generator_id
-                .as_deref()
-                .is_none_or(|want| want == generator)
-                && page.cursor.as_ref().is_none_or(|(at, id)| {
-                    let key = (started, name);
-                    let cursor = (at.as_str(), id.as_str());
-                    if page.descending {
-                        key < cursor
-                    } else {
-                        key > cursor
-                    }
-                })
-        });
+        let mut ordered: Vec<_> = facts
+            .iter()
+            .filter(|(name, (started, generator))| {
+                page.generator_id
+                    .as_deref()
+                    .is_none_or(|want| want == generator)
+                    && page.cursor.as_ref().is_none_or(|(at, id)| {
+                        let key = (started.as_str(), name.as_str());
+                        let cursor = (at.as_str(), id.as_str());
+                        if page.descending {
+                            key < cursor
+                        } else {
+                            key > cursor
+                        }
+                    })
+            })
+            .map(|(name, (started, generator))| (started.clone(), name.clone(), generator.clone()))
+            .collect();
+        ordered.sort();
         if page.descending {
             ordered.reverse();
         }
@@ -145,12 +228,12 @@ pub(crate) fn list_items_page(
                 }
             }
             let Some(item) = read_run(runs_dir, name, store)? else {
-                store.forget(&runs_dir.join(name));
+                facts.remove(name);
                 continue;
             };
             if (&item.started_at, &item.generator_id) != (started, generator) {
                 // The journal was replaced: order again from what was read.
-                store.remember(&item);
+                facts.insert(item.run_id, (item.started_at, item.generator_id));
                 continue 'order;
             }
             if page.state.is_none_or(|state| item.state == state) {
@@ -160,11 +243,7 @@ pub(crate) fn list_items_page(
                 }
             }
         }
-        let next_cursor = (items.len() > page.limit).then(|| {
-            let last = &items[page.limit - 1];
-            format!("{}|{}", last.started_at, last.run_id)
-        });
-        items.truncate(page.limit);
-        return Ok(api::RunListResponse { items, next_cursor });
+        store.rebuild_index(facts, revision, rebuild || store.has_complete_index());
+        return Ok(response(items, page.limit));
     }
 }

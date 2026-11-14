@@ -1330,23 +1330,34 @@ refuse automatic replay. Preemption is therefore not a promise that every
 external command or side effect can safely restart.
 
 The observation cache shares `READ_CACHE_MAX_BYTES` bytes of conservative
-retained-memory charge (64 MiB by default) between full detail views and compact
-run-list projections, with one cached representation per journal. Full views
-also have a `MAX_TRACKED_RUNS` count limit; compact projections are count-bounded
-by their byte charge instead. All entries share incremental accounting and an
-indexed LRU; oversized views are returned without retention. The budget excludes
-transient request/parser buffers and is not a total process RSS limit.
+retained-memory charge (64 MiB by default) between full detail views, compact
+run-list projections, and in-memory ordering metadata. Full views also have a
+`MAX_TRACKED_RUNS` count limit; compact projections and ordering metadata are
+bounded by their byte charge instead. Journal views share an indexed LRU;
+oversized views are returned without retention. The budget excludes transient
+request/parser buffers and is not a total process RSS limit.
 
-Every list request still enumerates and counts all non-coordination entries under
-`MAX_DIRECTORY_SCAN_ENTRIES`, opens/fingerprints every eligible journal, validates
-changed journals (including off-page runs), and reads invalidation sidecars fresh.
-An unchanged journal can reuse its revision-bound identity/status/time/sequence
-projection without retaining or refolding its full state. Changed compact views
-are rebuilt from the opened journal; parse failures never serve stale results.
-Absent entries are pruned only after a complete successful census, including
-a missing runs root. Cache state is memory-only and rebuilt after restart.
-Filters, sorting and pagination still follow the complete census: this is not
-O(page) work or a persistent catalog. Cache eviction requires a new cold read.
+Server `GET /api/runs` pages use a fresh directory census under
+`MAX_DIRECTORY_SCAN_ENTRIES` in shared-filesystem mode and for any state,
+generator or since filter. Ordering facts are learned from journals; every run
+examined to fill a page (including the lookahead row) is refreshed, including
+its invalidation sidecar. Unchanged journals reuse revision-bound projections;
+changed compact views are rebuilt from the opened journal. Parse failures never
+serve stale selected results.
+
+In exclusive mode, unfiltered pages can instead seek `(started_at, run_id)` in
+a bounded, rebuildable ordered index, selecting only `limit + 1` keys. Every
+candidate is still refreshed and its key checked. Missing or replaced candidates
+invalidate the index and fall back to the capped census. Fresh API start/fork
+identities are inserted immediately after their durable queue event; concurrent
+or incomplete membership writes force a census until resolved. Direct-run
+execution disables this fast path until restart because its writers are not
+tracked admissions. Busy maintenance or insufficient cache budget also falls
+back to the census. The service GC path invalidates ordering metadata; deletions
+by other maintenance operations are detected when their key is selected, and
+stale keys outside a page cannot change that page. No catalog is persisted:
+restart learns ordering from authoritative journals. Response bodies, cursors
+and body-derived ETags are unchanged.
 
 ## Install backup maintenance
 

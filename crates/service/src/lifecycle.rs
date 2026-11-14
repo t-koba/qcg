@@ -1058,11 +1058,13 @@ impl LocalService {
     pub(crate) async fn collect_retained_runs(&self) -> Result<(), ServiceError> {
         let directory = self.inner.runs_dir.clone();
         let policy = self.inner.deployment_policy;
+        let store = self.inner.read_store.clone();
         let maintenance = self
             .blocking_work(move || {
                 let Some(lock) = try_lock_store_maintenance(&directory)? else {
                     return Ok(None);
                 };
+                store.invalidate_index();
                 let deleted = lock.gc_run_directories(
                     policy.gc_keep,
                     policy.gc_keep_failed,
@@ -1138,8 +1140,16 @@ impl LocalService {
         let directory = self.inner.runs_dir.clone();
         let cap = self.inner.deployment_policy.max_directory_scan_entries;
         let store = self.inner.read_store.clone();
+        let indexed = self.inner.run_store_mode == RunStoreMode::Exclusive
+            && page.state.is_none()
+            && page.generator_id.is_none()
+            && page.since.is_none();
         self.blocking_read(move || {
-            crate::summaries::list_items_page(&directory, cap, &store, &page)
+            if indexed {
+                crate::summaries::indexed_items_page(&directory, cap, &store, &page)
+            } else {
+                crate::summaries::list_items_page(&directory, cap, &store, &page)
+            }
         })
         .await
     }
@@ -1746,6 +1756,7 @@ impl LocalService {
         run: DirectRun,
         mode: DirectEventMode,
     ) -> Result<DirectRunOutput, ApiError> {
+        self.inner.read_store.disable_index();
         self.ensure_running()?;
         let mut contract = Contract::load(&run.generator_path).map_err(api_internal)?;
         contract.apply_audit_floor(self.inner.deployment_policy.audit_floor);

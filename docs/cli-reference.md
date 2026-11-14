@@ -457,7 +457,8 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
 - `MAX_PARALLEL_STEPS`: deployment cap on parallel wave scheduling.
   Unset uses the CPU count; `0` and invalid values refuse boot.
 - `READ_CACHE_MAX_BYTES` (default `67108864`): shared maximum retained memory
-  charge for full run read views and compact run-list projections. Positive
+  charge for full run read views, compact run-list projections, and rebuildable
+  run-list ordering metadata. Positive
   integers only; invalid values refuse boot. Full-view count is also bounded
   by `MAX_TRACKED_RUNS`; compact projection count is bounded by its byte charge,
   not the active-run limit. This is a rebuildable observation cache; execution
