@@ -4,6 +4,29 @@ use llm::{CacheRetention, PromptCacheRetention, TokenUsage};
 
 use super::types::LlmGateway;
 
+fn bounded_microusd(amount: f64, round_up: bool) -> Option<u64> {
+    if !amount.is_finite() || amount < 0.0 {
+        return None;
+    }
+    let rounded = if round_up {
+        amount.ceil()
+    } else {
+        amount.round()
+    };
+    // `u64::MAX as f64` rounds up to 2^64, which is already outside the
+    // representable integer range. Reject it rather than saturating a charge.
+    (rounded.is_finite() && rounded < u64::MAX as f64).then_some(rounded as u64)
+}
+
+pub(super) fn checked_microusd(
+    node: &NodeDef,
+    amount: f64,
+    round_up: bool,
+) -> Result<u64, StepError> {
+    bounded_microusd(amount, round_up)
+        .ok_or_else(|| StepError::failed(&node.id, "model cost is not representable in microusd"))
+}
+
 impl<'a> LlmGateway<'a> {
     /// Price the requested TTL; streaming usage may omit its breakdown.
     pub(super) fn cache_write_multiplier(
@@ -66,11 +89,10 @@ impl<'a> LlmGateway<'a> {
         let price = self
             .selected_route(routes, provider, model)
             .and_then(|route| route.web_search_call_cost_usd)?;
-        Some(
-            (calls as f64 * price * 1_000_000.0)
-                .round()
-                .clamp(0.0, u64::MAX as f64) as u64,
-        )
+        if !price.is_finite() || price < 0.0 {
+            return None;
+        }
+        bounded_microusd(calls as f64 * price * 1_000_000.0, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -98,9 +120,9 @@ impl<'a> LlmGateway<'a> {
         };
         // The tier is decided by whole prompt input (ordinary plus the
         // disjoint cache subsets); the selected tier prices the request.
-        let prompt_input = ordinary_input
-            .saturating_add(usage.cached_input)
-            .saturating_add(usage.cache_creation_input);
+        // `ordinary_input` validated that the disjoint cache subsets fit in
+        // `usage.input`; all three categories therefore total this exact value.
+        let prompt_input = usage.input;
         let tier = policy::select_cost_tier(&route.cost_tiers, prompt_input);
         let mut rates = route.rates().resolve(tier);
         // Extended TTL uses the tier's input rate, never the cache-write rate.
@@ -142,6 +164,6 @@ impl<'a> LlmGateway<'a> {
             }
             microusd += calls as f64 * price * 1_000_000.0;
         }
-        Ok(microusd.round().clamp(0.0, u64::MAX as f64) as u64)
+        checked_microusd(node, microusd, false)
     }
 }

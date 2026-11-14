@@ -330,9 +330,13 @@ impl<'a> LlmGateway<'a> {
             {
                 return Err(StepError::failed(&node.id, "invalid model pricing"));
             }
-            cost_microusd = self.budget.max_cost_microusd.map_or(0, |_| {
-                ((input_est as f64 * input_rate) + (max_output as f64 * output)).ceil() as u64
-            });
+            if self.budget.max_cost_microusd.is_some() {
+                cost_microusd = super::cost::checked_microusd(
+                    node,
+                    input_est as f64 * input_rate + max_output as f64 * output,
+                    true,
+                )?;
+            }
         }
         Ok(bounded.then_some(PendingReservation {
             tokens,

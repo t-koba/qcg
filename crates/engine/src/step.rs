@@ -511,6 +511,15 @@ pub struct StepContext<'a> {
     pub llm: Option<LlmGateway<'a>>,
 }
 
+fn checked_settled_tokens(input: u64, output: u64) -> Result<u64, StepError> {
+    input.checked_add(output).ok_or_else(|| {
+        StepError::failed(
+            "budget",
+            "settled token usage overflowed; refusing further spend",
+        )
+    })
+}
+
 impl StepContext<'_> {
     /// Node-scoped shared checkpoint; only scope and error mapping differ,
     /// never elapsed enforcement (E11).
@@ -527,10 +536,7 @@ impl StepContext<'_> {
         )?;
         let budget = &self.run.contract.manifest.budget;
         let state = self.journal.state();
-        let tokens = state
-            .budget
-            .tokens_input
-            .saturating_add(state.budget.tokens_output);
+        let tokens = checked_settled_tokens(state.budget.tokens_input, state.budget.tokens_output)?;
         if let Some(limit) = budget.max_tokens
             && tokens > limit
         {
@@ -834,6 +840,15 @@ impl io::Write for BoundedTemplateWriter {
 mod tests {
     use super::{RuntimeLimits, TemplateService};
     use serde_json::json;
+
+    #[test]
+    fn settled_token_total_rejects_overflow() {
+        assert_eq!(
+            super::checked_settled_tokens(u64::MAX, 0).unwrap(),
+            u64::MAX
+        );
+        assert!(super::checked_settled_tokens(u64::MAX, 1).is_err());
+    }
 
     #[test]
     fn continuation_safety_defaults_fail_closed() {

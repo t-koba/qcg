@@ -233,6 +233,110 @@ fn cache_cost_validates_counts_and_does_not_mix_pricing_rows() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+fn unrepresentable_model_and_search_costs_fail_closed() {
+    let dir = test_dir("unrepresentable-cost");
+    let journal = test_journal(&dir, &format!("unrepresentable-{}", uuid::Uuid::now_v7()));
+    let secrets = SecretStore::default();
+    let gateway = LlmGateway::new(
+        Arc::new(CacheMeteredProvider),
+        &secrets,
+        &journal,
+        CancellationToken::new(),
+        LlmCostBudget {
+            max_tokens: None,
+            max_cost_microusd: None,
+            require_pricing: true,
+        },
+        vec![],
+    );
+    let mut model_price = cache_pricing(Some(0.0), Some(0.0));
+    model_price.input_cost_per_million_usd = Some(f64::MAX);
+    model_price.output_cost_per_million_usd = Some(0.0);
+    let usage = TokenUsage {
+        input: 1,
+        ..Default::default()
+    };
+    assert!(
+        gateway
+            .cost_microusd(
+                &test_node(),
+                &[model_price],
+                "cache-metered",
+                "test",
+                &usage,
+                None,
+                None,
+            )
+            .is_err()
+    );
+
+    let mut search_price = cache_pricing(Some(0.0), Some(0.0));
+    search_price.input_cost_per_million_usd = Some(0.0);
+    search_price.output_cost_per_million_usd = Some(0.0);
+    search_price.web_search_call_cost_usd = Some(f64::MAX);
+    assert_eq!(
+        gateway
+            .web_search_cost_microusd(&[search_price.clone()], "cache-metered", "test", Some(1),),
+        None,
+        "an unrepresentable search charge is unknown, not saturated"
+    );
+    assert!(
+        gateway
+            .cost_microusd(
+                &test_node(),
+                &[search_price],
+                "cache-metered",
+                "test",
+                &TokenUsage::default(),
+                None,
+                Some(1),
+            )
+            .is_err()
+    );
+    let _ = std::fs::remove_dir_all(dir);
+}
+
+#[tokio::test]
+async fn unrepresentable_cost_estimate_refuses_dispatch() {
+    let dir = test_dir("unrepresentable-estimate");
+    let journal = test_journal(
+        &dir,
+        &format!("unrepresentable-estimate-{}", uuid::Uuid::now_v7()),
+    );
+    let secrets = SecretStore::default();
+    let provider = Arc::new(CountingCacheProvider {
+        calls: Default::default(),
+        usage: TokenUsage::default(),
+    });
+    let gateway = LlmGateway::new(
+        provider.clone(),
+        &secrets,
+        &journal,
+        CancellationToken::new(),
+        LlmCostBudget {
+            max_tokens: None,
+            max_cost_microusd: Some(u64::MAX),
+            require_pricing: true,
+        },
+        vec![],
+    );
+    let mut request = test_request();
+    request.provider = "cache-metered".into();
+    request.model = "test".into();
+    let mut pricing = cache_pricing(Some(0.0), Some(0.0));
+    pricing.input_cost_per_million_usd = Some(f64::MAX);
+    pricing.output_cost_per_million_usd = Some(f64::MAX);
+    let error = gateway
+        .complete(&test_node(), request, &[pricing], |_| json!({}))
+        .await
+        .expect_err("a non-representable reservation must fail before spending");
+    assert!(error.to_string().contains("not representable in microusd"));
+    assert_eq!(provider.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+    assert_eq!(journal.state().budget.llm_calls, 0);
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 struct CountingCacheProvider {
     calls: std::sync::atomic::AtomicUsize,
     usage: TokenUsage,
