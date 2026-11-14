@@ -57,13 +57,13 @@ mod windows {
     use std::ptr::null_mut;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertSecurityDescriptorToStringSecurityDescriptorW,
+        ConvertSecurityDescriptorToStringSecurityDescriptorW, ConvertSidToStringSidW,
         ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SDDL_REVISION_1,
         SE_FILE_OBJECT,
     };
     use windows_sys::Win32::Security::{
         DACL_SECURITY_INFORMATION, GetTokenInformation, OWNER_SECURITY_INFORMATION,
-        SECURITY_ATTRIBUTES, SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
@@ -131,9 +131,31 @@ mod windows {
         }
     }
 
+    fn owner_sddl(user: &CurrentUser, dacl: &str) -> io::Result<Vec<u16>> {
+        let mut owner_sid_ptr = null_mut();
+        if unsafe { ConvertSidToStringSidW(user.sid(), &mut owner_sid_ptr) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let owner_sid_storage = LocalAllocation(owner_sid_ptr.cast());
+        let owner_sid = unsafe {
+            let pointer = owner_sid_storage.0.cast::<u16>();
+            let mut length = 0;
+            while *pointer.add(length) != 0 {
+                length += 1;
+            }
+            String::from_utf16(std::slice::from_raw_parts(pointer, length))
+        }
+        .map_err(|_| io::Error::other("invalid current user SID"))?;
+        // Include the owner before conversion: the converter returns a self-relative descriptor.
+        Ok(format!("O:{owner_sid}{dacl}")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect())
+    }
+
     pub(super) fn open(path: &Utf8Path, access: Access) -> io::Result<File> {
         let user = CurrentUser::load()?;
-        let sddl: Vec<u16> = OWNER_ONLY_DACL.encode_utf16().chain(Some(0)).collect();
+        let sddl = owner_sddl(&user, OWNER_ONLY_DACL)?;
         let mut descriptor = null_mut();
         if unsafe {
             ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -147,9 +169,6 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         let descriptor = LocalAllocation(descriptor);
-        if unsafe { SetSecurityDescriptorOwner(descriptor.0, user.sid(), 0) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
         let attributes = SECURITY_ATTRIBUTES {
             nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
             lpSecurityDescriptor: descriptor.0,
@@ -302,6 +321,7 @@ mod tests {
 mod windows_tests {
     use super::*;
     use camino::Utf8PathBuf;
+    use std::io::{Read as _, Write as _};
     use std::mem::size_of;
     use std::os::windows::ffi::OsStrExt as _;
     use std::os::windows::io::{FromRawHandle as _, RawHandle};
@@ -317,16 +337,40 @@ mod windows_tests {
     };
 
     #[test]
+    fn creates_appends_and_reopens_owner_only_trace_file() {
+        let dir = std::env::temp_dir().join(format!("qcg-trace-owner-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("trace.jsonl")).unwrap();
+
+        open(&path, Access::Append)
+            .unwrap()
+            .write_all(b"first")
+            .unwrap();
+        open(&path, Access::Append)
+            .unwrap()
+            .write_all(b" second")
+            .unwrap();
+        let mut contents = Vec::new();
+        open(&path, Access::Read)
+            .unwrap()
+            .read_to_end(&mut contents)
+            .unwrap();
+
+        assert_eq!(contents, b"first second");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn refuses_existing_everyone_readable_trace_file() {
         let dir = std::env::temp_dir().join(format!("qcg-trace-public-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = Utf8PathBuf::from_path_buf(dir.join("trace.jsonl")).unwrap();
-        let mut sddl: Vec<u16> = "D:P(A;;FA;;;WD)".encode_utf16().chain(Some(0)).collect();
+        let sddl = owner_sddl(&CurrentUser::load().unwrap(), "D:P(A;;FA;;;WD)").unwrap();
         let mut descriptor = null_mut();
         assert_ne!(
             unsafe {
                 ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    sddl.as_mut_ptr(),
+                    sddl.as_ptr(),
                     SDDL_REVISION_1,
                     &mut descriptor,
                     null_mut(),
@@ -360,7 +404,8 @@ mod windows_tests {
         drop(unsafe { File::from_raw_handle(handle as RawHandle) });
         unsafe { LocalFree(descriptor) };
 
-        assert!(open(&path, Access::Append).is_err());
+        let error = open(&path, Access::Append).unwrap_err();
+        assert_eq!(error.to_string(), "private trace DACL is not owner-only");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }
