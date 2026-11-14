@@ -1,7 +1,7 @@
 use crate::common::{bounded_transform_text, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome};
+use engine::{ContinuationSafety, StepContext, StepError, StepExecutor, StepOutcome};
 use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
@@ -31,6 +31,10 @@ impl StepExecutor for CheckFormatStep {
     }
 
     engine::parallel_step_traits!();
+
+    fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
+        ContinuationSafety::ReadOnly
+    }
 
     fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
         let _params = check_format_params(node)?;
@@ -98,4 +102,24 @@ fn check_format_params(node: &NodeDef) -> Result<CheckFormatParams, StepError> {
         ));
     }
     Ok(params)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn continuation_safety_is_read_only() {
+        let node: NodeDef = serde_json::from_value(serde_json::json!({
+            "id": "format",
+            "type": "check.format"
+        }))
+        .unwrap();
+        let mut registry = engine::StepRegistry::new();
+        registry.register(CheckFormatStep);
+        assert_eq!(
+            registry.continuation_safety(&node),
+            ContinuationSafety::ReadOnly
+        );
+    }
 }

@@ -227,12 +227,28 @@ pub(crate) fn required_input_field(
     }
 }
 
+/// Effect safety for per-node continuation, independent of model-response reuse
+/// and parallel scheduling. This declaration alone never authorizes reuse.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContinuationSafety {
+    #[default]
+    Unsupported,
+    /// No side effects beyond captured reads and the outcome. Reuse may only be
+    /// considered once an eligibility evaluator proves all dependencies unchanged.
+    ReadOnly,
+}
+
 #[async_trait]
 pub trait StepExecutor: Send + Sync {
     fn type_id(&self) -> &'static str;
 
     fn traits(&self) -> StepTraits {
         StepTraits::default()
+    }
+
+    /// Undeclared executors are ineligible for per-node continuation.
+    fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
+        ContinuationSafety::Unsupported
     }
 
     /// Safe/guarded re-entry after an unreported direct node execution; parallel safety is not enough.
@@ -356,6 +372,14 @@ impl StepRegistry {
         self.executors
             .get(kind.as_str())
             .map(|executor| executor.traits())
+    }
+
+    /// Unknown step types fail closed, just like undeclared executors.
+    pub fn continuation_safety(&self, node: &NodeDef) -> ContinuationSafety {
+        self.executors
+            .get(node.kind.as_str())
+            .map(|executor| executor.continuation_safety(node))
+            .unwrap_or_default()
     }
 
     pub fn params_schemas(&self) -> BTreeMap<String, Value> {
@@ -810,6 +834,56 @@ impl io::Write for BoundedTemplateWriter {
 mod tests {
     use super::{RuntimeLimits, TemplateService};
     use serde_json::json;
+
+    #[test]
+    fn continuation_safety_defaults_fail_closed() {
+        use super::*;
+
+        struct CustomStep;
+
+        #[async_trait]
+        impl StepExecutor for CustomStep {
+            fn type_id(&self) -> &'static str {
+                "custom"
+            }
+
+            async fn execute(
+                &self,
+                _ctx: &mut StepContext<'_>,
+                _node: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                unreachable!("classification does not execute the step")
+            }
+        }
+
+        let node = |kind: &str| -> NodeDef {
+            serde_json::from_value(json!({"id": kind, "type": kind})).unwrap()
+        };
+        let custom = node("custom");
+        let unknown = node("unregistered");
+        let mut registry = StepRegistry::new();
+        assert_eq!(
+            ContinuationSafety::default(),
+            ContinuationSafety::Unsupported
+        );
+        assert_eq!(
+            registry.continuation_safety(&unknown),
+            ContinuationSafety::Unsupported
+        );
+        assert_eq!(
+            CustomStep.continuation_safety(&custom),
+            ContinuationSafety::Unsupported
+        );
+        registry.register(CustomStep);
+        assert_eq!(
+            registry.continuation_safety(&custom),
+            ContinuationSafety::Unsupported
+        );
+        assert_eq!(
+            registry.continuation_safety(&unknown),
+            ContinuationSafety::Unsupported
+        );
+    }
 
     #[test]
     fn required_input_field_serializes_required_defaults() {
