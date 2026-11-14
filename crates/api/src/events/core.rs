@@ -14,7 +14,7 @@ use super::llm::{
     LlmRouteFailedEventData, LlmValidationFailedEventData,
 };
 use super::resources::ResourceEventData;
-use super::run::{GraphResolvedEventData, RunStartedEventData};
+use super::run::{GraphResolvedEventData, RunResumedEventData, RunStartedEventData};
 use super::steps::{
     ForeachBudgetEventData, ForeachIterationEventData, ReasonEventData,
     RegenerateAttemptStartedEventData, RepairAttemptStartedEventData, StepFinishedEventData,
@@ -87,7 +87,7 @@ run_event_data_registry! {
     "elapsed_accounted" => ElapsedAccounted: super::run::ElapsedAccountedEventData,
     "run_queued" => RunQueued: RunStartedEventData,
     "run_started" => RunStarted: RunStartedEventData,
-    "run_resumed" => RunResumed: EmptyEventData,
+    "run_resumed" => RunResumed: RunResumedEventData,
     "graph_resolved" => GraphResolved: GraphResolvedEventData,
     "resource" => Resource: ResourceEventData,
     "step_started" => StepStarted: StepStartedEventData,

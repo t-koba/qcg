@@ -8,8 +8,10 @@ use super::resources::ResourceEventData;
 /// Current journal record schema version. The engine writes it in the run
 /// identity record and refuses to fold a journal or state whose version it
 /// does not implement, so an incompatible format fails closed instead of
-/// being reinterpreted.
-pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+/// being reinterpreted. Version 3 adds an explicit step-budget baseline.
+pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
+/// Version of the explicit step-budget checkpoint embedded in engine entry events.
+pub const STEP_BUDGET_BASELINE_VERSION: u32 = 1;
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct RunStartedEventData {
@@ -66,6 +68,25 @@ pub struct RunStartedEventData {
     /// use the actual event timestamp (C04), which is never backdated.
     #[serde(default)]
     pub queued_at: Option<String>,
+    /// Versioned step-budget checkpoint emitted by the engine at a durable
+    /// run-entry boundary. Older identity events omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_budget_baseline: Option<StepBudgetBaseline>,
+}
+/// Exact cumulative step usage and charge-ledger position at a run-entry boundary.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct StepBudgetBaseline {
+    pub version: u32,
+    pub used: u64,
+    pub charged: u64,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunResumedEventData {
+    /// Absent on historical `run_resumed` records; present on new engine entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_budget_baseline: Option<StepBudgetBaseline>,
 }
 #[derive(Debug, Clone, Serialize, serde::Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]

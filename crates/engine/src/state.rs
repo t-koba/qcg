@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-pub const RUN_STATE_SCHEMA_VERSION: u32 = 10;
+pub const RUN_STATE_SCHEMA_VERSION: u32 = 11;
 
 fn is_known_journal_event_kind(kind: &str) -> bool {
     api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
@@ -79,10 +79,16 @@ pub struct BudgetState {
     pub steps_executed: usize,
     /// Durable charge deltas shared by live/recovered retry and foreach accounting.
     pub budget_charged: usize,
-    /// Inherited legacy usage captured at a durable resume/fork boundary before new deltas.
+    /// Total usage captured by an explicit versioned run-entry baseline.
     #[serde(default)]
     pub step_budget_seed: Option<usize>,
-    /// Legacy retries/foreach executions before the charge ledger have no exact charge proof.
+    /// Cumulative charge count at the same baseline; only later deltas are added.
+    #[serde(default)]
+    pub step_budget_charged_at_seed: Option<usize>,
+    /// An old resume/fork boundary may conceal uncharged legacy work until a new baseline.
+    #[serde(default)]
+    pub legacy_budget_resume_pending: bool,
+    /// Legacy retries/foreach executions before a baseline have no exact charge proof.
     #[serde(default)]
     pub legacy_step_budget_unknown: bool,
     /// True when at least one `budget_charged` delta has been recorded.
@@ -108,23 +114,20 @@ pub struct BudgetState {
 }
 
 impl BudgetState {
-    fn seed_legacy_usage(&mut self) {
-        if self.step_budget_seed.is_none()
-            && !self.has_budget_charges
-            && !self.legacy_step_budget_unknown
-        {
-            self.step_budget_seed = Some(self.steps_executed);
-        }
-    }
-
     pub(crate) fn step_budget_consumed(&self) -> Result<usize, &'static str> {
         if self.legacy_step_budget_unknown {
-            return Err("legacy retry or foreach history has no exact step-budget charge proof");
+            return Err("legacy step-budget history has no exact charge proof");
         }
-        let (seed, deltas) = match self.step_budget_seed {
-            Some(seed) => (seed, self.budget_charged),
-            None if self.has_budget_charges => (0, self.budget_charged),
-            None => (0, self.steps_executed),
+        let (seed, deltas) = match (self.step_budget_seed, self.step_budget_charged_at_seed) {
+            (Some(seed), Some(charged_at_seed)) => (
+                seed,
+                self.budget_charged
+                    .checked_sub(charged_at_seed)
+                    .ok_or("budget charge count precedes its step-budget baseline")?,
+            ),
+            (None, None) if self.has_budget_charges => (0, self.budget_charged),
+            (None, None) => (0, self.steps_executed),
+            _ => return Err("step-budget baseline is incomplete"),
         };
         seed.checked_add(deltas)
             .ok_or("step-budget consumption overflowed")
@@ -461,6 +464,63 @@ impl RunState {
         Ok(state)
     }
 
+    fn apply_step_budget_baseline(&mut self, event: &Value) -> Result<(), crate::JournalError> {
+        let Some(value) = event.get("step_budget_baseline") else {
+            return Ok(());
+        };
+        if value.is_null() {
+            return Err(crate::JournalError::InvalidEvent(
+                "step-budget baseline cannot be null when present".into(),
+            ));
+        }
+        let invalid = |message: &str| crate::JournalError::InvalidEvent(message.to_string());
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| invalid("step-budget baseline version must be an integer"))?;
+        if version != u64::from(api::STEP_BUDGET_BASELINE_VERSION) {
+            return Err(invalid("unsupported step-budget baseline version"));
+        }
+        let used = value
+            .get("used")
+            .and_then(Value::as_u64)
+            .and_then(|used| usize::try_from(used).ok())
+            .ok_or_else(|| invalid("step-budget baseline usage is not representable"))?;
+        let charged = value
+            .get("charged")
+            .and_then(Value::as_u64)
+            .and_then(|charged| usize::try_from(charged).ok())
+            .ok_or_else(|| invalid("step-budget baseline charge count is not representable"))?;
+        if self.budget.legacy_step_budget_unknown {
+            return Err(invalid(
+                "cannot establish a step-budget baseline for ambiguous legacy history",
+            ));
+        }
+        if self.budget.step_budget_seed.is_none()
+            && self.budget.has_budget_charges
+            && !self.budget.legacy_budget_resume_pending
+        {
+            return Err(invalid(
+                "cannot establish a baseline for unanchored step-budget charges",
+            ));
+        }
+        if charged != self.budget.budget_charged {
+            return Err(invalid(
+                "step-budget baseline charge count does not match the journal",
+            ));
+        }
+        let expected = self.budget.step_budget_consumed().map_err(invalid)?;
+        if used != expected {
+            return Err(invalid(
+                "step-budget baseline usage does not match folded history",
+            ));
+        }
+        self.budget.step_budget_seed = Some(used);
+        self.budget.step_budget_charged_at_seed = Some(charged);
+        self.budget.legacy_budget_resume_pending = false;
+        Ok(())
+    }
+
     pub fn apply(&mut self, event: &Value) -> Result<(), crate::JournalError> {
         if let Some(seq) = event.get("seq").and_then(Value::as_u64) {
             // Strict monotonicity: duplicate or rewound seq values indicate
@@ -518,7 +578,7 @@ impl RunState {
         // Identity records declare the schema; schema 1 alone omits wall-clock mode.
         if matches!(kind, "run_queued" | "run_started")
             && let Some(version) = event.get("schema_version").and_then(Value::as_u64)
-            && version != 1
+            && !matches!(version, 1 | 2)
             && version != u64::from(api::JOURNAL_SCHEMA_VERSION)
         {
             return Err(crate::JournalError::InvalidEvent(format!(
@@ -659,8 +719,18 @@ impl RunState {
                         .get("parent_run_id")
                         .and_then(Value::as_str)
                         .map(str::to_string);
-                    if self.parent_run_id.is_some() {
-                        self.budget.seed_legacy_usage();
+                    if event.get("step_budget_baseline").is_some() {
+                        return Err(crate::JournalError::InvalidEvent(
+                            "run_queued cannot establish a step-budget baseline".into(),
+                        ));
+                    }
+                    if self.parent_run_id.is_some() && self.budget.step_budget_seed.is_none() {
+                        if self.budget.legacy_budget_resume_pending
+                            && self.budget.has_budget_charges
+                        {
+                            self.budget.legacy_step_budget_unknown = true;
+                        }
+                        self.budget.legacy_budget_resume_pending = true;
                     }
                     // Requeue order survives restarts. Preemption may
                     // carry a preserved `queued_at` key; otherwise the actual
@@ -685,6 +755,7 @@ impl RunState {
                 }
                 if kind == "run_started" {
                     self.execution_started = true;
+                    self.apply_step_budget_baseline(event)?;
                 }
                 if let Some(labels) = event.get("labels").and_then(Value::as_object) {
                     self.labels = labels
@@ -697,10 +768,21 @@ impl RunState {
             }
             "run_resumed" => {
                 self.terminal = None;
-                self.budget.seed_legacy_usage();
+                let has_baseline = event.get("step_budget_baseline").is_some();
+                if self.budget.step_budget_seed.is_none()
+                    && self.budget.has_budget_charges
+                    && !self.budget.legacy_budget_resume_pending
+                {
+                    self.budget.legacy_step_budget_unknown = true;
+                }
+                if has_baseline {
+                    self.apply_step_budget_baseline(event)?;
+                } else if self.budget.step_budget_seed.is_none() {
+                    self.budget.legacy_budget_resume_pending = true;
+                }
             }
             "step_retry" | "foreach_iteration" => {
-                if !self.budget.has_budget_charges {
+                if self.budget.step_budget_seed.is_none() {
                     self.budget.legacy_step_budget_unknown = true;
                 }
             }
@@ -769,6 +851,12 @@ impl RunState {
                             )
                         })?,
                 };
+                if amount > 0
+                    && self.budget.legacy_budget_resume_pending
+                    && self.budget.step_budget_seed.is_none()
+                {
+                    self.budget.legacy_step_budget_unknown = true;
+                }
                 self.budget.budget_charged = self
                     .budget
                     .budget_charged
@@ -2111,41 +2199,98 @@ mod tests {
         assert!(!zero.budget.has_budget_charges);
     }
 
+    fn step_budget_boundary(seq: u64, kind: &str, run_id: &str, used: u64, charged: u64) -> Value {
+        let mut event = json!({
+            "t": kind,
+            "seq": seq,
+            "run_id": run_id,
+            "step_budget_baseline": {
+                "version": api::STEP_BUDGET_BASELINE_VERSION,
+                "used": used,
+                "charged": charged
+            }
+        });
+        if kind == "run_started" {
+            event["schema_version"] = json!(api::JOURNAL_SCHEMA_VERSION);
+            event["elapsed_budget_mode"] = json!(policy::ElapsedBudgetMode::default());
+        }
+        event
+    }
+
     #[test]
-    fn legacy_step_budget_seed_survives_new_deltas_and_a_second_resume() {
+    fn legacy_resume_markers_do_not_freeze_usage_and_new_baselines_track_deltas() {
         let mut state = RunState::default();
         state
-            .apply(&json!({"t":"step_started", "seq":1, "node":"legacy"}))
+            .apply(&json!({"t":"step_started", "seq":1, "node":"legacy-a"}))
             .unwrap();
         state
             .apply(&json!({"t":"run_resumed", "seq":2, "run_id":"run"}))
             .unwrap();
-        assert_eq!(state.budget.step_budget_seed, Some(1));
-        assert_eq!(state.budget.step_budget_consumed(), Ok(1));
+        state
+            .apply(&json!({"t":"step_started", "seq":3, "node":"legacy-b"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"run_resumed", "seq":4, "run_id":"run"}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, None);
+        assert_eq!(state.budget.step_budget_consumed(), Ok(2));
 
+        // The current engine records an explicit boundary before new work.
         state
-            .apply(&json!({"t":"step_started", "seq":3, "node":"new-1"}))
+            .apply(&step_budget_boundary(5, "run_resumed", "run", 2, 0))
             .unwrap();
-        state
-            .apply(&json!({"t":"budget_charged", "seq":4, "node":"new-1", "amount":1}))
-            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, Some(2));
+        assert_eq!(state.budget.step_budget_charged_at_seed, Some(0));
+        assert!(!state.budget.legacy_budget_resume_pending);
         assert_eq!(state.budget.step_budget_consumed(), Ok(2));
 
         state
-            .apply(&json!({"t":"run_resumed", "seq":5, "run_id":"run"}))
+            .apply(&json!({"t":"step_started", "seq":6, "node":"new-a"}))
             .unwrap();
         state
-            .apply(&json!({"t":"step_started", "seq":6, "node":"new-2"}))
+            .apply(&json!({"t":"budget_charged", "seq":7, "node":"new-a", "amount":1}))
             .unwrap();
-        state
-            .apply(&json!({"t":"budget_charged", "seq":7, "node":"new-2", "amount":1}))
-            .unwrap();
-        assert_eq!(state.budget.step_budget_seed, Some(1));
         assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+
+        // A later restart re-anchors the cumulative total and charge position.
+        state
+            .apply(&step_budget_boundary(8, "run_resumed", "run", 3, 1))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, Some(3));
+        assert_eq!(state.budget.step_budget_charged_at_seed, Some(1));
+        state
+            .apply(&json!({"t":"step_started", "seq":9, "node":"new-b"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":10, "node":"new-b", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(4));
     }
 
     #[test]
-    fn fork_inherits_legacy_step_budget_before_new_charges() {
+    fn unseeded_legacy_resume_followed_by_new_charges_fails_closed() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({"t":"step_started", "seq":1, "node":"legacy-a"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"run_resumed", "seq":2, "run_id":"run"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":3, "node":"legacy-b"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"run_resumed", "seq":4, "run_id":"run"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":5, "node":"new", "amount":1}))
+            .unwrap();
+        assert!(state.budget.legacy_step_budget_unknown);
+        assert!(state.budget.step_budget_consumed().is_err());
+    }
+
+    #[test]
+    fn fork_inherits_legacy_usage_at_its_new_run_started_boundary() {
         let mut state = RunState {
             run_id: Some("source".into()),
             ..RunState::default()
@@ -2157,15 +2302,53 @@ mod tests {
                 "schema_version":1
             }))
             .expect("fork admission should fold");
-        assert_eq!(state.budget.step_budget_seed, Some(4));
+        assert_eq!(state.budget.step_budget_seed, None);
+        assert!(state.budget.legacy_budget_resume_pending);
+        assert_eq!(state.budget.step_budget_consumed(), Ok(4));
         state
-            .apply(&json!({"t":"budget_charged", "seq":2, "node":"new", "amount":1}))
+            .apply(&step_budget_boundary(2, "run_started", "child", 4, 0))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":3, "node":"new", "amount":1}))
             .unwrap();
         assert_eq!(state.budget.step_budget_consumed(), Ok(5));
     }
 
     #[test]
-    fn fork_with_charge_deltas_does_not_double_count_step_starts() {
+    fn legacy_fork_queue_markers_do_not_freeze_step_usage() {
+        let mut state = RunState {
+            run_id: Some("source".into()),
+            ..RunState::default()
+        };
+        state.budget.steps_executed = 1;
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":1, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":2, "node":"legacy-after-queue"}))
+            .unwrap();
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":3, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_seed, None);
+        assert_eq!(state.budget.step_budget_consumed(), Ok(2));
+        state
+            .apply(&step_budget_boundary(4, "run_started", "child", 2, 0))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":5, "node":"new", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+    }
+
+    #[test]
+    fn fork_with_charge_deltas_without_a_baseline_fails_closed() {
         let mut state = RunState {
             run_id: Some("source".into()),
             ..RunState::default()
@@ -2177,24 +2360,89 @@ mod tests {
             .apply(&json!({"t":"step_started", "seq":2, "node":"prior-2"}))
             .unwrap();
         state
-            .apply(&json!({"t":"budget_charged", "seq":3, "node":"prior", "amount":2}))
+            .apply(&json!({"t":"run_resumed", "seq":3, "run_id":"source"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":4, "node":"prior", "amount":2}))
             .unwrap();
         state
             .apply(&json!({
-                "t":"run_queued", "seq":4, "run_id":"child", "parent_run_id":"source",
+                "t":"run_queued", "seq":5, "run_id":"child", "parent_run_id":"source",
                 "schema_version":1
             }))
             .expect("fork admission should fold");
-        assert_eq!(state.budget.step_budget_seed, None);
+        assert!(state.budget.legacy_step_budget_unknown);
+        assert!(state.budget.step_budget_consumed().is_err());
+    }
+
+    #[test]
+    fn fork_with_a_complete_charge_ledger_can_establish_a_baseline() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({
+                "t":"run_started", "seq":1, "run_id":"source", "schema_version":1
+            }))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":2, "node":"prior-1"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":3, "node":"prior-2"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":4, "node":"prior", "amount":2}))
+            .unwrap();
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":5, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .expect("fork admission should fold");
+        assert!(!state.budget.legacy_step_budget_unknown);
+        assert!(state.budget.legacy_budget_resume_pending);
         assert_eq!(state.budget.step_budget_consumed(), Ok(2));
         state
-            .apply(&json!({"t":"budget_charged", "seq":5, "node":"new", "amount":1}))
+            .apply(&step_budget_boundary(6, "run_resumed", "child", 2, 2))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":7, "node":"new", "amount":1}))
             .unwrap();
         assert_eq!(state.budget.step_budget_consumed(), Ok(3));
     }
 
     #[test]
-    fn legacy_retry_and_foreach_without_charges_refuse_a_seed() {
+    fn fork_with_a_durable_baseline_preserves_charged_usage() {
+        let mut state = RunState::default();
+        state
+            .apply(&step_budget_boundary(1, "run_started", "source", 0, 0))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":2, "node":"prior-1"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"step_started", "seq":3, "node":"prior-2"}))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":4, "node":"prior", "amount":2}))
+            .unwrap();
+        state
+            .apply(&json!({
+                "t":"run_queued", "seq":5, "run_id":"child", "parent_run_id":"source",
+                "schema_version":1
+            }))
+            .expect("fork admission should fold");
+        assert_eq!(state.budget.step_budget_consumed(), Ok(2));
+        state
+            .apply(&step_budget_boundary(6, "run_started", "child", 2, 2))
+            .unwrap();
+        state
+            .apply(&json!({"t":"budget_charged", "seq":7, "node":"new", "amount":1}))
+            .unwrap();
+        assert_eq!(state.budget.step_budget_consumed(), Ok(3));
+    }
+
+    #[test]
+    fn legacy_retry_and_foreach_without_baselines_refuse_new_baselines() {
         for event in [
             json!({"t":"step_retry", "seq":2, "node":"legacy", "attempt":1}),
             json!({"t":"foreach_iteration", "seq":2, "node":"legacy_each", "index":0}),
@@ -2204,9 +2452,11 @@ mod tests {
                 .apply(&json!({"t":"step_started", "seq":1, "node":"legacy"}))
                 .unwrap();
             state.apply(&event).unwrap();
-            state
-                .apply(&json!({"t":"run_resumed", "seq":3, "run_id":"run"}))
-                .unwrap();
+            let boundary = step_budget_boundary(3, "run_resumed", "run", 1, 0);
+            let error = state
+                .apply(&boundary)
+                .expect_err("unknown legacy work cannot be baselined");
+            assert!(error.to_string().contains("ambiguous legacy history"));
             assert!(state.budget.legacy_step_budget_unknown);
             assert!(state.budget.step_budget_seed.is_none());
             assert!(state.budget.step_budget_consumed().is_err());
@@ -2214,9 +2464,42 @@ mod tests {
     }
 
     #[test]
+    fn step_budget_baseline_requires_matching_usage_and_charge_count() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({"t":"step_started", "seq":1, "node":"legacy"}))
+            .unwrap();
+        let mismatch = step_budget_boundary(2, "run_resumed", "run", 2, 0);
+        assert!(state.apply(&mismatch).is_err());
+        assert_eq!(state.budget.step_budget_seed, None);
+
+        let mut charged = RunState::default();
+        charged
+            .apply(&step_budget_boundary(1, "run_started", "run", 0, 0))
+            .unwrap();
+        charged
+            .apply(&json!({"t":"budget_charged", "seq":2, "node":"new", "amount":1}))
+            .unwrap();
+        let wrong_charge_count = step_budget_boundary(3, "run_resumed", "run", 1, 0);
+        assert!(charged.apply(&wrong_charge_count).is_err());
+        assert_eq!(charged.budget.step_budget_seed, Some(0));
+
+        let mut future = RunState::default();
+        let mut unsupported = step_budget_boundary(1, "run_started", "run", 0, 0);
+        unsupported["step_budget_baseline"]["version"] = json!(2);
+        assert!(future.apply(&unsupported).is_err());
+        let mut null_state = RunState::default();
+        let null = json!({
+            "t":"run_resumed", "seq":1, "run_id":"run", "step_budget_baseline":null
+        });
+        assert!(null_state.apply(&null).is_err());
+    }
+
+    #[test]
     fn step_budget_seed_addition_overflow_fails_closed() {
         let mut state = RunState::default();
         state.budget.step_budget_seed = Some(usize::MAX);
+        state.budget.step_budget_charged_at_seed = Some(0);
         state.budget.budget_charged = 1;
         state.budget.has_budget_charges = true;
         assert!(state.budget.step_budget_consumed().is_err());

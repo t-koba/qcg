@@ -148,8 +148,8 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 |---|---|
 | `elapsed_accounted` | `active_nanoseconds`, `active_started_at` |
 | `run_queued` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode` |
-| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode` |
-| `run_resumed` | none |
+| `run_started` | `generator`, `generator_path`, `contract_sha256`, `inputs`, `schema_version`, `elapsed_budget_mode`; optional: `step_budget_baseline` (`version`, `used`, `charged`) |
+| `run_resumed` | none; optional: `step_budget_baseline` (`version`, `used`, `charged`) |
 | `graph_resolved` | `nodes` |
 | `resource` | `name`, `type`, `source`, `sha256`, `bytes`, `cache`, `trust`, `llm_visible` |
 | `step_started` | `type`, `attempt` |
@@ -193,6 +193,8 @@ Generated from the OpenAPI `RunEvent` schema. Every event uses the required enve
 | `run_interrupted` | `reason` |
 | `run_finished` | `status`, `metrics` |
 | `lagged` | `action` |
+
+Engine-written `run_started` and `run_resumed` events may carry `step_budget_baseline` version 1: `used` is total consumed steps at the boundary and `charged` is the cumulative charge-ledger count. Historical records omit it; their `run_resumed` markers are not treated as budget boundaries. The fold validates each baseline against prior history and fails closed when legacy usage is ambiguous.
 <!-- run-events:end -->
 
 ## Durability records

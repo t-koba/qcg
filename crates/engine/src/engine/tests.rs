@@ -5328,7 +5328,7 @@ async fn foreach_single_charge_matches_live_and_fold() {
     );
     assert!(
         state.budget.has_budget_charges,
-        "resume must seed from the delta, not the six starts"
+        "one-unit charge baseline, not six observational starts"
     );
     assert_eq!(state.budget.step_budget_consumed(), Ok(1));
     assert!(!state.budget.legacy_step_budget_unknown);
@@ -5384,7 +5384,7 @@ async fn budget_charges_match_attempts_live_and_after_fold() {
     );
     assert!(
         state.budget.has_budget_charges,
-        "new journals must seed from charges, not event counts"
+        "the durable baseline and deltas recover attempts, not event counts"
     );
     assert_eq!(state.budget.step_budget_consumed(), Ok(3));
     assert!(!state.budget.legacy_step_budget_unknown);
@@ -5457,7 +5457,7 @@ async fn legacy_retry_without_charge_ledger_refuses_resume_before_writing() {
     assert!(
         error
             .to_string()
-            .contains("legacy retry or foreach history"),
+            .contains("ambiguous legacy step-budget history"),
         "{error}"
     );
     assert_eq!(

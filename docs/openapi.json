@@ -825,10 +825,6 @@
         ],
         "type": "object"
       },
-      "EmptyEventData": {
-        "additionalProperties": false,
-        "type": "object"
-      },
       "FailureCode": {
         "oneOf": [
           {
@@ -3241,7 +3237,7 @@
             "$ref": "#/components/schemas/RunStartedEventData"
           },
           {
-            "$ref": "#/components/schemas/EmptyEventData"
+            "$ref": "#/components/schemas/RunResumedEventData"
           },
           {
             "$ref": "#/components/schemas/GraphResolvedEventData"
@@ -3630,6 +3626,23 @@
         ],
         "type": "object"
       },
+      "RunResumedEventData": {
+        "additionalProperties": false,
+        "properties": {
+          "step_budget_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepBudgetBaseline"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Absent on historical `run_resumed` records; present on new engine entries."
+          }
+        },
+        "type": "object"
+      },
       "RunSnapshot": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
         "properties": {
@@ -3924,6 +3937,17 @@
             "format": "uint32",
             "minimum": 0,
             "type": "integer"
+          },
+          "step_budget_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StepBudgetBaseline"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Versioned step-budget checkpoint emitted by the engine at a durable\nrun-entry boundary. Older identity events omit it."
           }
         },
         "required": [
@@ -4104,6 +4128,33 @@
           "inputs"
         ],
         "title": "StartRun",
+        "type": "object"
+      },
+      "StepBudgetBaseline": {
+        "additionalProperties": false,
+        "description": "Exact cumulative step usage and charge-ledger position at a run-entry boundary.",
+        "properties": {
+          "charged": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "version": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "version",
+          "used",
+          "charged"
+        ],
         "type": "object"
       },
       "StepFinishedEventData": {

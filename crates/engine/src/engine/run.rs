@@ -488,9 +488,14 @@ impl Engine {
             audit_limits,
         )?;
         let replay = JournalReplay::from_state(journal.state());
-        if replay.state.budget.legacy_step_budget_unknown {
+        if replay.state.budget.legacy_step_budget_unknown
+            || (replay.state.execution_started
+                && replay.state.budget.step_budget_seed.is_none()
+                && replay.state.budget.has_budget_charges
+                && !replay.state.budget.legacy_budget_resume_pending)
+        {
             return Err(EngineError::Failed(format!(
-                "cannot safely resume run `{requested_run_id}`: legacy retry or foreach history has no exact step-budget charge proof"
+                "cannot safely resume run `{requested_run_id}`: ambiguous legacy step-budget history has no exact charge proof"
             )));
         }
         let inherited_steps = replay
@@ -502,6 +507,20 @@ impl Engine {
                     "cannot safely resume run `{requested_run_id}`: {error}"
                 ))
             })?;
+        let step_budget_used = u64::try_from(inherited_steps).map_err(|_| {
+            EngineError::Failed("step-budget usage is not representable in the journal".into())
+        })?;
+        let step_budget_charged =
+            u64::try_from(replay.state.budget.budget_charged).map_err(|_| {
+                EngineError::Failed(
+                    "step-budget charge count is not representable in the journal".into(),
+                )
+            })?;
+        let step_budget_baseline = api::StepBudgetBaseline {
+            version: api::STEP_BUDGET_BASELINE_VERSION,
+            used: step_budget_used,
+            charged: step_budget_charged,
+        };
         replay
             .state
             .ensure_no_fail_closed_inflight_operations()
@@ -552,6 +571,7 @@ impl Engine {
                 "schema_version": api::JOURNAL_SCHEMA_VERSION,
                 "elapsed_budget_mode": mode,
                 "retention_days": contract.manifest.retention.days,
+                "step_budget_baseline": &step_budget_baseline,
             }))?;
         }
         let mut episode = None;
@@ -691,6 +711,7 @@ impl Engine {
                     "retention_days": context.contract.manifest.retention.days,
                     "parallel_compatibility": context.parallel_compatibility,
                     "parallel_compatibility_origin": "deployment_policy",
+                    "step_budget_baseline": &step_budget_baseline,
                 }),
             )?;
             }
@@ -739,7 +760,13 @@ impl Engine {
             }
         }
         if resume {
-            journal.event("run_resumed", json!({ "run_id": run_id }))?;
+            journal.event(
+                "run_resumed",
+                json!({
+                    "run_id": run_id,
+                    "step_budget_baseline": &step_budget_baseline,
+                }),
+            )?;
         }
 
         let mut vars = if resume {

@@ -1189,8 +1189,9 @@ in `run_started`. Requeues repeat that mode, adopted resumes read journal truth,
 and forks inherit the checkpoint's mode, accumulated consumption, and any open
 interval rather than applying today's deployment mode to the source's history.
 Changing deployment configuration cannot reinterpret existing runs. Journal
-schema 2 requires the pinned mode; schema-1 absence explicitly means historical
-`wall_clock`, never zero active consumption. Old folded-state caches are rebuilt
+schemas 2 and later require the pinned mode; schema-1 absence explicitly means
+historical `wall_clock`, never zero active consumption. Schema 3 also records a
+versioned step-budget baseline at each engine entry. Old folded-state caches are rebuilt
 from the journal; caches from newer, unsupported versions are refused.
 
 Active accounting uses one durable `elapsed_accounted` ledger: accumulated

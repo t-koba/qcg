@@ -273,9 +273,14 @@ pub fn run_event_reference_markdown() -> String {
             markdown.push_str(
                 "; optional: `web_search` (`calls`, `cost_microusd`, `events`, `citations`)",
             );
+        } else if matches!(event, "run_started" | "run_resumed") {
+            markdown.push_str("; optional: `step_budget_baseline` (`version`, `used`, `charged`)");
         }
         markdown.push_str(" |\n");
     }
+    markdown.push_str(
+        "\nEngine-written `run_started` and `run_resumed` events may carry `step_budget_baseline` version 1: `used` is total consumed steps at the boundary and `charged` is the cumulative charge-ledger count. Historical records omit it; their `run_resumed` markers are not treated as budget boundaries. The fold validates each baseline against prior history and fails closed when legacy usage is ambiguous.\n",
+    );
     markdown
 }
 

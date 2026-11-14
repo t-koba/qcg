@@ -367,10 +367,15 @@ fn elapsed_event_schema_is_required_and_nullable_and_wire_values_validate() {
 }
 
 #[test]
-fn schema_two_run_identity_requires_elapsed_mode_in_openapi() {
+fn current_run_identity_requires_elapsed_mode_and_keeps_budget_baseline_optional() {
     let schema = &api::openapi_components()["schemas"]["RunStartedEventData"];
     let required = schema["required"].as_array().expect("required properties");
     assert!(required.iter().any(|name| name == "elapsed_budget_mode"));
+    assert_eq!(api::JOURNAL_SCHEMA_VERSION, 3);
+    assert!(
+        !required.iter().any(|name| name == "step_budget_baseline"),
+        "legacy identity records remain parseable without a baseline"
+    );
 }
 
 #[test]
