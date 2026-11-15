@@ -474,9 +474,10 @@ pub fn stage_file_at(
 /// This is the single home for the sidecar persistence policy that operation
 /// results, pending tool payloads, run state, and checkpoint blobs all need:
 /// owner-only mode, no symlink at the destination, an atomic publish, and a
-/// parent directory sync so the name survives power loss. Callers must not
-/// hand-roll an `OpenOptions` block for a metadata file, because that is how
-/// the call sites drifted apart before.
+/// parent-directory sync on Unix. Other platforms sync the staged file but
+/// do not sync the containing directory, so entry durability is not claimed.
+/// Callers must not hand-roll an `OpenOptions` block for a metadata file,
+/// because that is how the call sites drifted apart before.
 ///
 /// The parent directory must already exist; creating it is the caller's
 /// decision because only the owner of a run's metadata layout knows its shape.

@@ -261,23 +261,23 @@ journal appends are not individually fsynced and survive a process crash via
 the page cache (a host power loss may lose them — outside the guaranteed
 boundary); terminal records are fsynced, and a crash-truncated tail is
 repaired under the journal lock on next open. Host power loss and
-storage-media failure are outside the guaranteed boundary; those would require
-synchronizing every external side effect behind directory-entry durability.
-Directory-entry durability means file bytes plus the naming directory entry
-are both durable (data + parent directory fsync so a crash cannot lose the
-rename). qcg applies it to `state.json`, workspace replacements/removals,
-and idempotency records; journal appends use operation-driven fsync plus
-repair instead. Terminal journal records and operation mappings
-(`operation_started` / `operation_finished`) are fsynced individually with
-parent directory sync (`JournalWriter::event` fast path and
-`append_events_if` batch path in
-`crates/engine/src/journal/writer.rs`); non-terminal appends
-rely on the next terminal sync or clean shutdown, and a crash-truncated tail
-without a trailing newline is repaired on the next open under the journal
-lock. Repair marker: a terminal event writes `.clean_shutdown` next to the
-journal; any later non-terminal append clears it. A truncated tail WITH the
-marker refuses repair as possible tampering; WITHOUT it the tail repairs as
-crash residue (complete JSON gains its newline, torn fragments truncate).
+storage-media failure are outside the guaranteed boundary.
+Directory-entry durability requires syncing file bytes and the naming
+directory. On Unix, qcg requests this for selected atomic sidecar and workspace
+replacement paths; it does not claim a power-loss transaction across a complete
+new run tree. On non-Unix, `sync_dir_entry`, `sync_parent_dir`, and the shared
+atomic writer do not sync parent directories: file contents may be synced, but
+entry persistence is best effort. Journal appends use operation-driven file
+sync plus repair; terminal records and operation mappings
+(`operation_started` / `operation_finished`) also request parent-directory
+sync on Unix (`JournalWriter::event` fast path and `append_events_if` batch
+path in `crates/engine/src/journal/writer.rs`). Non-terminal appends rely on
+the next terminal sync or clean shutdown, and a crash-truncated tail without
+a trailing newline is repaired on the next open under the journal lock. Repair
+marker: a terminal event writes `.clean_shutdown` next to the journal; any
+later non-terminal append clears it. A truncated tail WITH the marker refuses
+repair as possible tampering; WITHOUT it the tail repairs as crash residue
+(complete JSON gains its newline, torn fragments truncate).
 The marker must be a non-symlink regular file; unreadable markers fail
 closed. See `docs/operations.md` durability section for the operator mapping
 table, admission-records vs run-coordination-lock distinction, large-result

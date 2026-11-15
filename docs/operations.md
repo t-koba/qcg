@@ -671,21 +671,19 @@ already-settled run returns history and ends immediately.
 
 The durability model targets process termination (including SIGKILL) and
 restart. Host power loss and storage-media failure are outside the guaranteed
-boundary; those would require synchronizing every external side effect behind
-directory-entry durability (see below).
+boundary, even where synchronization calls are made.
 
-Directory-entry durability means both the file bytes and the directory entry
-that names them are durable: the data reaches the disk and the parent
-directory is fsynced so a crash cannot lose the rename that installed the
-file. qcg applies this to run metadata (`state.json` atomic replace plus
-parent directory sync in `persist_serialized_atomic`), workspace atomic
-replacements and removals, idempotency records, fork journals and blobs, and
-large operation-result sidecars (file plus parent directory sync);
-journal line appends synchronize at the boundaries in the next table plus
-repair, not on a per-append directory fsync. Host power loss and storage-media
-failure stay outside the guaranteed boundary as stated above, so no test
-fault-injects them: the table below pins the process-crash contract that
-native tests do cover.
+Directory-entry durability means both file bytes and the naming directory
+entry are synchronized: the file data is synced and its containing directory
+is fsynced. qcg requests that for selected sidecar and replacement paths on
+Unix, including `state.json`, workspace replacements/removals, and idempotency
+records. Journal and checkpoint-fork code syncs file contents and selected
+containing directories as described below, but does not establish a durable
+transaction across the full newly-created run-directory ancestry. On non-Unix,
+`sync_dir_entry` and `sync_parent_dir` are no-ops: call sites may sync file
+contents, but parent-directory entry persistence is not established. These
+are not host-power-loss guarantees; the table below describes the process-crash
+contract covered by native tests.
 
 Runtime dependency evidence is private run metadata in
 `meta/.dependency-traces.jsonl`, not a public event stream or an API field.
@@ -759,11 +757,11 @@ Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):
 
 | path | what is fsynced | when |
 |---|---|---|
-| `JournalWriter::event` fast path | `file.sync_data()` on the journal file plus parent directory sync | when the event is terminal or operation-driven (`operation_started` / `operation_finished` set `needs_sync`; see `JournalWriter::event` in `writer.rs`) |
-| `append_events_if` batch path | `file.sync_data()` on the journal file plus parent directory sync | when the batch contains a terminal or operation event (`needs_sync`) |
+| `JournalWriter::event` fast path | `file.sync_data()` on the journal file plus parent-directory sync on Unix (`sync_parent_dir` is a non-Unix no-op) | when the event is terminal or operation-driven (`operation_started` / `operation_finished` set `needs_sync`; see `JournalWriter::event` in `writer.rs`) |
+| `append_events_if` batch path | `file.sync_data()` on the journal file plus parent-directory sync on Unix (`sync_parent_dir` is a non-Unix no-op) | when the batch contains a terminal or operation event (`needs_sync`) |
 | torn-tail repair `truncate_to` / newline commit | `sync_data()` after truncate or newline commit | every repair |
-| `state.json` persist | atomic write + replace via `persist_serialized_atomic` | every append (state always follows the journal) |
-| private dependency trace capture | outcome journal `sync_data()`, then private trace file and parent directory sync | terminal node/iteration outcomes with runtime read recorders; evidence failures are nonfatal |
+| `state.json` persist | synced staged file + atomic replace; parent-directory sync on Unix only | every append (state always follows the journal) |
+| private dependency trace capture | outcome journal `sync_data()`, then private trace file and parent-directory sync on Unix | terminal node/iteration outcomes with runtime read recorders; evidence failures are nonfatal |
 | `.clean_shutdown` marker | plain `write` / `remove_file`, no fsync | best-effort I/O, failures propagate (a failed terminal marker fails the operation; see repair marker below) |
 
 Cancel mailbox (`request_remote_cancel` in `crates/service/src/run_dirs.rs`):

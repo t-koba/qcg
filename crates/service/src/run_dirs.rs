@@ -991,8 +991,9 @@ fn populate_checkpoint_fork(
     if let Some(audit) = audit_writer.as_mut() {
         audit.sync_all()?;
     }
-    // Sync the directory entry like every other journal publication path:
-    // without it a power loss can lose the fork journal itself (Q2).
+    // Sync the containing metadata directory on Unix after publishing the
+    // fork journal. `sync_dir_entry` is a non-Unix no-op; neither platform
+    // behavior establishes power-loss safety for the whole new run tree.
     sync_dir_entry(&target_meta).map_err(ServiceError::Io)?;
     if let Some(projection) = trace_projection {
         projection.publish(&journal_path);
