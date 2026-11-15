@@ -126,11 +126,30 @@ impl PreparedForkPlan {
     #[doc(hidden)]
     pub fn new(
         diagnostic_digest: &str,
-        mut files: Vec<ForkFileObservation>,
+        files: Vec<ForkFileObservation>,
     ) -> Result<Self, crate::ServiceError> {
         if !valid_hash(diagnostic_digest) {
             return Err(invalid("invalid diagnostic digest"));
         }
+        Self::bind("qcg-prepared-fork-v1", diagnostic_digest, files)
+    }
+
+    /// Bind opaque source diagnostic evidence and the complete file manifest.
+    /// This neither authorizes continuation nor writes a reset/overlay. A digest
+    /// alone cannot supply the reset payload to this constructor.
+    #[doc(hidden)]
+    pub fn from_reset_candidate(
+        candidate: &engine::ResetPlanCandidate,
+        files: Vec<ForkFileObservation>,
+    ) -> Result<Self, crate::ServiceError> {
+        Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)
+    }
+
+    fn bind<T: Serialize + ?Sized>(
+        domain: &str,
+        diagnostic: &T,
+        mut files: Vec<ForkFileObservation>,
+    ) -> Result<Self, crate::ServiceError> {
         files.sort_by(|a, b| a.path.cmp(&b.path));
         let mut previous = None;
         for observation in &files {
@@ -155,7 +174,7 @@ impl PreparedForkPlan {
         }
         // Domain-separated, deterministic encoding of the full sorted manifest.
         // This is a composite service identity, NOT the engine diagnostic digest.
-        let identity = serde_json::to_vec(&("qcg-prepared-fork-v1", diagnostic_digest, &files))?;
+        let identity = serde_json::to_vec(&(domain, diagnostic, &files))?;
         Ok(Self {
             binding: ForkPlanBinding {
                 binding_version: 1,
@@ -410,6 +429,62 @@ mod tests {
             );
         }
         assert!(PreparedForkPlan::new("not a digest", vec![file]).is_err());
+    }
+
+    #[test]
+    fn composite_binding_commits_to_the_entire_reset_payload_and_keeps_ordinary_encoding() {
+        let files = vec![ForkFileObservation {
+            path: "meta/journal.jsonl".into(),
+            length: 10,
+            sha256: "b".repeat(64),
+        }];
+        let digest = "a".repeat(64);
+        // The ordinary constructor's exact pre-existing wire encoding is stable,
+        // including the empty-manifest case; it is not a reset candidate.
+        for manifest in [vec![], files.clone()] {
+            let expected = hex::encode(Sha256::digest(
+                serde_json::to_vec(&("qcg-prepared-fork-v1", &digest, &manifest)).unwrap(),
+            ));
+            assert_eq!(
+                PreparedForkPlan::new(&digest, manifest)
+                    .unwrap()
+                    .binding
+                    .plan_digest,
+                expected
+            );
+        }
+        // Exercise the shared encoding primitive, not an arbitrary candidate
+        // constructor: engine alone owns construction of the opaque typed value.
+        let payload = serde_json::json!({
+            "identity": digest, "source_run_id": "source", "source_last_seq": 10,
+            "reset_nodes": {"a": {"output_alias": "result", "predecessors": ["b"]}},
+        });
+        let bind = |value: &serde_json::Value, files| {
+            PreparedForkPlan::bind("qcg-prepared-reset-candidate-v1", value, files).unwrap()
+        };
+        let original = bind(&payload, files.clone());
+        assert_ne!(
+            original.binding(),
+            PreparedForkPlan::new(&digest, files.clone())
+                .unwrap()
+                .binding()
+        );
+        assert_eq!(original.binding(), bind(&payload, files.clone()).binding());
+        for (pointer, value) in [
+            ("/source_run_id", serde_json::json!("other")),
+            ("/source_last_seq", serde_json::json!(11)),
+            ("/reset_nodes/a/output_alias", serde_json::json!("other")),
+            ("/reset_nodes/a/predecessors", serde_json::json!([])),
+        ] {
+            let mut changed = payload.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert_ne!(
+                original.binding(),
+                bind(&changed, files.clone()).binding(),
+                "{pointer}"
+            );
+        }
+        assert_ne!(original.binding(), bind(&payload, vec![]).binding());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Source-currentness diagnostics only. No reset operations or child binding.
+//! Source-currentness and reset-plan diagnostics only. No reset operations.
 //! Only a workspace paired with the journal through the persisted service-run layout is accepted.
 use super::{bounded, digest, history};
 use crate::{
@@ -27,11 +27,12 @@ enum Refusal {
     InputIdentity,
     InputIo,
     Limit,
+    ResetDependency,
 }
 
 /// Opaque point-in-time evidence identity, not authorization or a lease. It
 /// does not close analysis-to-copy TOCTOU, even when two identities match.
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize)]
 struct DiagnosticIdentity([u8; 32]);
 
 impl std::fmt::Debug for DiagnosticIdentity {
@@ -40,7 +41,13 @@ impl std::fmt::Debug for DiagnosticIdentity {
     }
 }
 
-struct SourceDiagnostic {
+/// Opaque, point-in-time reset-plan evidence, not fork authorization or a lease.
+/// Only successful private source analysis creates this value. Serialization is
+/// a read-only diagnostic payload; there is deliberately no decoding or digest
+/// constructor. It does not close analysis-to-copy TOCTOU.
+#[doc(hidden)]
+#[derive(Clone, Serialize)]
+pub struct ResetPlanCandidate {
     identity: DiagnosticIdentity,
     source_run_id: String,
     source_contract_sha256: String,
@@ -49,13 +56,20 @@ struct SourceDiagnostic {
     stale_outcomes: Vec<String>,
     preserved_outcomes: Vec<String>,
     inherited_budget: BudgetState,
+    reset_nodes: BTreeMap<String, ResetNode>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+struct ResetNode {
+    output_alias: String,
+    predecessors: BTreeSet<String>,
 }
 
 // Even debug output is bounded and path/value-redacted. Node IDs are retained
 // internally for inspection, never workspace paths or captured values.
-impl std::fmt::Debug for SourceDiagnostic {
+impl std::fmt::Debug for ResetPlanCandidate {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SourceDiagnostic")
+        f.debug_struct("ResetPlanCandidate")
             .field("retry_roots", &self.retry_roots.len())
             .field("stale_outcomes", &self.stale_outcomes.len())
             .field("preserved_outcomes", &self.preserved_outcomes.len())
@@ -63,7 +77,7 @@ impl std::fmt::Debug for SourceDiagnostic {
     }
 }
 
-/// V1 hashes length-framed, labelled JSON parts under a versioned domain.
+/// V2 hashes length-framed, labelled JSON parts under a versioned domain.
 /// JSON maps and captured read sets have deterministic sorted iteration. Only
 /// one policy-bounded part is materialized at a time and immediately discarded;
 /// no values, paths, trace payloads or workspace bytes enter the result.
@@ -96,7 +110,7 @@ fn analyze_source(
     registry: &StepRegistry,
     workspace: &FsGateway,
     limits: JournalLimits,
-) -> Result<SourceDiagnostic, Refusal> {
+) -> Result<ResetPlanCandidate, Refusal> {
     let limits = bounded(limits);
     if !source_layout_matches(path, state, workspace) {
         return Err(Refusal::SourceBinding);
@@ -148,7 +162,7 @@ fn analyze_source(
     // shortened in-memory trace merely because its terminal digest matches.
     super::TraceJournal::restore(&mut folded, events, path, limits);
     let mut identity = Sha256::new();
-    identity.update(b"qcg-private-source-diagnostic-v1\0");
+    identity.update(b"qcg-private-source-diagnostic-v2\0");
     // Contract SHA binds the manifest/package declarations; consumed package
     // bytes are additionally bound by trace and current-file observations.
     identity_part(
@@ -161,7 +175,7 @@ fn analyze_source(
         ),
         limits.max_state_bytes,
     )?;
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: state.run_id.clone().ok_or(Refusal::SourceBinding)?,
         source_contract_sha256: contract.sha256.clone(),
@@ -170,6 +184,7 @@ fn analyze_source(
         stale_outcomes: Vec::new(),
         preserved_outcomes: Vec::new(),
         inherited_budget: state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
     let mut outcomes = 0;
     // Index only current successes by the exact step path they consumed. The
@@ -315,23 +330,21 @@ fn analyze_source(
     if outcomes != state.nodes.len() || outcomes != state.dependency_traces.owners.len() {
         return Err(Refusal::IncompleteTrace);
     }
+    result.reset_nodes = reset_schedule(
+        contract,
+        result.retry_roots.iter().chain(&result.stale_outcomes),
+        |owner| {
+            state
+                .dependency_traces
+                .owners
+                .get(owner)
+                .map(|trace| &trace.trace.reads)
+        },
+    )?;
     result.retry_roots.sort();
     result.stale_outcomes.sort();
     result.preserved_outcomes.sort();
-    identity_part(
-        &mut identity,
-        "source-plan-budget",
-        &(
-            &result.source_run_id,
-            &result.source_contract_sha256,
-            result.source_last_seq,
-            &result.retry_roots,
-            &result.stale_outcomes,
-            &result.preserved_outcomes,
-            &result.inherited_budget,
-        ),
-        limits.max_state_bytes,
-    )?;
+    bind_candidate_payload(&mut identity, &result, limits.max_state_bytes)?;
     // Detect source journal changes during analysis. There is deliberately no
     // reusable authorization token: external workspace mutation remains outside
     // this point-in-time, source-only diagnostic.
@@ -347,6 +360,28 @@ fn analyze_source(
     Ok(result)
 }
 
+fn bind_candidate_payload(
+    identity: &mut Sha256,
+    result: &ResetPlanCandidate,
+    limit: Option<usize>,
+) -> Result<(), Refusal> {
+    identity_part(
+        identity,
+        "source-plan-budget",
+        &(
+            &result.source_run_id,
+            &result.source_contract_sha256,
+            result.source_last_seq,
+            &result.retry_roots,
+            &result.stale_outcomes,
+            &result.preserved_outcomes,
+            &result.inherited_budget,
+            &result.reset_nodes,
+        ),
+        limit,
+    )
+}
+
 /// Index captured reads of node outputs/statuses. Empty-path reads are
 /// aggregate; the `steps` root is aggregate only when its collection is consumed.
 fn index_step_readers(
@@ -356,27 +391,149 @@ fn index_step_readers(
     aggregate_readers: &mut BTreeSet<String>,
 ) {
     for read in reads {
-        if !matches!(read.kind, ReadKind::Lookup | ReadKind::Collection) {
-            continue;
-        }
-        let steps_root = read.path.as_slice() == ["steps"];
-        // A collection's `Lookup/Present` is only the ancestor needed to
-        // reach a child. Only its `Collection` record consumes the subtree;
-        // non-presence lookup identities stay conservative.
-        if read.path.is_empty()
-            || (steps_root
-                && !(read.kind == ReadKind::Lookup && read.identity == ReadIdentity::Present))
-        {
-            aggregate_readers.insert(owner.to_owned());
-        } else if read.path.first().is_some_and(|root| root == "steps")
-            && let Some(step) = read.path.get(1)
-        {
-            readers_by_step
-                .entry(step.clone())
-                .or_default()
-                .insert(owner.to_owned());
+        match step_read(read) {
+            StepRead::None => {}
+            StepRead::Aggregate => {
+                aggregate_readers.insert(owner.to_owned());
+            }
+            StepRead::Named(step) => {
+                readers_by_step
+                    .entry(step.to_owned())
+                    .or_default()
+                    .insert(owner.to_owned());
+            }
         }
     }
+}
+
+// Share the captured-read interpretation with stale closure. A Present lookup
+// of the steps root only traverses an ancestor; it does not consume the root.
+enum StepRead<'a> {
+    None,
+    Aggregate,
+    Named(&'a str),
+}
+fn step_read(read: &ReadDependency) -> StepRead<'_> {
+    if !matches!(read.kind, ReadKind::Lookup | ReadKind::Collection) {
+        return StepRead::None;
+    }
+    if read.path.is_empty()
+        || (read.path.as_slice() == ["steps"]
+            && !(read.kind == ReadKind::Lookup && read.identity == ReadIdentity::Present))
+    {
+        StepRead::Aggregate
+    } else if read.path.first().is_some_and(|root| root == "steps")
+        && let Some(step) = read.path.get(1)
+    {
+        StepRead::Named(step)
+    } else {
+        StepRead::None
+    }
+}
+
+/// Resolve both node IDs and exact contract output aliases. Collisions are
+/// retained, not overwritten: a consumed ambiguous name must refuse even when
+/// only one of its possible owners is reset.
+fn reset_schedule<'a>(
+    contract: &Contract,
+    owners: impl Iterator<Item = &'a String>,
+    reads: impl Fn(&str) -> Option<&'a BTreeSet<ReadDependency>>,
+) -> Result<BTreeMap<String, ResetNode>, Refusal> {
+    let mut aliases = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for (owner, node) in &contract.graph.nodes {
+        for alias in [owner.as_str(), node.output.as_deref().unwrap_or(&node.id)] {
+            aliases.entry(alias).or_default().insert(owner);
+        }
+    }
+    let mut reset = BTreeMap::new();
+    for owner in owners {
+        let node = contract.graph.nodes.get(owner).ok_or(Refusal::Executor)?;
+        let output_alias = node.output.as_deref().unwrap_or(&node.id);
+        // The eventual overlay removes both possible step-output keys. Neither
+        // may also name a different node's output, or clearing one reset node
+        // could erase a preserved result even when no trace read that key.
+        for name in [owner.as_str(), output_alias] {
+            let targets = aliases.get(name).ok_or(Refusal::ResetDependency)?;
+            if targets.len() != 1 || !targets.contains(owner.as_str()) {
+                return Err(Refusal::ResetDependency);
+            }
+        }
+        reset.insert(
+            owner.clone(),
+            ResetNode {
+                output_alias: output_alias.to_owned(),
+                predecessors: BTreeSet::new(),
+            },
+        );
+    }
+    let reset_ids = reset.keys().cloned().collect::<BTreeSet<_>>();
+    for (owner, node) in &mut reset {
+        node.predecessors = reset_predecessors(
+            reads(owner).ok_or(Refusal::IncompleteTrace)?,
+            &aliases,
+            &reset_ids,
+        )?;
+    }
+    // Kahn traversal is iterative and proportional to the captured reset graph.
+    // Self reads (including a consumed aggregate containing the reader) refuse:
+    // silently dropping that gate would guess a different execution dependency.
+    let mut remaining = BTreeMap::new();
+    let mut successors = BTreeMap::<&str, Vec<&str>>::new();
+    let mut ready = VecDeque::new();
+    for (owner, node) in &reset {
+        remaining.insert(owner.as_str(), node.predecessors.len());
+        if node.predecessors.is_empty() {
+            ready.push_back(owner.as_str());
+        }
+        for predecessor in &node.predecessors {
+            successors.entry(predecessor).or_default().push(owner);
+        }
+    }
+    let mut visited = 0;
+    while let Some(owner) = ready.pop_front() {
+        visited += 1;
+        for successor in successors.get(owner).into_iter().flatten() {
+            let count = remaining
+                .get_mut(successor)
+                .ok_or(Refusal::ResetDependency)?;
+            *count -= 1;
+            if *count == 0 {
+                ready.push_back(successor);
+            }
+        }
+    }
+    if visited != reset.len() {
+        return Err(Refusal::ResetDependency);
+    }
+    Ok(reset)
+}
+
+fn reset_predecessors(
+    reads: &BTreeSet<ReadDependency>,
+    aliases: &BTreeMap<&str, BTreeSet<&str>>,
+    reset_ids: &BTreeSet<String>,
+) -> Result<BTreeSet<String>, Refusal> {
+    let mut predecessors = BTreeSet::new();
+    for read in reads {
+        match step_read(read) {
+            StepRead::None => {}
+            // Aggregate identity contains no per-entry provenance. Expanding
+            // it to every reset node can create a dense graph and a self-cycle;
+            // refuse rather than guess or allocate a quadratic edge set.
+            StepRead::Aggregate => return Err(Refusal::ResetDependency),
+            StepRead::Named(alias) => {
+                let targets = aliases.get(alias).ok_or(Refusal::ResetDependency)?;
+                if targets.len() != 1 {
+                    return Err(Refusal::ResetDependency);
+                }
+                let target = *targets.first().ok_or(Refusal::ResetDependency)?;
+                if reset_ids.contains(target) {
+                    predecessors.insert(target.to_owned());
+                }
+            }
+        }
+    }
+    Ok(predecessors)
 }
 
 /// Compute the transitive outcomes that may change when a retry root (or an
@@ -388,7 +545,7 @@ fn index_step_readers(
 /// the node id and output alias are possible writes to captured readers.
 fn propagate_step_invalidation(
     contract: &Contract,
-    result: &mut SourceDiagnostic,
+    result: &mut ResetPlanCandidate,
     readers_by_step: &BTreeMap<String, BTreeSet<String>>,
     aggregate_readers: &BTreeSet<String>,
 ) -> Result<(), Refusal> {
@@ -447,7 +604,7 @@ fn propagate_step_invalidation(
 fn mark_stale(
     owner: &str,
     invalidated: &mut BTreeSet<String>,
-    result: &mut SourceDiagnostic,
+    result: &mut ResetPlanCandidate,
     pending: &mut VecDeque<String>,
 ) {
     if invalidated.insert(owner.to_owned()) {

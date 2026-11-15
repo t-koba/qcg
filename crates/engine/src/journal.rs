@@ -10,6 +10,8 @@ pub use read::*;
 pub use serialize::*;
 #[doc(hidden)] // Service-only bridge; not part of the public continuation API.
 pub use traces::ForkTraceProjection;
+#[doc(hidden)]
+pub use traces::ResetPlanCandidate;
 pub use types::*;
 pub use writer::{
     acquire_journal_read_lock, journal_lock_path, read_last_seq_from_file_tail,

@@ -63,7 +63,18 @@ impl StepExecutor for Probe {
                 );
         }
         if node.output.as_deref() == Some("a_result") {
-            let _ = ctx.vars.get_path("steps.b.output");
+            // This executor reads one exact snapshot path and records it,
+            // including absence. ValueBag::get_path intentionally adds a whole
+            // steps collection read when canonical IDs are not yet known.
+            let snapshot = ctx.vars.template_snapshot();
+            ctx.vars
+                .read_recorder()
+                .for_owner(ReadOwner::Node(node.id.clone()))
+                .record(
+                    &["steps".into(), "b".into(), "output".into()],
+                    ReadKind::Lookup,
+                    ReadIdentity::of(snapshot.pointer("/steps/b/output")),
+                );
         }
         if node.id == "b" {
             Ok(StepOutcome::check_failed(vec![model::Finding::error(
@@ -247,7 +258,7 @@ type = "test.probe"
     fn fs(&self) -> FsGateway {
         FsGateway::new(self.workspace.clone(), &self.contract.manifest.permissions)
     }
-    fn analyze(&self) -> Result<SourceDiagnostic, Refusal> {
+    fn analyze(&self) -> Result<ResetPlanCandidate, Refusal> {
         analyze_source(
             &self.path,
             &self.state,
@@ -317,6 +328,24 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
     assert_eq!(plan.source_contract_sha256, f.contract.sha256);
     assert_eq!(plan.source_last_seq, f.state.last_seq);
     assert_eq!(
+        serde_json::to_value(&plan).unwrap()["source_run_id"],
+        "source-probe"
+    );
+    assert_eq!(
+        serde_json::to_value(&plan).unwrap()["source_last_seq"],
+        f.state.last_seq
+    );
+    assert_eq!(
+        plan.reset_nodes,
+        BTreeMap::from([(
+            "b".into(),
+            ResetNode {
+                output_alias: "b".into(),
+                predecessors: BTreeSet::new(),
+            }
+        )])
+    );
+    assert_eq!(
         serde_json::to_value(&plan.inherited_budget).unwrap(),
         serde_json::to_value(&f.state.budget).unwrap()
     );
@@ -327,7 +356,7 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
     );
     assert_eq!(
         format!("{plan:?}"),
-        "SourceDiagnostic { retry_roots: 1, stale_outcomes: 0, preserved_outcomes: 1, .. }"
+        "ResetPlanCandidate { retry_roots: 1, stale_outcomes: 0, preserved_outcomes: 1, .. }"
     );
     assert_eq!(std::fs::read(&f.path).unwrap(), before);
     assert_eq!(
@@ -411,6 +440,34 @@ async fn retry_root_invalidates_success_that_read_its_missing_output() {
     assert_eq!(plan.retry_roots, ["b"]);
     assert_eq!(plan.stale_outcomes, ["a"]);
     assert!(plan.preserved_outcomes.is_empty());
+    assert_eq!(
+        serde_json::to_value(&plan.reset_nodes).unwrap(),
+        json!({
+            "a": {"output_alias": "a_result", "predecessors": ["b"]},
+            "b": {"output_alias": "b", "predecessors": []},
+        })
+    );
+    let payload_identity = |candidate: &ResetPlanCandidate| {
+        let mut hash = Sha256::new();
+        bind_candidate_payload(&mut hash, candidate, None).unwrap();
+        hash.finalize()
+    };
+    let original = payload_identity(&plan);
+    for field in ["alias", "gates", "source", "seq"] {
+        let mut changed = plan.clone();
+        match field {
+            "alias" => changed.reset_nodes.get_mut("a").unwrap().output_alias = "other".into(),
+            "gates" => changed
+                .reset_nodes
+                .get_mut("a")
+                .unwrap()
+                .predecessors
+                .clear(),
+            "source" => changed.source_run_id.push_str("-other"),
+            _ => changed.source_last_seq += 1,
+        }
+        assert_ne!(original, payload_identity(&changed), "{field}");
+    }
 }
 
 #[tokio::test]
@@ -443,7 +500,7 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
         &mut readers_by_step,
         &mut aggregate_readers,
     );
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
@@ -452,6 +509,7 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
         stale_outcomes: Vec::new(),
         preserved_outcomes: vec!["a".into(), "c".into()],
         inherited_budget: f.state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
 
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
@@ -504,7 +562,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
     // A succeeded, B failed, C succeeded through AnySucceeded. A is now
     // stale and may fail/skip on retry while B remains failed: C may skip.
     // Neither C nor D captured any data read of its gate prerequisites.
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
@@ -522,6 +580,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
         .map(String::from)
         .into(),
         inherited_budget: f.state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
     // First isolate the already-stale seed, then the failed retry root.
     // Either prerequisite changing must invalidate C without a captured read.
@@ -529,7 +588,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
         (vec![], vec!["a".into()], false),
         (vec!["b".into()], vec![], true),
     ] {
-        let mut seeded = SourceDiagnostic {
+        let mut seeded = ResetPlanCandidate {
             identity: DiagnosticIdentity([0; 32]),
             retry_roots,
             stale_outcomes,
@@ -538,6 +597,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
             source_contract_sha256: result.source_contract_sha256.clone(),
             source_last_seq: result.source_last_seq,
             inherited_budget: result.inherited_budget.clone(),
+            reset_nodes: BTreeMap::new(),
         };
         if preserved_a {
             seeded.preserved_outcomes.push("a".into());
@@ -607,7 +667,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
     assert!(aggregate_readers.is_empty());
     assert_eq!(readers_by_step["c"], BTreeSet::from(["a".into()]));
 
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
@@ -616,13 +676,14 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
         stale_outcomes: Vec::new(),
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
     assert!(result.stale_outcomes.is_empty());
     assert_eq!(result.preserved_outcomes, ["a"]);
 
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
@@ -631,6 +692,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
         stale_outcomes: Vec::new(),
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
@@ -678,7 +740,7 @@ async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
     );
     assert_eq!(uncertain_aggregate, BTreeSet::from(["a".into()]));
 
-    let mut result = SourceDiagnostic {
+    let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
@@ -687,6 +749,7 @@ async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
         stale_outcomes: Vec::new(),
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
+        reset_nodes: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
@@ -1272,4 +1335,131 @@ async fn package_file_currentness_uses_exact_consumed_bytes_under_source_root() 
 
     f.contract.root = f.workspace.clone();
     assert_eq!(f.analyze().unwrap_err(), Refusal::SourceBinding);
+}
+
+#[tokio::test]
+async fn reset_schedule_resolves_exact_captured_names_and_refuses_uncertain_edges() {
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    for id in ["c", "preserved"] {
+        let mut node = contract.graph.nodes["b"].clone();
+        node.id = id.into();
+        contract.graph.nodes.insert(id.into(), node);
+    }
+    contract.graph.nodes.get_mut("b").unwrap().output = Some("b_result".into());
+    // Scheduler needs are not evidence of value reads.
+    contract.graph.nodes.get_mut("b").unwrap().needs = vec!["a".into()];
+    let read = |owner: &str, path: &[&str], kind, identity| ReadDependency {
+        owner: ReadOwner::Node(owner.into()),
+        path: path.iter().map(|part| (*part).to_owned()).collect(),
+        kind,
+        identity,
+    };
+    let missing = |owner: &str, name: &str, field: &str| {
+        read(
+            owner,
+            &["steps", name, field],
+            ReadKind::Lookup,
+            ReadIdentity::Missing,
+        )
+    };
+    let owners = ["c", "a", "b", "a"].map(String::from);
+    let mut reads = BTreeMap::from([
+        (
+            "a",
+            BTreeSet::from([
+                missing("a", "c", "reason"),
+                missing("a", "b_result", "output"),
+                read(
+                    "a",
+                    &["steps", "b", "status"],
+                    ReadKind::Lookup,
+                    ReadIdentity::of(Some(&json!("failed"))),
+                ),
+                missing("a", "preserved", "output"),
+                read("a", &["steps"], ReadKind::Lookup, ReadIdentity::Present),
+            ]),
+        ),
+        ("b", BTreeSet::new()),
+        ("c", BTreeSet::from([missing("c", "b", "status")])),
+    ]);
+    let schedule = |contract: &Contract, reads: &BTreeMap<&str, BTreeSet<ReadDependency>>| {
+        reset_schedule(contract, owners.iter(), |owner| reads.get(owner))
+    };
+    let reset = schedule(&contract, &reads).unwrap();
+    assert_eq!(
+        serde_json::to_value(&reset).unwrap(),
+        json!({
+            "a": {"output_alias": "a", "predecessors": ["b", "c"]},
+            "b": {"output_alias": "b_result", "predecessors": []},
+            "c": {"output_alias": "c", "predecessors": ["b"]},
+        })
+    );
+    assert!(
+        reset_schedule(&contract, [].iter(), |_| None)
+            .unwrap()
+            .is_empty()
+    );
+    for name in ["unknown", "a", "b"] {
+        let saved = reads.insert("b", BTreeSet::from([missing("b", name, "output")]));
+        assert_eq!(
+            schedule(&contract, &reads),
+            Err(Refusal::ResetDependency),
+            "{name}"
+        );
+        reads.insert("b", saved.unwrap());
+    }
+    // Both duplicate output aliases and alias/node-ID collisions refuse.
+    // Without the collision, a's existing read is acyclic and succeeds.
+    for alias in ["b_result", "b"] {
+        let mut ambiguous = contract.clone();
+        ambiguous.graph.nodes.get_mut("c").unwrap().output = Some(alias.into());
+        assert_eq!(schedule(&ambiguous, &reads), Err(Refusal::ResetDependency));
+    }
+    // A reset node's own output key must be unique even when no trace reads
+    // it: the future overlay clears that key and must not erase a preserved node.
+    let no_reads = BTreeMap::from([
+        ("a", BTreeSet::new()),
+        ("b", BTreeSet::new()),
+        ("c", BTreeSet::new()),
+    ]);
+    let mut ambiguous_output_alias = contract.clone();
+    ambiguous_output_alias
+        .graph
+        .nodes
+        .get_mut("a")
+        .unwrap()
+        .output = Some("shared".into());
+    ambiguous_output_alias
+        .graph
+        .nodes
+        .get_mut("preserved")
+        .unwrap()
+        .output = Some("shared".into());
+    assert_eq!(
+        schedule(&ambiguous_output_alias, &no_reads),
+        Err(Refusal::ResetDependency)
+    );
+    let mut ambiguous_node_id = contract.clone();
+    ambiguous_node_id.graph.nodes.get_mut("a").unwrap().output = Some("preserved".into());
+    assert_eq!(
+        schedule(&ambiguous_node_id, &no_reads),
+        Err(Refusal::ResetDependency)
+    );
+    // Consumed collections/roots do not retain per-entry provenance. Refuse
+    // them directly instead of guessing edges or building a dense reset graph.
+    // An ancestor Present lookup is not consumed and remains a precise no-edge.
+    let reset_ids = reset.keys().cloned().collect();
+    for path in [vec!["steps"], vec![]] {
+        for kind in [ReadKind::Collection, ReadKind::Lookup] {
+            let aggregate =
+                BTreeSet::from([read("a", &path, kind, ReadIdentity::of(Some(&json!({}))))]);
+            assert_eq!(
+                reset_predecessors(&aggregate, &BTreeMap::new(), &reset_ids),
+                Err(Refusal::ResetDependency)
+            );
+            reads.insert("a", aggregate);
+            assert_eq!(schedule(&contract, &reads), Err(Refusal::ResetDependency));
+        }
+    }
 }

@@ -15,6 +15,8 @@ mod history;
 mod planner;
 mod private_file;
 mod projection;
+#[doc(hidden)]
+pub use planner::ResetPlanCandidate;
 use private_file::{Access as TraceAccess, open as open_private_trace};
 pub use projection::ForkTraceProjection;
 use std::io::{Read, Seek, SeekFrom, Write};
