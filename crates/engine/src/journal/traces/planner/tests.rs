@@ -613,6 +613,27 @@ async fn unsupported_state_budget_and_limits_refuse() {
             s.latest_file_pins.insert("private".into(), "digest".into());
         },
         |s| {
+            s.historical_file_pins.insert(
+                "private".into(),
+                std::collections::BTreeSet::from(["digest".into()]),
+            );
+        },
+        |s| {
+            s.removed_files.insert("gone.txt".into());
+        },
+        |s| {
+            s.nodes.insert(
+                model::NodePath::root("a"),
+                crate::NodeOutcome::Success {
+                    output: None,
+                    files: vec![crate::FilePin {
+                        path: camino::Utf8PathBuf::from("out/result.json"),
+                        sha256: "a".repeat(64),
+                    }],
+                },
+            );
+        },
+        |s| {
             s.effects.insert("effect".into(), json!({}));
         },
         |s| {
