@@ -7,7 +7,7 @@ use crate::{
     serialize_bounded,
 };
 use camino::Utf8Path;
-use contract::{Contract, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
+use contract::{Contract, FieldType, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -93,6 +93,12 @@ fn analyze_source(
     }
     history::proves_failed_history(events, &state.dependency_traces, limits)
         .ok_or(Refusal::History)?;
+    // The history proof establishes exactly one run_started. Use its admitted
+    // values, never the folded/materialized workspace-path projection.
+    let original_inputs = &events
+        .iter()
+        .find(|event| event["t"] == "run_started")
+        .ok_or(Refusal::History)?["inputs"];
     supported_state(state, contract)?;
     exact_budget(&state.budget)?;
     let mut folded = RunState::fold_values(events).map_err(|_| Refusal::History)?;
@@ -186,11 +192,9 @@ fn analyze_source(
                 ReadKind::PackageFile => {
                     package_currentness(path, contract, read, policy::MAX_JSON_SCHEMA_BYTES)?
                 }
-                ReadKind::WorkspaceFile => file_matches(
-                    workspace,
-                    read,
-                    contract.manifest.runtime.file_input_limit_bytes,
-                )?,
+                ReadKind::WorkspaceFile => {
+                    file_matches(workspace, read, contract, original_inputs)?
+                }
             };
         }
         match event["status"].as_str() {
@@ -452,13 +456,55 @@ fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
     Ok(())
 }
 
+/// Only admitted FileValues can explain workspace reads. This is a diagnostic
+/// binding, not authorization to continue or restore any workspace state.
 fn file_matches(
     fs: &FsGateway,
     read: &ReadDependency,
-    limit: Option<usize>,
+    contract: &Contract,
+    original_inputs: &Value,
 ) -> Result<bool, Refusal> {
     let (expected, relative) = file_read_identity(read)?;
-    let limit = limit.ok_or(Refusal::Limit)?;
+    let limit = contract
+        .manifest
+        .runtime
+        .file_input_limit_bytes
+        .ok_or(Refusal::Limit)?;
+    let [root, field_id, name] = read.path.as_slice() else {
+        return Err(Refusal::InputIdentity);
+    };
+    if root != "files" || !policy::is_safe_path_component(field_id) {
+        return Err(Refusal::InputIdentity);
+    }
+    let mut fields = contract
+        .manifest
+        .inputs
+        .stages
+        .iter()
+        .flat_map(|stage| &stage.fields)
+        .filter(|field| &field.id == field_id);
+    let field = fields.next().ok_or(Refusal::InputIdentity)?;
+    if fields.next().is_some() || field.kind != FieldType::File {
+        return Err(Refusal::InputIdentity);
+    }
+    let value = original_inputs
+        .get(&field.id)
+        .ok_or(Refusal::InputIdentity)?;
+    let invalid_file = |error| match error {
+        model::FileValueError::TooLarge { .. } => Refusal::Limit,
+        _ => Refusal::InputIdentity,
+    };
+    // Parsing normalizes base64 and checks the name and decoded size under
+    // the explicit bound; decoding uses that same bound, never a fallback.
+    let file = model::FileValue::from_value_with_limit(value, limit).map_err(invalid_file)?;
+    let canonical = serde_json::to_value(&file).map_err(|_| Refusal::InputIdentity)?;
+    if &canonical != value || &file.name != name {
+        return Err(Refusal::InputIdentity);
+    }
+    let bytes = file.decode_with_limit(limit).map_err(invalid_file)?;
+    if <[u8; 32]>::from(Sha256::digest(&bytes)) != expected {
+        return Err(Refusal::InputIdentity);
+    }
     let file = match fs.open_diagnostic_read(&relative) {
         Ok(file) => file,
         Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),

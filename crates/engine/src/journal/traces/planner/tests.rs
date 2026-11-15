@@ -36,14 +36,14 @@ impl StepExecutor for Probe {
         let _ = ctx.vars.get_path("inputs.private");
         #[cfg(unix)]
         {
-            let mut file = ctx.run.fs.open_read("private.json").unwrap();
+            let mut file = ctx.run.fs.open_read("files/upload/private.json").unwrap();
             let mut bytes = Vec::new();
             file.read_to_end(&mut bytes).unwrap();
             ctx.vars
                 .read_recorder()
                 .for_owner(ReadOwner::Node(node.id.clone()))
                 .record(
-                    &["private.json".into()],
+                    &["files".into(), "upload".into(), "private.json".into()],
                     ReadKind::WorkspaceFile,
                     ReadIdentity::Digest(Sha256::digest(&bytes).into()),
                 );
@@ -157,7 +157,7 @@ containers = { enabled = false }
 side_effects = "none"
 [[inputs.stages]]
 id = "source"
-fields = [{ id = "private", type = "string" }]
+fields = [{ id = "private", type = "string" }, { id = "upload", type = "file" }]
 [[flow]]
 id = "a"
 type = "test.probe"
@@ -182,7 +182,6 @@ type = "test.probe"
         let metadata = run_dir.join("meta");
         let workspace = run_dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        std::fs::write(workspace.join("private.json"), b"{}").unwrap();
         let options = RunOptions {
             elapsed_budget_mode: policy::ElapsedBudgetMode::ActiveExecution,
             output_dir: workspace.clone(),
@@ -209,7 +208,13 @@ type = "test.probe"
                 "source-probe".into(),
                 metadata.clone(),
                 contract.clone(),
-                BTreeMap::from([("private".into(), json!("original"))]),
+                BTreeMap::from([
+                    ("private".into(), json!("original")),
+                    (
+                        "upload".into(),
+                        json!({"name": "private.json", "text": "{}"}),
+                    ),
+                ]),
                 options,
             )
             .await
@@ -231,6 +236,13 @@ type = "test.probe"
             events,
             state,
         }
+    }
+    fn original_inputs(&self) -> &Value {
+        &self
+            .events
+            .iter()
+            .find(|event| event["t"] == "run_started")
+            .unwrap()["inputs"]
     }
     fn fs(&self) -> FsGateway {
         FsGateway::new(self.workspace.clone(), &self.contract.manifest.permissions)
@@ -270,7 +282,8 @@ async fn source_diagnostic_refuses_a_different_run_workspace() {
     let other_workspace = f._dir.path().join("other-run/workspace");
     std::fs::create_dir_all(&other_workspace).unwrap();
     // Matching bytes must not make an unrelated workspace look source-bound.
-    std::fs::write(other_workspace.join("private.json"), b"{}").unwrap();
+    std::fs::create_dir_all(other_workspace.join("files/upload")).unwrap();
+    std::fs::write(other_workspace.join("files/upload/private.json"), b"{}").unwrap();
     let other_fs = FsGateway::new(
         Utf8PathBuf::from_path_buf(other_workspace).unwrap(),
         &f.contract.manifest.permissions,
@@ -314,7 +327,7 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
         trace_before
     );
     assert_eq!(
-        std::fs::read(f.workspace.join("private.json")).unwrap(),
+        std::fs::read(f.workspace.join("files/upload/private.json")).unwrap(),
         b"{}"
     );
 }
@@ -660,7 +673,9 @@ async fn changed_and_missing_values_or_files_are_stale_not_graph_dependencies() 
     let mut f = Fixture::new().await;
     // These have no bearing on dependencies: no needs edge is consulted.
     f.contract.graph.nodes.get_mut("a").unwrap().needs = vec!["b".into()];
-    for value in [json!({"private":"changed"}), json!({})] {
+    let original_inputs = f.original_inputs().clone();
+    for mut value in [json!({"private":"changed"}), json!({})] {
+        value["upload"] = original_inputs["upload"].clone();
         f.events
             .iter_mut()
             .find(|event| event["t"] == "run_started")
@@ -674,12 +689,12 @@ async fn changed_and_missing_values_or_files_are_stale_not_graph_dependencies() 
     f.events
         .iter_mut()
         .find(|event| event["t"] == "run_started")
-        .unwrap()["inputs"] = json!({"private":"original"});
+        .unwrap()["inputs"] = original_inputs;
     f.rewrite_source();
     assert_eq!(f.analyze().unwrap().preserved_outcomes, ["a"]);
-    std::fs::write(f.workspace.join("private.json"), b"{ }").unwrap();
+    std::fs::write(f.workspace.join("files/upload/private.json"), b"{ }").unwrap();
     assert_eq!(f.analyze().unwrap().stale_outcomes, ["a"]);
-    std::fs::remove_file(f.workspace.join("private.json")).unwrap();
+    std::fs::remove_file(f.workspace.join("files/upload/private.json")).unwrap();
     assert_eq!(f.analyze().unwrap().stale_outcomes, ["a"]);
 }
 
@@ -701,7 +716,7 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
         .unwrap_err(),
         Refusal::InputIo
     );
-    let file = f.workspace.join("private.json");
+    let file = f.workspace.join("files/upload/private.json");
     std::fs::remove_file(&file).unwrap();
     std::os::unix::fs::symlink("unknown", &file).unwrap();
     assert_eq!(f.analyze().unwrap_err(), Refusal::InputIo);
@@ -720,8 +735,9 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
         .find(|read| read.kind == ReadKind::WorkspaceFile)
         .unwrap()
         .clone();
+    let original_inputs = f.original_inputs();
     assert_eq!(
-        file_matches(&unknown, &read, Some(1024)),
+        file_matches(&unknown, &read, &f.contract, original_inputs),
         Err(Refusal::InputIo)
     );
     assert!(!root.exists());
@@ -732,7 +748,7 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
     ] {
         read.identity = identity;
         assert_eq!(
-            file_matches(&f.fs(), &read, Some(1024)),
+            file_matches(&f.fs(), &read, &f.contract, original_inputs),
             Err(Refusal::InputIdentity)
         );
     }
@@ -756,12 +772,114 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
 
 #[cfg(unix)]
 #[tokio::test]
+async fn workspace_file_binding_requires_exact_declared_path_and_value_digest() {
+    let f = Fixture::new().await;
+    let mut read = ReadDependency {
+        owner: ReadOwner::Node("a".into()),
+        path: vec!["files".into(), "upload".into(), "private.json".into()],
+        kind: ReadKind::WorkspaceFile,
+        identity: ReadIdentity::Digest(Sha256::digest(b"{}").into()),
+    };
+    assert_eq!(
+        file_matches(&f.fs(), &read, &f.contract, f.original_inputs()),
+        Ok(true)
+    );
+    // Both encodings bind the decoded bytes, not the serialized input value.
+    let base64_inputs = json!({"upload": {"name": "private.json", "content_base64": "e30="}});
+    assert_eq!(
+        file_matches(&f.fs(), &read, &f.contract, &base64_inputs),
+        Ok(true)
+    );
+    for path in [
+        vec!["private.json"],
+        vec!["files", "unknown", "private.json"],
+        vec!["files", "upload", "other.json"],
+    ] {
+        let relative = path.join("/");
+        let target = f.workspace.join(&relative);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(target, b"{}").unwrap();
+        read.path = path.into_iter().map(String::from).collect();
+        // Matching source-workspace bytes alone cannot preserve an arbitrary
+        // read, an undeclared field, or a different name for a declared file.
+        assert_eq!(
+            file_matches(&f.fs(), &read, &f.contract, f.original_inputs()),
+            Err(Refusal::InputIdentity)
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_file_binding_refuses_missing_invalid_ambiguous_or_over_limit_inputs() {
+    let mut f = Fixture::new().await;
+    let read = ReadDependency {
+        owner: ReadOwner::Node("a".into()),
+        path: vec!["files".into(), "upload".into(), "private.json".into()],
+        kind: ReadKind::WorkspaceFile,
+        identity: ReadIdentity::Digest(Sha256::digest(b"{}").into()),
+    };
+    for inputs in [
+        json!({}),
+        json!({"upload": "files/upload/private.json"}),
+        json!({"upload": {"name": "../private.json", "text": "{}"}}),
+        json!({"upload": {"name": "private.json", "content_base64": "invalid"}}),
+        json!({"upload": {"name": "private.json", "text": "{}", "content_base64": "e30="}}),
+    ] {
+        assert_eq!(
+            file_matches(&f.fs(), &read, &f.contract, &inputs),
+            Err(Refusal::InputIdentity)
+        );
+    }
+    let inputs = f.original_inputs().clone();
+    let fields = &mut f.contract.manifest.inputs.stages[0].fields;
+    let upload = fields
+        .iter()
+        .position(|field| field.id == "upload")
+        .unwrap();
+    fields[upload].kind = FieldType::Json;
+    assert_eq!(
+        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        Err(Refusal::InputIdentity)
+    );
+    let fields = &mut f.contract.manifest.inputs.stages[0].fields;
+    fields[upload].kind = FieldType::File;
+    fields.push(fields[upload].clone());
+    assert_eq!(
+        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        Err(Refusal::InputIdentity)
+    );
+    f.contract.manifest.inputs.stages[0].fields.pop();
+    f.contract.manifest.runtime.file_input_limit_bytes = Some(1);
+    assert_eq!(
+        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        Err(Refusal::Limit)
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn source_diagnostic_refuses_workspace_digest_not_bound_to_original_filevalue() {
+    let mut f = Fixture::new().await;
+    assert_eq!(f.analyze().unwrap().preserved_outcomes, ["a"]);
+    // The trace still matches the actual workspace file. Only the admitted
+    // value differs, and no executor lookup of `upload` can mask this gate.
+    f.events
+        .iter_mut()
+        .find(|event| event["t"] == "run_started")
+        .unwrap()["inputs"]["upload"]["text"] = json!("different admitted bytes");
+    f.rewrite_source();
+    assert_eq!(f.analyze().unwrap_err(), Refusal::InputIdentity);
+}
+
+#[cfg(unix)]
+#[tokio::test]
 async fn workspace_file_requires_explicit_byte_limit() {
     let mut f = Fixture::new().await;
     f.contract.manifest.runtime.file_input_limit_bytes = None;
     assert_eq!(f.analyze().unwrap_err(), Refusal::Limit);
     // Even a missing file cannot be classified without a configured bound.
-    std::fs::remove_file(f.workspace.join("private.json")).unwrap();
+    std::fs::remove_file(f.workspace.join("files/upload/private.json")).unwrap();
     assert_eq!(f.analyze().unwrap_err(), Refusal::Limit);
 }
 
@@ -945,11 +1063,15 @@ async fn package_file_currentness_uses_exact_consumed_bytes_under_source_root() 
     // Workspace and package inputs are independent; an unchanged schema does
     // not hide a changed workspace source.
     std::fs::write(f.contract.root.join("schema.json"), b"{}").unwrap();
-    std::fs::write(f.workspace.join("private.json"), b"changed workspace").unwrap();
+    std::fs::write(
+        f.workspace.join("files/upload/private.json"),
+        b"changed workspace",
+    )
+    .unwrap();
     let plan = f.analyze().expect("changed workspace file is stale");
     assert_eq!(plan.stale_outcomes, ["a"]);
 
-    std::fs::write(f.workspace.join("private.json"), b"{}").unwrap();
+    std::fs::write(f.workspace.join("files/upload/private.json"), b"{}").unwrap();
     std::fs::remove_file(f.contract.root.join("schema.json")).unwrap();
     assert_eq!(f.analyze().unwrap().stale_outcomes, ["a"]);
 
