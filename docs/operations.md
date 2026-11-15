@@ -716,18 +716,24 @@ are distinct from expression/template value reads. Unavailable, unsafe, or
 unretainable file evidence makes the owner's evidence incomplete, without
 changing the step's ordinary result. Paths and digests stay in private traces,
 not public events or `state.json` (existing step output is unchanged).
-Private trace format v2 rejects v1 evidence, which predates file dependencies.
+Private trace format/checksum v3 binds each read owner to the executing
+registry entry's type ID, semantics-version token, effect safety and read
+coverage. V1/v2 evidence cannot establish this proof. Attestations share the
+recorder's existing byte bound; conflicting declarations invalidate the owner.
 No other executor captures file evidence.
 A private, unwired engine diagnostic can compare a cleanly sealed failed
 source run's captured reads with that same source's folded values and workspace
 bytes. It accepts only the persisted service-run layout (`<run-id>/meta/journal.jsonl`
 paired with `<run-id>/workspace`); direct and mismatched layouts fail closed. It
 requires complete event-bound traces for every outcome and separate
-executor attestations for read-only effects and complete runtime-read coverage;
-`check.format` supplies both, while custom/unknown executors default to
-unsupported. The bounded, redacted diagnostic classifies failed retry roots,
-stale successful outcomes and unchanged successful outcomes, preserving the
-exact inherited budget. Unsupported history, state, budget or ambiguous I/O
+executor declarations for read-only effects and complete runtime-read coverage,
+plus a nonmissing exact match between the captured and current registry
+attestations. `check.format` supplies these with initial semantics token `1`.
+Executor authors must change their token when execution or read-capture semantics
+change. Missing/empty tokens, unknown executors and mismatched attestations fail
+closed, even with complete coverage; custom executors default to unsupported.
+The bounded, redacted diagnostic classifies failed retry roots, stale successful
+outcomes and unchanged successful outcomes, preserving the exact inherited budget. Unsupported history, state, budget or ambiguous I/O
 refuses analysis. Workspace-file rechecks require an explicit
 `runtime.file_input_limit_bytes` and Unix handle-relative reads; they refuse on
 other platforms.
@@ -735,8 +741,7 @@ Neither the evidence nor this source-only diagnostic enables continuation or
 reset, authorizes a child/fork, rebinds traces across runs, cleans effects, or
 establishes external-effect or power-loss safety. Ordinary fork/replay is
 unchanged; no public continuation/reset endpoint or runtime route was added.
-The additive, default-deny executor-coverage declaration on `StepExecutor` is
-metadata-only.
+The default-deny executor declarations on `StepExecutor` are metadata-only.
 
 Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):
 

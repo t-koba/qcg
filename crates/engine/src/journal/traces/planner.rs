@@ -124,6 +124,9 @@ fn analyze_source(
         // Deliberately never inspect graph needs: captured reads are the only
         // source of dependencies. Lifecycle proof pairs each start and finish.
         let node = contract.graph.nodes.get(owner).ok_or(Refusal::Executor)?;
+        let attestation = registry
+            .continuation_attestation(node)
+            .ok_or(Refusal::Executor)?;
         if registry.continuation_safety(node) != ContinuationSafety::ReadOnly
             || registry.continuation_read_coverage(node) != ContinuationReadCoverage::Complete
             || (event["t"] == "step_started" && event["type"].as_str() != Some(node.kind.as_str()))
@@ -147,10 +150,14 @@ fn analyze_source(
         if trace.seq != source_trace.seq
             || trace.event_digest != source_trace.event_digest
             || trace.trace.reads != source_trace.trace.reads
+            || trace.trace.executor_attestations != source_trace.trace.executor_attestations
         {
             return Err(Refusal::IncompleteTrace);
         }
         let read_owner = ReadOwner::Node(owner.to_owned());
+        if trace.trace.executor_attestations.get(&read_owner) != Some(&Some(attestation)) {
+            return Err(Refusal::Executor);
+        }
         if trace.seq != event["seq"].as_u64().ok_or(Refusal::History)?
             || Some(trace.event_digest) != digest(event)
             || !trace.trace.complete_for(&read_owner)

@@ -35,6 +35,10 @@ impl StepExecutor for CheckFormatStep {
 
     engine::parallel_step_traits!();
 
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        Some("1")
+    }
+
     fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
         ContinuationSafety::ReadOnly
     }
@@ -156,6 +160,7 @@ mod tests {
         .unwrap();
         let mut registry = engine::StepRegistry::new();
         registry.register(CheckFormatStep);
+        assert_eq!(CheckFormatStep.continuation_semantics_version(), Some("1"));
         assert_eq!(
             registry.continuation_read_coverage(&node),
             ContinuationReadCoverage::Complete

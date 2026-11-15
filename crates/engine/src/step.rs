@@ -8,6 +8,7 @@ use minijinja::{Environment, ErrorKind};
 use model::Finding;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::Arc;
@@ -266,6 +267,13 @@ pub trait StepExecutor: Send + Sync {
         ContinuationReadCoverage::Unsupported
     }
 
+    /// Stable semantics token for private continuation evidence. Bump whenever
+    /// execution or read-capture semantics change. Missing/empty tokens deny
+    /// proof even when effect safety and read coverage are declared.
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Safe/guarded re-entry after an unreported direct node execution; parallel safety is not enough.
     fn replay_safe_after_interruption(&self) -> bool {
         false
@@ -402,6 +410,33 @@ impl StepRegistry {
             .get(node.kind.as_str())
             .map(|executor| executor.continuation_read_coverage(node))
             .unwrap_or_default()
+    }
+
+    /// Canonical private proof for the currently registered executor.
+    pub(crate) fn continuation_attestation(&self, node: &NodeDef) -> Option<[u8; 32]> {
+        Self::attest_executor(self.executors.get(node.kind.as_str())?.as_ref(), node)
+    }
+
+    /// Use the same entry that will execute, never a later registry lookup.
+    pub(crate) fn attest_executor(executor: &dyn StepExecutor, node: &NodeDef) -> Option<[u8; 32]> {
+        let version = executor
+            .continuation_semantics_version()
+            .filter(|v| !v.is_empty())?;
+        let safety = match executor.continuation_safety(node) {
+            ContinuationSafety::Unsupported => "unsupported",
+            ContinuationSafety::ReadOnly => "read_only",
+        };
+        let coverage = match executor.continuation_read_coverage(node) {
+            ContinuationReadCoverage::Unsupported => "unsupported",
+            ContinuationReadCoverage::Complete => "complete",
+        };
+        // JSON tuple framing is unambiguous even for tokens containing separators.
+        let canonical =
+            serde_json::to_vec(&(executor.type_id(), version, safety, coverage)).ok()?;
+        let mut hash = Sha256::new();
+        hash.update(b"qcg-executor-continuation-attestation-v1\0");
+        hash.update(canonical);
+        Some(hash.finalize().into())
     }
 
     pub fn params_schemas(&self) -> BTreeMap<String, Value> {
@@ -923,7 +958,10 @@ mod tests {
             registry.continuation_read_coverage(&unknown),
             ContinuationReadCoverage::Unsupported
         );
+        assert_eq!(CustomStep.continuation_semantics_version(), None);
+        assert_eq!(registry.continuation_attestation(&unknown), None);
         registry.register(CustomStep);
+        assert_eq!(registry.continuation_attestation(&custom), None);
         assert_eq!(
             registry.continuation_read_coverage(&custom),
             ContinuationReadCoverage::Unsupported
@@ -936,6 +974,59 @@ mod tests {
         assert_eq!(
             registry.continuation_safety(&unknown),
             ContinuationSafety::Unsupported
+        );
+    }
+
+    #[test]
+    fn continuation_attestation_canonically_binds_all_executor_declarations() {
+        use super::*;
+        struct Declared(
+            &'static str,
+            &'static str,
+            ContinuationSafety,
+            ContinuationReadCoverage,
+        );
+        #[async_trait]
+        impl StepExecutor for Declared {
+            fn type_id(&self) -> &'static str {
+                self.0
+            }
+            fn continuation_semantics_version(&self) -> Option<&'static str> {
+                Some(self.1)
+            }
+            fn continuation_safety(&self, _: &NodeDef) -> ContinuationSafety {
+                self.2
+            }
+            fn continuation_read_coverage(&self, _: &NodeDef) -> ContinuationReadCoverage {
+                self.3
+            }
+            async fn execute(
+                &self,
+                _: &mut StepContext<'_>,
+                _: &NodeDef,
+            ) -> Result<StepOutcome, StepError> {
+                unreachable!("attestation does not execute")
+            }
+        }
+        let node: NodeDef = serde_json::from_value(json!({"id":"n", "type":"test"})).unwrap();
+        let attest = |id, version, safety, coverage| {
+            StepRegistry::attest_executor(&Declared(id, version, safety, coverage), &node).unwrap()
+        };
+        let safe = ContinuationSafety::ReadOnly;
+        let complete = ContinuationReadCoverage::Complete;
+        let expected = attest("test", "1", safe, complete);
+        assert_eq!(attest("test", "1", safe, complete), expected);
+        for changed in [
+            attest("other", "1", safe, complete),
+            attest("test", "2", safe, complete),
+            attest("test", "1", ContinuationSafety::Unsupported, complete),
+            attest("test", "1", safe, ContinuationReadCoverage::Unsupported),
+        ] {
+            assert_ne!(changed, expected);
+        }
+        assert_ne!(
+            attest("test:a", "b", safe, complete),
+            attest("test", "a:b", safe, complete)
         );
     }
 

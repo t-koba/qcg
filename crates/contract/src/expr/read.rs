@@ -1,5 +1,5 @@
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -73,6 +73,9 @@ pub struct ReadDependency {
 pub struct ReadTrace {
     pub reads: BTreeSet<ReadDependency>,
     pub owners: BTreeSet<ReadOwner>,
+    /// Opaque executor-semantics digests, captured before execution. An explicit
+    /// missing declaration cannot be upgraded by a later merge.
+    pub executor_attestations: BTreeMap<ReadOwner, Option<[u8; 32]>>,
     pub incomplete_owners: BTreeSet<ReadOwner>,
     pub incomplete: bool,
     pub overflow: bool,
@@ -150,6 +153,7 @@ impl Default for ReadTrace {
         Self {
             reads: BTreeSet::new(),
             owners: BTreeSet::new(),
+            executor_attestations: BTreeMap::new(),
             incomplete_owners: BTreeSet::new(),
             incomplete: false,
             overflow: false,
@@ -208,6 +212,14 @@ impl ReadRecorder {
     /// Snapshot only a complete exact owner's reads, under one recorder lock.
     /// No unrelated owner payload is cloned at terminal outcome boundaries.
     pub fn complete_reads_for(&self, owner: &ReadOwner) -> Option<Vec<ReadDependency>> {
+        self.complete_evidence_for(owner).map(|(_, reads)| reads)
+    }
+
+    /// Atomically capture the executor attestation and exact owner reads.
+    pub fn complete_evidence_for(
+        &self,
+        owner: &ReadOwner,
+    ) -> Option<(Option<[u8; 32]>, Vec<ReadDependency>)> {
         let trace = self.lock();
         if !trace.complete_for(owner) {
             return None;
@@ -218,14 +230,15 @@ impl ReadRecorder {
             kind: ReadKind::Lookup,
             identity: ReadIdentity::Present,
         };
-        Some(
+        Some((
+            trace.executor_attestations.get(owner).copied().flatten(),
             trace
                 .reads
                 .range(start..)
                 .take_while(|read| &read.owner == owner)
                 .cloned()
                 .collect(),
-        )
+        ))
     }
 
     pub(crate) fn fork(&self) -> Self {
@@ -240,6 +253,7 @@ impl ReadRecorder {
             trace.reads.clear();
             trace.incomplete_owners.clear();
             trace.owners.clear();
+            trace.executor_attestations.clear();
             trace.retained_bytes = 0;
             trace.incomplete = true;
             trace.overflow = true;
@@ -273,6 +287,25 @@ impl ReadRecorder {
         if !trace.incomplete_owners.contains(owner) && Self::charge(trace, Self::owner_bytes(owner))
         {
             trace.incomplete_owners.insert(owner.clone());
+        }
+    }
+
+    /// Retain a bounded declaration for this owner; conflicting executions or
+    /// joins invalidate the owner rather than selecting one executor's proof.
+    pub fn record_executor_attestation(&self, attestation: Option<[u8; 32]>) {
+        let mut trace = self.lock();
+        if let Some(previous) = trace.executor_attestations.get(&self.owner) {
+            if *previous != attestation {
+                Self::mark_unsupported(&mut trace, &self.owner);
+            }
+            return;
+        }
+        let bytes =
+            Self::owner_bytes(&self.owner).saturating_add(std::mem::size_of::<Option<[u8; 32]>>());
+        if Self::charge(&mut trace, bytes) {
+            trace
+                .executor_attestations
+                .insert(self.owner.clone(), attestation);
         }
     }
 
@@ -329,6 +362,10 @@ impl ReadRecorder {
         let child = other.snapshot();
         for owner in child.owners {
             self.for_owner(owner);
+        }
+        for (owner, attestation) in child.executor_attestations {
+            self.for_owner(owner)
+                .record_executor_attestation(attestation);
         }
         for read in child.reads {
             self.insert(read);
@@ -393,6 +430,52 @@ mod tests {
         assert!(tiny.snapshot().reads.is_empty());
         assert_eq!(tiny.snapshot().retained_bytes, 0);
         assert!(!child.snapshot().overflow);
+    }
+
+    #[test]
+    fn executor_attestations_are_bounded_deduplicated_and_joined_fail_closed() {
+        let owner = ReadOwner::Node("node".into());
+        let reads = ReadRecorder::new(1024).for_owner(owner.clone());
+        let owner_bytes = reads.snapshot().retained_bytes;
+        reads.record_executor_attestation(Some([1; 32]));
+        let bytes = reads.snapshot().retained_bytes;
+        assert!(bytes > owner_bytes);
+        reads.set_byte_limit(bytes);
+        reads.record_executor_attestation(Some([1; 32]));
+        assert_eq!(reads.snapshot().retained_bytes, bytes);
+        assert_eq!(
+            reads.complete_evidence_for(&owner),
+            Some((Some([1; 32]), vec![]))
+        );
+
+        let parent = ReadRecorder::new(1024);
+        parent.merge(&reads);
+        parent.merge(&reads);
+        assert_eq!(parent.snapshot().retained_bytes, bytes);
+        assert_eq!(
+            parent.snapshot().executor_attestations,
+            reads.snapshot().executor_attestations
+        );
+        assert!(parent.snapshot().complete_for(&owner));
+        assert!(parent.fork().snapshot().executor_attestations.is_empty());
+
+        for attestation in [None, Some([2; 32])] {
+            for reverse in [false, true] {
+                let a = ReadRecorder::new(1024).for_owner(owner.clone());
+                let b = ReadRecorder::new(1024).for_owner(owner.clone());
+                a.record_executor_attestation(Some([1; 32]));
+                b.record_executor_attestation(attestation);
+                let (parent, child) = if reverse { (b, a) } else { (a, b) };
+                parent.merge(&child);
+                assert!(parent.complete_evidence_for(&owner).is_none());
+            }
+        }
+        let tiny = ReadRecorder::new(bytes - 1);
+        tiny.merge(&reads);
+        assert!(tiny.snapshot().overflow);
+        assert!(tiny.snapshot().executor_attestations.is_empty());
+        reads.set_byte_limit(0);
+        assert!(reads.snapshot().executor_attestations.is_empty());
     }
 
     #[test]

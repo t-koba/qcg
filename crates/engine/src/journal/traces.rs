@@ -17,9 +17,9 @@ mod private_file;
 use private_file::{Access as TraceAccess, open as open_private_trace};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-// Wire-format version, not a configurable policy limit. V1 predates file
-// dependencies and cannot establish complete check.format read evidence.
-const VERSION: u32 = 2;
+// Wire/checksum version, not policy. V1 predates file dependencies; V2
+// predates executor semantics binding. Neither can establish this proof.
+const VERSION: u32 = 3;
 const FILE_NAME: &str = ".dependency-traces.jsonl";
 
 #[derive(Debug, Clone)]
@@ -66,6 +66,7 @@ struct Record {
     event_digest: [u8; 32],
     owner: String,
     complete: bool,
+    executor_attestation: Option<[u8; 32]>,
     reads: Vec<Dependency>,
     record_digest: [u8; 32],
 }
@@ -77,6 +78,7 @@ struct RecordContents<'a> {
     event_digest: [u8; 32],
     owner: &'a str,
     complete: bool,
+    executor_attestation: Option<[u8; 32]>,
     reads: &'a [Dependency],
 }
 
@@ -187,11 +189,11 @@ impl Record {
             return None;
         }
         let scope = ReadOwner::Node(owner.clone());
-        let reads = reads?.complete_reads_for(&scope);
-        let complete = reads.is_some();
+        let evidence = reads?.complete_evidence_for(&scope);
+        let complete = evidence.is_some();
+        let (executor_attestation, reads) = evidence.unwrap_or_default();
         let reads = reads
             .into_iter()
-            .flatten()
             .map(|read| Dependency {
                 path: read.path,
                 kind: match read.kind {
@@ -213,6 +215,7 @@ impl Record {
             event_digest: digest(event)?,
             owner,
             complete,
+            executor_attestation,
             reads,
             record_digest: [0; 32],
         };
@@ -237,10 +240,11 @@ impl Record {
             event_digest: self.event_digest,
             owner: &self.owner,
             complete: self.complete,
+            executor_attestation: self.executor_attestation,
             reads: &self.reads,
         };
         let mut writer = HashWriter(Sha256::new());
-        writer.0.update(b"qcg-private-dependency-trace-v2\0");
+        writer.0.update(b"qcg-private-dependency-trace-v3\0");
         serde_json::to_writer(&mut writer, &contents).ok()?;
         Some(writer.0.finalize().into())
     }
@@ -259,6 +263,7 @@ impl Record {
         let owner = ReadOwner::Node(self.owner.clone());
         let recorder =
             ReadRecorder::new(limits.max_event_bytes.unwrap_or_default()).for_owner(owner.clone());
+        recorder.record_executor_attestation(self.executor_attestation);
         for read in self.reads {
             recorder.record(
                 &read.path,

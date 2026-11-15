@@ -757,6 +757,14 @@ impl Engine {
             }),
         };
         step_context.step_checkpoint(node).await?;
+        step_context
+            .vars
+            .read_recorder()
+            .for_owner(contract::ReadOwner::Node(node.id.clone()))
+            .record_executor_attestation(crate::StepRegistry::attest_executor(
+                executor.as_ref(),
+                node,
+            ));
         Ok(executor.execute(&mut step_context, node).await?)
     }
 }

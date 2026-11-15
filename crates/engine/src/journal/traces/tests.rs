@@ -178,6 +178,7 @@ fn exact_owner_seq_digest_version_and_supported_identity_are_required() {
         ("owner", json!("a/child")),
         ("seq", json!(2)),
         ("event_digest", json!(vec![0_u8; 32])),
+        ("executor_attestation", json!(vec![1_u8; 32])),
         ("version", json!(0)),
         ("version", json!(VERSION + 1)),
         ("complete", json!(false)),
@@ -898,14 +899,17 @@ fn restart_refuses_unsafe_or_missing_workspace_file_identity() {
         assert_success(&state, "format");
         assert!(state.dependency_traces.owners.is_empty());
     }
-    // Older complete traces could contain only value reads (or no reads).
-    // They must not supply evidence after introducing file dependencies.
-    let mut legacy: Record = serde_json::from_value(original).unwrap();
-    legacy.version = 1;
-    legacy.reads.clear();
-    legacy.record_digest = legacy.calculate_digest().unwrap();
-    f.replace(&[serde_json::to_value(legacy).unwrap()]);
-    assert!(f.restore_traces().dependency_traces.owners.is_empty());
+    // Old wire versions cannot claim current proof even with a recomputed
+    // checksum and an injected attestation field.
+    for version in [1, 2] {
+        let mut legacy: Record = serde_json::from_value(original.clone()).unwrap();
+        legacy.version = version;
+        legacy.reads.clear();
+        legacy.executor_attestation = Some([1; 32]);
+        legacy.record_digest = legacy.calculate_digest().unwrap();
+        f.replace(&[serde_json::to_value(legacy).unwrap()]);
+        assert!(f.restore_traces().dependency_traces.owners.is_empty());
+    }
     f.replace(&[]);
     assert!(f.restore_traces().dependency_traces.owners.is_empty());
 }

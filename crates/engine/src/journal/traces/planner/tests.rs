@@ -11,11 +11,14 @@ use tokio_util::sync::CancellationToken;
 
 /// A real executor: all runtime reads pass through ValueBag or are explicitly
 /// recorded as raw workspace bytes. The second node produces a failed check.
-struct Probe;
+struct Probe(Option<&'static str>);
 #[async_trait]
 impl StepExecutor for Probe {
     fn type_id(&self) -> &'static str {
         "test.probe"
+    }
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        self.0
     }
     fn continuation_safety(&self, _: &NodeDef) -> ContinuationSafety {
         ContinuationSafety::ReadOnly
@@ -57,6 +60,9 @@ impl StepExecutor for Probe {
 struct ReadOnlyWithoutCoverage;
 #[async_trait]
 impl StepExecutor for ReadOnlyWithoutCoverage {
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        Some("1")
+    }
     fn type_id(&self) -> &'static str {
         "test.probe"
     }
@@ -73,7 +79,7 @@ impl StepExecutor for ReadOnlyWithoutCoverage {
 }
 fn registry() -> StepRegistry {
     let mut registry = StepRegistry::new();
-    registry.register(Probe);
+    registry.register(Probe(Some("1")));
     registry
 }
 
@@ -87,6 +93,9 @@ struct Fixture {
 }
 impl Fixture {
     async fn new() -> Self {
+        Self::with_version(Some("1")).await
+    }
+    async fn with_version(version: Option<&'static str>) -> Self {
         let dir = crate::test_support::TestDir::create("source-diagnostic");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
         std::fs::write(
@@ -143,7 +152,9 @@ type = "test.probe"
             shutdown: None,
             scheduler_yield: CancellationToken::new(),
         };
-        let failure = Engine::new(registry())
+        let mut executing_registry = StepRegistry::new();
+        executing_registry.register(Probe(version));
+        let failure = Engine::new(executing_registry)
             .run_with_id(
                 "source-probe".into(),
                 metadata.clone(),
@@ -282,6 +293,46 @@ async fn read_only_and_unknown_executors_do_not_attest_complete_reads() {
             )
             .unwrap_err(),
             Refusal::Executor
+        );
+    }
+}
+
+#[tokio::test]
+async fn same_type_id_requires_the_executed_semantics_version() {
+    let f = Fixture::new().await;
+    assert!(f.analyze().is_ok());
+    for version in [Some("2"), Some("unknown"), Some(""), None] {
+        let mut changed = StepRegistry::new();
+        changed.register(Probe(version));
+        assert_eq!(
+            analyze_source(
+                &f.path,
+                &f.state,
+                &f.events,
+                &f.contract,
+                &changed,
+                &f.fs(),
+                JournalLimits::default(),
+            )
+            .unwrap_err(),
+            Refusal::Executor,
+        );
+    }
+}
+
+#[tokio::test]
+async fn complete_coverage_without_a_captured_version_cannot_gain_proof() {
+    // A real ordinary run still succeeds/fails exactly as before. Reopening it
+    // under a now-attesting executor cannot retroactively grant proof.
+    let f = Fixture::with_version(None).await;
+    assert_eq!(f.analyze().unwrap_err(), Refusal::Executor);
+    for trace in f.state.dependency_traces.owners.values() {
+        assert!(
+            trace
+                .trace
+                .executor_attestations
+                .values()
+                .all(Option::is_none)
         );
     }
 }
