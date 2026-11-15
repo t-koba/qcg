@@ -70,6 +70,19 @@ impl StepExecutor for CheckFormatStep {
                 .fs
                 .resolve_read(&source)
                 .map_err(|error| format!("source path is not in workspace: {error}"))?;
+            // Bind the evidence to the rendered path, not only its resolved
+            // target. A symlink alias can be retargeted while the canonical
+            // target we recorded remains unchanged.
+            let requested_key = ctx
+                .run
+                .fs
+                .workspace_relative_key(&ctx.run.fs.workspace().join(&source))
+                .ok();
+            if requested_key.is_none()
+                || requested_key != ctx.run.fs.workspace_relative_key(&source_path).ok()
+            {
+                reads.unsupported();
+            }
             captured_transform_text(
                 &ctx.run.fs,
                 &source_path,
@@ -239,6 +252,36 @@ mod tests {
                     .complete_for(&ReadOwner::Node(node.id))
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_alias_is_not_complete_dependency_evidence() {
+        let mut h = Harness::new("format-symlink-alias");
+        let first = h.run.workspace.join("first.json");
+        let second = h.run.workspace.join("second.json");
+        let alias = h.run.workspace.join("alias.json");
+        std::fs::write(&first, b"{}").unwrap();
+        std::fs::write(&second, b"[]").unwrap();
+        std::os::unix::fs::symlink("first.json", &alias).unwrap();
+
+        let node = node("alias.json");
+        let owner = ReadOwner::Node(node.id.clone());
+        let mut ctx = h.context();
+        assert!(matches!(
+            CheckFormatStep.execute(&mut ctx, &node).await.unwrap(),
+            StepOutcome::Success { .. }
+        ));
+        assert!(!ctx.vars.read_trace().complete_for(&owner));
+
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink("second.json", &alias).unwrap();
+        let mut ctx = h.context();
+        assert!(matches!(
+            CheckFormatStep.execute(&mut ctx, &node).await.unwrap(),
+            StepOutcome::Success { .. }
+        ));
+        assert!(!ctx.vars.read_trace().complete_for(&owner));
     }
 
     #[cfg(unix)]
