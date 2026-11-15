@@ -1633,6 +1633,59 @@ async fn child_reset_overlay_clears_only_exact_projection_and_suppresses_replay(
 }
 
 #[tokio::test]
+async fn child_reset_overlay_preserves_nonzero_billing_and_elapsed_liabilities() {
+    // Keep the source-bound integration above authoritative for eligibility and
+    // binding. This synthetic state only exercises the overlay's narrow
+    // projection against meaningful accounting values, including liabilities
+    // that make a real source ineligible for continuation.
+    let f = Fixture::new().await;
+    let mut candidate = f.analyze().unwrap();
+    candidate.inherited_budget.llm_calls = 2;
+    candidate.inherited_budget.tokens_input = 17;
+    candidate.inherited_budget.tokens_output = 9;
+    candidate.inherited_budget.tokens_cached_input = 4;
+    candidate.inherited_budget.tokens_cache_creation_input = 3;
+    candidate.inherited_budget.cost_microusd = 125;
+    candidate.inherited_budget.unresolved_llm_cost = true;
+    candidate.inherited_budget.unresolved_search_cost = true;
+    candidate.inherited_budget.elapsed = Some(api::ElapsedAccountedEventData {
+        active_nanoseconds: 987_654_321,
+        active_started_at: None,
+    });
+
+    let events = reset_child_events(&f, &candidate);
+    let mut state = RunState::fold_values(&events[..events.len() - 2]).unwrap();
+    // Bind this synthetic projection to the same candidate budget; no source
+    // analysis or continuation eligibility is inferred from these values.
+    state.budget = candidate.inherited_budget.clone();
+    state.apply(&events[events.len() - 2]).unwrap();
+    let before = serde_json::to_value(&state).unwrap();
+    state.apply(events.last().unwrap()).unwrap();
+    let after = serde_json::to_value(&state).unwrap();
+
+    assert_eq!(after["budget"], before["budget"]);
+    for (key, value) in before.as_object().unwrap() {
+        if !["nodes", "vars", "last_seq"].contains(&key.as_str()) {
+            assert_eq!(&after[key], value, "preserve {key}");
+        }
+    }
+    assert!(state.budget.steps_executed > 0);
+    assert!(state.budget.budget_charged > 0);
+    assert_eq!(state.budget.llm_calls, 2);
+    assert_eq!(state.budget.tokens_input, 17);
+    assert_eq!(state.budget.tokens_output, 9);
+    assert_eq!(state.budget.tokens_cached_input, 4);
+    assert_eq!(state.budget.tokens_cache_creation_input, 3);
+    assert_eq!(state.budget.cost_microusd, 125);
+    assert!(state.budget.unresolved_llm_cost);
+    assert!(state.budget.unresolved_search_cost);
+    assert_eq!(
+        state.budget.elapsed.as_ref().unwrap().active_nanoseconds,
+        987_654_321
+    );
+}
+
+#[tokio::test]
 async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_window_evidence() {
     let f = Fixture::with_output_dependency().await;
     let candidate = f.analyze().unwrap();
