@@ -390,6 +390,117 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
 }
 
 #[tokio::test]
+async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    for id in [
+        "c",
+        "d",
+        "output_reader",
+        "status_reader",
+        "reader_gate",
+        "unrelated",
+    ] {
+        let mut node = contract.graph.nodes["a"].clone();
+        node.id = id.into();
+        contract.graph.nodes.insert(id.into(), node);
+    }
+    let c = contract.graph.nodes.get_mut("c").unwrap();
+    c.needs = vec!["a".into(), "b".into()];
+    c.on_deps = contract::OnDeps::AnySucceeded;
+    c.output = Some("c_result".into());
+    contract.graph.nodes.get_mut("d").unwrap().needs = vec!["c".into()];
+    contract.graph.nodes.get_mut("reader_gate").unwrap().needs = vec!["output_reader".into()];
+
+    let mut readers_by_step = BTreeMap::new();
+    let mut aggregate_readers = BTreeSet::new();
+    for (owner, step, field) in [
+        ("output_reader", "c_result", "output"),
+        ("status_reader", "d", "status"),
+    ] {
+        index_step_readers(
+            owner,
+            &BTreeSet::from([ReadDependency {
+                owner: ReadOwner::Node(owner.into()),
+                path: vec!["steps".into(), step.into(), field.into()],
+                kind: ReadKind::Lookup,
+                identity: ReadIdentity::Missing,
+            }]),
+            &mut readers_by_step,
+            &mut aggregate_readers,
+        );
+    }
+    // A succeeded, B failed, C succeeded through AnySucceeded. A is now
+    // stale and may fail/skip on retry while B remains failed: C may skip.
+    // Neither C nor D captured any data read of its gate prerequisites.
+    let mut result = SourceDiagnostic {
+        source_run_id: "synthetic".into(),
+        source_contract_sha256: contract.sha256.clone(),
+        source_last_seq: 0,
+        retry_roots: vec!["b".into()],
+        stale_outcomes: vec!["a".into()],
+        preserved_outcomes: [
+            "c",
+            "d",
+            "output_reader",
+            "status_reader",
+            "reader_gate",
+            "unrelated",
+        ]
+        .map(String::from)
+        .into(),
+        inherited_budget: f.state.budget.clone(),
+    };
+    // First isolate the already-stale seed, then the failed retry root.
+    // Either prerequisite changing must invalidate C without a captured read.
+    for (retry_roots, stale_outcomes, preserved_a) in [
+        (vec![], vec!["a".into()], false),
+        (vec!["b".into()], vec![], true),
+    ] {
+        let mut seeded = SourceDiagnostic {
+            retry_roots,
+            stale_outcomes,
+            preserved_outcomes: result.preserved_outcomes.clone(),
+            source_run_id: result.source_run_id.clone(),
+            source_contract_sha256: result.source_contract_sha256.clone(),
+            source_last_seq: result.source_last_seq,
+            inherited_budget: result.inherited_budget.clone(),
+        };
+        if preserved_a {
+            seeded.preserved_outcomes.push("a".into());
+        }
+        propagate_step_invalidation(&contract, &mut seeded, &readers_by_step, &aggregate_readers)
+            .unwrap();
+        assert!(seeded.stale_outcomes.iter().any(|owner| owner == "c"));
+    }
+    propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
+        .unwrap();
+    result.stale_outcomes.sort();
+    assert_eq!(
+        result.stale_outcomes,
+        [
+            "a",
+            "c",
+            "d",
+            "output_reader",
+            "reader_gate",
+            "status_reader"
+        ]
+    );
+    assert_eq!(result.retry_roots, ["b"]);
+    assert_eq!(result.preserved_outcomes, ["unrelated"]);
+    assert!(!readers_by_step.contains_key("a"));
+    assert!(!readers_by_step.contains_key("b"));
+
+    // An unresolved scheduler prerequisite cannot justify preservation.
+    contract.graph.nodes.get_mut("unrelated").unwrap().needs = vec!["unknown".into()];
+    assert_eq!(
+        propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers),
+        Err(Refusal::Executor)
+    );
+}
+
+#[tokio::test]
 async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read() {
     let f = Fixture::new().await;
     let mut contract = f.contract.clone();
@@ -669,10 +780,9 @@ async fn persisted_event_mismatch_and_substituted_source_trace_refuse() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn changed_and_missing_values_or_files_are_stale_not_graph_dependencies() {
+async fn changed_and_missing_values_or_files_are_stale_without_gate_edges() {
     let mut f = Fixture::new().await;
-    // These have no bearing on dependencies: no needs edge is consulted.
-    f.contract.graph.nodes.get_mut("a").unwrap().needs = vec!["b".into()];
+    // Isolate captured-input currentness from scheduler-gate invalidation.
     let original_inputs = f.original_inputs().clone();
     for mut value in [json!({"private":"changed"}), json!({})] {
         value["upload"] = original_inputs["upload"].clone();

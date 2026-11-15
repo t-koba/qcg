@@ -124,7 +124,7 @@ fn analyze_source(
     };
     let mut outcomes = 0;
     // Index only current successes by the exact step path they consumed. The
-    // read set lets retry effects propagate without guessing from graph `needs`.
+    // read set tracks data dependencies separately from scheduler `needs` gates.
     let mut readers_by_step = BTreeMap::<String, BTreeSet<String>>::new();
     let mut aggregate_readers = BTreeSet::<String>::new();
     for event in events {
@@ -132,8 +132,8 @@ fn analyze_source(
             continue;
         }
         let owner = event["node"].as_str().ok_or(Refusal::History)?;
-        // Deliberately never inspect graph needs: captured reads are the only
-        // source of dependencies. Lifecycle proof pairs each start and finish.
+        // Captured reads alone establish data dependencies; scheduler gates are
+        // handled separately below. Lifecycle proof pairs each start and finish.
         let node = contract.graph.nodes.get(owner).ok_or(Refusal::Executor)?;
         let attestation = registry
             .continuation_attestation(node)
@@ -280,14 +280,33 @@ fn index_step_readers(
 }
 
 /// Compute the transitive outcomes that may change when a retry root (or an
-/// already-stale success) runs again. A rerun can change its output, status,
-/// or reason, so both the node id and output alias are possible writes.
+/// already-stale success) runs again. `needs` are eligibility gates, not data
+/// reads: conservatively stale every preserved success with a changed gate
+/// prerequisite. Do not assume another successful prerequisite will keep an
+/// `AnySucceeded` gate open, or preserve a gate whose semantics are uncertain.
+/// A rerun or changed eligibility can change output, status, or reason, so both
+/// the node id and output alias are possible writes to captured readers.
 fn propagate_step_invalidation(
     contract: &Contract,
     result: &mut SourceDiagnostic,
     readers_by_step: &BTreeMap<String, BTreeSet<String>>,
     aggregate_readers: &BTreeSet<String>,
 ) -> Result<(), Refusal> {
+    // Keep scheduler edges out of the captured-reader index. Index only
+    // preserved successes: roots and already-stale nodes are queued below.
+    let mut gated_by_step = BTreeMap::<String, BTreeSet<String>>::new();
+    for owner in &result.preserved_outcomes {
+        let node = contract.graph.nodes.get(owner).ok_or(Refusal::Executor)?;
+        for need in &node.needs {
+            if !contract.graph.nodes.contains_key(need) {
+                return Err(Refusal::Executor);
+            }
+            gated_by_step
+                .entry(need.clone())
+                .or_default()
+                .insert(owner.clone());
+        }
+    }
     let mut invalidated = result
         .retry_roots
         .iter()
@@ -302,34 +321,41 @@ fn propagate_step_invalidation(
             .nodes
             .get(&changed_owner)
             .ok_or(Refusal::Executor)?;
+        if let Some(dependents) = gated_by_step.get(&changed_owner) {
+            for dependent in dependents {
+                mark_stale(dependent, &mut invalidated, result, &mut pending);
+            }
+        }
         let output_name = node.output.as_deref().unwrap_or(&node.id);
         for name in [changed_owner.as_str(), output_name] {
             if let Some(readers) = readers_by_step.get(name) {
                 for reader in readers {
-                    mark_stale_reader(reader, &mut invalidated, result, &mut pending);
+                    mark_stale(reader, &mut invalidated, result, &mut pending);
                 }
             }
         }
         if !aggregate_processed {
             aggregate_processed = true;
             for reader in aggregate_readers {
-                mark_stale_reader(reader, &mut invalidated, result, &mut pending);
+                mark_stale(reader, &mut invalidated, result, &mut pending);
             }
         }
     }
     Ok(())
 }
 
-fn mark_stale_reader(
-    reader: &str,
+fn mark_stale(
+    owner: &str,
     invalidated: &mut BTreeSet<String>,
     result: &mut SourceDiagnostic,
     pending: &mut VecDeque<String>,
 ) {
-    if invalidated.insert(reader.to_owned()) {
-        result.preserved_outcomes.retain(|owner| owner != reader);
-        result.stale_outcomes.push(reader.to_owned());
-        pending.push_back(reader.to_owned());
+    if invalidated.insert(owner.to_owned()) {
+        result
+            .preserved_outcomes
+            .retain(|preserved| preserved != owner);
+        result.stale_outcomes.push(owner.to_owned());
+        pending.push_back(owner.to_owned());
     }
 }
 
