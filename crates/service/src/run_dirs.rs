@@ -795,7 +795,7 @@ fn populate_checkpoint_fork(
         // Reuse prior digest verification across paths to avoid redundant copies/hashes (E06).
         if verified_blobs.contains(&digest) {
             let target_blob = target_meta.join("checkpoint-blobs").join(&digest);
-            copy_verified_blob_to_workspace(&target_blob, &destination, &path, &digest)?;
+            copy_verified_blob(&target_blob, &destination, &path, &digest)?;
             continue;
         }
         // Fail-closed: a missing blob refuses the fork. The
@@ -846,13 +846,7 @@ fn populate_checkpoint_fork(
         }
         verified_blobs.insert(digest.clone());
         let target_blob = target_meta.join("checkpoint-blobs").join(&digest);
-        std::fs::copy(&destination, &target_blob)?;
-        sync_dir_entry(&target_meta.join("checkpoint-blobs")).map_err(ServiceError::Io)?;
-        if files::hash_file_sha256(&target_blob, None).map(|(hex, _)| hex)? != digest {
-            return Err(ServiceError::Invalid(format!(
-                "checkpoint blob `{digest}` for `{path}` failed integrity verification after the copy"
-            )));
-        }
+        copy_verified_blob(&destination, &target_blob, &path, &digest)?;
     }
     // Historical revisions come only from the blob store: a missing blob
     // refuses the fork instead of falling back to the mutable workspace
@@ -875,27 +869,7 @@ fn populate_checkpoint_fork(
             )));
         }
         verified_source(&source_blob, digest, path)?;
-        // Stage through a temp plus rename, never directly at the final
-        // path: a crash mid-copy must leave no partial blob that later
-        // verifies as fixed corruption (E03/E06).
-        let blob_tmp = target_blob.with_file_name(format!(
-            ".{digest}.part-{}",
-            uuid::Uuid::now_v7().as_simple()
-        ));
-        copy_source_handle_to_tmp(&source_blob, &blob_tmp, digest, path)?;
-        if files::hash_file_sha256(&blob_tmp, None).map(|(hex, _)| hex)? != *digest {
-            let _ = std::fs::remove_file(&blob_tmp);
-            return Err(ServiceError::Invalid(format!(
-                "checkpoint blob `{digest}` for `{path}` failed integrity verification after the copy"
-            )));
-        }
-        std::fs::rename(&blob_tmp, &target_blob).map_err(ServiceError::Io)?;
-        sync_dir_entry(&target_meta.join("checkpoint-blobs")).map_err(ServiceError::Io)?;
-        if files::hash_file_sha256(&target_blob, None).map(|(hex, _)| hex)? != *digest {
-            return Err(ServiceError::Invalid(format!(
-                "checkpoint blob `{digest}` for `{path}` failed integrity verification after the copy"
-            )));
-        }
+        copy_verified_blob(&source_blob, &target_blob, path, digest)?;
     }
 
     let journal_path = target_meta.join("journal.jsonl");
@@ -1126,16 +1100,19 @@ fn copy_source_handle_to_tmp(
         .create_new(true)
         .open(tmp)
         .map_err(ServiceError::Io)?;
-    std::io::copy(&mut handle, &mut tmp_file).map_err(ServiceError::Io)?;
-    tmp_file.sync_all().map_err(ServiceError::Io)?;
+    let result = std::io::copy(&mut handle, &mut tmp_file).and_then(|_| tmp_file.sync_all());
     drop(tmp_file);
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(tmp);
+        return Err(ServiceError::Io(error));
+    }
     Ok(())
 }
 
-/// Project a verified target-store blob through the same synced staging path.
-/// Verify both copy and committed destination, without reopening the original source.
-fn copy_verified_blob_to_workspace(
-    verified_blob: &Utf8Path,
+/// Copy verified checkpoint bytes through a synced temp, atomic rename, and
+/// directory sync. Verify both the staged and committed bytes.
+fn copy_verified_blob(
+    verified_source: &Utf8Path,
     destination: &Utf8Path,
     path_label: &Utf8Path,
     expected_digest: &str,
@@ -1145,20 +1122,30 @@ fn copy_verified_blob_to_workspace(
         destination.file_name().unwrap_or("blob"),
         uuid::Uuid::now_v7().as_simple()
     ));
-    copy_source_handle_to_tmp(verified_blob, &tmp, expected_digest, path_label)?;
-    if files::hash_file_sha256(&tmp, None).map(|(hex, _)| hex)? != expected_digest {
+    copy_source_handle_to_tmp(verified_source, &tmp, expected_digest, path_label)?;
+    let copied_digest = match files::hash_file_sha256(&tmp, None) {
+        Ok((digest, _)) => digest,
+        Err(error) => {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(ServiceError::Io(error));
+        }
+    };
+    if copied_digest != expected_digest {
         let _ = std::fs::remove_file(&tmp);
         return Err(ServiceError::Invalid(format!(
-            "checkpoint file `{path_label}` changed while it was copied"
+            "checkpoint file `{path_label}` failed integrity verification after the copy"
         )));
     }
-    std::fs::rename(&tmp, destination)?;
+    if let Err(error) = std::fs::rename(&tmp, destination) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(ServiceError::Io(error));
+    }
     if let Some(parent) = destination.parent() {
         sync_dir_entry(parent).map_err(ServiceError::Io)?;
     }
     if files::hash_file_sha256(destination, None).map(|(hex, _)| hex)? != expected_digest {
         return Err(ServiceError::Invalid(format!(
-            "checkpoint file `{path_label}` changed while it was committed"
+            "checkpoint file `{path_label}` failed integrity verification after the copy"
         )));
     }
     Ok(())
