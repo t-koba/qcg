@@ -1,10 +1,12 @@
 use super::*;
-use crate::{Engine, RunOptions, StepContext, StepError, StepExecutor, StepOutcome};
+use crate::{
+    Engine, RunOptions, StepContext, StepError, StepExecutor, StepOutcome, TemplateService,
+};
 use async_trait::async_trait;
 use camino::Utf8PathBuf;
-use contract::NodeDef;
 #[cfg(unix)]
 use contract::Permissions;
+use contract::{NodeDef, RuntimeLimits, ValueBag};
 use serde_json::json;
 use std::collections::BTreeMap;
 use tokio_util::sync::CancellationToken;
@@ -371,6 +373,124 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
     assert_eq!(result.stale_outcomes, ["a", "c"]);
+    assert!(result.preserved_outcomes.is_empty());
+}
+
+#[tokio::test]
+async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read() {
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    let mut c = contract.graph.nodes["b"].clone();
+    c.id = "c".into();
+    contract.graph.nodes.insert(c.id.clone(), c);
+    let mut bag = ValueBag::default();
+    bag.set_step_status("c", "success");
+    TemplateService
+        .render_bag_scoped(
+            ReadOwner::Node("a".into()),
+            "{{ steps.c.status }}",
+            &bag,
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+    let reads = bag.read_trace().reads;
+    assert!(reads.iter().any(|read| {
+        read.path == ["steps"]
+            && read.kind == ReadKind::Lookup
+            && read.identity == ReadIdentity::Present
+    }));
+    assert!(
+        reads
+            .iter()
+            .any(|read| { read.path == ["steps", "c", "status"] && read.kind == ReadKind::Lookup })
+    );
+    let mut readers_by_step = BTreeMap::new();
+    let mut aggregate_readers = BTreeSet::new();
+    index_step_readers("a", &reads, &mut readers_by_step, &mut aggregate_readers);
+    assert!(aggregate_readers.is_empty());
+    assert_eq!(readers_by_step["c"], BTreeSet::from(["a".into()]));
+
+    let mut result = SourceDiagnostic {
+        source_run_id: "synthetic".into(),
+        source_contract_sha256: contract.sha256.clone(),
+        source_last_seq: 0,
+        retry_roots: vec!["b".into()],
+        stale_outcomes: Vec::new(),
+        preserved_outcomes: vec!["a".into()],
+        inherited_budget: f.state.budget.clone(),
+    };
+    propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
+        .unwrap();
+    assert!(result.stale_outcomes.is_empty());
+    assert_eq!(result.preserved_outcomes, ["a"]);
+
+    let mut result = SourceDiagnostic {
+        source_run_id: "synthetic".into(),
+        source_contract_sha256: contract.sha256.clone(),
+        source_last_seq: 0,
+        retry_roots: vec!["c".into()],
+        stale_outcomes: Vec::new(),
+        preserved_outcomes: vec!["a".into()],
+        inherited_budget: f.state.budget.clone(),
+    };
+    propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
+        .unwrap();
+    assert_eq!(result.stale_outcomes, ["a"]);
+    assert!(result.preserved_outcomes.is_empty());
+}
+
+#[tokio::test]
+async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
+    let f = Fixture::new().await;
+    let contract = f.contract.clone();
+    let mut bag = ValueBag::default();
+    bag.set_step_status("c", "success");
+    TemplateService
+        .render_bag_scoped(
+            ReadOwner::Node("a".into()),
+            "{{ steps }}",
+            &bag,
+            &RuntimeLimits::default(),
+        )
+        .unwrap();
+    let reads = bag.read_trace().reads;
+    assert!(
+        reads
+            .iter()
+            .any(|read| { read.path == ["steps"] && read.kind == ReadKind::Collection })
+    );
+    let mut readers_by_step = BTreeMap::new();
+    let mut aggregate_readers = BTreeSet::new();
+    index_step_readers("a", &reads, &mut readers_by_step, &mut aggregate_readers);
+    assert_eq!(aggregate_readers, BTreeSet::from(["a".into()]));
+
+    let uncertain_root = ReadDependency {
+        owner: ReadOwner::Node("a".into()),
+        path: vec!["steps".into()],
+        kind: ReadKind::Lookup,
+        identity: ReadIdentity::Missing,
+    };
+    let mut uncertain_aggregate = BTreeSet::new();
+    index_step_readers(
+        "a",
+        &BTreeSet::from([uncertain_root]),
+        &mut BTreeMap::new(),
+        &mut uncertain_aggregate,
+    );
+    assert_eq!(uncertain_aggregate, BTreeSet::from(["a".into()]));
+
+    let mut result = SourceDiagnostic {
+        source_run_id: "synthetic".into(),
+        source_contract_sha256: contract.sha256.clone(),
+        source_last_seq: 0,
+        retry_roots: vec!["b".into()],
+        stale_outcomes: Vec::new(),
+        preserved_outcomes: vec!["a".into()],
+        inherited_budget: f.state.budget.clone(),
+    };
+    propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
+        .unwrap();
+    assert_eq!(result.stale_outcomes, ["a"]);
     assert!(result.preserved_outcomes.is_empty());
 }
 

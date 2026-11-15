@@ -243,8 +243,8 @@ fn analyze_source(
     Ok(result)
 }
 
-/// Index captured reads of node outputs/statuses. An empty path is the
-/// complete template snapshot, and `steps` alone is the full step collection.
+/// Index captured reads of node outputs/statuses. Empty-path reads are
+/// aggregate; the `steps` root is aggregate only when its collection is consumed.
 fn index_step_readers(
     owner: &str,
     reads: &BTreeSet<ReadDependency>,
@@ -255,7 +255,14 @@ fn index_step_readers(
         if !matches!(read.kind, ReadKind::Lookup | ReadKind::Collection) {
             continue;
         }
-        if read.path.is_empty() || (read.path.len() == 1 && read.path[0] == "steps") {
+        let steps_root = read.path.as_slice() == ["steps"];
+        // A collection's `Lookup/Present` is only the ancestor needed to
+        // reach a child. Only its `Collection` record consumes the subtree;
+        // non-presence lookup identities stay conservative.
+        if read.path.is_empty()
+            || (steps_root
+                && !(read.kind == ReadKind::Lookup && read.identity == ReadIdentity::Present))
+        {
             aggregate_readers.insert(owner.to_owned());
         } else if read.path.first().is_some_and(|root| root == "steps")
             && let Some(step) = read.path.get(1)
