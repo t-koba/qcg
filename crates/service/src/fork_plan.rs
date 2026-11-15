@@ -11,22 +11,33 @@ use std::io::{Read, Write};
 pub struct ForkPlanBinding {
     binding_version: u8,
     plan_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reset_candidate_sha256: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct BindingWire {
     binding_version: u8,
     plan_digest: String,
+    #[serde(default)]
+    reset_candidate_sha256: Option<String>,
 }
 impl TryFrom<BindingWire> for ForkPlanBinding {
     type Error = String;
     fn try_from(value: BindingWire) -> Result<Self, Self::Error> {
-        if value.binding_version != 1 || !valid_hash(&value.plan_digest) {
+        if value.binding_version != 1
+            || !valid_hash(&value.plan_digest)
+            || value
+                .reset_candidate_sha256
+                .as_deref()
+                .is_some_and(|digest| !valid_hash(digest))
+        {
             return Err("invalid fork plan binding".into());
         }
         Ok(Self {
             binding_version: 1,
             plan_digest: value.plan_digest,
+            reset_candidate_sha256: value.reset_candidate_sha256,
         })
     }
 }
@@ -51,6 +62,7 @@ pub struct ForkFileObservation {
 pub struct PreparedForkPlan {
     binding: ForkPlanBinding,
     files: Vec<ForkFileObservation>,
+    candidate: Option<engine::ResetPlanCandidate>,
 }
 
 #[cfg(test)]
@@ -135,14 +147,18 @@ impl PreparedForkPlan {
     }
 
     /// Bind opaque source diagnostic evidence and the complete file manifest.
-    /// This neither authorizes continuation nor writes a reset/overlay. A digest
-    /// alone cannot supply the reset payload to this constructor.
+    /// This retains the candidate for an internal child overlay; it does not
+    /// authorize continuation. A digest alone cannot supply the reset payload.
     #[doc(hidden)]
     pub fn from_reset_candidate(
         candidate: &engine::ResetPlanCandidate,
         files: Vec<ForkFileObservation>,
     ) -> Result<Self, crate::ServiceError> {
-        Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)
+        let mut plan = Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)?;
+        plan.binding.reset_candidate_sha256 =
+            Some(hex::encode(Sha256::digest(serde_json::to_vec(candidate)?)));
+        plan.candidate = Some(candidate.clone());
+        Ok(plan)
     }
 
     fn bind<T: Serialize + ?Sized>(
@@ -179,9 +195,22 @@ impl PreparedForkPlan {
             binding: ForkPlanBinding {
                 binding_version: 1,
                 plan_digest: hex::encode(Sha256::digest(identity)),
+                reset_candidate_sha256: None,
             },
             files,
+            candidate: None,
         })
+    }
+
+    pub(crate) fn reset_overlay(&self) -> Result<Option<serde_json::Value>, crate::ServiceError> {
+        self.candidate
+            .as_ref()
+            .map(|candidate| {
+                candidate
+                    .fork_overlay_evidence(serde_json::to_value(&self.binding)?)
+                    .map_err(crate::ServiceError::invalid)
+            })
+            .transpose()
     }
 
     pub fn binding(&self) -> &ForkPlanBinding {
@@ -517,6 +546,10 @@ mod tests {
             serde_json::to_value(plan.binding()).unwrap()
         );
         assert!(lineage.get("files").is_none());
+        assert!(plan.candidate.is_none());
+        assert!(plan.reset_overlay().unwrap().is_none());
+        assert!(lineage.get("reset_overlay_sha256").is_none());
+        assert!(!events.iter().any(|e| e["t"] == "child_reset_overlay"));
         assert_eq!(lineage["fork_tree_commit_version"], 1);
         let staged = staged.unwrap();
         let staging_path = staged.0.clone();
@@ -563,5 +596,43 @@ mod tests {
                 .is_none()
         );
         assert!(!staging_path.exists());
+    }
+    #[test]
+    fn private_reset_overlay_is_hidden_from_public_event_projection() {
+        let root = temp_run_dir("private-reset-events");
+        let _guard = TempGuard(root.clone());
+        let source = synthetic_hitl_record(&root, "source");
+        let meta = crate::summaries::run_meta_dir(&source.run_dir);
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(meta.join("journal.jsonl"))
+            .unwrap();
+        let event = serde_json::json!({
+            "t": "child_reset_overlay", "seq": 2, "run_id": "source",
+            "ts": "2026-01-01T00:00:00Z", "trace_id": "trace", "span_id": "span",
+            "overlay": {"private": "evidence"},
+        });
+        writeln!(file, "{event}").unwrap();
+        assert!(
+            crate::summaries::read_journal_events(&source.run_dir)
+                .unwrap()
+                .iter()
+                .any(|e| e["t"] == "child_reset_overlay")
+        );
+        assert!(
+            !crate::summaries::read_run_events(&source.run_dir)
+                .unwrap()
+                .iter()
+                .any(|e| e.kind == "child_reset_overlay")
+        );
+        assert!(
+            !crate::summaries::read_events_with_audit(&source.run_dir)
+                .unwrap()
+                .iter()
+                .any(|e| e["t"] == "child_reset_overlay")
+        );
+        assert!(!api::all_run_event_kinds().contains(&"child_reset_overlay"));
+        // Hiding is not validation or authority: the fold still refuses it.
+        assert!(engine::RunState::fold_journal(&meta.join("journal.jsonl")).is_err());
     }
 }

@@ -11,28 +11,43 @@ use super::read::{journal_metrics, read_journal_values};
 use super::serialize::{append_serialized_json_line, serialize_bounded};
 use super::types::{JournalError, JournalLimits, JournalWriter};
 
-/// Adopts a cache only when its schema and sequence match the durable journal tail.
+/// Adopts a matching ordinary cache. Reset children refold from durable events
+/// because their scheduler gates are intentionally not serialized in state.json.
 fn resync_durable_state(
     journal_path: &Utf8Path,
     state_path: &Utf8Path,
     limits: JournalLimits,
     durable_seq: u64,
 ) -> Result<crate::RunState, JournalError> {
-    if let Ok(bytes) = std::fs::read(state_path) {
-        // Reject newer schemas; older or malformed caches are refolded from the journal.
-        ensure_supported_state_schema(&bytes)?;
-        if let Ok(mut persisted) = serde_json::from_slice::<crate::RunState>(&bytes)
-            && persisted.schema_version == crate::RUN_STATE_SCHEMA_VERSION
-            && persisted.last_seq == durable_seq
-        {
-            // Cache fields cannot grant trace authority: bind private records
-            // to the actual bounded durable events, even on cache adoption.
-            let events = read_journal_values(journal_path, limits)?.events;
-            super::traces::TraceJournal::restore(&mut persisted, &events, journal_path, limits);
-            return Ok(persisted);
+    let cache = match std::fs::read(state_path) {
+        Ok(bytes) => {
+            ensure_supported_state_schema(&bytes)?;
+            serde_json::from_slice::<crate::RunState>(&bytes).ok()
         }
-    }
-    crate::RunState::fold_journal_with_limits(journal_path, limits)
+        Err(_) => None,
+    };
+    let events = read_journal_values(journal_path, limits)?.events;
+    let reset_admission = events.iter().any(|event| {
+        event["t"] == super::traces::overlay::KIND
+            || (event["t"] == "run_forked"
+                && (event.get("reset_overlay_sha256").is_some()
+                    || event
+                        .get("binding")
+                        .and_then(|binding| binding.as_object())
+                        .is_some_and(|binding| binding.contains_key("reset_candidate_sha256"))))
+    });
+    let mut state = if reset_admission {
+        crate::RunState::fold_values(&events)?
+    } else if let Some(mut persisted) = cache.filter(|state| {
+        state.schema_version == crate::RUN_STATE_SCHEMA_VERSION && state.last_seq == durable_seq
+    }) {
+        super::traces::TraceJournal::restore(&mut persisted, &events, journal_path, limits);
+        return Ok(persisted);
+    } else {
+        crate::RunState::fold_values(&events)?
+    };
+    super::traces::TraceJournal::restore(&mut state, &events, journal_path, limits);
+    Ok(state)
 }
 
 /// Rejects newer schemas, including integers serde_json represents as f64.
@@ -547,13 +562,7 @@ impl JournalWriter {
         // Single scan feeds both stats and the fold; a second full read
         // would double I/O on every open.
         let scan = read_journal_values(path, limits)?;
-        let mut state = crate::RunState::default();
-        for event in &scan.events {
-            api::RunEvent::from_flat(event).map_err(|message| {
-                JournalError::InvalidEvent(format!("invalid journal event: {message}"))
-            })?;
-            state.apply(event)?;
-        }
+        let mut state = crate::RunState::fold_values(&scan.events)?;
         // The folded state's schema version is the constant it was built
         // from, so it carries no information here: the journal's own
         // schema version is checked by the fold, and a persisted state
@@ -958,7 +967,7 @@ impl JournalWriter {
             }
             (line, event)
         };
-        if self.mirror_stdout {
+        if self.mirror_stdout && kind != super::traces::overlay::KIND {
             // The mirrored line is the already-redacted journal line
             // (secret values are digests or placeholders by construction),
             // shown on the operator's own terminal for direct runs only.
@@ -966,7 +975,9 @@ impl JournalWriter {
             // (Q2): the CLI subscriber renders it to the terminal.
             tracing::info!("{line}");
         }
-        if let Some(sender) = &self.event_sender {
+        if let Some(sender) = &self.event_sender
+            && kind != super::traces::overlay::KIND
+        {
             // A send failure only means no receiver is listening; the event
             // is already durable above, so it is intentionally ignored here
             // and documented as best-effort broadcast (E13).
@@ -1165,7 +1176,9 @@ impl JournalWriter {
             append_serialized_json_line(&mut file, bytes, &mut stats, limits)?;
             super::counters::observe(kind, &value, first_queued);
             needs_sync |= event_requires_journal_sync(kind);
-            appended.push(event);
+            if kind != super::traces::overlay::KIND {
+                appended.push(event);
+            }
         }
         if needs_sync {
             sync_journal(&file, journal_path)?;
@@ -1495,6 +1508,40 @@ mod tests {
     }
 
     #[test]
+    fn reset_cache_cannot_replace_a_missing_durable_overlay() {
+        let (dir, path) = marker_fail_dir("reset-cache");
+        let events = [
+            json!({"t": "step_finished", "seq": 1, "ts": "2026-01-01T00:00:00Z",
+            "run_id": "child", "trace_id": "trace", "span_id": "span",
+            "node": "a", "status": "success", "output": 42, "files": []}),
+            json!({"t": "run_forked", "seq": 2, "ts": "2026-01-01T00:00:01Z",
+            "run_id": "child", "trace_id": "trace", "span_id": "span",
+            "source_run_id": "source", "source_seq": 1, "source_contract_sha256": "a".repeat(64),
+            "binding": {"binding_version": 1, "plan_digest": "b".repeat(64),
+                "reset_candidate_sha256": "c".repeat(64)},
+            "reset_overlay_sha256": "d".repeat(64)}),
+        ];
+        std::fs::write(
+            &path,
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut forged = crate::RunState::fold_values(&events[..1]).unwrap();
+        forged.last_seq = 2;
+        forged.nodes.clear();
+        forged.vars.clear_step_projection("a", "a");
+        let state_path = path.with_file_name("state.json");
+        forged.persist_atomic(&state_path).unwrap();
+        assert!(
+            super::resync_durable_state(&path, &state_path, JournalLimits::default(), 2).is_err()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn a_persisted_state_from_another_schema_is_not_adopted() {
         // The persisted state is a cache of the journal fold, so its
         // schema version decides how it is read: a state that declares
@@ -1522,12 +1569,12 @@ mod tests {
                 .expect("run_started should append");
         }
         let current = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION);
-        let adopted = super::resync_durable_state(&path, &current, JournalLimits::default(), 1)
-            .expect("a state of this runtime's schema must be adopted");
+        let current_fold =
+            super::resync_durable_state(&path, &current, JournalLimits::default(), 1)
+                .expect("a current-schema ordinary cache should be adopted");
         assert_eq!(
-            adopted.removed_files,
-            std::collections::BTreeSet::from(["out/stale.txt".to_string()]),
-            "a state of this runtime's schema is adopted as it stands"
+            current_fold.removed_files,
+            std::collections::BTreeSet::from(["out/stale.txt".to_string()])
         );
         let older = persisted_state_with_schema_version(&dir, crate::RUN_STATE_SCHEMA_VERSION - 1);
         let recomputed = super::resync_durable_state(&path, &older, JournalLimits::default(), 1)

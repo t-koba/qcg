@@ -249,6 +249,8 @@ fn publish_with_sync(
 ) -> Result<(), ServiceError> {
     let meta = run_meta_dir(run_dir);
     let journal = meta.join("journal.jsonl");
+    // The prepared-fork fold and queue append validate reset evidence before
+    // this tree barrier. Ordinary commits remain a hash/sync operation.
     // Some Minimal checkpoints have no observation stream yet. Materialize
     // its empty initial prefix so later writer creation does not change shape.
     match OpenOptions::new()
@@ -310,7 +312,12 @@ pub(crate) fn verify(
     run_id: &str,
     events: &[Value],
 ) -> Result<(), ServiceError> {
-    let Some(fork) = events.iter().rev().find(|event| event["t"] == "run_forked") else {
+    let Some((fork_index, fork)) = events
+        .iter()
+        .enumerate()
+        .rev()
+        .find(|(_, event)| event["t"] == "run_forked")
+    else {
         return Ok(());
     };
     let Some(version) = fork.get("fork_tree_commit_version") else {
@@ -322,14 +329,14 @@ pub(crate) fn verify(
     let fork_seq = fork["seq"]
         .as_u64()
         .ok_or_else(|| invalid("missing fork sequence"))?;
-    let queue = events
-        .iter()
-        .find(|event| {
-            event["t"] == "run_queued"
-                && event["run_id"] == run_id
-                && event["seq"].as_u64().is_some_and(|seq| seq > fork_seq)
-        })
-        .ok_or_else(|| invalid("missing child queue identity"))?;
+    let Some((queue_index, queue)) = events.iter().enumerate().find(|(_, event)| {
+        event["t"] == "run_queued"
+            && event["run_id"] == run_id
+            && event["seq"].as_u64().is_some_and(|seq| seq > fork_seq)
+    }) else {
+        return Err(invalid("missing child queue identity"));
+    };
+    validate_reset_admission(fork, queue, events, fork_index, queue_index)?;
     let commit: Commit =
         serde_json::from_reader(open_plain(&run_meta_dir(run_dir).join(MANIFEST))?)?;
     if commit.commit_sha256 != commit.checksum()?
@@ -389,6 +396,88 @@ pub(crate) fn verify(
                 return Err(invalid("recorded directory sync capability is unavailable"));
             }
         }
+    }
+    Ok(())
+}
+
+fn validate_reset_admission(
+    fork: &Value,
+    queue: &Value,
+    events: &[Value],
+    fork_index: usize,
+    queue_index: usize,
+) -> Result<(), ServiceError> {
+    let has_candidate = fork
+        .get("binding")
+        .and_then(|binding| binding.get("reset_candidate_sha256"))
+        .is_some();
+    let has_overlay_digest = fork.get("reset_overlay_sha256").is_some();
+    if queue_index <= fork_index {
+        return Err(invalid("child queue precedes fork marker"));
+    }
+    let window = events
+        .iter()
+        .enumerate()
+        .take(queue_index)
+        .skip(fork_index + 1);
+    let any_overlay = window
+        .clone()
+        .any(|(_, event)| event["t"] == "child_reset_overlay");
+    if !has_candidate && !has_overlay_digest {
+        return if any_overlay {
+            Err(invalid("reset overlay is not bound by the fork marker"))
+        } else {
+            Ok(())
+        };
+    }
+    if !has_candidate || !has_overlay_digest {
+        return Err(invalid("reset binding or overlay digest is missing"));
+    }
+    let mut patch_seen = false;
+    let mut overlay_index = None;
+    for (index, event) in window {
+        match event["t"].as_str() {
+            Some("state_patched") if !patch_seen && overlay_index.is_none() => {
+                patch_seen = true;
+            }
+            Some("child_reset_overlay") if overlay_index.is_none() => {
+                overlay_index = Some(index);
+            }
+            _ => return Err(invalid("unexpected event in fork reset admission window")),
+        }
+    }
+    let candidate_digest = fork["binding"]["reset_candidate_sha256"]
+        .as_str()
+        .ok_or_else(|| invalid("reset candidate digest is malformed"))?;
+    let overlay_digest = fork["reset_overlay_sha256"]
+        .as_str()
+        .ok_or_else(|| invalid("reset overlay digest is malformed"))?;
+    let index = overlay_index.ok_or_else(|| invalid("reset overlay event is missing"))?;
+    let event = &events[index];
+    let overlay = event
+        .get("overlay")
+        .ok_or_else(|| invalid("reset overlay payload is missing"))?;
+    let candidate = overlay
+        .get("candidate")
+        .ok_or_else(|| invalid("reset candidate payload is missing"))?;
+    let actual_candidate_digest = hex::encode(Sha256::digest(serde_json::to_vec(candidate)?));
+    let actual_overlay_digest = hex::encode(Sha256::digest(serde_json::to_vec(overlay)?));
+    if overlay["version"].as_u64() != Some(1)
+        || events.get(index + 1).is_none_or(|next| {
+            next["t"] != "run_queued"
+                || next["run_id"] != fork["run_id"]
+                || next["seq"] != queue["seq"]
+        })
+        || event["run_id"] != fork["run_id"]
+        || overlay["binding"] != fork["binding"]
+        || candidate["source_run_id"] != fork["source_run_id"]
+        || candidate["source_last_seq"] != fork["source_seq"]
+        || candidate["source_contract_sha256"] != fork["source_contract_sha256"]
+        || queue["contract_sha256"] != fork["source_contract_sha256"]
+        || actual_candidate_digest != candidate_digest
+        || actual_overlay_digest != overlay_digest
+    {
+        return Err(invalid("reset admission identity mismatch"));
     }
     Ok(())
 }
@@ -461,6 +550,19 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_fork_admission_does_not_constrain_non_reset_events() {
+        let fork = json!({"t":"run_forked", "seq":1, "run_id":"child",
+            "binding":{"binding_version":1, "plan_digest":"b".repeat(64)}});
+        let queue = json!({"t":"run_queued", "seq":3, "run_id":"child"});
+        let events = vec![
+            fork.clone(),
+            json!({"t":"legacy_internal_admission_note", "seq":2, "run_id":"child"}),
+            queue.clone(),
+        ];
+        validate_reset_admission(&fork, &queue, &events, 0, 2).unwrap();
+    }
+
+    #[test]
     fn commit_syncs_bottom_up_and_adopts_only_the_bound_tree() {
         let f = Fixture::new();
         let mut synced = Vec::new();
@@ -488,6 +590,61 @@ mod tests {
         assert!(f.adopt().unwrap().adopted);
         assert!(!run_dirs::fork_admission_pending(f.dir()).unwrap());
         verify(f.dir(), "child", &f.events).unwrap();
+    }
+
+    #[test]
+    fn committed_reset_binding_refuses_a_missing_private_overlay() {
+        let mut f = Fixture::new();
+        let fork = f
+            .events
+            .iter_mut()
+            .find(|event| event["t"] == "run_forked")
+            .unwrap();
+        fork["binding"] = json!({
+            "binding_version": 1,
+            "plan_digest": "b".repeat(64),
+            "reset_candidate_sha256": "c".repeat(64),
+        });
+        fork["reset_overlay_sha256"] = json!("a".repeat(64));
+        let error = verify(f.dir(), "child", &f.events).unwrap_err();
+        assert!(error.to_string().contains("reset overlay event is missing"));
+        assert!(!f.manifest().exists());
+    }
+
+    #[test]
+    fn incomplete_reset_admission_without_overlay_is_wiped_not_adopted() {
+        let f = Fixture::new();
+        let mut events = f
+            .events
+            .iter()
+            .filter(|event| event["t"] != "run_queued")
+            .cloned()
+            .collect::<Vec<_>>();
+        let fork = events
+            .iter_mut()
+            .find(|event| event["t"] == "run_forked")
+            .unwrap();
+        fork["binding"] = json!({
+            "binding_version": 1,
+            "plan_digest": "b".repeat(64),
+            "reset_candidate_sha256": "c".repeat(64),
+        });
+        fork["reset_overlay_sha256"] = json!("a".repeat(64));
+        let path = run_meta_dir(f.dir()).join("journal.jsonl");
+        std::fs::write(
+            path,
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let adopted = run_dirs::try_adopt_run_dir_with_snapshot(f.dir(), "child").unwrap();
+        assert!(!adopted.adopted);
+        assert!(
+            !f.dir().exists(),
+            "incomplete pending child is safely removed"
+        );
     }
 
     #[test]

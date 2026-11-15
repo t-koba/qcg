@@ -918,16 +918,18 @@ impl LocalService {
             if let Some(bind) = bind.take() {
                 bind()?;
             }
-            let (fresh, staged_source) = crate::run_dirs::prepare_checkpoint_fork_prepared(
-                source_dir,
-                source_id,
-                &run_dir,
-                &run_id,
-                request.at_seq,
-                &request.state_patch,
-                prepared,
-            )
-            .map_err(api_internal)?;
+            let (fresh, staged_source) =
+                crate::run_dirs::prepare_checkpoint_fork_prepared_with_limits(
+                    source_dir,
+                    source_id,
+                    &run_dir,
+                    &run_id,
+                    request.at_seq,
+                    &request.state_patch,
+                    prepared,
+                    engine::JournalLimits::from(&contract.manifest.runtime),
+                )
+                .map_err(api_internal)?;
             created_fresh = fresh;
             let source_dir = staged_source
                 .as_ref()

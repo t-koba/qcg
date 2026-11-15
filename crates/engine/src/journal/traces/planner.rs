@@ -1,4 +1,4 @@
-//! Source-currentness and reset-plan diagnostics only. No reset operations.
+//! Source-currentness and reset planning; private child projection lives in overlay.
 //! Only a workspace paired with the journal through the persisted service-run layout is accepted.
 use super::{bounded, digest, history};
 use crate::{
@@ -8,7 +8,9 @@ use crate::{
 };
 use camino::Utf8Path;
 use contract::{Contract, FieldType, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+
+pub(crate) mod overlay;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -32,7 +34,7 @@ enum Refusal {
 
 /// Opaque point-in-time evidence identity, not authorization or a lease. It
 /// does not close analysis-to-copy TOCTOU, even when two identities match.
-#[derive(Clone, PartialEq, Eq, Serialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct DiagnosticIdentity([u8; 32]);
 
 impl std::fmt::Debug for DiagnosticIdentity {
@@ -43,7 +45,7 @@ impl std::fmt::Debug for DiagnosticIdentity {
 
 /// Opaque, point-in-time reset-plan evidence, not fork authorization or a lease.
 /// Only successful private source analysis creates this value. Serialization is
-/// a read-only diagnostic payload; there is deliberately no decoding or digest
+/// an internal evidence payload; there is deliberately no public decoding or digest
 /// constructor. It does not close analysis-to-copy TOCTOU.
 #[doc(hidden)]
 #[derive(Clone, Serialize)]
@@ -59,7 +61,8 @@ pub struct ResetPlanCandidate {
     reset_nodes: BTreeMap<String, ResetNode>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ResetNode {
     output_alias: String,
     predecessors: BTreeSet<String>,

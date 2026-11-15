@@ -115,6 +115,28 @@ fn registry() -> StepRegistry {
     registry
 }
 
+fn probe_options(output_dir: Utf8PathBuf) -> RunOptions {
+    RunOptions {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::ActiveExecution,
+        output_dir,
+        json_events: false,
+        event_sender: None,
+        interactive: false,
+        answers: BTreeMap::new(),
+        confirmations: BTreeMap::new(),
+        max_total_steps: 100,
+        max_parallel_steps: 1,
+        parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
+        llm_provider: None,
+        llm_seed_override: None,
+        run_refs: BTreeMap::new(),
+        reuse: None,
+        cancellation: CancellationToken::new(),
+        shutdown: None,
+        scheduler_yield: CancellationToken::new(),
+    }
+}
+
 struct Fixture {
     _dir: crate::test_support::TestDir,
     path: Utf8PathBuf,
@@ -186,32 +208,14 @@ type = "test.probe"
                 replaced, manifest,
                 "fixture alias must be included in its contract hash"
             );
-            manifest = replaced;
+            manifest = format!("parallel = [\"a\", \"b\"]\n{replaced}");
         }
         std::fs::write(package_root.join(contract::MANIFEST_FILE), manifest).unwrap();
         let contract = Contract::load(&package_root).unwrap();
         let metadata = run_dir.join("meta");
         let workspace = run_dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        let options = RunOptions {
-            elapsed_budget_mode: policy::ElapsedBudgetMode::ActiveExecution,
-            output_dir: workspace.clone(),
-            json_events: false,
-            event_sender: None,
-            interactive: false,
-            answers: BTreeMap::new(),
-            confirmations: BTreeMap::new(),
-            max_total_steps: 100,
-            max_parallel_steps: 1,
-            parallel_compatibility: policy::scheduling::ParallelCompatibility::default(),
-            llm_provider: None,
-            llm_seed_override: None,
-            run_refs: BTreeMap::new(),
-            reuse: None,
-            cancellation: CancellationToken::new(),
-            shutdown: None,
-            scheduler_yield: CancellationToken::new(),
-        };
+        let options = probe_options(workspace.clone());
         let mut executing_registry = StepRegistry::new();
         executing_registry.register(Probe(version));
         let failure = Engine::new(executing_registry)
@@ -1462,4 +1466,375 @@ async fn reset_schedule_resolves_exact_captured_names_and_refuses_uncertain_edge
             assert_eq!(schedule(&contract, &reads), Err(Refusal::ResetDependency));
         }
     }
+}
+
+/// Mirrors the service's typed candidate + sorted manifest identity, without
+/// making the candidate decodable or adding a reset caller to the runtime.
+fn reset_child_events(f: &Fixture, candidate: &ResetPlanCandidate) -> Vec<Value> {
+    #[derive(Serialize)]
+    struct File {
+        path: String,
+        length: u64,
+        sha256: String,
+    }
+    let files = vec![File {
+        path: "meta/journal.jsonl".into(),
+        length: 42,
+        sha256: "a".repeat(64),
+    }];
+    let binding = json!({"binding_version": 1, "plan_digest": hex::encode(Sha256::digest(
+        serde_json::to_vec(&("qcg-prepared-reset-candidate-v1", candidate, &files)).unwrap()
+    )), "reset_candidate_sha256": hex::encode(Sha256::digest(
+        serde_json::to_vec(candidate).unwrap()
+    ))});
+    let payload = candidate.fork_overlay_evidence(binding.clone()).unwrap();
+    let mut events = f
+        .events
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e["t"].as_str(),
+                Some(
+                    "run_error"
+                        | "run_finished"
+                        | "run_canceled"
+                        | "run_interrupted"
+                        | "run_waiting"
+                )
+            )
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    for event in &mut events {
+        event["run_id"] = json!("child");
+    }
+    let seq = f.state.last_seq + 1;
+    events.push(
+        json!({"t": "run_forked", "seq": seq, "ts": "2026-01-01T00:00:00Z",
+            "run_id": "child", "trace_id": "trace", "span_id": "span",
+            "source_run_id": candidate.source_run_id, "source_seq": candidate.source_last_seq,
+            "source_contract_sha256": candidate.source_contract_sha256,
+            "binding": binding, "reset_overlay_sha256": overlay::digest(&payload).unwrap(),
+        }),
+    );
+    events.push(
+        json!({"t": "child_reset_overlay", "seq": seq + 1, "ts": "2026-01-01T00:00:00Z",
+            "run_id": "child", "trace_id": "trace", "span_id": "span", "overlay": payload,
+        }),
+    );
+    events
+}
+
+fn append_child_queue(f: &Fixture, events: &mut Vec<Value>) {
+    let mut queued = f
+        .events
+        .iter()
+        .find(|event| event["t"] == "run_started")
+        .unwrap()
+        .clone();
+    queued["t"] = json!("run_queued");
+    queued["seq"] = json!(events.last().unwrap()["seq"].as_u64().unwrap() + 1);
+    queued["run_id"] = json!("child");
+    queued["parent_run_id"] = json!("source");
+    queued
+        .as_object_mut()
+        .unwrap()
+        .remove("step_budget_baseline");
+    events.push(queued);
+}
+
+#[tokio::test]
+async fn child_reset_overlay_refuses_inherited_budget_mismatch() {
+    let f = Fixture::new().await;
+    let candidate = f.analyze().unwrap();
+    let events = reset_child_events(&f, &candidate);
+    let mut state = RunState::fold_values(&events[..events.len() - 2]).unwrap();
+    state.budget.cost_microusd = state.budget.cost_microusd.saturating_add(1);
+    state.apply(&events[events.len() - 2]).unwrap();
+    assert!(state.apply(events.last().unwrap()).is_err());
+}
+
+#[tokio::test]
+async fn child_reset_overlay_clears_only_exact_projection_and_suppresses_replay() {
+    for stale in [false, true] {
+        let f = if stale {
+            Fixture::with_output_dependency().await
+        } else {
+            Fixture::new().await
+        };
+        let candidate = f.analyze().unwrap();
+        let events = reset_child_events(&f, &candidate);
+        let overlay = events.last().unwrap();
+        let before_source = std::fs::read(&f.path).unwrap();
+        let mut state = RunState::fold_values(&events[..events.len() - 2]).unwrap();
+        // Explicitly stress liabilities and history: the projection has no
+        // authority over any of these, regardless of their amounts.
+        state.dependency_traces = f.state.dependency_traces.clone();
+        state
+            .reset_gates
+            .insert("obsolete_gate".into(), BTreeSet::from(["old".into()]));
+        state.vars.set_step_output("b", json!("old root output"));
+        state
+            .vars
+            .set_step_output("a", json!("old canonical output"));
+        state.vars.set_step_output("unrelated", json!("retained"));
+        state.vars.set_step_outcome("a/child", "success", None);
+        state
+            .vars
+            .set_step_outcome("a", "success", Some(json!("old reason")));
+        let before = serde_json::to_value(&state).unwrap();
+        let traces = format!("{:?}", state.dependency_traces);
+        state.apply(&events[events.len() - 2]).unwrap();
+        state.apply(overlay).unwrap();
+        assert!(!state.reset_gates.contains_key("obsolete_gate"));
+        let after = serde_json::to_value(&state).unwrap();
+        for (key, value) in before.as_object().unwrap() {
+            if !["nodes", "vars", "last_seq"].contains(&key.as_str()) {
+                assert_eq!(&after[key], value, "preserve {key}");
+            }
+        }
+        assert_eq!(format!("{:?}", state.dependency_traces), traces);
+        assert_eq!(
+            state.vars.template_snapshot()["steps"]["unrelated"]["output"],
+            "retained"
+        );
+        assert_eq!(
+            state.vars.template_snapshot()["steps"]["a/child"]["status"],
+            "success"
+        );
+        assert!(!state.nodes.contains_key(&model::NodePath::root("b")));
+        assert!(state.vars.template_snapshot()["steps"].get("b").is_none());
+        if stale {
+            assert!(state.vars.template_snapshot()["steps"].get("a").is_none());
+            assert!(
+                state.vars.template_snapshot()["steps"]
+                    .get("a_result")
+                    .is_none()
+            );
+            assert!(state.nodes.is_empty());
+        } else {
+            assert_eq!(
+                state.vars.template_snapshot()["steps"]["a"]["output"],
+                "old canonical output"
+            );
+            assert_eq!(
+                state.vars.template_snapshot()["steps"]["a"]["reason"],
+                "old reason"
+            );
+        }
+        let replay = crate::engine::JournalReplay::from_state(state);
+        assert!(!replay.steps.contains_key("b"));
+        assert_eq!(replay.steps.contains_key("a"), !stale);
+        assert_eq!(std::fs::read(&f.path).unwrap(), before_source);
+        // Folding, persistence and recovery derive the same gates/removals.
+        let folded = RunState::fold_admission_values(&events).unwrap();
+        assert_eq!(folded.reset_gates, replay.state.reset_gates);
+    }
+}
+
+#[tokio::test]
+async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_window_evidence() {
+    let f = Fixture::with_output_dependency().await;
+    let candidate = f.analyze().unwrap();
+    let events = reset_child_events(&f, &candidate);
+    assert!(RunState::fold_admission_values(&events).is_ok());
+    assert!(RunState::fold_values(&events).is_err());
+    assert!(RunState::fold_values(&events[..events.len() - 1]).is_err());
+    let fork_index = events.len() - 2;
+    let overlay_index = events.len() - 1;
+    for (index, pointer, value) in [
+        (fork_index, "/source_run_id", json!("foreign")),
+        (fork_index, "/source_seq", json!(0)),
+        (fork_index, "/source_contract_sha256", json!("b".repeat(64))),
+        (fork_index, "/binding/plan_digest", json!("b".repeat(64))),
+        (fork_index, "/reset_overlay_sha256", Value::Null),
+        (overlay_index, "/run_id", json!("foreign")),
+        (overlay_index, "/overlay/version", json!(2)),
+        (
+            overlay_index,
+            "/overlay/candidate/source_last_seq",
+            json!(0),
+        ),
+        (
+            overlay_index,
+            "/overlay/candidate/reset_nodes/a/output_alias",
+            json!("other"),
+        ),
+        (
+            overlay_index,
+            "/overlay/candidate/reset_nodes/a/predecessors",
+            json!([]),
+        ),
+        (
+            overlay_index,
+            "/overlay/binding/reset_candidate_sha256",
+            json!("c".repeat(64)),
+        ),
+        (overlay_index, "/overlay/binding/binding_version", json!(2)),
+    ] {
+        let mut changed = events.clone();
+        *changed[index].pointer_mut(pointer).unwrap() = value;
+        assert!(
+            RunState::fold_admission_values(&changed).is_err(),
+            "{pointer}"
+        );
+    }
+    for key in ["candidate", "binding", "version"] {
+        let mut malformed = events.clone();
+        malformed[overlay_index]["overlay"]
+            .as_object_mut()
+            .unwrap()
+            .remove(key);
+        assert!(
+            RunState::fold_admission_values(&malformed).is_err(),
+            "missing {key}"
+        );
+    }
+    let mut extra_field = events.clone();
+    extra_field[overlay_index]["overlay"]["unexpected"] = json!(true);
+    extra_field[fork_index]["reset_overlay_sha256"] =
+        json!(overlay::digest(&extra_field[overlay_index]["overlay"]).unwrap());
+    assert!(RunState::fold_admission_values(&extra_field).is_err());
+    let mut missing_binding = events.clone();
+    missing_binding[fork_index]
+        .as_object_mut()
+        .unwrap()
+        .remove("binding");
+    assert!(RunState::fold_admission_values(&missing_binding).is_err());
+    let mut no_marker = events.clone();
+    no_marker[fork_index]
+        .as_object_mut()
+        .unwrap()
+        .remove("reset_overlay_sha256");
+    assert!(RunState::fold_admission_values(&no_marker).is_err());
+    let mut duplicate = events.clone();
+    let mut extra = events[overlay_index].clone();
+    extra["seq"] = json!(f.state.last_seq + 3);
+    duplicate.push(extra);
+    assert!(RunState::fold_admission_values(&duplicate).is_err());
+    let mut outside = events.clone();
+    outside[overlay_index]["seq"] = json!(f.state.last_seq + 3);
+    outside.insert(
+        overlay_index,
+        json!({"t": "audit_degraded", "seq": f.state.last_seq+2,
+        "ts": "2026-01-01T00:00:00Z", "run_id": "child", "trace_id": "trace", "span_id": "span"}),
+    );
+    assert!(RunState::fold_admission_values(&outside).is_err());
+    // Exactly one optional patch is admitted BEFORE, never used for removals.
+    let mut patched = events.clone();
+    patched[overlay_index]["seq"] = json!(f.state.last_seq + 3);
+    patched.insert(
+        overlay_index,
+        json!({"t": "state_patched", "seq": f.state.last_seq+2,
+        "ts": "2026-01-01T00:00:00Z", "run_id": "child", "trace_id": "trace", "span_id": "span",
+        "step_outputs": {"unrelated": 12}}),
+    );
+    assert_eq!(
+        RunState::fold_admission_values(&patched)
+            .unwrap()
+            .vars
+            .template_snapshot()["steps"]["unrelated"]["output"],
+        12
+    );
+    let mut reintroduced = events.clone();
+    append_child_queue(&f, &mut reintroduced);
+    let queue_seq = reintroduced.last().unwrap()["seq"].as_u64().unwrap();
+    let patch = json!({"t": "state_patched", "seq": queue_seq + 1,
+        "ts": "2026-01-01T00:00:00Z", "run_id": "child", "trace_id": "trace", "span_id": "span",
+        "step_outputs": {"a_result": "stale"}});
+    let mut state = RunState::fold_values(&reintroduced).unwrap();
+    let before = state.vars.template_snapshot();
+    assert!(state.apply(&patch).is_err());
+    assert_eq!(state.vars.template_snapshot(), before);
+    reintroduced.push(patch);
+    assert!(RunState::fold_values(&reintroduced).is_err());
+}
+
+#[tokio::test]
+async fn child_reset_overlay_captured_gate_requires_all_settled_targets() {
+    use contract::NodeState;
+    let f = Fixture::with_output_dependency().await;
+    let events = reset_child_events(&f, &f.analyze().unwrap());
+    let mut state = RunState::fold_admission_values(&events).unwrap();
+    assert_eq!(state.reset_gates["a"], BTreeSet::from(["b".into()]));
+    let mut states = BTreeMap::from([("a".into(), NodeState::Pending)]);
+    assert!(!overlay::settled(&state.reset_gates, "a", &states));
+    states.insert("b".into(), NodeState::Pending);
+    assert!(!overlay::settled(&state.reset_gates, "a", &states));
+    states.insert("b".into(), NodeState::Running);
+    assert!(!overlay::settled(&state.reset_gates, "a", &states));
+    states.insert("b".into(), NodeState::Success);
+    assert!(overlay::settled(&state.reset_gates, "a", &states));
+    state
+        .reset_gates
+        .get_mut("a")
+        .unwrap()
+        .insert("missing".into());
+    assert!(!overlay::settled(&state.reset_gates, "a", &states));
+}
+
+#[tokio::test]
+async fn child_reset_overlay_scheduler_runs_captured_predecessor_before_reader() {
+    struct Retry;
+    #[async_trait]
+    impl StepExecutor for Retry {
+        fn type_id(&self) -> &'static str {
+            "test.probe"
+        }
+        async fn execute(
+            &self,
+            ctx: &mut StepContext<'_>,
+            node: &NodeDef,
+        ) -> Result<StepOutcome, StepError> {
+            if node.id == "a" {
+                let snapshot = ctx.vars.template_snapshot();
+                assert_eq!(snapshot["steps"]["b"]["status"], "success");
+                assert_eq!(snapshot["steps"]["b"]["output"], 42);
+            }
+            Ok(StepOutcome::success(Some(json!(42))))
+        }
+    }
+    let f = Fixture::with_output_dependency().await;
+    let mut events = reset_child_events(&f, &f.analyze().unwrap());
+    append_child_queue(&f, &mut events);
+    let child = f
+        .workspace
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("child");
+    let meta = child.join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let path = meta.join("journal.jsonl");
+    std::fs::write(
+        &path,
+        events.iter().map(|e| format!("{e}\n")).collect::<String>(),
+    )
+    .unwrap();
+    let mut registry = StepRegistry::new();
+    registry.register(Retry);
+    let result = Engine::new(registry)
+        .run_with_id(
+            "child".into(),
+            meta,
+            f.contract.clone(),
+            BTreeMap::new(),
+            probe_options(child.join("workspace")),
+        )
+        .await;
+    let after = read_journal_values(&path, JournalLimits::default())
+        .unwrap()
+        .events;
+    assert!(result.is_ok(), "{result:?}; {:?}", &after[events.len()..]);
+    assert_eq!(&after[..events.len()], &events);
+    let started = after[events.len()..]
+        .iter()
+        .filter(|e| e["t"] == "step_started")
+        .map(|e| e["node"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(started, ["b", "a"]);
+    let state = RunState::fold_values(&after).unwrap();
+    assert_eq!(state.node_executions["a"], 2);
+    assert_eq!(state.node_executions["b"], 2);
 }

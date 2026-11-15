@@ -489,7 +489,7 @@ impl Engine {
             audit_policy,
             audit_limits,
         )?;
-        let replay = JournalReplay::from_state(journal.state());
+        let mut replay = JournalReplay::from_state(journal.state());
         if replay.state.budget.legacy_step_budget_unknown
             || (replay.state.execution_started
                 && replay.state.budget.step_budget_seed.is_none()
@@ -869,11 +869,15 @@ impl Engine {
                 let node = context.contract.graph.nodes.get(&id).ok_or_else(|| {
                     StepError::failed("scheduler", format!("node `{id}` disappeared"))
                 })?;
+                if !crate::journal::traces::overlay::settled(&replay.state.reset_gates, &id, &states) {
+                    continue;
+                }
                 if let Some(reason) = context
                     .contract
                     .graph
                     .should_skip_by_dependencies(node, &states)
                 {
+                    replay.state.reset_gates.remove(&id);
                     states.insert(id.clone(), NodeState::Skipped(reason.clone()));
                     journal.event("step_skipped", json!({ "node": id, "reason": reason }))?;
                     progressed = true;
@@ -890,6 +894,7 @@ impl Engine {
                             message,
                         })?;
                 if !when {
+                    replay.state.reset_gates.remove(&id);
                     let reason = FailureDetail::new(
                         FailureCode::WhenFalse,
                         format!("when expression evaluated false: {:?}", node.when),
@@ -899,6 +904,9 @@ impl Engine {
                     progressed = true;
                     continue;
                 }
+                // The captured predecessor set has served its only purpose once
+                // this node is ready to replay or execute.
+                replay.state.reset_gates.remove(&id);
                 if let Some(replayed) = replay.steps.get(&id) {
                     // Single shared output-name helper (E10): declared
                     // `output` alias wins, otherwise the node id.

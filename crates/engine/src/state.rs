@@ -10,7 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const RUN_STATE_SCHEMA_VERSION: u32 = 11;
 
 fn is_known_journal_event_kind(kind: &str) -> bool {
-    api::is_known_run_event_kind(kind) || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
+    kind == crate::journal::traces::overlay::KIND
+        || api::is_known_run_event_kind(kind)
+        || api::INTERNAL_RUN_EVENT_KINDS.contains(&kind)
 }
 
 /// Requires Option presence (E07): explicit null is accepted; absence fails closed.
@@ -140,6 +142,14 @@ impl BudgetState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
     #[serde(skip)]
+    pub(crate) pending_reset: Option<crate::journal::traces::overlay::Pending>,
+    #[serde(skip)]
+    pub(crate) reset_gates: BTreeMap<String, BTreeSet<String>>,
+    #[serde(skip)]
+    pub(crate) reset_queue_required: bool,
+    #[serde(skip)]
+    pub(crate) reset_patch_forbidden: bool,
+    #[serde(skip)]
     pub(crate) dependency_traces: crate::journal::traces::OutcomeTraces,
     pub schema_version: u32,
     #[serde(deserialize_with = "required_presence")]
@@ -250,6 +260,10 @@ pub struct RunState {
 impl Default for RunState {
     fn default() -> Self {
         Self {
+            pending_reset: None,
+            reset_gates: BTreeMap::new(),
+            reset_queue_required: false,
+            reset_patch_forbidden: false,
             dependency_traces: Default::default(),
             schema_version: RUN_STATE_SCHEMA_VERSION,
             run_id: None,
@@ -451,18 +465,36 @@ impl RunState {
             }
             state.apply(event)?;
         }
+        crate::journal::traces::overlay::complete(&state)?;
         crate::journal::traces::TraceJournal::restore(&mut state, &events, path, limits);
         Ok(state)
     }
 
     /// Folds already-read values with the same typed validation as [`Self::fold_journal`].
     pub fn fold_values(events: &[Value]) -> Result<Self, crate::JournalError> {
+        Self::fold_values_inner(events, true)
+    }
+
+    /// Folds a pending service-admission snapshot so recovery can remove an
+    /// incomplete child. It never authorizes execution or adoption.
+    #[doc(hidden)]
+    pub fn fold_admission_values(events: &[Value]) -> Result<Self, crate::JournalError> {
+        Self::fold_values_inner(events, false)
+    }
+
+    fn fold_values_inner(
+        events: &[Value],
+        require_complete_overlay: bool,
+    ) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
         for event in events {
             api::RunEvent::from_flat(event).map_err(|message| {
                 crate::JournalError::InvalidEvent(format!("invalid journal event: {message}"))
             })?;
             state.apply(event)?;
+        }
+        if require_complete_overlay {
+            crate::journal::traces::overlay::complete(&state)?;
         }
         Ok(state)
     }
@@ -636,6 +668,7 @@ impl RunState {
                 "unknown run event kind `{kind}`"
             )));
         }
+        crate::journal::traces::overlay::validate(self, event)?;
         // Final runs accept only explicit lifecycle restarts. `run_interrupted` is
         // nonterminal and HITL resume appends after it; any other post-final event is invalid,
         // except `effect_closed`: a late cleanup or recovery may still confirm an instance gone.
@@ -1455,6 +1488,7 @@ impl RunState {
         if let Some(owner) = crate::journal::traces::trace_owner(event) {
             self.dependency_traces.remove(&owner);
         }
+        crate::journal::traces::overlay::observe(self, event)?;
         Ok(())
     }
 

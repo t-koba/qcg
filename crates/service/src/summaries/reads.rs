@@ -256,6 +256,7 @@ pub(crate) fn read_merged_events_from_meta(
             events.sort_by_key(|event| event.get("seq").and_then(Value::as_u64));
         }
     }
+    events.retain(|event| event["t"] != "child_reset_overlay");
     Ok(events)
 }
 
@@ -268,6 +269,7 @@ pub fn read_events_with_audit(run_dir: &Utf8Path) -> Result<Vec<Value>, ServiceE
 pub(crate) fn read_durable_run_events(run_dir: &Utf8Path) -> Result<Vec<RunEvent>, ServiceError> {
     read_journal_events(run_dir)?
         .into_iter()
+        .filter(|event| event["t"] != "child_reset_overlay")
         .map(|event| RunEvent::from_flat(&event).map_err(ServiceError::Invalid))
         .collect()
 }

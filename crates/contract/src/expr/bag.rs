@@ -228,6 +228,15 @@ impl ValueBag {
         }
     }
 
+    /// Remove exactly one current node projection, not descendants or history.
+    #[doc(hidden)]
+    pub fn clear_step_projection(&mut self, owner: &str, output_alias: &str) {
+        self.statuses.remove(owner);
+        self.reasons.remove(owner);
+        self.steps.remove(owner);
+        self.steps.remove(output_alias);
+    }
+
     /// Replaces only outcome metadata with the journal-fold projection.
     /// Outputs, inputs, and the foreach item remain live-scope data.
     pub fn sync_outcome_metadata(&mut self, folded: &ValueBag) {

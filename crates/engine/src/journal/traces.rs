@@ -451,3 +451,5 @@ impl TraceJournal {
 
 #[cfg(test)]
 mod tests;
+
+pub(crate) use planner::overlay;

@@ -611,6 +611,7 @@ pub(crate) fn prepare_checkpoint_fork(
     .map(|(created, _)| created)
 }
 
+#[cfg(test)]
 pub(crate) fn prepare_checkpoint_fork_prepared(
     source_dir: &Utf8Path,
     source_id: &str,
@@ -619,6 +620,29 @@ pub(crate) fn prepare_checkpoint_fork_prepared(
     at_seq: u64,
     patch: &ForkStatePatch,
     prepared: Option<&crate::PreparedForkPlan>,
+) -> Result<(bool, Option<crate::fork_plan::StagedSource>), ServiceError> {
+    prepare_checkpoint_fork_prepared_with_limits(
+        source_dir,
+        source_id,
+        target_dir,
+        target_id,
+        at_seq,
+        patch,
+        prepared,
+        JournalLimits::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)] // One explicit admission boundary, including its journal limits.
+pub(crate) fn prepare_checkpoint_fork_prepared_with_limits(
+    source_dir: &Utf8Path,
+    source_id: &str,
+    target_dir: &Utf8Path,
+    target_id: &str,
+    at_seq: u64,
+    patch: &ForkStatePatch,
+    prepared: Option<&crate::PreparedForkPlan>,
+    limits: JournalLimits,
 ) -> Result<(bool, Option<crate::fork_plan::StagedSource>), ServiceError> {
     // An incomplete admission may retain its directory for a cancel mailbox.
     // Record actual create-dir ownership before populating; whole-directory
@@ -651,7 +675,8 @@ pub(crate) fn prepare_checkpoint_fork_prepared(
             target_id,
             at_seq,
             patch,
-            prepared.map(crate::PreparedForkPlan::binding),
+            prepared,
+            limits,
         )?;
         Ok(staged)
     });
@@ -666,6 +691,7 @@ pub(crate) fn prepare_checkpoint_fork_prepared(
     Ok((created_fresh, staged))
 }
 
+#[allow(clippy::too_many_arguments)] // These source, target and policy inputs define one fork projection.
 fn populate_checkpoint_fork(
     source_dir: &Utf8Path,
     source_id: &str,
@@ -673,8 +699,13 @@ fn populate_checkpoint_fork(
     target_id: &str,
     at_seq: u64,
     patch: &ForkStatePatch,
-    binding: Option<&crate::ForkPlanBinding>,
+    prepared: Option<&crate::PreparedForkPlan>,
+    limits: JournalLimits,
 ) -> Result<(), ServiceError> {
+    let overlay = prepared
+        .map(crate::PreparedForkPlan::reset_overlay)
+        .transpose()?
+        .flatten();
     let source_meta = run_meta_dir(source_dir);
     let source_events = read_events_from_meta(&source_meta)?;
     // Zero names the initial state: the sequence of the first `run_started`.
@@ -1000,8 +1031,15 @@ fn populate_checkpoint_fork(
         "source_seq": at_seq,
         "fork_tree_commit_version": crate::fork_commit::VERSION,
     });
-    if let Some(binding) = binding {
+    if let Some(binding) = prepared.map(crate::PreparedForkPlan::binding) {
         fork_event["binding"] = serde_json::to_value(binding)?;
+    }
+    if let Some(overlay) = &overlay {
+        fork_event["source_contract_sha256"] =
+            overlay["candidate"]["source_contract_sha256"].clone();
+        fork_event["reset_overlay_sha256"] = Value::String(hex::encode(sha2::Sha256::digest(
+            serde_json::to_vec(overlay)?,
+        )));
     }
     serde_json::to_writer(&mut journal, &fork_event)?;
     journal.write_all(b"\n")?;
@@ -1020,6 +1058,26 @@ fn populate_checkpoint_fork(
             "step_statuses": patch.step_statuses,
         });
         serde_json::to_writer(&mut journal, &patch_event)?;
+        journal.write_all(b"\n")?;
+    }
+    if let Some(overlay) = overlay {
+        next_seq = next_seq.saturating_add(1);
+        let event = json!({
+            "t": "child_reset_overlay", "ts": chrono::Utc::now().to_rfc3339(),
+            "seq": next_seq, "run_id": target_id,
+            "trace_id": api::trace_id_for_run(target_id),
+            "span_id": api::span_id_for_seq(next_seq), "overlay": overlay,
+        });
+        let bytes = serde_json::to_vec(&event)?;
+        if limits
+            .max_event_bytes
+            .is_some_and(|maximum| bytes.len() > maximum)
+        {
+            return Err(ServiceError::Invalid(
+                "child reset overlay exceeds the configured journal event limit".into(),
+            ));
+        }
+        journal.write_all(&bytes)?;
         journal.write_all(b"\n")?;
     }
     journal.sync_all()?;
@@ -1356,7 +1414,12 @@ pub(crate) fn try_adopt_run_dir_with_snapshot(
     }
     // Reuse one read for folding and admission identity.
     let events = read_events_from_meta(&run_meta_dir(run_dir))?;
-    let state = RunState::fold_values(&events).map_err(ServiceError::invalid)?;
+    let state = if fork_admission_pending(run_dir)? {
+        RunState::fold_admission_values(&events)
+    } else {
+        RunState::fold_values(&events)
+    }
+    .map_err(ServiceError::invalid)?;
     if !check_run_admission(run_dir, run_id, &events, &state)? {
         return Ok(AdoptSnapshot::empty());
     }
@@ -1410,24 +1473,35 @@ pub(crate) fn check_run_admission(
         });
     if !initialized {
         if let Some(fork_seq) = last_fork_seq {
-            // Preparation writes only the fork marker and at most one pure
-            // state patch before the child's admission marker. Older buggy
-            // recovery may have executed an incomplete fork; preserve every
-            // unexpected post-marker event as evidence, especially effects.
-            let mut state_patches = 0;
+            // Preparation writes the fork marker, at most one state patch,
+            // and (only for a typed reset binding) one private overlay before
+            // admission. Any other post-marker record may represent execution
+            // or effects, so preserve it and refuse cleanup.
+            let reset_bound = events
+                .iter()
+                .rev()
+                .find(|event| event["t"] == "run_forked" && event["seq"].as_u64() == Some(fork_seq))
+                .and_then(|fork| fork.get("binding"))
+                .and_then(|binding| binding.get("reset_candidate_sha256"))
+                .is_some();
+            let mut state_patched = false;
+            let mut overlay_seen = false;
             for event in events
                 .iter()
                 .filter(|event| event["seq"].as_u64().is_some_and(|seq| seq > fork_seq))
             {
-                if event["t"] == "state_patched"
-                    && state_patches == 0
-                    && fork_seq.checked_add(1) == event["seq"].as_u64()
-                {
-                    state_patches += 1;
-                } else {
-                    return Err(ServiceError::Invalid(format!(
-                        "incomplete fork `{run_id}` has unexpected post-marker history; refusing cleanup"
-                    )));
+                match event["t"].as_str() {
+                    Some("state_patched") if !state_patched && !overlay_seen => {
+                        state_patched = true;
+                    }
+                    Some("child_reset_overlay") if reset_bound && !overlay_seen => {
+                        overlay_seen = true;
+                    }
+                    _ => {
+                        return Err(ServiceError::Invalid(format!(
+                            "incomplete fork `{run_id}` has unexpected post-marker history; refusing cleanup"
+                        )));
+                    }
                 }
             }
         }

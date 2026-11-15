@@ -829,12 +829,30 @@ sidecar. Different or bound/unbound replay identities conflict; exact Ready
 replay needs only the child, not the source or its prepared observations.
 
 A prepared plan is opaque: its constructor derives the final binding from a
-versioned, domain-separated encoding of the engine diagnostic digest and the
-canonical, sorted manifest of source-relative regular files, lengths and hashes.
+versioned, domain-separated encoding of the engine diagnostic digest (or typed
+reset candidate) and the canonical, sorted manifest of source-relative regular files, lengths and hashes.
 The diagnostic digest alone is not this final identity; no independent binding
 can be attached to another manifest. The manifest must include the metadata,
 referenced blobs and pinned package required by projection, not just the engine
 observed-file subset. Missing required files fail projection.
+
+A candidate-backed prepared plan retains the typed reset candidate and binds its
+complete payload with that same sorted manifest. Its child writes one versioned,
+private `child_reset_overlay` after `run_forked` and any state patch, before queue
+admission. The fork marker binds the payload digest, source run/checkpoint,
+source contract and composite plan identity; the child-tree commit covers the
+journal prefix through queue admission. Ordinary forks and digest-only prepared
+plans write no overlay. This record has no public event projection or schema.
+
+Folding refuses missing, duplicate, unsupported, out-of-window or mismatched
+overlays. A valid overlay removes only retry-root/stale current outcomes, their
+exact output keys and node status/reason facts. It keeps the candidate's captured
+reset-predecessor gates, evaluated before dependency skips, needs and expressions;
+missing targets do not count as settled. History, execution counts, file pins,
+trace evidence, elapsed accounting and all budget/cost liabilities remain intact.
+Replay therefore omits cleared successes without rewriting copied history.
+Recovery and peer-writer resync derive these projections/gates from durable events,
+never from `state.json` authority. No public/CLI/runtime reset caller is enabled.
 
 The copy stages the exact no-follow source streams while hashing those same
 bytes, then projects checkpoint history and the pinned package from that tree.
