@@ -701,6 +701,15 @@ fn populate_checkpoint_fork(
         )));
     }
 
+    // Optional private evidence follows only selected durable journal events.
+    // Audit records are merged later and can never supply source identity.
+    let mut trace_projection = engine::ForkTraceProjection::new(
+        &source_meta.join("journal.jsonl"),
+        &selected,
+        at_seq,
+        JournalLimits::default(),
+    );
+
     let target_meta = run_meta_dir(target_dir);
     let target_workspace = run_workspace_dir(target_dir);
     std::fs::create_dir_all(&target_workspace)?;
@@ -932,7 +941,7 @@ fn populate_checkpoint_fork(
         None
     };
     let mut next_seq = 0_u64;
-    for (_, is_audit, mut event) in history {
+    for (source_seq, is_audit, mut event) in history {
         next_seq = next_seq.saturating_add(1);
         let object = event.as_object_mut().ok_or_else(|| {
             ServiceError::Invalid("checkpoint journal event is not an object".into())
@@ -967,6 +976,12 @@ fn populate_checkpoint_fork(
         };
         serde_json::to_writer(&mut *writer, &event)?;
         writer.write_all(b"\n")?;
+        if !is_audit
+            && let Some(projection) = trace_projection.as_mut()
+            && projection.bind(source_seq, &event).is_none()
+        {
+            trace_projection = None;
+        }
     }
     next_seq = next_seq.saturating_add(1);
     let fork_event = json!({
@@ -1005,6 +1020,9 @@ fn populate_checkpoint_fork(
     // Sync the directory entry like every other journal publication path:
     // without it a power loss can lose the fork journal itself (Q2).
     sync_dir_entry(&target_meta).map_err(ServiceError::Io)?;
+    if let Some(projection) = trace_projection {
+        projection.publish(&journal_path);
+    }
     let state = RunState::fold_journal(&journal_path).map_err(ServiceError::invalid)?;
     state
         .persist_atomic(&target_meta.join("state.json"))

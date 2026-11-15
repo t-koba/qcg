@@ -739,10 +739,20 @@ outcomes and unchanged successful outcomes, preserving the exact inherited budge
 refuses analysis. Workspace-file rechecks require an explicit
 `runtime.file_input_limit_bytes` and Unix handle-relative reads; they refuse on
 other platforms.
-Neither the evidence nor this source-only diagnostic enables continuation or
-reset, authorizes a child/fork, rebinds traces across runs, cleans effects, or
-establishes external-effect or power-loss safety. Ordinary fork/replay is
-unchanged; no public continuation/reset endpoint or runtime route was added.
+Checkpoint forks optionally project private traces from the selected durable
+source journal, excluding records past the cutoff. Each record must match exactly
+one source event; audit-only records cannot supply evidence, even at a shared
+sequence. The child record binds to the exact copied event after run, sequence,
+trace and span rewriting, with both checksums recomputed. Invalid, duplicate,
+ambiguous, unsupported or incomplete evidence omits the whole optional sidecar.
+Publication uses an owner-only temporary file and atomic rename only after the
+child journal and audit are synchronized; private write failures discard the
+projection without changing ordinary fork/replay. Restart still requires an
+exact latest terminal-event match, not just a matching owner.
+Neither projected evidence nor the source-only diagnostic enables continuation
+or reset, authorizes a child/fork, cleans effects, or establishes external-effect
+or power-loss safety. No public continuation/reset endpoint or runtime route was
+added.
 The default-deny executor declarations on `StepExecutor` are metadata-only.
 
 Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):

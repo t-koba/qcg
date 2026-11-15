@@ -14,7 +14,9 @@ mod history;
 #[allow(dead_code)]
 mod planner;
 mod private_file;
+mod projection;
 use private_file::{Access as TraceAccess, open as open_private_trace};
+pub use projection::ForkTraceProjection;
 use std::io::{Read, Seek, SeekFrom, Write};
 
 // Wire/checksum version, not policy. V1 predates file dependencies; V2
@@ -249,14 +251,14 @@ impl Record {
         Some(writer.0.finalize().into())
     }
 
-    fn install(self, traces: &mut OutcomeTraces, event: &Value, limits: JournalLimits) {
+    fn validated_trace(&self, event: &Value, limits: JournalLimits) -> Option<OutcomeTrace> {
         if self.calculate_digest() != Some(self.record_digest)
             || self.version != VERSION
             || !self.complete
             || !terminal(event)
             || trace_owner(event).as_deref() != Some(self.owner.as_str())
         {
-            return;
+            return None;
         }
         // Re-charge parsed dependencies rather than trusting serialized counts
         // or flags. Unsupported identities and memory overflow stay incomplete.
@@ -264,7 +266,7 @@ impl Record {
         let recorder =
             ReadRecorder::new(limits.max_event_bytes.unwrap_or_default()).for_owner(owner.clone());
         recorder.record_executor_attestation(self.executor_attestation);
-        for read in self.reads {
+        for read in &self.reads {
             recorder.record(
                 &read.path,
                 match read.kind {
@@ -290,6 +292,14 @@ impl Record {
             && event["seq"].as_u64() == Some(trace.seq)
             && digest(event) == Some(trace.event_digest)
         {
+            Some(trace)
+        } else {
+            None
+        }
+    }
+
+    fn install(self, traces: &mut OutcomeTraces, event: &Value, limits: JournalLimits) {
+        if let Some(trace) = self.validated_trace(event, limits) {
             traces.insert(
                 self.owner,
                 trace,

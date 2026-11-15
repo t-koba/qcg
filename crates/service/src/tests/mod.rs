@@ -7,6 +7,7 @@ mod container_effects;
 pub(crate) mod endpoints;
 pub(crate) mod execution;
 pub(crate) mod fork_adoption;
+mod fork_traces;
 pub(crate) mod host_cgroup;
 pub(crate) mod mcp_authorization;
 pub(crate) mod misc;

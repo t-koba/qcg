@@ -7,6 +7,26 @@ use std::io;
 pub(super) enum Access {
     Read,
     Append,
+    CreateNew,
+}
+
+// CreateNew owns the new path, including cleanup if the handle fails private
+// access validation (for example, an ambient umask removed owner permissions).
+#[cfg(any(unix, windows))]
+fn checked(
+    file: File,
+    path: &Utf8Path,
+    access: Access,
+    check: impl FnOnce(&File) -> io::Result<()>,
+) -> io::Result<File> {
+    if let Err(error) = check(&file) {
+        drop(file);
+        if matches!(access, Access::CreateNew) {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(error);
+    }
+    Ok(file)
 }
 
 #[cfg(unix)]
@@ -22,12 +42,14 @@ pub(super) fn open(path: &Utf8Path, access: Access) -> io::Result<File> {
         Access::Append => {
             options.create(true).append(true).mode(0o600);
         }
+        Access::CreateNew => {
+            options.create_new(true).append(true).mode(0o600);
+        }
     }
     let file = options
         .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
         .open(path)?;
-    check(&file)?;
-    Ok(file)
+    checked(file, path, access, check)
 }
 
 #[cfg(unix)]
@@ -66,10 +88,11 @@ mod windows {
         SECURITY_ATTRIBUTES, TOKEN_QUERY, TOKEN_USER, TokenUser,
     };
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_APPEND_DATA, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING, READ_CONTROL,
+        BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_APPEND_DATA,
+        FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_READ_DATA, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_ALWAYS, OPEN_EXISTING,
+        READ_CONTROL,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
@@ -194,6 +217,10 @@ mod windows {
                 FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
                 OPEN_ALWAYS,
             ),
+            Access::CreateNew => (
+                FILE_APPEND_DATA | FILE_READ_ATTRIBUTES | READ_CONTROL,
+                CREATE_NEW,
+            ),
         };
         let handle = unsafe {
             CreateFileW(
@@ -210,8 +237,7 @@ mod windows {
             return Err(io::Error::last_os_error());
         }
         let file = unsafe { File::from_raw_handle(handle as RawHandle) };
-        check(&file, &user)?;
-        Ok(file)
+        super::checked(file, path, access, |file| check(file, &user))
     }
 
     fn check(file: &File, user: &CurrentUser) -> io::Result<()> {
@@ -412,6 +438,30 @@ mod windows_tests {
 
         let error = open(&path, Access::Append).unwrap_err();
         assert_eq!(error.to_string(), "private trace DACL is not owner-only");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[cfg(all(test, any(unix, windows)))]
+mod creation_tests {
+    use super::*;
+    use camino::Utf8PathBuf;
+
+    #[test]
+    fn rejected_new_private_file_is_removed_and_existing_file_is_not_replaced() {
+        let dir = std::env::temp_dir().join(format!("qcg-trace-create-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = Utf8PathBuf::from_path_buf(dir.join("trace.jsonl")).unwrap();
+        let file = open(&path, Access::CreateNew).unwrap();
+        assert!(open(&path, Access::CreateNew).is_err());
+        assert!(path.is_file());
+        assert!(
+            checked(file, &path, Access::CreateNew, |_| Err(io::Error::other(
+                "private access rejected"
+            )))
+            .is_err()
+        );
+        assert!(!path.exists());
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

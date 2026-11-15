@@ -913,3 +913,5 @@ fn restart_refuses_unsafe_or_missing_workspace_file_identity() {
     f.replace(&[]);
     assert!(f.restore_traces().dependency_traces.owners.is_empty());
 }
+
+mod projection;
