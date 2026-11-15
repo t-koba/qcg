@@ -97,6 +97,159 @@ async fn failed_engine_terminal_is_reconciled_before_fork() {
 }
 
 #[tokio::test]
+async fn fork_inherits_exact_step_charges_and_enforces_remaining_limit() {
+    let root = temp_run_dir("fork-inherited-step-budget");
+    let _guard = TempGuard(root.clone());
+    let generator = root.join("generator");
+    let runs = root.join("runs");
+    std::fs::create_dir_all(&generator).expect("generator directory should be created");
+    std::fs::write(
+        generator.join(contract::MANIFEST_FILE),
+        r#"
+[generator]
+id = "generator"
+name = "generator"
+version = "0.1.0"
+
+[budget]
+max_steps = 5
+
+[permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "first"
+type = "write"
+[flow.params]
+output_file = "first.txt"
+content = "first"
+
+[[flow]]
+id = "second"
+needs = ["first"]
+type = "write"
+[flow.params]
+output_file = "second.txt"
+content = "second"
+
+[[flow]]
+id = "ask"
+needs = ["second"]
+type = "ask_user"
+[flow.params]
+content = "Continue?"
+options = ["yes"]
+
+[[flow]]
+id = "third"
+needs = ["ask"]
+type = "write"
+[flow.params]
+output_file = "third.txt"
+content = "third"
+
+[[flow]]
+id = "fourth"
+needs = ["third"]
+type = "write"
+[flow.params]
+output_file = "fourth.txt"
+content = "fourth"
+"#,
+    )
+    .expect("generator manifest should be written");
+    let service = test_service(vec![root], runs.clone());
+    let source = service
+        .start_run(StartRun {
+            generator_id: "generator".into(),
+            ..Default::default()
+        })
+        .await
+        .expect("source run should start");
+    wait_for_snapshot(&service, &source, RunStatus::Waiting).await;
+
+    let source_dir = runs.join(&source);
+    let source_events = read_journal_events(&source_dir).expect("source journal should read");
+    let source_state = engine::RunState::fold_values(&source_events).expect("source should fold");
+    assert_eq!(source_state.budget.budget_charged, 3);
+    assert_eq!(source_state.budget.step_budget_seed, Some(0));
+    assert_eq!(source_state.budget.step_budget_charged_at_seed, Some(0));
+    let waiting_seq = source_events
+        .iter()
+        .find(|event| event.get("t").and_then(Value::as_str) == Some("run_waiting"))
+        .and_then(|event| event.get("seq").and_then(Value::as_u64))
+        .expect("source waiting checkpoint should exist");
+
+    let fork = service
+        .fork_run(
+            &source,
+            ForkRun {
+                at_seq: waiting_seq,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("fork should inherit the checkpoint budget");
+    let waiting = wait_for_snapshot(&service, &fork, RunStatus::Waiting).await;
+    let fork_dir = runs.join(&fork);
+    let inherited = engine::RunState::fold_values(
+        &read_journal_events(&fork_dir).expect("fork journal should read"),
+    )
+    .expect("fork should fold");
+    assert_eq!(inherited.budget.budget_charged, 3);
+    assert_eq!(inherited.budget.step_budget_seed, Some(0));
+    assert_eq!(inherited.budget.step_budget_charged_at_seed, Some(0));
+
+    service
+        .answer(
+            fork.clone(),
+            waiting.question.expect("fork question should exist").id,
+            AnswerPayload {
+                values: BTreeMap::from([("answer".into(), json!("yes"))]),
+            },
+        )
+        .await
+        .expect("fork answer should be accepted");
+    assert_eq!(
+        wait_for_terminal_snapshot(&service, &fork).await.state,
+        RunStatus::Failed,
+        "the fork should fail before executing beyond its inherited allowance"
+    );
+    let events = read_journal_events(&fork_dir).expect("settled fork journal should read");
+    let state = engine::RunState::fold_values(&events).expect("settled fork should fold");
+    assert_eq!(state.budget.budget_charged, 5);
+    let exhausted = service
+        .snapshot(fork)
+        .await
+        .expect("failed fork snapshot should exist");
+    let reason = exhausted.step_summaries["fourth"]
+        .reason
+        .as_ref()
+        .expect("over-budget step should retain its failure reason");
+    assert_eq!(
+        exhausted.step_summaries["third"].status,
+        api::StepSummaryStatus::Success
+    );
+    assert_eq!(
+        exhausted.step_summaries["fourth"].status,
+        api::StepSummaryStatus::Failed
+    );
+    assert!(
+        reason
+            .message
+            .contains("global step budget exceeded: 5 >= 5")
+    );
+}
+
+#[tokio::test]
 async fn terminal_fork_checks_current_source_operations_before_copy() {
     for mode in [RunStoreMode::Exclusive, RunStoreMode::SharedFilesystem] {
         let root = temp_run_dir("fork-terminal-inflight");
