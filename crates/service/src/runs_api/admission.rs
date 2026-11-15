@@ -779,6 +779,21 @@ impl LocalService {
         request: ForkRun,
         reserved_run_id: Option<String>,
     ) -> Result<String, ApiError> {
+        self.fork_run_prepared(source_id, request, reserved_run_id, None, || Ok(()))
+            .await
+    }
+
+    /// Internal prepared-plan admission. The coordinator retains its key gate;
+    /// `bind` runs under target admission and (for fresh copies) source execution.
+    #[doc(hidden)]
+    pub async fn fork_run_prepared(
+        &self,
+        source_id: &str,
+        request: ForkRun,
+        reserved_run_id: Option<String>,
+        prepared: Option<&crate::PreparedForkPlan>,
+        bind: impl FnOnce() -> Result<(), ApiError>,
+    ) -> Result<String, ApiError> {
         self.ensure_running()?;
         if request.at_seq == 0 && request.reuse.is_none() {
             return Err(ApiError::invalid_field(
@@ -818,6 +833,25 @@ impl LocalService {
         // probe cannot be missed (E05).
         let adopt_snapshot = crate::run_dirs::try_adopt_run_dir_with_snapshot(&run_dir, &run_id)
             .map_err(api_internal)?;
+        if adopt_snapshot.adopted {
+            let lineage = adopt_snapshot
+                .events
+                .iter()
+                .rev()
+                .find(|event| event["t"] == "run_forked")
+                .ok_or_else(|| api_internal("fork lineage is missing"))?;
+            let stored: Option<crate::ForkPlanBinding> = lineage
+                .get("binding")
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()
+                .map_err(api_internal)?;
+            if stored.as_ref() != prepared.map(crate::PreparedForkPlan::binding) {
+                return Err(ApiError::Conflict {
+                    detail: "fork lineage binding mismatch".into(),
+                });
+            }
+        }
+        let mut bind = Some(bind);
         let adopted = adopt_snapshot.adopted;
         let live_hit = self.live_run_record(&run_id).await;
         if live_hit && !adopted {
@@ -865,6 +899,9 @@ impl LocalService {
             (package_sha256, generator_path, contract, Some(source_dir))
         };
         if live_hit {
+            if let Some(bind) = bind.take() {
+                bind()?;
+            }
             resolve_fork_live_hit(&adopt_snapshot, &contract, source_id, &request)?;
             return Ok(run_id);
         }
@@ -878,15 +915,23 @@ impl LocalService {
             // is consulted. Source leases remain held through the copy
             // and are released before child execution.
             let source_lease = self.fork_source_copy_lease(source_id, source_dir).await?;
-            created_fresh = prepare_checkpoint_fork(
+            if let Some(bind) = bind.take() {
+                bind()?;
+            }
+            let (fresh, staged_source) = crate::run_dirs::prepare_checkpoint_fork_prepared(
                 source_dir,
                 source_id,
                 &run_dir,
                 &run_id,
                 request.at_seq,
                 &request.state_patch,
+                prepared,
             )
             .map_err(api_internal)?;
+            created_fresh = fresh;
+            let source_dir = staged_source
+                .as_ref()
+                .map_or(source_dir, |staged| staged.0.as_path());
             let copied = crate::run_package::copy(
                 &crate::run_package::package_dir(source_dir),
                 &run_dir,
@@ -901,7 +946,13 @@ impl LocalService {
                     return Err(api_internal(error));
                 }
             }
+            if let Some(staged) = staged_source {
+                staged.finish().map_err(api_internal)?;
+            }
             drop(source_lease);
+        }
+        if let Some(bind) = bind.take() {
+            bind()?;
         }
         // Single snapshot for the whole fork admission: adopted reuses the
         // adoption read (with its fold), fresh reads and folds once after

@@ -11,6 +11,8 @@ pub const MAX_IDEMPOTENCY_FILE_BYTES: u64 = 64 * 1024;
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Association {
+    #[serde(default, rename = "binding")]
+    _binding: Option<crate::ForkPlanBinding>,
     key: String,
     digest: String,
     run_id: Option<String>,

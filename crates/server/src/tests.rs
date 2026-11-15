@@ -1221,6 +1221,7 @@ async fn concurrent_idempotent_start_creates_one_run() {
             entries.insert(
                 format!("pending-{index}"),
                 IdempotencyEntry::Pending {
+                    binding: None,
                     digest: "digest".into(),
                     owner_id: uuid::Uuid::now_v7(),
                     created_at: Instant::now(),
@@ -1641,6 +1642,7 @@ async fn matching_pending_start_waits_after_package_removal() {
     state.idempotency.lock().await.insert(
         key.to_string(),
         IdempotencyEntry::Pending {
+            binding: None,
             digest: digest.clone(),
             owner_id: uuid::Uuid::now_v7(),
             created_at: Instant::now(),
@@ -1690,6 +1692,7 @@ async fn matching_pending_start_waits_after_package_removal() {
     assert_eq!(conflict.problem.status, StatusCode::CONFLICT.as_u16());
 
     let ready_record = crate::durable::DurableIdempotencyRecord {
+        binding: None,
         publication_id: None,
         key: key.to_string(),
         digest,

@@ -810,12 +810,44 @@ error would make the caller retry under a fresh operation id and journal a
 duplicate cancel for one published request. Power loss may drop the directory
 entry; the next boot observes the request as absent and a retry publishes
 under a fresh operation id, with deduplication by cancel-drain idempotence
-(E01). Idempotency Ready commit (`store_durable_ready` in
-`crates/server/src/server/idempotency/durable.rs`): directory-sync
-failure is likewise warn-only (the staged file is `sync_all` durable); a
-power-loss entry loss resurrects the key as unclaimed and a retry re-commits
-the same mapping instead of minting a duplicate. Duplicate execution under
-power loss is accepted there (E02/Q2).
+(E01). Ordinary, unbound idempotency Ready commit in
+`crates/server/src/server/idempotency/durable.rs` keeps directory-sync
+failure warn-only (the staged file is `sync_all` durable); a power-loss entry
+loss can resurrect the key as unclaimed. Duplicate execution under power loss
+is accepted for that ordinary protocol (E02/Q2).
+
+The internal prepared-fork coordinator additionally supports a private binding
+`{"binding_version":1,"plan_digest":"<64 lowercase hex>"}`. It is absent for
+ordinary operations and does not change the request digest. Under the key gate,
+target admission lock and source execution lease, an exact owner/generation/
+reserved-child CAS durably binds Pending before child content is written.
+Adoption preserves the binding and child identity; generic release refuses a
+bound claim. The binding travels in child fork lineage, Ready and the recovery
+sidecar. Different or bound/unbound replay identities conflict; exact Ready
+replay needs only the child, not the source or its prepared observations.
+
+A prepared plan is opaque: its constructor derives the final binding from a
+versioned, domain-separated encoding of the engine diagnostic digest and the
+canonical, sorted manifest of source-relative regular files, lengths and hashes.
+The diagnostic digest alone is not this final identity; no independent binding
+can be attached to another manifest. The manifest must include the metadata,
+referenced blobs and pinned package required by projection, not just the engine
+observed-file subset. Missing required files fail projection.
+
+The copy stages the exact no-follow source streams while hashing those same
+bytes, then projects checkpoint history and the pinned package from that tree.
+There is one fixed `.prepared-source` directory inside the reserved child, under
+its admission lease and pending marker, not a global temporary tree. Staging is
+removed before admission can complete; a copy failure removes it on scope exit,
+and existing incomplete-child recovery wipes crash leftovers on recovery/retry.
+Thus staging shares the child's lifecycle and cannot accumulate per-attempt
+trees. A source mismatch retains bound Pending. This no-follow staging currently fails closed
+on non-Unix platforms. The existing `fork-tree.commit.json` barrier still binds
+the completed child tree. For a bound Ready, directory-sync failure is an
+unresolved commit: Pending remains, no successful response is returned, and an
+exact retry can sync the same Ready bytes before replay/retirement. These are
+internal primitives only: no API, CLI, continuation or reset caller selects a
+prepared plan, and they do not establish end-to-end continuation/reset safety.
 Other non-terminal appends are not individually fsynced; they rely on the next
 terminal sync or clean shutdown for media durability. A crash-truncated tail
 without a trailing newline is repaired on the next open under the journal

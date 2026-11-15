@@ -2086,6 +2086,7 @@ async fn stale_ready_is_revalidated_after_admission_wait() {
     let admission = state.service.lock_idempotency_snapshot(&id).await.unwrap();
     // No canonical Ready exists: a stale cached/observed identity cannot serve.
     let record = durable::DurableIdempotencyRecord {
+        binding: None,
         key: KEY.into(),
         digest: "d".into(),
         run_id: id,
@@ -2171,6 +2172,7 @@ async fn ready_replay_distinguishes_loss_expiry_and_canonical_replacement() {
         tokio_util::sync::CancellationToken::new(),
     ));
     let record = durable::DurableIdempotencyRecord {
+        binding: None,
         key: KEY.into(),
         digest: request_digest("cancel_run", "target", b"", None),
         run_id: "target".into(),
@@ -2272,6 +2274,7 @@ async fn start_lookup_checks_live_memory_pending_digest_before_disk() {
     state.idempotency.lock().await.insert(
         KEY.into(),
         IdempotencyEntry::Pending {
+            binding: None,
             digest,
             owner_id: uuid::Uuid::now_v7(),
             created_at: Instant::now(),

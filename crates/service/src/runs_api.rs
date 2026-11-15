@@ -9,9 +9,7 @@ use crate::artifacts::{
     api_internal, check_bundle_limits, check_verified_artifact_hashes, json_size,
 };
 use crate::lifecycle::SpawnRun;
-use crate::run_dirs::{
-    is_regular_directory, prepare_api_run_directory, prepare_checkpoint_fork, write_run_event,
-};
+use crate::run_dirs::{is_regular_directory, prepare_api_run_directory, write_run_event};
 use crate::summaries::{
     poll_journal_events, read_optional_output_manifest, read_run_generator_path, run_meta_dir,
     run_workspace_dir, truncate_trailing_canceled_events,

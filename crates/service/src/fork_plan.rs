@@ -1,0 +1,492 @@
+//! Private protocol plumbing for a future prepared-fork caller, not an HTTP API.
+use camino::{Utf8Path, Utf8PathBuf};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::io::{Read, Write};
+
+/// A plan identity, not the plan itself. Construction and decoding are checked.
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "BindingWire")]
+pub struct ForkPlanBinding {
+    binding_version: u8,
+    plan_digest: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BindingWire {
+    binding_version: u8,
+    plan_digest: String,
+}
+impl TryFrom<BindingWire> for ForkPlanBinding {
+    type Error = String;
+    fn try_from(value: BindingWire) -> Result<Self, Self::Error> {
+        if value.binding_version != 1 || !valid_hash(&value.plan_digest) {
+            return Err("invalid fork plan binding".into());
+        }
+        Ok(Self {
+            binding_version: 1,
+            plan_digest: value.plan_digest,
+        })
+    }
+}
+fn valid_hash(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Exact source-relative regular files used by checkpoint/package projection.
+/// Unlisted bytes are never read by the projection: it reads the owned staging tree.
+#[doc(hidden)]
+#[derive(Debug, Clone, Serialize)]
+pub struct ForkFileObservation {
+    pub path: Utf8PathBuf,
+    pub length: u64,
+    pub sha256: String,
+}
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct PreparedForkPlan {
+    binding: ForkPlanBinding,
+    files: Vec<ForkFileObservation>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static SOURCE_OPENED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+// Lives inside the child admission, never in a separate temporary namespace.
+// Until projection, package copy and removal finish, the child remains pending;
+// existing incomplete-admission recovery owns removal after a process crash.
+pub(crate) struct StagedSource(pub Utf8PathBuf);
+impl StagedSource {
+    pub(crate) fn finish(self) -> Result<(), crate::ServiceError> {
+        std::fs::remove_dir_all(&self.0)?;
+        Ok(())
+    }
+}
+impl Drop for StagedSource {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+fn invalid(detail: &str) -> crate::ServiceError {
+    crate::ServiceError::Invalid(format!("prepared fork: {detail}"))
+}
+
+// Pin and walk every ancestor, not just the leaf. No source link is followed.
+#[cfg(unix)]
+fn open_source(root: &Utf8Path, relative: &Utf8Path) -> Result<std::fs::File, crate::ServiceError> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut parent = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)?;
+    let parts: Vec<_> = relative.components().collect();
+    for (index, part) in parts.iter().enumerate() {
+        let name = std::ffi::CString::new(part.as_str()).map_err(|_| invalid("invalid path"))?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | libc::O_NONBLOCK
+            | if index + 1 < parts.len() {
+                libc::O_DIRECTORY
+            } else {
+                0
+            };
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(parent)
+}
+#[cfg(not(unix))]
+fn open_source(
+    _root: &Utf8Path,
+    _relative: &Utf8Path,
+) -> Result<std::fs::File, crate::ServiceError> {
+    // No race-safe ancestor traversal implementation on this platform yet.
+    Err(invalid(
+        "no-follow source staging is unsupported on this platform",
+    ))
+}
+
+impl PreparedForkPlan {
+    /// Bind a diagnostic identity AND the complete projection file manifest.
+    /// The engine diagnostic alone is not a prepared plan. No independent final
+    /// binding can be supplied, and neither the manifest nor binding is mutable.
+    /// Include metadata, referenced blobs and the pinned package, not merely the
+    /// engine diagnostic's observed-file subset. Missing inputs fail projection.
+    #[doc(hidden)]
+    pub fn new(
+        diagnostic_digest: &str,
+        mut files: Vec<ForkFileObservation>,
+    ) -> Result<Self, crate::ServiceError> {
+        if !valid_hash(diagnostic_digest) {
+            return Err(invalid("invalid diagnostic digest"));
+        }
+        files.sort_by(|a, b| a.path.cmp(&b.path));
+        let mut previous = None;
+        for observation in &files {
+            let path = &observation.path;
+            if path.as_str().is_empty()
+                || !path
+                    .components()
+                    .all(|p| matches!(p, camino::Utf8Component::Normal(_)))
+                || path.as_str().contains(['\\', ':', '\0'])
+                || path
+                    .components()
+                    .map(|p| p.as_str())
+                    .collect::<Vec<_>>()
+                    .join("/")
+                    != path.as_str()
+                || previous == Some(path)
+                || !valid_hash(&observation.sha256)
+            {
+                return Err(invalid("unsafe, duplicate or malformed observation"));
+            }
+            previous = Some(path);
+        }
+        // Domain-separated, deterministic encoding of the full sorted manifest.
+        // This is a composite service identity, NOT the engine diagnostic digest.
+        let identity = serde_json::to_vec(&("qcg-prepared-fork-v1", diagnostic_digest, &files))?;
+        Ok(Self {
+            binding: ForkPlanBinding {
+                binding_version: 1,
+                plan_digest: hex::encode(Sha256::digest(identity)),
+            },
+            files,
+        })
+    }
+
+    pub fn binding(&self) -> &ForkPlanBinding {
+        &self.binding
+    }
+
+    pub(crate) fn stage(
+        &self,
+        source: &Utf8Path,
+        target: &Utf8Path,
+    ) -> Result<StagedSource, crate::ServiceError> {
+        // The caller owns target admission and has published its pending marker.
+        // One fixed tree per child; a retry first wipes incomplete admission.
+        let root = target.join(".prepared-source");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&root)?;
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir(&root)?;
+        let staged = StagedSource(root);
+        for observation in &self.files {
+            let path = &observation.path;
+            let mut input = open_source(source, path)?;
+            let metadata = input.metadata()?;
+            if !metadata.is_file() || metadata.len() != observation.length {
+                return Err(invalid("source type or length changed"));
+            }
+            #[cfg(test)]
+            SOURCE_OPENED.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().take() {
+                    hook();
+                }
+            });
+            let destination = staged.0.join(path);
+            std::fs::create_dir_all(destination.parent().unwrap())?;
+            let mut output = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&destination)?;
+            let mut hash = Sha256::new();
+            let mut length = 0u64;
+            let mut buffer = [0; 8192];
+            loop {
+                let count = input.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                length = length
+                    .checked_add(count as u64)
+                    .ok_or_else(|| invalid("source length overflow"))?;
+                if length > observation.length {
+                    return Err(invalid("source grew during copy"));
+                }
+                hash.update(&buffer[..count]);
+                output.write_all(&buffer[..count])?;
+            }
+            output.set_permissions(metadata.permissions())?;
+            if length != observation.length || hex::encode(hash.finalize()) != observation.sha256 {
+                return Err(invalid("source changed during copy"));
+            }
+        }
+        Ok(staged)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::support::*;
+    use serde_json::json;
+
+    fn binding() -> ForkPlanBinding {
+        serde_json::from_value(json!({"binding_version":1,"plan_digest":"a".repeat(64)})).unwrap()
+    }
+    #[test]
+    fn binding_is_strict_and_canonical() {
+        for value in [
+            json!({"binding_version":2,"plan_digest":"a".repeat(64)}),
+            json!({"binding_version":1,"plan_digest":"A".repeat(64)}),
+            json!({"binding_version":1,"plan_digest":"a".repeat(63)}),
+            json!({"binding_version":1,"plan_digest":"a".repeat(64),"extra":true}),
+        ] {
+            assert!(serde_json::from_value::<ForkPlanBinding>(value).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(binding()).unwrap(),
+            json!({"binding_version":1,"plan_digest":"a".repeat(64)})
+        );
+    }
+    #[test]
+    #[cfg(unix)]
+    fn staging_hashes_the_copied_stream_and_refuses_link_and_length_races() {
+        let root = temp_run_dir("prepared-copy");
+        let _guard = TempGuard(root.clone());
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join("data");
+        let bytes = b"prepared bytes";
+        let plan = PreparedForkPlan::new(
+            &"a".repeat(64),
+            vec![ForkFileObservation {
+                path: "data".into(),
+                length: bytes.len() as u64,
+                sha256: hex::encode(Sha256::digest(bytes)),
+            }],
+        )
+        .unwrap();
+        let target = root.join("child");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+        let staged = plan.stage(&source, &target).unwrap();
+        assert_eq!(std::fs::read(staged.0.join("data")).unwrap(), bytes);
+        let staging_path = staged.0.clone();
+        drop(staged);
+        assert!(!staging_path.exists());
+        for replacement in [
+            b"different data".to_vec(),
+            b"short".to_vec(),
+            b"prepared bytes with growth".to_vec(),
+        ] {
+            std::fs::write(&path, bytes).unwrap();
+            let changing = path.clone();
+            SOURCE_OPENED.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    std::fs::write(&changing, replacement).unwrap();
+                }))
+            });
+            assert!(plan.stage(&source, &target).is_err());
+        }
+        std::fs::remove_file(&path).unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, bytes).unwrap();
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        assert!(plan.stage(&source, &target).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink(&root, source.join("ancestor")).unwrap();
+        let linked = PreparedForkPlan::new(
+            &"a".repeat(64),
+            vec![ForkFileObservation {
+                path: "ancestor/outside".into(),
+                length: bytes.len() as u64,
+                sha256: hex::encode(Sha256::digest(bytes)),
+            }],
+        )
+        .unwrap();
+        assert!(linked.stage(&source, &target).is_err());
+        assert!(!target.join(".prepared-source").exists());
+    }
+    fn observe_tree(root: &Utf8Path, dir: &Utf8Path) -> Vec<ForkFileObservation> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let path = Utf8PathBuf::from_path_buf(entry.path()).unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                files.extend(observe_tree(root, &path));
+            } else {
+                let bytes = std::fs::read(&path).unwrap();
+                files.push(ForkFileObservation {
+                    path: path.strip_prefix(root).unwrap().into(),
+                    length: bytes.len() as u64,
+                    sha256: hex::encode(Sha256::digest(&bytes)),
+                });
+            }
+        }
+        files
+    }
+
+    #[test]
+    fn binding_commits_to_the_canonical_manifest_not_just_the_diagnostic() {
+        let file = ForkFileObservation {
+            path: "meta/journal.jsonl".into(),
+            length: 10,
+            sha256: "b".repeat(64),
+        };
+        let other = ForkFileObservation {
+            path: "workspace/data".into(),
+            ..file.clone()
+        };
+        let files = vec![file.clone(), other.clone()];
+        let plan = PreparedForkPlan::new(&"a".repeat(64), files.clone()).unwrap();
+        assert_ne!(plan.binding(), &binding());
+        assert_eq!(
+            plan.binding(),
+            PreparedForkPlan::new(&"a".repeat(64), vec![other, file.clone()])
+                .unwrap()
+                .binding()
+        );
+        for changed in [
+            ForkFileObservation {
+                path: "meta/other".into(),
+                ..file.clone()
+            },
+            ForkFileObservation {
+                length: 11,
+                ..file.clone()
+            },
+            ForkFileObservation {
+                sha256: "c".repeat(64),
+                ..file.clone()
+            },
+        ] {
+            assert_ne!(
+                plan.binding(),
+                PreparedForkPlan::new(&"a".repeat(64), vec![changed, files[1].clone()])
+                    .unwrap()
+                    .binding()
+            );
+        }
+        assert_ne!(
+            plan.binding(),
+            PreparedForkPlan::new(&"a".repeat(64), vec![file.clone()])
+                .unwrap()
+                .binding()
+        );
+        assert_ne!(
+            plan.binding(),
+            PreparedForkPlan::new(&"d".repeat(64), files)
+                .unwrap()
+                .binding()
+        );
+        assert!(PreparedForkPlan::new(&"a".repeat(64), vec![file.clone(), file.clone()]).is_err());
+        for path in [
+            "",
+            "/absolute",
+            "../escape",
+            "a/../b",
+            "./a",
+            "a//b",
+            "a/",
+            "a\\b",
+            "a:b",
+        ] {
+            assert!(
+                PreparedForkPlan::new(
+                    &"a".repeat(64),
+                    vec![ForkFileObservation {
+                        path: path.into(),
+                        ..file.clone()
+                    }]
+                )
+                .is_err(),
+                "{path}"
+            );
+        }
+        assert!(PreparedForkPlan::new("not a digest", vec![file]).is_err());
+    }
+
+    #[test]
+    fn child_lineage_and_crash_staging_share_incomplete_admission_ownership() {
+        let root = temp_run_dir("prepared-lineage");
+        let _guard = TempGuard(root.clone());
+        let source = synthetic_hitl_record(&root, "source");
+        // Use the complete projection tree, including metadata/blobs, not just
+        // an engine observed-file subset.
+        let files = observe_tree(&source.run_dir, &source.run_dir);
+        let plan = PreparedForkPlan::new(&"a".repeat(64), files).unwrap();
+        let target = root.join("runs/child");
+        let (_, staged) = crate::run_dirs::prepare_checkpoint_fork_prepared(
+            &source.run_dir,
+            "source",
+            &target,
+            "child",
+            1,
+            &api::ForkStatePatch::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        let events = crate::summaries::read_journal_events(&target).unwrap();
+        let lineage = events
+            .iter()
+            .find(|event| event["t"] == "run_forked")
+            .unwrap();
+        assert_eq!(
+            lineage["binding"],
+            serde_json::to_value(plan.binding()).unwrap()
+        );
+        assert!(lineage.get("files").is_none());
+        assert_eq!(lineage["fork_tree_commit_version"], 1);
+        let staged = staged.unwrap();
+        let staging_path = staged.0.clone();
+        assert!(staging_path.starts_with(&target));
+        assert!(staging_path.join("meta/journal.jsonl").is_file());
+        assert!(crate::run_dirs::fork_admission_pending(&target).unwrap());
+        // Skip Drop to simulate process death with a fully copied source tree.
+        std::mem::forget(staged);
+        assert!(staging_path.exists());
+        assert!(
+            !crate::run_dirs::try_adopt_run_dir_with_snapshot(&target, "child")
+                .unwrap()
+                .adopted
+        );
+        assert!(!staging_path.exists());
+        // Recovery cannot accumulate a second staging tree: it reuses the same
+        // reserved child and the same path after wiping incomplete admission.
+        let (_, staged) = crate::run_dirs::prepare_checkpoint_fork_prepared(
+            &source.run_dir,
+            "source",
+            &target,
+            "child",
+            1,
+            &api::ForkStatePatch::default(),
+            Some(&plan),
+        )
+        .unwrap();
+        let staged = staged.unwrap();
+        assert_eq!(staged.0, staging_path);
+        staged.finish().unwrap();
+        assert!(!staging_path.exists());
+
+        // A crash during staging (before checkpoint projection) leaves the
+        // empty child journal plus pending marker. Boot recovery owns it too.
+        crate::run_dirs::try_adopt_run_dir_with_snapshot(&target, "child").unwrap();
+        crate::run_dirs::prepare_api_run_directory(&target).unwrap();
+        crate::run_dirs::mark_fork_admission_pending(&target).unwrap();
+        let staged = plan.stage(&source.run_dir, &target).unwrap();
+        std::mem::forget(staged);
+        assert!(staging_path.exists());
+        assert!(
+            crate::summaries::read_recovery_state(&target)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!staging_path.exists());
+    }
+}

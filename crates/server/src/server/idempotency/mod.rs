@@ -11,8 +11,8 @@ pub(crate) use config::{
     prune_idempotency,
 };
 pub(crate) use durable::{
-    ClaimOutcome, ExecutionGate, OwnerCheck, StoreReadyError, WaitOutcome, find_orphan_run,
-    load_durable_ready_result, wait_for_peer_ready, write_orphan_record,
+    ClaimOutcome, ExecutionGate, OwnerCheck, StoreReadyError, WaitOutcome,
+    load_durable_ready_result,
 };
 #[cfg(test)]
 pub(crate) use durable::{check_pending_owner, claim_durable_pending, release_durable_pending};
@@ -205,6 +205,25 @@ where
     F: FnOnce(ExecutorContext) -> Fut,
     Fut: std::future::Future<Output = Result<String, ApiError>>,
 {
+    with_prepared_fork(call, None).await
+}
+
+/// Internal-only plumbing; no route/CLI selects a prepared plan.
+pub(crate) async fn with_prepared_fork<F, Fut>(
+    call: IdempotentCall<'_, F, Fut>,
+    prepared: Option<service::PreparedForkPlan>,
+) -> Result<Response, ApiHttpError>
+where
+    F: FnOnce(ExecutorContext) -> Fut,
+    Fut: std::future::Future<Output = Result<String, ApiError>>,
+{
+    let binding = prepared.as_ref().map(service::PreparedForkPlan::binding);
+    if prepared.is_some() && (call.scope != "fork_run" || idempotency_key(call.headers)?.is_none())
+    {
+        return Err(ApiHttpError::internal(
+            "prepared fork requires a keyed fork claim",
+        ));
+    }
     let IdempotentCall {
         state,
         headers,
@@ -253,7 +272,8 @@ where
                         let record = record.clone();
                         drop(idempotency);
                         if let Some(response) =
-                            replay_ready(state, record.clone(), created, &request_digest).await?
+                            replay_bound(state, record.clone(), created, &request_digest, binding)
+                                .await?
                         {
                             return Ok(response);
                         }
@@ -265,9 +285,12 @@ where
                         continue;
                     }
                     Some(IdempotencyEntry::Pending {
-                        digest, completed, ..
+                        digest,
+                        binding: stored_binding,
+                        completed,
+                        ..
                     }) => {
-                        if digest != &request_digest {
+                        if digest != &request_digest || stored_binding.as_ref() != binding {
                             return Err(idempotency_conflict());
                         }
                         (Some(completed.subscribe()), None, None)
@@ -281,7 +304,8 @@ where
                         if let Some(durable) =
                             load_durable_ready_async(runs_dir, key, policy_ttl).await?
                             && let Some(response) =
-                                replay_ready(state, durable, created, &request_digest).await?
+                                replay_bound(state, durable, created, &request_digest, binding)
+                                    .await?
                         {
                             return Ok(response);
                         }
@@ -290,14 +314,25 @@ where
                         if carried_adopted.is_none() && matches!(scope, "start_run" | "fork_run") {
                             let runs_dir = state.runs_dir.clone();
                             let key = idempotency_key.clone();
-                            if let Some((orphan_run_id, orphan_digest)) =
-                                storage(move || find_orphan_run(&runs_dir, &key, policy_ttl))
-                                    .await?
+                            if let Some(orphan) = {
+                                let binding = binding.cloned();
+                                storage(move || {
+                                    durable::find_orphan_bound(
+                                        &runs_dir,
+                                        &key,
+                                        policy_ttl,
+                                        binding.as_ref(),
+                                    )
+                                })
+                            }
+                            .await?
                             {
-                                if orphan_digest != request_digest {
+                                if orphan.digest != request_digest
+                                    || orphan.binding.as_ref() != binding
+                                {
                                     return Err(idempotency_conflict());
                                 }
-                                carried_adopted = Some(orphan_run_id);
+                                carried_adopted = Some(orphan.run_id);
                             }
                         }
                         let key = idempotency_key.clone();
@@ -319,24 +354,31 @@ where
                             policy_ttl,
                             state.idempotency_timing,
                             !matches!(scope, "start_run" | "fork_run"),
+                            binding.cloned(),
                         )
                         .await?
                         {
                             ClaimOutcome::Peer => {
                                 execution_gate.take();
-                                match wait_for_peer_ready(
+                                match durable::wait_for_peer_bound(
                                     &state.runs_dir,
                                     &idempotency_key,
                                     &request_digest,
                                     policy_ttl,
                                     state.idempotency_timing,
+                                    binding,
                                 )
                                 .await?
                                 {
                                     WaitOutcome::Ready(record) => {
-                                        if let Some(response) =
-                                            replay_ready(state, record, created, &request_digest)
-                                                .await?
+                                        if let Some(response) = replay_bound(
+                                            state,
+                                            record,
+                                            created,
+                                            &request_digest,
+                                            binding,
+                                        )
+                                        .await?
                                         {
                                             return Ok(response);
                                         }
@@ -366,7 +408,8 @@ where
                                 // Committed between our last look and the claim.
                                 execution_gate.take();
                                 if let Some(response) =
-                                    replay_ready(state, record, created, &request_digest).await?
+                                    replay_bound(state, record, created, &request_digest, binding)
+                                        .await?
                                 {
                                     return Ok(response);
                                 }
@@ -385,6 +428,7 @@ where
                             Ready,
                             Pending {
                                 digest: String,
+                                binding: Option<service::ForkPlanBinding>,
                                 waiter: tokio::sync::watch::Receiver<bool>,
                             },
                             Absent,
@@ -399,9 +443,13 @@ where
                                 Reexamined::Ready
                             }
                             Some(IdempotencyEntry::Pending {
-                                digest, completed, ..
+                                digest,
+                                binding: stored_binding,
+                                completed,
+                                ..
                             }) => Reexamined::Pending {
                                 digest: digest.clone(),
+                                binding: stored_binding.clone(),
                                 waiter: completed.subscribe(),
                             },
                             None | Some(IdempotencyEntry::Ready { .. }) => Reexamined::Absent,
@@ -426,7 +474,11 @@ where
                                 execution_gate.take();
                                 continue;
                             }
-                            Reexamined::Pending { digest, waiter } => {
+                            Reexamined::Pending {
+                                digest,
+                                binding: stored_binding,
+                                waiter,
+                            } => {
                                 let release = claim_owner.clone().zip(claim_generation);
                                 drop(idempotency);
                                 if let Some((owner, generation)) = release {
@@ -443,7 +495,7 @@ where
                                     )
                                     .await?;
                                 }
-                                if digest != request_digest {
+                                if digest != request_digest || stored_binding.as_ref() != binding {
                                     return Err(idempotency_conflict());
                                 }
                                 // A peer owns this key in memory: wait on its
@@ -467,6 +519,7 @@ where
                                     idempotency_key.clone(),
                                     IdempotencyEntry::Pending {
                                         digest: request_digest.clone(),
+                                        binding: binding.cloned(),
                                         owner_id,
                                         created_at: Instant::now(),
                                         completed,
@@ -545,15 +598,43 @@ where
             .as_ref()
             .ok_or_else(|| ApiHttpError::internal("missing execution gate"))?,
     );
-    let run_id = match service::with_acceptance_guard(
-        gate.clone(),
-        execute(ExecutorContext {
-            reserved_run_id: adopted_run_id,
-            operation_id: Some(operation_id),
-        }),
-    )
-    .await
-    {
+    let execution = async {
+        if let Some(plan) = prepared.as_ref() {
+            let request: api::ForkRun =
+                serde_json::from_slice(body).map_err(|e| ApiError::internal(e.to_string()))?;
+            let reserved = adopted_run_id
+                .as_deref()
+                .ok_or_else(|| ApiError::internal("missing prepared fork child"))?
+                .to_owned();
+            state
+                .service
+                .fork_run_prepared(target, request, adopted_run_id.clone(), Some(plan), || {
+                    durable::bind_pending_gated(
+                        &gate,
+                        &idempotency_key,
+                        &request_digest,
+                        &claim_owner,
+                        claim_generation,
+                        &reserved,
+                        plan.binding(),
+                    )
+                    .map_err(|error| match error {
+                        durable::BindPendingError::Conflict => ApiError::Conflict {
+                            detail: "fork binding CAS conflict".into(),
+                        },
+                        durable::BindPendingError::Storage(detail) => ApiError::internal(detail),
+                    })
+                })
+                .await
+        } else {
+            execute(ExecutorContext {
+                reserved_run_id: adopted_run_id,
+                operation_id: Some(operation_id),
+            })
+            .await
+        }
+    };
+    let run_id = match service::with_acceptance_guard(gate.clone(), execution).await {
         Ok(run_id) => run_id,
         Err(error) => {
             // Errors cannot prove absence of effects. Retain durable evidence/acceptance ID;
@@ -572,6 +653,7 @@ where
             run_id.clone(),
             idempotency_key.clone(),
             request_digest.clone(),
+            binding.cloned(),
         )
         .await
     {
@@ -603,6 +685,7 @@ where
         claim_owner.clone(),
         claim_generation,
         policy_ttl,
+        binding.cloned(),
     )
     .await
     {
@@ -617,6 +700,9 @@ where
         Err(error) => {
             snapshot_guard.take();
             if matches!(error, StoreReadyError::DigestConflict) {
+                if binding.is_some() {
+                    return Err(idempotency_conflict());
+                }
                 release_durable_pending_or_503(
                     gate.clone(),
                     idempotency_key.clone(),
@@ -635,7 +721,9 @@ where
                 policy_ttl,
             )
             .await
+                && binding.is_none()
                 && committed.digest == request_digest
+                && committed.binding.as_ref() == binding
                 && committed.run_id != run_id
             {
                 settle_orphan(run_id.clone()).await?;
@@ -717,7 +805,7 @@ where
     if snapshot_guard.is_some() {
         snapshot_response(state, committed_run_id, created).await
     } else {
-        replay_ready(state, committed_record, created, &request_digest)
+        replay_bound(state, committed_record, created, &request_digest, binding)
             .await?
             .ok_or_else(|| {
                 ApiHttpError::service_unavailable(
@@ -735,6 +823,15 @@ async fn replay_ready(
     record: durable::DurableIdempotencyRecord,
     created: bool,
     expected_digest: &str,
+) -> Result<Option<Response>, ApiHttpError> {
+    replay_bound(state, record, created, expected_digest, None).await
+}
+async fn replay_bound(
+    state: &Arc<AppState>,
+    record: durable::DurableIdempotencyRecord,
+    created: bool,
+    expected_digest: &str,
+    binding: Option<&service::ForkPlanBinding>,
 ) -> Result<Option<Response>, ApiHttpError> {
     let _admission = state
         .service
@@ -756,7 +853,7 @@ async fn replay_ready(
         }
         return Ok(None);
     }
-    if record.digest != expected_digest {
+    if record.digest != expected_digest || record.binding.as_ref() != binding {
         return Err(idempotency_conflict());
     }
     state
@@ -834,6 +931,7 @@ async fn acquire_execution_gate(
 }
 
 /// Off-thread claim publication under the execution gate.
+#[allow(clippy::too_many_arguments)] // Same durable protocol identity across the blocking boundary.
 async fn claim_durable_pending_async(
     gate: Arc<ExecutionGate>,
     key: String,
@@ -842,9 +940,10 @@ async fn claim_durable_pending_async(
     ttl: std::time::Duration,
     timing: config::IdempotencyTiming,
     require_target: bool,
+    binding: Option<service::ForkPlanBinding>,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     tokio::task::spawn_blocking(move || {
-        durable::claim_durable_pending_for_target_gated(
+        durable::claim_pending_bound(
             &gate,
             &key,
             &digest,
@@ -852,6 +951,7 @@ async fn claim_durable_pending_async(
             ttl,
             timing,
             require_target,
+            binding.as_ref(),
         )
     })
     .await
@@ -876,6 +976,7 @@ async fn storage<T: Send + 'static>(
         .map_err(ApiHttpError::internal)
 }
 
+#[allow(clippy::too_many_arguments)] // Same durable protocol identity across the blocking boundary.
 async fn store_durable_ready_async(
     gate: Arc<ExecutionGate>,
     key: String,
@@ -884,9 +985,19 @@ async fn store_durable_ready_async(
     owner: String,
     generation: u64,
     ttl: std::time::Duration,
+    binding: Option<service::ForkPlanBinding>,
 ) -> Result<durable::DurableIdempotencyRecord, durable::StoreReadyError> {
     tokio::task::spawn_blocking(move || {
-        durable::store_durable_ready_gated(&gate, &key, &digest, &run_id, &owner, generation, ttl)
+        durable::store_ready_bound(
+            &gate,
+            &key,
+            &digest,
+            &run_id,
+            &owner,
+            generation,
+            ttl,
+            binding.as_ref(),
+        )
     })
     .await
     .map_err(|error| {
@@ -928,10 +1039,11 @@ async fn write_orphan_record_async(
     run_id: String,
     key: String,
     digest: String,
+    binding: Option<service::ForkPlanBinding>,
 ) -> Result<(), String> {
     tokio::task::spawn_blocking(move || {
         let _gate = gate;
-        write_orphan_record(&runs_dir, &run_id, &key, &digest)
+        durable::write_orphan_bound(&runs_dir, &key, &digest, &run_id, binding.as_ref())
     })
     .await
     .map_err(|error| format!("idempotency orphan write task failed: {error}"))?
@@ -1096,6 +1208,7 @@ mod tests {
         state.idempotency.lock().await.insert(
             key.clone(),
             IdempotencyEntry::Pending {
+                binding: None,
                 digest: "digest".into(),
                 owner_id: successor,
                 created_at: Instant::now(),
@@ -1175,6 +1288,7 @@ mod tests {
             state.idempotency.lock().await.insert(
                 key.clone(),
                 IdempotencyEntry::Pending {
+                    binding: None,
                     digest: digest.clone(),
                     owner_id,
                     created_at: Instant::now(),
@@ -1614,6 +1728,179 @@ mod tests {
             "stale surplus run must be settled to terminal, got: {:?}",
             snapshot.state
         );
+    }
+
+    #[tokio::test]
+    async fn prepared_fork_binds_lineage_and_replays_ready_without_source() {
+        let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("prepared-coordinator-{}", uuid::Uuid::now_v7()));
+        let _temp_guard = ModTempGuard(runs.clone());
+        let state = mod_test_state(&runs);
+        let source = state
+            .service
+            .start_run(api::StartRun {
+                generator_id: "hello-template".into(),
+                inputs: BTreeMap::from([("name".into(), serde_json::json!("prepared"))]),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while !state
+                .service
+                .snapshot(source.clone())
+                .await
+                .unwrap()
+                .state
+                .is_terminal()
+            {
+                tokio::task::yield_now().await;
+            }
+            let lease = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(runs.join(&source).join("meta/execution.lock"))
+                .unwrap();
+            while lease.try_lock().is_err() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let source_dir = runs.join(&source);
+        fn observe(
+            root: &camino::Utf8Path,
+            dir: &camino::Utf8Path,
+            files: &mut Vec<service::ForkFileObservation>,
+        ) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = camino::Utf8PathBuf::from_path_buf(entry.path()).unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    observe(root, &path, files);
+                } else if entry.file_type().unwrap().is_file() {
+                    let bytes = std::fs::read(&path).unwrap();
+                    files.push(service::ForkFileObservation {
+                        path: path.strip_prefix(root).unwrap().into(),
+                        length: bytes.len() as u64,
+                        sha256: hex::encode(Sha256::digest(&bytes)),
+                    });
+                }
+            }
+        }
+        let mut files = Vec::new();
+        observe(&source_dir, &source_dir, &mut files);
+        let plan = service::PreparedForkPlan::new(&"a".repeat(64), files.clone()).unwrap();
+        let binding = plan.binding().clone();
+        let journal = std::fs::read_to_string(source_dir.join("meta/journal.jsonl")).unwrap();
+        let at_seq = journal
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["t"] == "run_started")
+            .unwrap()["seq"]
+            .as_u64()
+            .unwrap();
+        let body = serde_json::to_vec(&api::ForkRun {
+            at_seq,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(policy::IDEMPOTENCY_HEADER, "prepared-key".parse().unwrap());
+        let call = || IdempotentCall {
+            state: &state,
+            headers: &headers,
+            scope: "fork_run",
+            target: &source,
+            body: &body,
+            digest_context: None,
+            created: true,
+            reserved_run_id: Some("prepared-child".into()),
+            execute: |_| async { panic!("prepared path must use coordinated service admission") },
+        };
+        // A modified source stream binds the claim but cannot publish child content.
+        let workspace_file = files
+            .iter()
+            .find(|file| file.path.starts_with("workspace"))
+            .unwrap();
+        let changing = source_dir.join(&workspace_file.path);
+        let original = std::fs::read(&changing).unwrap();
+        std::fs::write(&changing, b"changed after preparation").unwrap();
+        assert!(
+            with_prepared_fork(call(), Some(plan.clone()))
+                .await
+                .is_err()
+        );
+        let pending_path = runs.join("idempotency").join(format!(
+            "{}.pending.json",
+            hex::encode(Sha256::digest(b"prepared-key"))
+        ));
+        let mut pending: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&pending_path).unwrap()).unwrap();
+        assert_eq!(pending["binding"], serde_json::to_value(&binding).unwrap());
+        assert_eq!(pending["run_id"], "prepared-child");
+        assert!(!runs.join("prepared-child").exists());
+        // Re-observing the changed stream cannot pair it with the original
+        // binding, even while the original bound Pending is recoverable.
+        let mut changed_files = files.clone();
+        let changed_file = changed_files
+            .iter_mut()
+            .find(|file| source_dir.join(&file.path) == changing)
+            .unwrap();
+        let changed_bytes = std::fs::read(&changing).unwrap();
+        changed_file.length = changed_bytes.len() as u64;
+        changed_file.sha256 = hex::encode(Sha256::digest(&changed_bytes));
+        let changed_plan = service::PreparedForkPlan::new(&"a".repeat(64), changed_files).unwrap();
+        assert_ne!(plan.binding(), changed_plan.binding());
+        let mismatch = with_prepared_fork(call(), Some(changed_plan))
+            .await
+            .unwrap_err();
+        assert_eq!(mismatch.problem.status, 409);
+        assert!(!runs.join("prepared-child").exists());
+        std::fs::write(&changing, original).unwrap();
+        pending["created_at_unix"] = serde_json::json!(0);
+        std::fs::write(&pending_path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        let response = with_prepared_fork(call(), Some(plan.clone()))
+            .await
+            .unwrap();
+        let location = response
+            .headers()
+            .get(axum::http::header::LOCATION)
+            .cloned();
+        let child = runs.join("prepared-child");
+        let lineage = std::fs::read_to_string(child.join("meta/journal.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["t"] == "run_forked")
+            .unwrap();
+        assert_eq!(lineage["binding"], serde_json::to_value(&binding).unwrap());
+        assert!(child.join("meta/fork-tree.commit.json").exists());
+        assert!(!child.join(".prepared-source").exists());
+        assert!(child.join("generator-package").is_dir());
+        let ready = durable::read_ready(&runs, "prepared-key").unwrap().unwrap();
+        assert_eq!(ready.binding, Some(binding));
+        std::fs::remove_dir_all(&source_dir).unwrap();
+        for disk_replay in [false, true] {
+            if disk_replay {
+                state.idempotency.lock().await.clear();
+            }
+            let replay = with_prepared_fork(call(), Some(plan.clone()))
+                .await
+                .unwrap();
+            assert_eq!(
+                replay.headers().get(axum::http::header::LOCATION),
+                location.as_ref()
+            );
+        }
+        let unbound = with_idempotency(call()).await.unwrap_err();
+        assert_eq!(unbound.problem.status, 409);
+        // Same diagnostic, different manifest must not replay the bound Ready.
+        files.retain(|file| !file.path.starts_with("workspace"));
+        let plan = service::PreparedForkPlan::new(&"a".repeat(64), files).unwrap();
+        let mismatch = with_prepared_fork(call(), Some(plan)).await.unwrap_err();
+        assert_eq!(mismatch.problem.status, 409);
     }
 
     #[test]

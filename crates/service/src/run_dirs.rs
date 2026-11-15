@@ -596,6 +596,7 @@ pub(crate) fn prepare_api_run_directory(run_dir: &Utf8Path) -> Result<(), Servic
 }
 
 /// Returns whether this call created the target directory (cleanup ownership).
+#[cfg(test)]
 pub(crate) fn prepare_checkpoint_fork(
     source_dir: &Utf8Path,
     source_id: &str,
@@ -604,6 +605,21 @@ pub(crate) fn prepare_checkpoint_fork(
     at_seq: u64,
     patch: &ForkStatePatch,
 ) -> Result<bool, ServiceError> {
+    prepare_checkpoint_fork_prepared(
+        source_dir, source_id, target_dir, target_id, at_seq, patch, None,
+    )
+    .map(|(created, _)| created)
+}
+
+pub(crate) fn prepare_checkpoint_fork_prepared(
+    source_dir: &Utf8Path,
+    source_id: &str,
+    target_dir: &Utf8Path,
+    target_id: &str,
+    at_seq: u64,
+    patch: &ForkStatePatch,
+    prepared: Option<&crate::PreparedForkPlan>,
+) -> Result<(bool, Option<crate::fork_plan::StagedSource>), ServiceError> {
     // An incomplete admission may retain its directory for a cancel mailbox.
     // Record actual create-dir ownership before populating; whole-directory
     // cleanup is permitted only for a fresh target, never a pre-existing one.
@@ -623,17 +639,31 @@ pub(crate) fn prepare_checkpoint_fork(
         // The empty journal is ignored by list readers. Publish the marker
         // before the first copied event can make this look like a live run.
         mark_fork_admission_pending(target_dir)?;
-        populate_checkpoint_fork(source_dir, source_id, target_dir, target_id, at_seq, patch)
+        let staged = prepared
+            .map(|plan| plan.stage(source_dir, target_dir))
+            .transpose()?;
+        populate_checkpoint_fork(
+            staged
+                .as_ref()
+                .map_or(source_dir, |staged| staged.0.as_path()),
+            source_id,
+            target_dir,
+            target_id,
+            at_seq,
+            patch,
+            prepared.map(crate::PreparedForkPlan::binding),
+        )?;
+        Ok(staged)
     });
-    if let Err(error) = result {
+    let staged = result.map_err(|error| {
         if created_fresh && let Err(cleanup) = std::fs::remove_dir_all(target_dir) {
-            return Err(ServiceError::Invalid(format!(
+            return ServiceError::Invalid(format!(
                 "{error}; failed to clean fresh fork: {cleanup}"
-            )));
+            ));
         }
-        return Err(error);
-    }
-    Ok(created_fresh)
+        error
+    })?;
+    Ok((created_fresh, staged))
 }
 
 fn populate_checkpoint_fork(
@@ -643,6 +673,7 @@ fn populate_checkpoint_fork(
     target_id: &str,
     at_seq: u64,
     patch: &ForkStatePatch,
+    binding: Option<&crate::ForkPlanBinding>,
 ) -> Result<(), ServiceError> {
     let source_meta = run_meta_dir(source_dir);
     let source_events = read_events_from_meta(&source_meta)?;
@@ -958,7 +989,7 @@ fn populate_checkpoint_fork(
         }
     }
     next_seq = next_seq.saturating_add(1);
-    let fork_event = json!({
+    let mut fork_event = json!({
         "t": "run_forked",
         "ts": chrono::Utc::now().to_rfc3339(),
         "seq": next_seq,
@@ -969,6 +1000,9 @@ fn populate_checkpoint_fork(
         "source_seq": at_seq,
         "fork_tree_commit_version": crate::fork_commit::VERSION,
     });
+    if let Some(binding) = binding {
+        fork_event["binding"] = serde_json::to_value(binding)?;
+    }
     serde_json::to_writer(&mut journal, &fork_event)?;
     journal.write_all(b"\n")?;
     if !patch.inputs.is_empty() || !patch.step_outputs.is_empty() || !patch.step_statuses.is_empty()

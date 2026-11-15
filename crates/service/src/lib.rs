@@ -16,6 +16,9 @@ mod invalidation;
 pub use idempotency_refs::MAX_IDEMPOTENCY_FILE_BYTES;
 pub use invalidation::require_run_directory;
 mod fork_commit;
+mod fork_plan;
+#[doc(hidden)]
+pub use fork_plan::{ForkFileObservation, ForkPlanBinding, PreparedForkPlan};
 mod lifecycle;
 mod queue;
 mod read_store;

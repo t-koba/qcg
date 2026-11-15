@@ -86,6 +86,7 @@ impl IdempotencyTiming {
 pub(crate) enum IdempotencyEntry {
     Pending {
         digest: String,
+        binding: Option<service::ForkPlanBinding>,
         owner_id: uuid::Uuid,
         created_at: Instant,
         completed: tokio::sync::watch::Sender<bool>,
@@ -174,6 +175,7 @@ mod tests {
         let ttl = policy::IDEMPOTENCY_TTL;
         let (completed, _) = tokio::sync::watch::channel(false);
         let record = |key: &str, created| DurableIdempotencyRecord {
+            binding: None,
             publication_id: None,
             key: key.into(),
             digest: "digest".into(),
@@ -199,6 +201,7 @@ mod tests {
             (
                 "pending".into(),
                 IdempotencyEntry::Pending {
+                    binding: None,
                     digest: "digest".into(),
                     owner_id: uuid::Uuid::now_v7(),
                     created_at: now,

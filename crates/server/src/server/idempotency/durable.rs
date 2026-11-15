@@ -4,12 +4,33 @@ use crate::server::error::ApiHttpError;
 use camino::Utf8PathBuf;
 use serde::{Deserialize, Serialize};
 use service::sync_dir_entry as sync_dir;
+fn ready_sync(runs_dir: &Utf8PathBuf) -> io::Result<()> {
+    #[cfg(test)]
+    if FAIL_READY_SYNC.with(|fail| fail.get())
+        || FAIL_READY_SYNC_AFTER.with(|remaining| {
+            let count = remaining.get();
+            remaining.set(count.saturating_sub(1));
+            count == 1
+        })
+    {
+        return Err(io::Error::other("injected Ready directory sync failure"));
+    }
+    sync_dir(&idempotency_dir(runs_dir))
+}
+#[cfg(test)]
+thread_local! {
+    static FAIL_READY_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static FAIL_READY_SYNC_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+use service::ForkPlanBinding;
 use sha2::{Digest, Sha256};
 use std::fs::File;
 use std::io::{self, Write as _};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct DurableIdempotencyRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<ForkPlanBinding>,
     pub(crate) key: String,
     pub(crate) digest: String,
     pub(crate) run_id: String,
@@ -337,7 +358,11 @@ fn reap_expired_ready_snapshot(
         return Ok((None, 0));
     };
     let record = parse_ready(key, bytes)?;
+    validate_bound_pair(&record, snapshot.pending.as_deref())?;
     let generation = record.generation;
+    if record.binding.is_some() {
+        ready_sync(runs_dir).map_err(|e| e.to_string())?;
+    }
     if record.expired_at(now_unix()?, ttl) {
         // I/O or sync errors abort expiry; ambiguous Pending stays unresolved.
         if retire_ready_pending(runs_dir, &record, None)? {
@@ -413,6 +438,8 @@ fn acquire_maintenance_lock(
 const TEMP_GRACE_SECS: u64 = 60;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DurablePendingRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<ForkPlanBinding>,
     key: String,
     digest: String,
     /// Adoption retains the reserved run across the execution/Ready crash gap.
@@ -457,6 +484,7 @@ pub(crate) fn claim_durable_pending_gated(
         false,
     )
 }
+#[cfg(test)]
 pub(crate) fn claim_durable_pending_for_target_gated(
     gate: &ExecutionGate,
     key: &str,
@@ -465,6 +493,28 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     ttl: std::time::Duration,
     timing: IdempotencyTiming,
     require_target: bool,
+) -> Result<ClaimOutcome, ApiHttpError> {
+    claim_pending_bound(
+        gate,
+        key,
+        digest,
+        reserved_run_id,
+        ttl,
+        timing,
+        require_target,
+        None,
+    )
+}
+#[allow(clippy::too_many_arguments)] // Exact protocol identity plus boot-frozen timing policy.
+pub(crate) fn claim_pending_bound(
+    gate: &ExecutionGate,
+    key: &str,
+    digest: &str,
+    reserved_run_id: Option<String>,
+    ttl: std::time::Duration,
+    timing: IdempotencyTiming,
+    require_target: bool,
+    binding: Option<&ForkPlanBinding>,
 ) -> Result<ClaimOutcome, ApiHttpError> {
     let runs_dir = &gate.runs_dir;
     gate.validate(key).map_err(ApiHttpError::internal)?;
@@ -489,13 +539,14 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             }
         };
     if let Some(committed) = committed_opt {
-        if committed.digest != digest {
+        if committed.digest != digest || committed.binding.as_ref() != binding {
             return Ok(ClaimOutcome::Conflict);
         }
         return Ok(ClaimOutcome::Ready(committed));
     }
     // Expired Pending adopts only for its original digest and run; a foreign
     // digest conflicts rather than replacing unresolved evidence.
+    let mut adopted_binding = None;
     let mut adopted: Option<String> = None;
     let mut operation_id = uuid::Uuid::now_v7().to_string();
     let pending_generation: u64 = match match snapshot.pending.as_deref() {
@@ -503,13 +554,17 @@ pub(crate) fn claim_durable_pending_for_target_gated(
         None => PendingRead::Absent,
     } {
         PendingRead::Valid(record) => {
-            if record.digest != digest {
+            if record.digest != digest
+                || (record.binding.is_some() && record.binding.as_ref() != binding)
+            {
                 return Ok(ClaimOutcome::Conflict);
             }
             return Ok(ClaimOutcome::Peer);
         }
         PendingRead::Expired(record) => {
-            if record.digest != digest {
+            if record.digest != digest
+                || (record.binding.is_some() && record.binding.as_ref() != binding)
+            {
                 return Ok(ClaimOutcome::Conflict);
             }
             let accepted_id = record.operation_id.as_deref().ok_or_else(|| {
@@ -523,6 +578,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             let generation = record.generation;
             operation_id = accepted_id.to_string();
             adopted = record.run_id.clone();
+            adopted_binding = record.binding.clone();
             generation
         }
         PendingRead::Absent => 0,
@@ -555,6 +611,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
     let owner = uuid::Uuid::now_v7().to_string();
     let generation = pending_generation_from_parsed(pending_generation, ready_generation);
     let record = DurablePendingRecord {
+        binding: adopted_binding,
         key: key.to_string(),
         digest: digest.to_string(),
         run_id: run_id.clone(),
@@ -606,7 +663,7 @@ pub(crate) fn claim_durable_pending_for_target_gated(
             },
         ));
     }
-    match sync_dir(&idempotency_dir(runs_dir)) {
+    match ready_sync(runs_dir) {
         Ok(()) => {
             // The locked predecessor is expired/absent; live claims returned Peer.
             Ok(ClaimOutcome::Owner {
@@ -733,11 +790,84 @@ pub(crate) fn release_durable_pending_gated(
             "idempotency claim at key `{key}` belongs to a different key; refusing release; operator action required"
         ));
     }
+    if current.binding.is_some() {
+        return Err("bound idempotency claim cannot be released by generic cleanup".into());
+    }
     if current.owner == owner && current.generation == generation {
         std::fs::remove_file(path.as_std_path()).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
+#[derive(Debug)]
+pub(crate) enum BindPendingError {
+    Conflict,
+    Storage(String),
+}
+impl From<String> for BindPendingError {
+    fn from(value: String) -> Self {
+        Self::Storage(value)
+    }
+}
+
+/// Bind once under metadata only: caller already holds target/source leases.
+/// Never acquire store maintenance here (it must precede a run lease).
+pub(crate) fn bind_pending_gated(
+    gate: &ExecutionGate,
+    key: &str,
+    digest: &str,
+    owner: &str,
+    generation: u64,
+    run_id: &str,
+    binding: &ForkPlanBinding,
+) -> Result<(), BindPendingError> {
+    gate.validate(key)?;
+    let runs = &gate.runs_dir;
+    let _metadata = acquire_idempotency_lock(runs)?;
+    let mut current = match read_durable_pending(runs, key, u64::MAX) {
+        PendingRead::Valid(record) | PendingRead::Expired(record) => record,
+        _ => {
+            return Err("binding requires an intact Pending claim"
+                .to_string()
+                .into());
+        }
+    };
+    if current.key != key
+        || current.digest != digest
+        || current.owner != owner
+        || current.generation != generation
+        || current.run_id.as_deref() != Some(run_id)
+        || current
+            .binding
+            .as_ref()
+            .is_some_and(|stored| stored != binding)
+    {
+        return Err(BindPendingError::Conflict);
+    }
+    if current.binding.is_none() {
+        current.binding = Some(binding.clone());
+        let bytes = serde_json::to_vec(&current).map_err(|e| e.to_string())?;
+        return replace_pending(runs, key, &bytes).map_err(Into::into);
+    }
+    // Exact replay retries the same directory sync if the original was unresolved.
+    sync_dir(&idempotency_dir(runs)).map_err(|e| BindPendingError::Storage(e.to_string()))
+}
+
+/// Caller owns the metadata lock; failed staging never replaces the predecessor.
+fn replace_pending(runs: &Utf8PathBuf, key: &str, bytes: &[u8]) -> Result<(), String> {
+    let tmp = expiry::temp_dir(runs)?.join(format!(
+        "{}.pending.tmp-{}",
+        hex::encode(Sha256::digest(key)),
+        uuid::Uuid::now_v7()
+    ));
+    if let Err(error) =
+        stage_pending(&tmp, bytes).and_then(|()| rename_verified(&tmp, &pending_path(runs, key)))
+    {
+        let _ = std::fs::remove_file(tmp);
+        return Err(error.to_string());
+    }
+    sync_dir(&idempotency_dir(runs)).map_err(|e| e.to_string())
+}
+
 /// What a pre-execution ownership recheck found (E02).
 pub(crate) enum OwnerCheck {
     /// Our claim still owns the key: safe to execute.
@@ -859,11 +989,14 @@ fn retire_ready_pending(
     ready: &DurableIdempotencyRecord,
     owner: Option<&str>,
 ) -> Result<bool, String> {
+    if ready.binding.is_some() {
+        ready_sync(runs_dir).map_err(|e| e.to_string())?;
+    }
     let path = pending_path(runs_dir, &ready.key);
     let bytes = match read_bounded_idempotency_file(&path) {
         // Retry sync when Pending was already unlinked but its sync failed.
         BoundedRead::Absent => {
-            sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
+            ready_sync(runs_dir).map_err(|error| error.to_string())?;
             return Ok(false);
         }
         BoundedRead::Present(bytes) => bytes,
@@ -881,6 +1014,7 @@ fn retire_ready_pending(
     };
     if pending.key != ready.key
         || pending.digest != ready.digest
+        || pending.binding != ready.binding
         || pending.run_id.as_deref() != Some(ready.run_id.as_str())
         || pending.generation != ready.generation
         || owner.is_some_and(|owner| pending.owner != owner)
@@ -889,7 +1023,14 @@ fn retire_ready_pending(
         return Ok(false);
     }
     std::fs::remove_file(&path).map_err(|error| error.to_string())?;
-    sync_dir(&idempotency_dir(runs_dir)).map_err(|error| error.to_string())?;
+    if let Err(error) = ready_sync(runs_dir) {
+        if ready.binding.is_some() {
+            // Restore exact Pending evidence if its retirement sync is unresolved.
+            replace_pending(runs_dir, &ready.key, &bytes)
+                .map_err(|restore| format!("{error}; Pending restoration failed: {restore}"))?;
+        }
+        return Err(error.to_string());
+    }
     Ok(true)
 }
 /// Read live digest before package preflight so exact pending retries can join.
@@ -969,7 +1110,53 @@ pub(super) fn read_ready(
         BoundedRead::Absent => return Ok(None),
         BoundedRead::Unreadable(error) => return Err(error),
     };
-    parse_ready(key, &bytes).map(Some)
+    let record = parse_ready(key, &bytes)?;
+    let pending = match read_bounded_idempotency_file(&pending_path(runs_dir, key)) {
+        BoundedRead::Present(bytes) => Some(bytes),
+        BoundedRead::Absent => None,
+        BoundedRead::Unreadable(error) if record.binding.is_some() => return Err(error),
+        BoundedRead::Unreadable(_) => None,
+    };
+    validate_bound_pair(&record, pending.as_deref())?;
+    if record.binding.is_some() {
+        ready_sync(runs_dir).map_err(|error| error.to_string())?;
+    }
+    Ok(Some(record))
+}
+fn validate_bound_pair(
+    ready: &DurableIdempotencyRecord,
+    pending: Option<&[u8]>,
+) -> Result<(), String> {
+    let Some(bytes) = pending else {
+        return Ok(());
+    };
+    let pending: DurablePendingRecord = match serde_json::from_slice(bytes) {
+        Ok(record) => record,
+        Err(error) if ready.binding.is_some() => return Err(error.to_string()),
+        Err(error) => {
+            if serde_json::from_slice::<serde_json::Value>(bytes)
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .get("binding")
+                        .is_some_and(|binding| !binding.is_null())
+                })
+            {
+                return Err(error.to_string());
+            }
+            return Ok(());
+        }
+    };
+    if (ready.binding.is_some() || pending.binding.is_some())
+        && (pending.key != ready.key
+            || pending.digest != ready.digest
+            || pending.binding != ready.binding
+            || pending.generation != ready.generation
+            || pending.run_id.as_deref() != Some(&ready.run_id))
+    {
+        return Err("Ready/Pending binding identity mismatch".into());
+    }
+    Ok(())
 }
 fn parse_ready(key: &str, bytes: &[u8]) -> Result<DurableIdempotencyRecord, String> {
     if bytes.is_empty() {
@@ -994,12 +1181,23 @@ pub(crate) enum WaitOutcome {
 }
 /// Wait for equal-digest Ready; conflict on other digests. Retry vanished/
 /// expired pending, but report 503 for live claims held past the deadline.
+#[cfg(test)]
 pub(crate) async fn wait_for_peer_ready(
     runs_dir: &Utf8PathBuf,
     key: &str,
     digest: &str,
     ttl: std::time::Duration,
     timing: IdempotencyTiming,
+) -> Result<WaitOutcome, ApiHttpError> {
+    wait_for_peer_bound(runs_dir, key, digest, ttl, timing, None).await
+}
+pub(crate) async fn wait_for_peer_bound(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+    digest: &str,
+    ttl: std::time::Duration,
+    timing: IdempotencyTiming,
+    binding: Option<&ForkPlanBinding>,
 ) -> Result<WaitOutcome, ApiHttpError> {
     let started = tokio::time::Instant::now();
     loop {
@@ -1018,20 +1216,24 @@ pub(crate) async fn wait_for_peer_ready(
             .await?
         };
         if let Some(record) = ready {
-            if record.digest != digest {
+            if record.digest != digest || record.binding.as_ref() != binding {
                 return Err(idempotency_conflict());
             }
             return Ok(WaitOutcome::Ready(record));
         }
         let retry = match pending {
             PendingRead::Valid(pending) => {
-                if pending.digest != digest {
+                if pending.digest != digest
+                    || (pending.binding.is_some() && pending.binding.as_ref() != binding)
+                {
                     return Err(idempotency_conflict());
                 }
                 None
             }
             PendingRead::Expired(pending) => {
-                if pending.digest != digest {
+                if pending.digest != digest
+                    || (pending.binding.is_some() && pending.binding.as_ref() != binding)
+                {
                     return Err(idempotency_conflict());
                 }
                 Some(WaitOutcome::RetryClaim {
@@ -1052,7 +1254,7 @@ pub(crate) async fn wait_for_peer_ready(
             if let Some(record) =
                 super::load_durable_ready_async(runs_dir.clone(), key.into(), ttl).await?
             {
-                if record.digest != digest {
+                if record.digest != digest || record.binding.as_ref() != binding {
                     return Err(idempotency_conflict());
                 }
                 return Ok(WaitOutcome::Ready(record));
@@ -1103,6 +1305,7 @@ pub(crate) fn store_durable_ready(
     let gate = test_gate(runs_dir, key)?;
     store_durable_ready_gated(&gate, key, digest, run_id, owner, generation, ttl)
 }
+#[cfg(test)]
 pub(crate) fn store_durable_ready_gated(
     gate: &ExecutionGate,
     key: &str,
@@ -1111,6 +1314,19 @@ pub(crate) fn store_durable_ready_gated(
     owner: &str,
     generation: u64,
     ttl: std::time::Duration,
+) -> Result<DurableIdempotencyRecord, StoreReadyError> {
+    store_ready_bound(gate, key, digest, run_id, owner, generation, ttl, None)
+}
+#[allow(clippy::too_many_arguments)] // Exact protocol identity plus boot-frozen timing policy.
+pub(crate) fn store_ready_bound(
+    gate: &ExecutionGate,
+    key: &str,
+    digest: &str,
+    run_id: &str,
+    owner: &str,
+    generation: u64,
+    ttl: std::time::Duration,
+    binding: Option<&ForkPlanBinding>,
 ) -> Result<DurableIdempotencyRecord, StoreReadyError> {
     let runs_dir = &gate.runs_dir;
     gate.validate(key)?;
@@ -1129,7 +1345,7 @@ pub(crate) fn store_durable_ready_gated(
                 pending.generation
             )));
         }
-        if pending.digest != digest {
+        if pending.digest != digest || pending.binding.as_ref() != binding {
             return Err(StoreReadyError::Storage(
                 "idempotency claim was admitted for different content; commit refused".into(),
             ));
@@ -1148,7 +1364,10 @@ pub(crate) fn store_durable_ready_gated(
         .map(|bytes| parse_pending_bytes(key, bytes, u64::MAX))
         .unwrap_or(PendingRead::Absent);
     if let Some(existing) = existing {
-        if existing.digest != digest {
+        if existing.binding.is_some() {
+            ready_sync(runs_dir).map_err(|e| e.to_string())?;
+        }
+        if existing.digest != digest || existing.binding.as_ref() != binding {
             return Err(StoreReadyError::DigestConflict);
         }
         // Absent permits replay after release; damaged evidence fails closed.
@@ -1160,6 +1379,9 @@ pub(crate) fn store_durable_ready_gated(
                     && existing.generation == generation
                     && let Err(error) = retire_ready_pending(runs_dir, &existing, Some(owner))
                 {
+                    if binding.is_some() {
+                        return Err(error.into());
+                    }
                     tracing::warn!(%error, "Ready committed; pending retirement incomplete");
                 }
                 return Ok(existing);
@@ -1193,6 +1415,7 @@ pub(crate) fn store_durable_ready_gated(
         }
     }
     let record = DurableIdempotencyRecord {
+        binding: binding.cloned(),
         publication_id: Some(uuid::Uuid::now_v7().to_string()),
         key: key.to_string(),
         digest: digest.to_string(),
@@ -1239,15 +1462,20 @@ pub(crate) fn store_durable_ready_gated(
         let _ = std::fs::remove_file(tmp.as_std_path());
         return Err(error.to_string().into());
     }
-    // Q2: Ready directory-sync failure remains warn-only. The synced file
-    // covers process crashes, not power loss of the directory entry; duplicate
-    // execution under power loss is accepted in docs/operations.md.
-    if let Err(error) = sync_dir(&idempotency_dir(runs_dir)) {
+    // Q2 remains warn-only for ordinary claims; a bound claim stays unresolved
+    // until directory sync succeeds, so Pending must remain on this failure.
+    if let Err(error) = ready_sync(runs_dir) {
+        if binding.is_some() {
+            return Err(error.to_string().into());
+        }
         tracing::warn!(%error, "idempotency ready directory sync failed; file sync already durable");
     }
     // Ready is committed: retirement failure must not turn success into a
     // retryable mutation. Exact Ready expiry can retry leftover retirement.
     if let Err(error) = retire_ready_pending(runs_dir, &record, Some(owner)) {
+        if binding.is_some() {
+            return Err(error.into());
+        }
         tracing::warn!(%error, "Ready committed; pending retirement incomplete");
     }
     Ok(record)
@@ -1256,6 +1484,8 @@ pub(crate) fn store_durable_ready_gated(
 /// Ready. Unreadable sidecars fail closed rather than risk duplicate execution.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct OrphanIdempotencyRecord {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) binding: Option<ForkPlanBinding>,
     pub(crate) key: String,
     pub(crate) digest: String,
     pub(crate) run_id: String,
@@ -1266,14 +1496,13 @@ fn orphan_path_for_run(runs_dir: &Utf8PathBuf, run_id: &str) -> Utf8PathBuf {
     runs_dir.join(run_id).join("meta").join("idempotency.json")
 }
 /// Best-effort sidecar written after successful execution, before Ready.
-pub(crate) fn write_orphan_record(
+pub(crate) fn write_orphan_bound(
     runs_dir: &Utf8PathBuf,
-    run_id: &str,
     key: &str,
     digest: &str,
+    run_id: &str,
+    binding: Option<&ForkPlanBinding>,
 ) -> Result<(), String> {
-    // Fail closed on unsafe run ids: an absolute or traversing id must
-    // never escape the runs directory into an arbitrary write.
     if run_id.is_empty()
         || run_id.contains('/')
         || run_id.contains('\\')
@@ -1290,7 +1519,27 @@ pub(crate) fn write_orphan_record(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent.as_std_path()).map_err(|error| error.to_string())?;
     }
+    match read_bounded_idempotency_file(&path) {
+        BoundedRead::Present(bytes) => {
+            let existing: OrphanIdempotencyRecord =
+                serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+            if (existing.binding.is_some() || binding.is_some())
+                && (existing.key != key
+                    || existing.digest != digest
+                    || existing.run_id != run_id
+                    || existing.binding.as_ref() != binding)
+            {
+                return Err("orphan binding conflict".into());
+            }
+            if binding.is_some() {
+                return Ok(());
+            }
+        }
+        BoundedRead::Unreadable(error) => return Err(error),
+        BoundedRead::Absent => {}
+    }
     let record = OrphanIdempotencyRecord {
+        binding: binding.cloned(),
         key: key.to_string(),
         digest: digest.to_string(),
         run_id: run_id.to_string(),
@@ -1322,13 +1571,29 @@ pub(crate) fn write_orphan_record(
 /// but refuse mismatched run identities or duplicate associations. Concurrent
 /// sidecar publication may be missed; commit ownership settles surplus runs.
 /// Expired sidecars are skipped and best-effort removed.
+#[cfg(test)]
 pub(crate) fn find_orphan_run(
     runs_dir: &Utf8PathBuf,
     key: &str,
     ttl: std::time::Duration,
 ) -> Result<Option<(String, String)>, String> {
+    find_orphan_bound(runs_dir, key, ttl, None)?
+        .map(|record| {
+            if record.binding.is_some() {
+                return Err("orphan binding mismatch".into());
+            }
+            Ok((record.run_id, record.digest))
+        })
+        .transpose()
+}
+pub(crate) fn find_orphan_bound(
+    runs_dir: &Utf8PathBuf,
+    key: &str,
+    ttl: std::time::Duration,
+    binding: Option<&ForkPlanBinding>,
+) -> Result<Option<OrphanIdempotencyRecord>, String> {
     let entries = std::fs::read_dir(runs_dir.as_std_path()).map_err(|error| error.to_string())?;
-    let mut found: Option<(String, String)> = None;
+    let mut found: Option<OrphanIdempotencyRecord> = None;
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let Some(file_name) = entry.file_name().to_str().map(str::to_owned) else {
@@ -1356,6 +1621,13 @@ pub(crate) fn find_orphan_run(
         let record: OrphanIdempotencyRecord = match serde_json::from_slice(&bytes) {
             Ok(record) => record,
             Err(error) => {
+                if binding.is_some()
+                    || serde_json::from_slice::<serde_json::Value>(&bytes)
+                        .ok()
+                        .is_some_and(|v| v.get("binding").is_some() || v["key"] == key)
+                {
+                    return Err(format!("unusable orphan sidecar: {error}"));
+                }
                 tracing::warn!(path = %orphan_path, %error, "skipping corrupt orphan sidecar");
                 continue;
             }
@@ -1385,8 +1657,12 @@ pub(crate) fn find_orphan_run(
         // A key names at most one run with one digest: duplicate sidecars
         // for the same key with different runs or different digests are
         // damage, never readdir-order dependent (E02).
-        if let Some((existing_run, existing_digest)) = &found {
-            if existing_run != &record.run_id || existing_digest != &record.digest {
+        if let Some(existing) = &found {
+            let (existing_run, existing_digest) = (&existing.run_id, &existing.digest);
+            if existing_run != &record.run_id
+                || existing_digest != &record.digest
+                || existing.binding != record.binding
+            {
                 return Err(format!(
                     "duplicate orphan records for key `{key}`: (`{existing_run}`, digest `{existing_digest}`) vs (`{}`, digest `{}`)",
                     record.run_id, record.digest
@@ -1394,7 +1670,7 @@ pub(crate) fn find_orphan_run(
             }
             continue;
         }
-        found = Some((record.run_id, record.digest));
+        found = Some(record);
     }
     Ok(found)
 }
@@ -1661,6 +1937,7 @@ mod tests {
         let _guard = TempGuard(runs_dir.clone());
         let created = 1_000_000;
         let record = DurableIdempotencyRecord {
+            binding: None,
             publication_id: Some(uuid::Uuid::now_v7().to_string()),
             key: "near-expired".into(),
             digest: "digest".into(),
@@ -1827,6 +2104,7 @@ mod tests {
             Ok(OwnerCheck::Absent)
         ));
         let claim = |owner: &str, generation: u64| DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
@@ -1896,6 +2174,7 @@ mod tests {
             .expect("idempotency dir should be created");
         // Foreign-key file: key field differs from the lookup key.
         let foreign = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: "other".into(),
             digest: "d".into(),
@@ -1922,6 +2201,7 @@ mod tests {
         // `check_pending_owner` call acquires the same key's gate, so the
         // exact holder cannot have been replaced between aging and recheck.
         let expired = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
@@ -2210,6 +2490,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let foreign = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: "other".into(),
             digest: "d".into(),
@@ -2247,6 +2528,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let claim = |owner: &str, generation: u64| DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "d".into(),
@@ -2300,6 +2582,7 @@ mod tests {
         std::fs::create_dir_all(run_dir.join("meta").as_std_path())
             .expect("meta dir should be created");
         let stale = OrphanIdempotencyRecord {
+            binding: None,
             key: "key-ttl".to_string(),
             digest: "old-digest".to_string(),
             run_id: "run-old".to_string(),
@@ -2409,6 +2692,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let ready = |age_secs: u64| DurableIdempotencyRecord {
+            binding: None,
             publication_id: None,
             key: key.into(),
             digest: "d".into(),
@@ -2786,6 +3070,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let predecessor = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
@@ -2801,6 +3086,7 @@ mod tests {
         )
         .expect("predecessor claim should be written");
         let successor = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
@@ -2951,6 +3237,7 @@ mod tests {
         std::fs::create_dir_all(idempotency_dir(&runs_dir).as_std_path())
             .expect("idempotency dir should be created");
         let reservationless = DurablePendingRecord {
+            binding: None,
             operation_id: Some(uuid::Uuid::now_v7().to_string()),
             key: key.into(),
             digest: "digest".into(),
@@ -3184,5 +3471,369 @@ mod tests {
                 b"outside destination"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod plan_binding_tests {
+    use super::*;
+    fn binding(byte: char) -> ForkPlanBinding {
+        serde_json::from_value(
+            serde_json::json!({"binding_version": 1, "plan_digest": byte.to_string().repeat(64)}),
+        )
+        .unwrap()
+    }
+    struct Fixture(Utf8PathBuf);
+    impl Fixture {
+        fn new() -> Self {
+            Self(
+                Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                    .unwrap()
+                    .join(format!("qcg-binding-{}", uuid::Uuid::now_v7())),
+            )
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn claim(gate: &ExecutionGate, binding: Option<&ForkPlanBinding>) -> (String, u64) {
+        match claim_pending_bound(
+            gate,
+            "key",
+            "request",
+            Some("child".into()),
+            policy::IDEMPOTENCY_TTL,
+            IdempotencyTiming::DEFAULT,
+            false,
+            binding,
+        )
+        .unwrap()
+        {
+            ClaimOutcome::Owner {
+                owner,
+                generation,
+                run_id,
+                ..
+            } => {
+                assert_eq!(run_id.as_deref(), Some("child"));
+                (owner, generation)
+            }
+            _ => panic!("expected owner"),
+        }
+    }
+    #[test]
+    fn bound_cas_reclaim_release_and_ready_identity() {
+        let fixture = Fixture::new();
+        let gate = test_gate(&fixture.0, "key").unwrap();
+        let (owner, generation) = claim(&gate, Some(&binding('a')));
+        let path = pending_path(&fixture.0, "key");
+        let original = std::fs::read(&path).unwrap();
+        let unbound: DurablePendingRecord = serde_json::from_slice(&original).unwrap();
+        assert!(unbound.binding.is_none());
+        for (key, digest, claimant, candidate_generation, child) in [
+            ("key", "request", "stale", generation, "child"),
+            ("key", "request", owner.as_str(), generation + 1, "child"),
+            ("key", "other", owner.as_str(), generation, "child"),
+            ("key", "request", owner.as_str(), generation, "other"),
+            ("other", "request", owner.as_str(), generation, "child"),
+        ] {
+            assert!(
+                bind_pending_gated(
+                    &gate,
+                    key,
+                    digest,
+                    claimant,
+                    candidate_generation,
+                    child,
+                    &binding('a')
+                )
+                .is_err()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+        }
+        bind_pending_gated(
+            &gate,
+            "key",
+            "request",
+            &owner,
+            generation,
+            "child",
+            &binding('a'),
+        )
+        .unwrap();
+        let bound = std::fs::read(&path).unwrap();
+        bind_pending_gated(
+            &gate,
+            "key",
+            "request",
+            &owner,
+            generation,
+            "child",
+            &binding('a'),
+        )
+        .unwrap();
+        assert!(
+            bind_pending_gated(
+                &gate,
+                "key",
+                "request",
+                &owner,
+                generation,
+                "child",
+                &binding('b')
+            )
+            .is_err()
+        );
+        assert!(release_durable_pending_gated(&gate, "key", &owner, generation).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bound);
+        let mut pending: DurablePendingRecord = serde_json::from_slice(&bound).unwrap();
+        pending.created_at_unix = 0;
+        std::fs::write(&path, serde_json::to_vec(&pending).unwrap()).unwrap();
+        assert!(matches!(
+            claim_pending_bound(
+                &gate,
+                "key",
+                "request",
+                None,
+                policy::IDEMPOTENCY_TTL,
+                IdempotencyTiming::DEFAULT,
+                false,
+                None
+            )
+            .unwrap(),
+            ClaimOutcome::Conflict
+        ));
+        let (adopter, next) = claim(&gate, Some(&binding('a')));
+        assert_ne!(adopter, owner);
+        assert_eq!(next, generation + 1);
+        let adopted: DurablePendingRecord =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(adopted.binding, Some(binding('a')));
+        assert_eq!(adopted.operation_id, pending.operation_id);
+        assert!(
+            bind_pending_gated(
+                &gate,
+                "key",
+                "request",
+                &owner,
+                generation,
+                "child",
+                &binding('a')
+            )
+            .is_err()
+        );
+        assert!(
+            store_ready_bound(
+                &gate,
+                "key",
+                "request",
+                "child",
+                &adopter,
+                next,
+                policy::IDEMPOTENCY_TTL,
+                None
+            )
+            .is_err()
+        );
+        let ready = store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &adopter,
+            next,
+            policy::IDEMPOTENCY_TTL,
+            Some(&binding('a')),
+        )
+        .unwrap();
+        assert_eq!(ready.binding, Some(binding('a')));
+        assert!(!path.exists());
+        assert_eq!(
+            store_ready_bound(
+                &gate,
+                "key",
+                "request",
+                "child",
+                &adopter,
+                next,
+                policy::IDEMPOTENCY_TTL,
+                Some(&binding('a'))
+            )
+            .unwrap(),
+            ready
+        );
+        assert!(matches!(
+            store_ready_bound(
+                &gate,
+                "key",
+                "request",
+                "child",
+                &adopter,
+                next,
+                policy::IDEMPOTENCY_TTL,
+                Some(&binding('b'))
+            ),
+            Err(StoreReadyError::DigestConflict)
+        ));
+        write_orphan_bound(&fixture.0, "key", "request", "child", Some(&binding('a'))).unwrap();
+        let orphan = std::fs::read(orphan_path_for_run(&fixture.0, "child")).unwrap();
+        assert!(write_orphan_bound(&fixture.0, "key", "request", "child", None).is_err());
+        assert_eq!(
+            std::fs::read(orphan_path_for_run(&fixture.0, "child")).unwrap(),
+            orphan
+        );
+        assert_eq!(
+            find_orphan_bound(
+                &fixture.0,
+                "key",
+                policy::IDEMPOTENCY_TTL,
+                Some(&binding('a'))
+            )
+            .unwrap()
+            .map(|r| (r.run_id, r.digest)),
+            Some(("child".into(), "request".into()))
+        );
+        assert!(find_orphan_run(&fixture.0, "key", policy::IDEMPOTENCY_TTL).is_err());
+    }
+    #[test]
+    fn bound_records_and_pairs_fail_closed_on_damage() {
+        let fixture = Fixture::new();
+        let gate = test_gate(&fixture.0, "key").unwrap();
+        let (owner, generation) = claim(&gate, Some(&binding('a')));
+        bind_pending_gated(
+            &gate,
+            "key",
+            "request",
+            &owner,
+            generation,
+            "child",
+            &binding('a'),
+        )
+        .unwrap();
+        let pending_path = pending_path(&fixture.0, "key");
+        let pending = std::fs::read(&pending_path).unwrap();
+        let ready = store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &owner,
+            generation,
+            policy::IDEMPOTENCY_TTL,
+            Some(&binding('a')),
+        )
+        .unwrap();
+        std::fs::write(&pending_path, &pending).unwrap();
+        let mut damaged: serde_json::Value = serde_json::from_slice(&pending).unwrap();
+        damaged["binding"] = serde_json::to_value(binding('b')).unwrap();
+        std::fs::write(&pending_path, serde_json::to_vec(&damaged).unwrap()).unwrap();
+        assert!(read_ready(&fixture.0, "key").is_err());
+        damaged["binding"]["binding_version"] = serde_json::json!(2);
+        let damaged = serde_json::to_vec(&damaged).unwrap();
+        std::fs::write(&pending_path, &damaged).unwrap();
+        assert!(matches!(
+            read_durable_pending(&fixture.0, "key", u64::MAX),
+            PendingRead::Unusable(_)
+        ));
+        assert!(release_durable_pending_gated(&gate, "key", &owner, generation).is_err());
+        assert!(read_ready(&fixture.0, "key").is_err());
+        assert_eq!(std::fs::read(&pending_path).unwrap(), damaged);
+        let mut ready = serde_json::to_value(ready).unwrap();
+        ready["binding"]["unknown"] = serde_json::json!(true);
+        std::fs::write(
+            idempotency_path(&fixture.0, "key"),
+            serde_json::to_vec(&ready).unwrap(),
+        )
+        .unwrap();
+        assert!(read_ready(&fixture.0, "key").is_err());
+    }
+
+    #[test]
+    fn bound_ready_sync_failure_retains_pending_until_exact_sync_retry() {
+        let fixture = Fixture::new();
+        let gate = test_gate(&fixture.0, "key").unwrap();
+        let (owner, generation) = claim(&gate, Some(&binding('a')));
+        bind_pending_gated(
+            &gate,
+            "key",
+            "request",
+            &owner,
+            generation,
+            "child",
+            &binding('a'),
+        )
+        .unwrap();
+        let path = pending_path(&fixture.0, "key");
+        let pending = std::fs::read(&path).unwrap();
+        FAIL_READY_SYNC.with(|flag| flag.set(true));
+        let result = store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &owner,
+            generation,
+            policy::IDEMPOTENCY_TTL,
+            Some(&binding('a')),
+        );
+        let replay = load_durable_ready_result(&fixture.0, "key", policy::IDEMPOTENCY_TTL);
+        FAIL_READY_SYNC.with(|flag| flag.set(false));
+        assert!(result.is_err());
+        assert!(replay.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), pending);
+        let ready_bytes = std::fs::read(idempotency_path(&fixture.0, "key")).unwrap();
+        // On an existing Ready retry: snapshot sync, replay sync, pre-retirement
+        // sync, then the unlink sync. Its failure restores exact bound Pending.
+        FAIL_READY_SYNC_AFTER.with(|remaining| remaining.set(4));
+        let retirement = store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &owner,
+            generation,
+            policy::IDEMPOTENCY_TTL,
+            Some(&binding('a')),
+        );
+        FAIL_READY_SYNC_AFTER.with(|remaining| remaining.set(0));
+        assert!(retirement.is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), pending);
+        store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &owner,
+            generation,
+            policy::IDEMPOTENCY_TTL,
+            Some(&binding('a')),
+        )
+        .unwrap();
+        assert!(!path.exists());
+        assert_eq!(
+            std::fs::read(idempotency_path(&fixture.0, "key")).unwrap(),
+            ready_bytes
+        );
+        let ordinary = Fixture::new();
+        let gate = test_gate(&ordinary.0, "key").unwrap();
+        let (owner, generation) = claim(&gate, None);
+        FAIL_READY_SYNC.with(|flag| flag.set(true));
+        let result = store_ready_bound(
+            &gate,
+            "key",
+            "request",
+            "child",
+            &owner,
+            generation,
+            policy::IDEMPOTENCY_TTL,
+            None,
+        );
+        FAIL_READY_SYNC.with(|flag| flag.set(false));
+        assert!(
+            result.unwrap().binding.is_none(),
+            "ordinary sync failure remains warn-only"
+        );
     }
 }

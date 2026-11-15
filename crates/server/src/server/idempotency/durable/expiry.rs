@@ -451,6 +451,7 @@ mod tests {
 
     fn ready(runs: &Utf8PathBuf, key: &str, created: u64, indexed: bool) -> Utf8PathBuf {
         let record = DurableIdempotencyRecord {
+            binding: None,
             key: key.into(),
             digest: "digest".into(),
             run_id: "run".into(),
@@ -863,6 +864,7 @@ mod tests {
         for created in [1, live_created] {
             let key = format!("pending-{created}");
             let record = DurablePendingRecord {
+                binding: None,
                 operation_id: Some(uuid::Uuid::now_v7().to_string()),
                 key: key.clone(),
                 digest: "digest".into(),
@@ -1323,6 +1325,7 @@ mod tests {
         fs::remove_dir(&temps).unwrap();
         fs::write(&temps, b"publication obstruction").unwrap();
         let record = DurableIdempotencyRecord {
+            binding: None,
             key: "unpublished".into(),
             digest: "digest".into(),
             run_id: "run".into(),
