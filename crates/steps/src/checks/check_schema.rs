@@ -1,4 +1,4 @@
-use crate::common::{bounded_transform_text, package_file, parse_json, require};
+use crate::common::{bounded_transform_text, open_package_read, package_file, parse_json, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_findings};
@@ -85,12 +85,17 @@ fn load_package_schema(
     relative: &str,
 ) -> Result<Value, StepError> {
     let path = package_file(contract, node, relative, "schema")?;
-    let file = std::fs::File::open(&path).map_err(|error| {
-        StepError::failed(
-            &node.id,
-            format!("failed to read schema package file `{relative}`: {error}"),
-        )
-    })?;
+    read_package_schema(node, &path, relative)
+}
+
+fn read_package_schema(
+    node: &NodeDef,
+    path: &camino::Utf8Path,
+    relative: &str,
+) -> Result<Value, StepError> {
+    // `package_file` checks the pathname for useful diagnostics; only this
+    // opened-handle no-follow check is authoritative against a swapped leaf.
+    let file = open_package_read(node, path, "schema")?;
     let mut bytes = Vec::new();
     file.take((MAX_JSON_SCHEMA_BYTES + 1) as u64)
         .read_to_end(&mut bytes)
@@ -127,6 +132,39 @@ fn load_package_schema(
 mod tests {
     use super::*;
     use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+
+    #[cfg(unix)]
+    #[test]
+    fn schema_reader_refuses_a_terminal_symlink_after_path_resolution() {
+        let (_contract, root) = crate::common::test_helpers::test_contract("schema-symlink");
+        let node = package_node(
+            "check-schema",
+            "check.schema",
+            "source = \"value.json\"\nschema = \"schema.json\"",
+        );
+        let target = root.with_file_name(format!(
+            "{}-outside-schema.json",
+            root.file_name().expect("test root has a name")
+        ));
+        std::fs::write(&target, r#"{"type":"string"}"#).expect("outside schema should be written");
+        let link = root.join("schema-link.json");
+        std::os::unix::fs::symlink(&target, &link).expect("schema symlink should be created");
+
+        // `package_file` normally rejects this symlink during its pathname
+        // probe. Calling the handle reader directly models replacement after
+        // that probe and verifies that the authoritative open still refuses it.
+        let error = read_package_schema(&node, &link, "schema-link.json")
+            .expect_err("terminal schema symlink must not be followed");
+        assert!(
+            error
+                .to_string()
+                .contains("schema package path is not readable"),
+            "{error}"
+        );
+        std::fs::remove_file(link).expect("schema symlink should be removed");
+        std::fs::remove_file(target).expect("outside schema should be removed");
+        std::fs::remove_dir_all(root).expect("test package should be removed");
+    }
 
     #[tokio::test]
     async fn check_schema_guards_number_tokens_before_deserialization() {
