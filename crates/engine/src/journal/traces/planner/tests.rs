@@ -60,12 +60,17 @@ impl StepExecutor for Probe {
                     ReadIdentity::Digest(Sha256::digest(&bytes).into()),
                 );
         }
+        if node.output.as_deref() == Some("a_result") {
+            let _ = ctx.vars.get_path("steps.b.output");
+        }
         if node.id == "b" {
             Ok(StepOutcome::check_failed(vec![model::Finding::error(
                 "probe check failure".into(),
                 None,
                 None,
             )]))
+        } else if node.output.as_deref() == Some("a_result") {
+            Ok(StepOutcome::success(Some(json!({"value": "source"}))))
         } else {
             Ok(StepOutcome::success(None))
         }
@@ -113,6 +118,16 @@ impl Fixture {
         Self::with_package(version, false).await
     }
     async fn with_package(version: Option<&'static str>, package: bool) -> Self {
+        Self::with_options(version, package, false).await
+    }
+    async fn with_output_dependency() -> Self {
+        Self::with_options(Some("1"), false, true).await
+    }
+    async fn with_options(
+        version: Option<&'static str>,
+        package: bool,
+        output_dependency: bool,
+    ) -> Self {
         let dir = crate::test_support::TestDir::create("source-diagnostic");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
         let run_dir = root.join("source-probe");
@@ -123,9 +138,7 @@ impl Fixture {
         };
         std::fs::create_dir_all(&package_root).unwrap();
         std::fs::write(package_root.join("schema.json"), b"{}").unwrap();
-        std::fs::write(
-            package_root.join(contract::MANIFEST_FILE),
-            r#"
+        let mut manifest = r#"
 [generator]
 id = "probe"
 name = "Probe"
@@ -149,9 +162,20 @@ type = "test.probe"
 [[flow]]
 id = "b"
 type = "test.probe"
-"#,
-        )
-        .unwrap();
+"#
+        .to_owned();
+        if output_dependency {
+            let replaced = manifest.replace(
+                "id = \"a\"\ntype = \"test.probe\"\n",
+                "id = \"a\"\ntype = \"test.probe\"\noutput = \"a_result\"\n",
+            );
+            assert_ne!(
+                replaced, manifest,
+                "fixture alias must be included in its contract hash"
+            );
+            manifest = replaced;
+        }
+        std::fs::write(package_root.join(contract::MANIFEST_FILE), manifest).unwrap();
         let contract = Contract::load(&package_root).unwrap();
         let metadata = run_dir.join("meta");
         let workspace = run_dir.join("workspace");
@@ -291,6 +315,63 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
         std::fs::read(f.workspace.join("private.json")).unwrap(),
         b"{}"
     );
+}
+
+#[tokio::test]
+async fn retry_root_invalidates_success_that_read_its_missing_output() {
+    // a reads b's output while absent. A retry may introduce it, so a cannot
+    // be preserved just because its source-time missing read still matches.
+    let f = Fixture::with_output_dependency().await;
+    let plan = f.analyze().unwrap();
+    assert_eq!(plan.retry_roots, ["b"]);
+    assert_eq!(plan.stale_outcomes, ["a"]);
+    assert!(plan.preserved_outcomes.is_empty());
+}
+
+#[tokio::test]
+async fn stale_output_propagates_to_transitive_alias_consumers() {
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    contract.graph.nodes.get_mut("a").unwrap().output = Some("a_result".into());
+    let mut c = contract.graph.nodes["b"].clone();
+    c.id = "c".into();
+    c.output = Some("c_result".into());
+    contract.graph.nodes.insert(c.id.clone(), c);
+
+    let dependency = |owner: &str, step: &str| ReadDependency {
+        owner: ReadOwner::Node(owner.into()),
+        path: vec!["steps".into(), step.into(), "output".into()],
+        kind: ReadKind::Lookup,
+        identity: ReadIdentity::Missing,
+    };
+    let mut readers_by_step = BTreeMap::new();
+    let mut aggregate_readers = BTreeSet::new();
+    index_step_readers(
+        "a",
+        &BTreeSet::from([dependency("a", "b")]),
+        &mut readers_by_step,
+        &mut aggregate_readers,
+    );
+    index_step_readers(
+        "c",
+        &BTreeSet::from([dependency("c", "a_result")]),
+        &mut readers_by_step,
+        &mut aggregate_readers,
+    );
+    let mut result = SourceDiagnostic {
+        source_run_id: "synthetic".into(),
+        source_contract_sha256: contract.sha256.clone(),
+        source_last_seq: 0,
+        retry_roots: vec!["b".into()],
+        stale_outcomes: Vec::new(),
+        preserved_outcomes: vec!["a".into(), "c".into()],
+        inherited_budget: f.state.budget.clone(),
+    };
+
+    propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
+        .unwrap();
+    assert_eq!(result.stale_outcomes, ["a", "c"]);
+    assert!(result.preserved_outcomes.is_empty());
 }
 
 #[tokio::test]

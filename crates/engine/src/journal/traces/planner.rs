@@ -10,6 +10,7 @@ use camino::Utf8Path;
 use contract::{Contract, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Read};
 
 /// Fixed, redacted refusal categories; never embed paths, values or I/O errors.
@@ -116,6 +117,10 @@ fn analyze_source(
         inherited_budget: state.budget.clone(),
     };
     let mut outcomes = 0;
+    // Index only current successes by the exact step path they consumed. The
+    // read set lets retry effects propagate without guessing from graph `needs`.
+    let mut readers_by_step = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut aggregate_readers = BTreeSet::<String>::new();
     for event in events {
         if !matches!(event["t"].as_str(), Some("step_started" | "step_finished")) {
             continue;
@@ -190,11 +195,20 @@ fn analyze_source(
         }
         match event["status"].as_str() {
             Some("failed" | "check_failed") => result.retry_roots.push(owner.to_owned()),
-            Some("success") if unchanged => result.preserved_outcomes.push(owner.to_owned()),
+            Some("success") if unchanged => {
+                result.preserved_outcomes.push(owner.to_owned());
+                index_step_readers(
+                    owner,
+                    &trace.trace.reads,
+                    &mut readers_by_step,
+                    &mut aggregate_readers,
+                );
+            }
             Some("success") => result.stale_outcomes.push(owner.to_owned()),
             _ => return Err(Refusal::History),
         }
     }
+    propagate_step_invalidation(contract, &mut result, &readers_by_step, &aggregate_readers)?;
     if outcomes != state.nodes.len() || outcomes != state.dependency_traces.owners.len() {
         return Err(Refusal::IncompleteTrace);
     }
@@ -227,6 +241,85 @@ fn analyze_source(
         return Err(Refusal::SourceBinding);
     }
     Ok(result)
+}
+
+/// Index captured reads of node outputs/statuses. An empty path is the
+/// complete template snapshot, and `steps` alone is the full step collection.
+fn index_step_readers(
+    owner: &str,
+    reads: &BTreeSet<ReadDependency>,
+    readers_by_step: &mut BTreeMap<String, BTreeSet<String>>,
+    aggregate_readers: &mut BTreeSet<String>,
+) {
+    for read in reads {
+        if !matches!(read.kind, ReadKind::Lookup | ReadKind::Collection) {
+            continue;
+        }
+        if read.path.is_empty() || (read.path.len() == 1 && read.path[0] == "steps") {
+            aggregate_readers.insert(owner.to_owned());
+        } else if read.path.first().is_some_and(|root| root == "steps")
+            && let Some(step) = read.path.get(1)
+        {
+            readers_by_step
+                .entry(step.clone())
+                .or_default()
+                .insert(owner.to_owned());
+        }
+    }
+}
+
+/// Compute the transitive outcomes that may change when a retry root (or an
+/// already-stale success) runs again. A rerun can change its output, status,
+/// or reason, so both the node id and output alias are possible writes.
+fn propagate_step_invalidation(
+    contract: &Contract,
+    result: &mut SourceDiagnostic,
+    readers_by_step: &BTreeMap<String, BTreeSet<String>>,
+    aggregate_readers: &BTreeSet<String>,
+) -> Result<(), Refusal> {
+    let mut invalidated = result
+        .retry_roots
+        .iter()
+        .chain(&result.stale_outcomes)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut pending = VecDeque::from_iter(invalidated.iter().cloned());
+    let mut aggregate_processed = false;
+    while let Some(changed_owner) = pending.pop_front() {
+        let node = contract
+            .graph
+            .nodes
+            .get(&changed_owner)
+            .ok_or(Refusal::Executor)?;
+        let output_name = node.output.as_deref().unwrap_or(&node.id);
+        for name in [changed_owner.as_str(), output_name] {
+            if let Some(readers) = readers_by_step.get(name) {
+                for reader in readers {
+                    mark_stale_reader(reader, &mut invalidated, result, &mut pending);
+                }
+            }
+        }
+        if !aggregate_processed {
+            aggregate_processed = true;
+            for reader in aggregate_readers {
+                mark_stale_reader(reader, &mut invalidated, result, &mut pending);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn mark_stale_reader(
+    reader: &str,
+    invalidated: &mut BTreeSet<String>,
+    result: &mut SourceDiagnostic,
+    pending: &mut VecDeque<String>,
+) {
+    if invalidated.insert(reader.to_owned()) {
+        result.preserved_outcomes.retain(|owner| owner != reader);
+        result.stale_outcomes.push(reader.to_owned());
+        pending.push_back(reader.to_owned());
+    }
 }
 
 /// Bind the file-input gateway to the service-managed source run. Direct
