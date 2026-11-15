@@ -720,7 +720,9 @@ Private trace format v2 rejects v1 evidence, which predates file dependencies.
 No other executor captures file evidence.
 A private, unwired engine diagnostic can compare a cleanly sealed failed
 source run's captured reads with that same source's folded values and workspace
-bytes. It requires complete event-bound traces for every outcome and separate
+bytes. It accepts only the persisted service-run layout (`<run-id>/meta/journal.jsonl`
+paired with `<run-id>/workspace`); direct and mismatched layouts fail closed. It
+requires complete event-bound traces for every outcome and separate
 executor attestations for read-only effects and complete runtime-read coverage;
 `check.format` supplies both, while custom/unknown executors default to
 unsupported. The bounded, redacted diagnostic classifies failed retry roots,

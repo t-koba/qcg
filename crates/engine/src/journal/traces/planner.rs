@@ -1,5 +1,5 @@
 //! Source-currentness diagnostics only. No reset operations or child binding.
-//! The caller must supply the same source workspace used by this journal.
+//! Only a workspace paired with the journal through the persisted service-run layout is accepted.
 use super::{bounded, digest, history};
 use crate::{
     BudgetState, ContinuationReadCoverage, ContinuationSafety, FsGateway, GatewayError,
@@ -63,6 +63,9 @@ fn analyze_source(
     limits: JournalLimits,
 ) -> Result<SourceDiagnostic, Refusal> {
     let limits = bounded(limits);
+    if !source_layout_matches(path, state, workspace) {
+        return Err(Refusal::SourceBinding);
+    }
     if !history::journal_is_cleanly_sealed(path) {
         return Err(Refusal::Unsealed);
     }
@@ -214,6 +217,26 @@ fn analyze_source(
         return Err(Refusal::SourceBinding);
     }
     Ok(result)
+}
+
+/// Bind the file-input gateway to the service-managed source run. Direct
+/// executions and nonstandard layouts remain unsupported rather than relying
+/// on a caller to pair an unrelated workspace with this journal.
+fn source_layout_matches(path: &Utf8Path, state: &RunState, workspace: &FsGateway) -> bool {
+    let Some(run_id) = state.run_id.as_deref() else {
+        return false;
+    };
+    let Some(metadata_dir) = path.parent() else {
+        return false;
+    };
+    let Some(run_dir) = metadata_dir.parent() else {
+        return false;
+    };
+    let expected_workspace = run_dir.join("workspace");
+    path.file_name() == Some("journal.jsonl")
+        && metadata_dir.file_name() == Some("meta")
+        && run_dir.file_name() == Some(run_id)
+        && workspace.workspace() == expected_workspace.as_path()
 }
 
 fn supported_state(state: &RunState, contract: &Contract) -> Result<(), Refusal> {

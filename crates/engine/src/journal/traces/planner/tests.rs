@@ -119,8 +119,10 @@ type = "test.probe"
         )
         .unwrap();
         let contract = Contract::load(&root).unwrap();
-        let workspace = root.join("workspace");
-        std::fs::create_dir(&workspace).unwrap();
+        let run_dir = root.join("source-probe");
+        let metadata = run_dir.join("meta");
+        let workspace = run_dir.join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
         std::fs::write(workspace.join("private.json"), b"{}").unwrap();
         let options = RunOptions {
             elapsed_budget_mode: policy::ElapsedBudgetMode::ActiveExecution,
@@ -144,7 +146,7 @@ type = "test.probe"
         let failure = Engine::new(registry())
             .run_with_id(
                 "source-probe".into(),
-                root.join("meta"),
+                metadata.clone(),
                 contract.clone(),
                 BTreeMap::from([("private".into(), json!("original"))]),
                 options,
@@ -155,7 +157,7 @@ type = "test.probe"
             failure.to_string().contains("probe check failure"),
             "fixture failed before check: {failure}"
         );
-        let path = root.join("meta/journal.jsonl");
+        let path = metadata.join("journal.jsonl");
         let state = RunState::fold_journal(&path).unwrap();
         let events = read_journal_values(&path, JournalLimits::default())
             .unwrap()
@@ -199,6 +201,32 @@ type = "test.probe"
         self.state = RunState::fold_values(&self.events).unwrap();
         self.state.dependency_traces = traces;
     }
+}
+
+#[tokio::test]
+async fn source_diagnostic_refuses_a_different_run_workspace() {
+    let f = Fixture::new().await;
+    let other_workspace = f._dir.path().join("other-run/workspace");
+    std::fs::create_dir_all(&other_workspace).unwrap();
+    // Matching bytes must not make an unrelated workspace look source-bound.
+    std::fs::write(other_workspace.join("private.json"), b"{}").unwrap();
+    let other_fs = FsGateway::new(
+        Utf8PathBuf::from_path_buf(other_workspace).unwrap(),
+        &f.contract.manifest.permissions,
+    );
+    assert_eq!(
+        analyze_source(
+            &f.path,
+            &f.state,
+            &f.events,
+            &f.contract,
+            &registry(),
+            &other_fs,
+            JournalLimits::default(),
+        )
+        .unwrap_err(),
+        Refusal::SourceBinding
+    );
 }
 
 #[cfg(unix)]
