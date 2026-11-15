@@ -709,7 +709,17 @@ evidence. Private line/stream/count bounds reuse the configured journal limits
 byte bound. Trace I/O or bound failures disable further evidence writes for
 that writer without changing ordinary success/failure results. Historical
 records remain bound to their outcomes until the run metadata is deleted.
-This evidence does not enable continuation or reset.
+For `check.format`, the trace additionally records the normalized portable
+run-workspace-relative source path and SHA-256 of the exact bytes read through
+the gateway's opened handle and passed to the parser. These file dependencies
+are distinct from expression/template value reads. Unavailable, unsafe, or
+unretainable file evidence makes the owner's evidence incomplete, without
+changing the step's ordinary result. Paths and digests stay in private traces,
+not public events or `state.json` (existing step output is unchanged).
+Private trace format v2 rejects v1 evidence, which predates file dependencies.
+No other executor captures file evidence.
+This evidence does not enable continuation or reset, rebind traces across
+forks, or establish external-effect or power-loss safety.
 
 Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):
 

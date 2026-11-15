@@ -16,9 +16,13 @@ pub enum ReadOwner {
 pub enum ReadKind {
     Lookup,
     Collection,
+    /// Exact workspace file bytes. Path segments are a normalized portable
+    /// run-workspace-relative path; identity must be a raw-byte SHA-256 digest.
+    WorkspaceFile,
 }
 
-/// SHA-256 of the canonical JSON encoding, not a value retained in the trace.
+/// SHA-256 of canonical JSON for value reads, or exact bytes for workspace
+/// file reads. No consumed value or file content is retained in the trace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadIdentity {
     /// The path resolves to a collection used only to reach a child. Its
@@ -287,7 +291,16 @@ impl ReadRecorder {
 
     fn insert(&self, read: ReadDependency) -> bool {
         let mut trace = self.lock();
-        if matches!(read.owner, ReadOwner::Unscoped) || read.identity == ReadIdentity::Unsupported {
+        if matches!(read.owner, ReadOwner::Unscoped)
+            || read.identity == ReadIdentity::Unsupported
+            || (read.kind == ReadKind::WorkspaceFile
+                && (!matches!(read.identity, ReadIdentity::Digest(_))
+                    || read.path.is_empty()
+                    || read
+                        .path
+                        .iter()
+                        .any(|part| part.contains('/') || !policy::is_safe_relative_path(part))))
+        {
             Self::mark_unsupported(&mut trace, &read.owner);
         }
         if trace.reads.contains(&read) {

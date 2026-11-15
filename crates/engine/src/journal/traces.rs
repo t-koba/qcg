@@ -13,8 +13,9 @@ mod private_file;
 use private_file::{Access as TraceAccess, open as open_private_trace};
 use std::io::{Read, Seek, SeekFrom, Write};
 
-// Wire-format version, not a configurable policy limit.
-const VERSION: u32 = 1;
+// Wire-format version, not a configurable policy limit. V1 predates file
+// dependencies and cannot establish complete check.format read evidence.
+const VERSION: u32 = 2;
 const FILE_NAME: &str = ".dependency-traces.jsonl";
 
 #[derive(Debug, Clone)]
@@ -88,6 +89,7 @@ struct Dependency {
 enum Kind {
     Lookup,
     Collection,
+    WorkspaceFile,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -191,6 +193,7 @@ impl Record {
                 kind: match read.kind {
                     ReadKind::Lookup => Kind::Lookup,
                     ReadKind::Collection => Kind::Collection,
+                    ReadKind::WorkspaceFile => Kind::WorkspaceFile,
                 },
                 identity: match read.identity {
                     ReadIdentity::Present => Identity::Present,
@@ -233,7 +236,7 @@ impl Record {
             reads: &self.reads,
         };
         let mut writer = HashWriter(Sha256::new());
-        writer.0.update(b"qcg-private-dependency-trace-v1\0");
+        writer.0.update(b"qcg-private-dependency-trace-v2\0");
         serde_json::to_writer(&mut writer, &contents).ok()?;
         Some(writer.0.finalize().into())
     }
@@ -258,6 +261,7 @@ impl Record {
                 match read.kind {
                     Kind::Lookup => ReadKind::Lookup,
                     Kind::Collection => ReadKind::Collection,
+                    Kind::WorkspaceFile => ReadKind::WorkspaceFile,
                 },
                 match read.identity {
                     Identity::Present => ReadIdentity::Present,
