@@ -169,6 +169,7 @@ fn event_requires_journal_sync(kind: &str) -> bool {
         || matches!(
             kind,
             "run_queued"
+                | "llm_cost_unresolved"
                 | "operation_started"
                 | "effect_intent"
                 | "operation_finished"
@@ -1780,6 +1781,41 @@ mod tests {
             None,
         )
         .expect_err("a failed admission sync must reach the append caller");
+        assert!(
+            matches!(error, super::JournalError::Io(_)),
+            "the injected sync failure must propagate: {error}"
+        );
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn unresolved_llm_liability_sync_failure_propagates_from_append() {
+        assert!(super::event_requires_journal_sync("llm_cost_unresolved"));
+
+        let (dir, path) = marker_fail_dir("llm-liability-sync");
+        JournalWriter::create(&path, "llm-liability-sync", false, None)
+            .expect("journal should open");
+        super::fail_next_journal_sync_for_test();
+        let error = JournalWriter::append_single_event(
+            &path,
+            "llm-liability-sync",
+            "llm_cost_unresolved",
+            json!({
+                "node": "llm",
+                "provider": "test",
+                "model": "test",
+                "tokens": {
+                    "input": 1,
+                    "output": 0,
+                    "cached_input": 0,
+                    "cache_creation_input": 0,
+                },
+                "liability": "actual_cost_unrepresentable",
+            }),
+            JournalLimits::default(),
+            None,
+        )
+        .expect_err("liability sync failure must reach the append caller");
         assert!(
             matches!(error, super::JournalError::Io(_)),
             "the injected sync failure must propagate: {error}"
