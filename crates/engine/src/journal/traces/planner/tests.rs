@@ -320,7 +320,15 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
         serde_json::to_value(&plan.inherited_budget).unwrap(),
         serde_json::to_value(&f.state.budget).unwrap()
     );
-    assert!(!format!("{plan:?}").contains("private"));
+    assert_eq!(plan.identity, f.analyze().unwrap().identity);
+    assert_eq!(
+        format!("{:?}", plan.identity),
+        "DiagnosticIdentity([redacted])"
+    );
+    assert_eq!(
+        format!("{plan:?}"),
+        "SourceDiagnostic { retry_roots: 1, stale_outcomes: 0, preserved_outcomes: 1, .. }"
+    );
     assert_eq!(std::fs::read(&f.path).unwrap(), before);
     assert_eq!(
         std::fs::read(f.path.with_file_name(super::super::FILE_NAME)).unwrap(),
@@ -330,6 +338,68 @@ async fn synthetic_executor_is_source_bound_and_analysis_does_not_write() {
         std::fs::read(f.workspace.join("files/upload/private.json")).unwrap(),
         b"{}"
     );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn identity_binds_observed_bytes_and_missing_state_not_just_plan_sets() {
+    let f = Fixture::with_package(Some("1"), true).await;
+    let original = f.analyze().unwrap().identity;
+    assert_eq!(original, f.analyze().unwrap().identity);
+    // Exercise both no-follow file readers. Every mutation after the first
+    // leaves the retry/stale/preserved sets unchanged, including empty versus
+    // missing. Hashing only currentness booleans would miss these changes.
+    for path in [
+        f.workspace.join("files/upload/private.json"),
+        f.contract.root.join("schema.json"),
+    ] {
+        let mut identities = Vec::new();
+        for bytes in [Some(b"{ }".as_slice()), Some(b"{  }"), Some(b""), None] {
+            if let Some(bytes) = bytes {
+                std::fs::write(&path, bytes).unwrap();
+            } else {
+                std::fs::remove_file(&path).unwrap();
+            }
+            let plan = f.analyze().unwrap();
+            assert_eq!(plan.retry_roots, ["b"]);
+            assert_eq!(plan.stale_outcomes, ["a"]);
+            assert!(plan.preserved_outcomes.is_empty());
+            assert_ne!(plan.identity, original);
+            assert!(identities.iter().all(|previous| previous != &plan.identity));
+            assert_eq!(plan.identity, f.analyze().unwrap().identity);
+            identities.push(plan.identity);
+        }
+        std::fs::write(&path, b"{}").unwrap();
+        assert_eq!(original, f.analyze().unwrap().identity);
+    }
+}
+
+#[tokio::test]
+async fn identity_changes_with_validated_source_inputs_or_refuses_unbound_source() {
+    let mut f = Fixture::new().await;
+    let original = f.analyze().unwrap().identity;
+    let inputs = f.original_inputs().clone();
+    let start = f
+        .events
+        .iter()
+        .position(|event| event["t"] == "run_started")
+        .unwrap();
+    f.events[start]["inputs"]["private"] = json!("first changed value");
+    // A changed caller view without the same persisted source is not accepted.
+    assert_eq!(f.analyze().unwrap_err(), Refusal::SourceBinding);
+    f.rewrite_source();
+    let first = f.analyze().unwrap();
+    assert_ne!(first.identity, original);
+    f.events[start]["inputs"]["private"] = json!("second changed value");
+    f.rewrite_source();
+    let second = f.analyze().unwrap();
+    assert_eq!(first.retry_roots, second.retry_roots);
+    assert_eq!(first.stale_outcomes, second.stale_outcomes);
+    assert_eq!(first.preserved_outcomes, second.preserved_outcomes);
+    assert_ne!(first.identity, second.identity);
+    f.events[start]["inputs"] = inputs;
+    f.rewrite_source();
+    assert_eq!(original, f.analyze().unwrap().identity);
 }
 
 #[tokio::test]
@@ -374,6 +444,7 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
         &mut aggregate_readers,
     );
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -434,6 +505,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
     // stale and may fail/skip on retry while B remains failed: C may skip.
     // Neither C nor D captured any data read of its gate prerequisites.
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -458,6 +530,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
         (vec!["b".into()], vec![], true),
     ] {
         let mut seeded = SourceDiagnostic {
+            identity: DiagnosticIdentity([0; 32]),
             retry_roots,
             stale_outcomes,
             preserved_outcomes: result.preserved_outcomes.clone(),
@@ -535,6 +608,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
     assert_eq!(readers_by_step["c"], BTreeSet::from(["a".into()]));
 
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -549,6 +623,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
     assert_eq!(result.preserved_outcomes, ["a"]);
 
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -604,6 +679,7 @@ async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
     assert_eq!(uncertain_aggregate, BTreeSet::from(["a".into()]));
 
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -847,7 +923,7 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
         .clone();
     let original_inputs = f.original_inputs();
     assert_eq!(
-        file_matches(&unknown, &read, &f.contract, original_inputs),
+        workspace_observation(&unknown, &read, &f.contract, original_inputs),
         Err(Refusal::InputIo)
     );
     assert!(!root.exists());
@@ -858,7 +934,7 @@ async fn ambiguous_file_and_unsupported_identity_refuse_even_after_stale_input()
     ] {
         read.identity = identity;
         assert_eq!(
-            file_matches(&f.fs(), &read, &f.contract, original_inputs),
+            workspace_observation(&f.fs(), &read, &f.contract, original_inputs),
             Err(Refusal::InputIdentity)
         );
     }
@@ -891,14 +967,14 @@ async fn workspace_file_binding_requires_exact_declared_path_and_value_digest() 
         identity: ReadIdentity::Digest(Sha256::digest(b"{}").into()),
     };
     assert_eq!(
-        file_matches(&f.fs(), &read, &f.contract, f.original_inputs()),
-        Ok(true)
+        workspace_observation(&f.fs(), &read, &f.contract, f.original_inputs()),
+        Ok(Some(Sha256::digest(b"{}").into()))
     );
     // Both encodings bind the decoded bytes, not the serialized input value.
     let base64_inputs = json!({"upload": {"name": "private.json", "content_base64": "e30="}});
     assert_eq!(
-        file_matches(&f.fs(), &read, &f.contract, &base64_inputs),
-        Ok(true)
+        workspace_observation(&f.fs(), &read, &f.contract, &base64_inputs),
+        Ok(Some(Sha256::digest(b"{}").into()))
     );
     for path in [
         vec!["private.json"],
@@ -913,7 +989,7 @@ async fn workspace_file_binding_requires_exact_declared_path_and_value_digest() 
         // Matching source-workspace bytes alone cannot preserve an arbitrary
         // read, an undeclared field, or a different name for a declared file.
         assert_eq!(
-            file_matches(&f.fs(), &read, &f.contract, f.original_inputs()),
+            workspace_observation(&f.fs(), &read, &f.contract, f.original_inputs()),
             Err(Refusal::InputIdentity)
         );
     }
@@ -937,7 +1013,7 @@ async fn workspace_file_binding_refuses_missing_invalid_ambiguous_or_over_limit_
         json!({"upload": {"name": "private.json", "text": "{}", "content_base64": "e30="}}),
     ] {
         assert_eq!(
-            file_matches(&f.fs(), &read, &f.contract, &inputs),
+            workspace_observation(&f.fs(), &read, &f.contract, &inputs),
             Err(Refusal::InputIdentity)
         );
     }
@@ -949,20 +1025,20 @@ async fn workspace_file_binding_refuses_missing_invalid_ambiguous_or_over_limit_
         .unwrap();
     fields[upload].kind = FieldType::Json;
     assert_eq!(
-        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        workspace_observation(&f.fs(), &read, &f.contract, &inputs),
         Err(Refusal::InputIdentity)
     );
     let fields = &mut f.contract.manifest.inputs.stages[0].fields;
     fields[upload].kind = FieldType::File;
     fields.push(fields[upload].clone());
     assert_eq!(
-        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        workspace_observation(&f.fs(), &read, &f.contract, &inputs),
         Err(Refusal::InputIdentity)
     );
     f.contract.manifest.inputs.stages[0].fields.pop();
     f.contract.manifest.runtime.file_input_limit_bytes = Some(1);
     assert_eq!(
-        file_matches(&f.fs(), &read, &f.contract, &inputs),
+        workspace_observation(&f.fs(), &read, &f.contract, &inputs),
         Err(Refusal::Limit)
     );
 }

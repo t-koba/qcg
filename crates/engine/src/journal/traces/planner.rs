@@ -8,6 +8,7 @@ use crate::{
 };
 use camino::Utf8Path;
 use contract::{Contract, FieldType, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
+use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -28,7 +29,19 @@ enum Refusal {
     Limit,
 }
 
+/// Opaque point-in-time evidence identity, not authorization or a lease. It
+/// does not close analysis-to-copy TOCTOU, even when two identities match.
+#[derive(PartialEq, Eq)]
+struct DiagnosticIdentity([u8; 32]);
+
+impl std::fmt::Debug for DiagnosticIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DiagnosticIdentity([redacted])")
+    }
+}
+
 struct SourceDiagnostic {
+    identity: DiagnosticIdentity,
     source_run_id: String,
     source_contract_sha256: String,
     source_last_seq: u64,
@@ -48,6 +61,27 @@ impl std::fmt::Debug for SourceDiagnostic {
             .field("preserved_outcomes", &self.preserved_outcomes.len())
             .finish_non_exhaustive()
     }
+}
+
+/// V1 hashes length-framed, labelled JSON parts under a versioned domain.
+/// JSON maps and captured read sets have deterministic sorted iteration. Only
+/// one policy-bounded part is materialized at a time and immediately discarded;
+/// no values, paths, trace payloads or workspace bytes enter the result.
+fn identity_part<T: Serialize>(
+    hash: &mut Sha256,
+    label: &str,
+    value: &T,
+    limit: Option<usize>,
+) -> Result<(), Refusal> {
+    let bytes = serialize_bounded(value, limit, "source diagnostic identity")
+        .map_err(|_| Refusal::Limit)?;
+    let label_len = u64::try_from(label.len()).map_err(|_| Refusal::Limit)?;
+    let len = u64::try_from(bytes.len()).map_err(|_| Refusal::Limit)?;
+    hash.update(label_len.to_be_bytes());
+    hash.update(label.as_bytes());
+    hash.update(len.to_be_bytes());
+    hash.update(&bytes);
+    Ok(())
 }
 
 /// Requires an exact sealed source snapshot, not a projection from another
@@ -113,7 +147,22 @@ fn analyze_source(
     // Restore source-side evidence separately; never accept a substituted or
     // shortened in-memory trace merely because its terminal digest matches.
     super::TraceJournal::restore(&mut folded, events, path, limits);
+    let mut identity = Sha256::new();
+    identity.update(b"qcg-private-source-diagnostic-v1\0");
+    // Contract SHA binds the manifest/package declarations; consumed package
+    // bytes are additionally bound by trace and current-file observations.
+    identity_part(
+        &mut identity,
+        "contract-package",
+        &(
+            &contract.sha256,
+            &contract.manifest.generator.id,
+            &contract.manifest.generator.version,
+        ),
+        limits.max_state_bytes,
+    )?;
     let mut result = SourceDiagnostic {
+        identity: DiagnosticIdentity([0; 32]),
         source_run_id: state.run_id.clone().ok_or(Refusal::SourceBinding)?,
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: state.last_seq,
@@ -128,6 +177,14 @@ fn analyze_source(
     let mut readers_by_step = BTreeMap::<String, BTreeSet<String>>::new();
     let mut aggregate_readers = BTreeSet::<String>::new();
     for event in events {
+        // Includes the exact admitted inputs in run_started, not the folded
+        // workspace-path projection. Bind every validated event, not just tails.
+        identity_part(
+            &mut identity,
+            "journal-event",
+            event,
+            limits.max_event_bytes,
+        )?;
         if !matches!(event["t"].as_str(), Some("step_started" | "step_finished")) {
             continue;
         }
@@ -180,20 +237,62 @@ fn analyze_source(
         {
             return Err(Refusal::IncompleteTrace);
         }
+        identity_part(
+            &mut identity,
+            "trace-outcome",
+            &(
+                super::VERSION,
+                owner,
+                trace.seq,
+                trace.event_digest,
+                attestation,
+            ),
+            limits.max_event_bytes,
+        )?;
         // Validate every captured input, including failed roots. A changed
         // failed input still retries; an unknown input refuses the diagnostic.
         let mut unchanged = true;
         for read in &trace.trace.reads {
+            // Use the private trace wire vocabulary, including identity tags.
+            // Do not serialize Debug or retain the serialized payload.
+            let kind = match read.kind {
+                ReadKind::Lookup => super::Kind::Lookup,
+                ReadKind::Collection => super::Kind::Collection,
+                ReadKind::PackageFile => super::Kind::PackageFile,
+                ReadKind::WorkspaceFile => super::Kind::WorkspaceFile,
+            };
+            let read_identity = match read.identity {
+                ReadIdentity::Present => super::Identity::Present,
+                ReadIdentity::Missing => super::Identity::Missing,
+                ReadIdentity::Unsupported => super::Identity::Unsupported,
+                ReadIdentity::Digest(value) => super::Identity::Digest(value),
+            };
+            identity_part(
+                &mut identity,
+                "trace-read",
+                &(&read.path, kind, read_identity),
+                limits.max_event_bytes,
+            )?;
             unchanged &= match read.kind {
                 ReadKind::Lookup | ReadKind::Collection => state
                     .vars
                     .matches_dependency(read)
                     .ok_or(Refusal::InputIdentity)?,
-                ReadKind::PackageFile => {
-                    package_currentness(path, contract, read, policy::MAX_JSON_SCHEMA_BYTES)?
-                }
-                ReadKind::WorkspaceFile => {
-                    file_matches(workspace, read, contract, original_inputs)?
+                ReadKind::PackageFile | ReadKind::WorkspaceFile => {
+                    let observed = if read.kind == ReadKind::PackageFile {
+                        package_observation(path, contract, read, policy::MAX_JSON_SCHEMA_BYTES)?
+                    } else {
+                        workspace_observation(workspace, read, contract, original_inputs)?
+                    };
+                    // None is missing, Some is the raw-byte digest read through
+                    // the very same bounded no-follow handle used for currentness.
+                    identity_part(
+                        &mut identity,
+                        "current-file",
+                        &observed,
+                        limits.max_event_bytes,
+                    )?;
+                    observed.is_some_and(|digest| read.identity == ReadIdentity::Digest(digest))
                 }
             };
         }
@@ -219,7 +318,9 @@ fn analyze_source(
     result.retry_roots.sort();
     result.stale_outcomes.sort();
     result.preserved_outcomes.sort();
-    serialize_bounded(
+    identity_part(
+        &mut identity,
+        "source-plan-budget",
         &(
             &result.source_run_id,
             &result.source_contract_sha256,
@@ -230,9 +331,7 @@ fn analyze_source(
             &result.inherited_budget,
         ),
         limits.max_state_bytes,
-        "source diagnostic",
-    )
-    .map_err(|_| Refusal::Limit)?;
+    )?;
     // Detect source journal changes during analysis. There is deliberately no
     // reusable authorization token: external workspace mutation remains outside
     // this point-in-time, source-only diagnostic.
@@ -244,6 +343,7 @@ fn analyze_source(
     {
         return Err(Refusal::SourceBinding);
     }
+    result.identity = DiagnosticIdentity(identity.finalize().into());
     Ok(result)
 }
 
@@ -383,12 +483,12 @@ fn source_layout_matches(path: &Utf8Path, state: &RunState, workspace: &FsGatewa
 /// binds the manifest and therefore the requested relative schema path; the
 /// private read trace binds the raw bytes actually parsed. Unrelated package
 /// files do not affect this executor's result.
-fn package_currentness(
+fn package_observation(
     path: &Utf8Path,
     contract: &Contract,
     read: &ReadDependency,
     limit: usize,
-) -> Result<bool, Refusal> {
+) -> Result<Option<[u8; 32]>, Refusal> {
     let run_dir = path
         .parent()
         .and_then(Utf8Path::parent)
@@ -397,13 +497,13 @@ fn package_currentness(
     if contract.root != package_root {
         return Err(Refusal::SourceBinding);
     }
-    let (expected, relative) = file_read_identity(read)?;
+    let (_, relative) = file_read_identity(read)?;
     let file = match FsGateway::open_diagnostic_read_under_root(&contract.root, &relative) {
         Ok(file) => file,
-        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(Refusal::InputIo),
     };
-    opened_file_matches(file, expected, limit)
+    opened_file_digest(file, limit).map(Some)
 }
 
 fn supported_state(state: &RunState, contract: &Contract) -> Result<(), Refusal> {
@@ -484,12 +584,12 @@ fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
 
 /// Only admitted FileValues can explain workspace reads. This is a diagnostic
 /// binding, not authorization to continue or restore any workspace state.
-fn file_matches(
+fn workspace_observation(
     fs: &FsGateway,
     read: &ReadDependency,
     contract: &Contract,
     original_inputs: &Value,
-) -> Result<bool, Refusal> {
+) -> Result<Option<[u8; 32]>, Refusal> {
     let (expected, relative) = file_read_identity(read)?;
     let limit = contract
         .manifest
@@ -533,10 +633,10 @@ fn file_matches(
     }
     let file = match fs.open_diagnostic_read(&relative) {
         Ok(file) => file,
-        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(Refusal::InputIo),
     };
-    opened_file_matches(file, expected, limit)
+    opened_file_digest(file, limit).map(Some)
 }
 
 fn file_read_identity(read: &ReadDependency) -> Result<([u8; 32], String), Refusal> {
@@ -554,11 +654,7 @@ fn file_read_identity(read: &ReadDependency) -> Result<([u8; 32], String), Refus
     Ok((*expected, read.path.join("/")))
 }
 
-fn opened_file_matches(
-    mut file: std::fs::File,
-    expected: [u8; 32],
-    limit: usize,
-) -> Result<bool, Refusal> {
+fn opened_file_digest(mut file: std::fs::File, limit: usize) -> Result<[u8; 32], Refusal> {
     if !file.metadata().map_err(|_| Refusal::InputIo)?.is_file() {
         return Err(Refusal::InputIo);
     }
@@ -576,7 +672,7 @@ fn opened_file_matches(
         }
         hash.update(&bytes[..count]);
     }
-    Ok(<[u8; 32]>::from(hash.finalize()) == expected)
+    Ok(hash.finalize().into())
 }
 
 #[cfg(test)]
