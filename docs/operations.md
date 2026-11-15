@@ -709,9 +709,12 @@ evidence. Private line/stream/count bounds reuse the configured journal limits
 byte bound. Trace I/O or bound failures disable further evidence writes for
 that writer without changing ordinary success/failure results. Historical
 records remain bound to their outcomes until the run metadata is deleted.
-For `check.format`, the trace additionally records the normalized portable
-run-workspace-relative source path and SHA-256 of the exact bytes read through
-the gateway's opened handle and passed to the parser. These file dependencies
+For `check.format` and `check.schema`, the trace records the normalized
+portable run-workspace-relative source path and SHA-256 of the exact bytes read
+through the gateway's opened handle and passed to the parser. `check.schema`
+also records the requested package-schema path and SHA-256 of the exact raw
+bytes read through its no-follow package handle and parsed; currentness checks
+reopen that exact file under the bound package root. These file dependencies
 are distinct from expression/template value reads. Unavailable, unsafe, or
 unretainable file evidence makes the owner's evidence incomplete, without
 changing the step's ordinary result. Paths and digests stay in private traces,
@@ -720,7 +723,11 @@ Private trace format/checksum v3 binds each read owner to the executing
 registry entry's type ID, semantics-version token, effect safety and read
 coverage. V1/v2 evidence cannot establish this proof. Attestations share the
 recorder's existing byte bound; conflicting declarations invalidate the owner.
-No other executor captures file evidence.
+`check.format` declares read-only safety and complete coverage with semantics
+version `1`. `check.schema` declares read-only safety and semantics version `1`,
+but complete coverage only on Unix; it is unsupported for this diagnostic on
+non-Unix targets. No other built-in executor currently records this file
+evidence.
 A private, unwired engine diagnostic can compare a cleanly sealed failed
 source run's captured reads with that same source's folded values and workspace
 bytes. It accepts only the persisted service-run layout (`<run-id>/meta/journal.jsonl`
@@ -728,7 +735,7 @@ paired with `<run-id>/workspace`); direct and mismatched layouts fail closed. It
 requires complete event-bound traces for every outcome and separate
 executor declarations for read-only effects and complete runtime-read coverage,
 plus a nonmissing exact match between the captured and current registry
-attestations. `check.format` supplies these with initial semantics token `1`.
+attestations. `check.format` and Unix `check.schema` supply these with semantics token `1`.
 Executor authors must change their token when execution or read-capture semantics
 change. Missing/empty tokens, unknown executors and mismatched attestations fail
 closed, even with complete coverage; custom executors default to unsupported.
