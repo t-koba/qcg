@@ -1322,6 +1322,15 @@ impl LocalService {
             let queue_notify = Arc::clone(&self.inner.queue_notify);
             let handle = tokio::spawn(async move {
                 let _execution_lock = execution_lock;
+                // Refuse journal-observation failures before cleanup without
+                // changing the last-known queued state or interaction.
+                let state = match fold_run_state(&run_dir) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        tracing::error!(run_id = %run_id, phase = "pre_execution_journal", %error, "journal read failed; retaining queued state");
+                        return;
+                    }
+                };
                 // Host-cgroup reconciliation under the execution lease before
                 // any `Started` replay/refusal. Uses the persisted binding even
                 // when the current delegation was removed (a changed nonempty parent is refused); any
@@ -1336,27 +1345,22 @@ impl LocalService {
                     Ok::<_, ServiceError>(())
                 })() {
                     tracing::error!(run_id = %run_id, %error, "host-cgroup reconciliation refused re-entry; journal retained");
-                    service.mark_spawn_failed(&run_id).await;
                     return;
                 }
                 // Container effects of the dead previous owner are reclaimed
                 // by journaled name under the same lease, before any replay.
-                if let Err(error) = crate::effects::reconcile_run_effects(
+                // A failure remains retryable; it is not a terminal run result.
+                let state = match crate::effects::reconcile_run_effects_from_state(
                     &run_dir,
                     &run_id,
                     service.inner.deployment_policy.container_timeouts,
+                    state,
                 )
                 .await
                 {
-                    tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
-                    service.mark_spawn_failed(&run_id).await;
-                    return;
-                }
-                // Refuse journal-observation failures without changing queued state.
-                let state = match fold_run_state(&run_dir) {
                     Ok(state) => state,
                     Err(error) => {
-                        tracing::error!(run_id = %run_id, phase = "pre_execution_journal", %error, "journal read failed; retaining queued state");
+                        tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
                         return;
                     }
                 };

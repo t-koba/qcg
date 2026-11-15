@@ -5,7 +5,7 @@ use engine::{JournalLimits, JournalWriter};
 use serde_json::json;
 use std::collections::BTreeMap;
 
-use crate::summaries::{fold_run_state, read_recovery_state, run_meta_dir};
+use crate::summaries::{read_recovery_state, run_meta_dir};
 use crate::types::{LocalService, ServiceError};
 
 /// Ordered by strength: merges must never downgrade evidence already observed.
@@ -27,12 +27,28 @@ pub(crate) type EffectCandidates = BTreeMap<Utf8PathBuf, EffectProvenance>;
 /// failure leaves that intent open for the next recovery and is reported
 /// after the remaining intents were attempted. The caller must hold the run's
 /// execution lease, so no live process can be creating under these names.
+#[cfg(test)]
 pub(crate) async fn reconcile_run_effects(
     run_dir: &Utf8Path,
     run_id: &str,
     timeouts: policy::ContainerTimeouts,
 ) -> Result<(), ServiceError> {
-    let state = fold_run_state(run_dir)?;
+    let state = crate::summaries::fold_run_state(run_dir)?;
+    reconcile_effects(run_dir, run_id, timeouts, state)
+        .await
+        .map(drop)
+}
+
+/// Reconciles effects from the caller's already-validated journal fold and
+/// returns that state with successfully closed effects removed. Recovery uses
+/// this to make journal-observation failure retryable before cleanup begins,
+/// without folding the same journal twice.
+pub(crate) async fn reconcile_run_effects_from_state(
+    run_dir: &Utf8Path,
+    run_id: &str,
+    timeouts: policy::ContainerTimeouts,
+    state: engine::RunState,
+) -> Result<engine::RunState, ServiceError> {
     reconcile_effects(run_dir, run_id, timeouts, state).await
 }
 
@@ -40,12 +56,12 @@ async fn reconcile_effects(
     run_dir: &Utf8Path,
     run_id: &str,
     timeouts: policy::ContainerTimeouts,
-    state: engine::RunState,
-) -> Result<(), ServiceError> {
+    mut state: engine::RunState,
+) -> Result<engine::RunState, ServiceError> {
     let journal = run_meta_dir(run_dir).join("journal.jsonl");
     let mut unresolved = Vec::new();
-    for (name, backend) in state.effects {
-        let reclaimed = match serde_json::from_value::<container::Backend>(backend) {
+    for (name, backend) in std::mem::take(&mut state.effects) {
+        let reclaimed = match serde_json::from_value::<container::Backend>(backend.clone()) {
             Ok(backend) => container::reclaim(&backend, &name, timeouts)
                 .await
                 .map_err(|error| error.to_string()),
@@ -56,6 +72,7 @@ async fn reconcile_effects(
             Ok(container::Reclaimed::Absent) => "absent",
             Err(error) => {
                 unresolved.push(format!("{name}: {error}"));
+                state.effects.insert(name, backend);
                 continue;
             }
         };
@@ -63,15 +80,16 @@ async fn reconcile_effects(
             &journal,
             run_id,
             "effect_closed",
-            json!({"effect": name, "outcome": outcome}),
+            json!({"effect": &name, "outcome": outcome}),
             JournalLimits::default(),
             None,
         ) {
             unresolved.push(format!("{name}: closure not journaled: {error}"));
+            state.effects.insert(name, backend);
         }
     }
     if unresolved.is_empty() {
-        return Ok(());
+        return Ok(state);
     }
     Err(ServiceError::invalid(format!(
         "container effects of run `{run_id}` are not yet reclaimed and stay journaled for the next recovery: {}",
