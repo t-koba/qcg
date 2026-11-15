@@ -7,7 +7,7 @@ use camino::Utf8PathBuf;
 use serde_json::json;
 use std::time::Duration;
 
-use super::support::{TempGuard, temp_run_dir, test_service, wait_for_snapshot};
+use super::support::{TempGuard, temp_run_dir, wait_for_snapshot};
 
 use super::execution::daemon_policy_test_support::Daemon;
 
@@ -182,68 +182,166 @@ async fn an_unreachable_backend_keeps_the_intent_open_for_the_next_recovery() {
 }
 
 #[tokio::test]
-async fn failed_effect_reconciliation_keeps_suspended_run_retryable() {
+async fn queued_resumer_retries_failed_suspended_reconciliation_only() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}failed_effect_reconciliation_keeps_suspended_run_retryable"
+        "{T}queued_resumer_retries_failed_suspended_reconciliation_only"
     )) else {
         return;
     };
-    let root = temp_run_dir("effect-reconciliation-retry");
-    let _guard = TempGuard(root.clone());
-    let generators =
-        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
-    let runs = root.join("runs");
-    let service = test_service(vec![generators], runs);
-    let id = service
-        .start_run(StartRun {
-            generator_id: "ask-user".into(),
-            ..Default::default()
-        })
-        .await
+    for store_mode in [
+        crate::RunStoreMode::Exclusive,
+        crate::RunStoreMode::SharedFilesystem,
+    ] {
+        let root = temp_run_dir("effect-reconciliation-retry");
+        let _guard = TempGuard(root.clone());
+        let generators =
+            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+        let runs = root.join("runs");
+        let service = crate::LocalService::with_generator_roots_policy_and_store_mode(
+            vec![generators],
+            runs,
+            None,
+            1,
+            8,
+            store_mode,
+            crate::ServiceDeploymentPolicy {
+                queued_resumer_secs: 1,
+                ..Default::default()
+            },
+        )
         .unwrap();
-    wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
-    join_run_task(&service, &id).await;
+        let retries = &service.inner.reconciliation_retries;
+        let id = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_snapshot(&service, &id, RunStatus::Waiting).await;
+        join_run_task(&service, &id).await;
 
-    let dir = service.run_dir_for(&id).await.unwrap();
-    let journal = run_meta_dir(&dir).join("journal.jsonl");
-    let effect = name();
-    engine::JournalWriter::append_single_event(
-        &journal,
-        &id,
-        "effect_intent",
-        json!({
-            "effect": &effect,
-            "backend": container::Backend::Docker {
-                binary: "docker".into(),
-                runtime_flag: None,
+        let dir = service.run_dir_for(&id).await.unwrap();
+        let journal = run_meta_dir(&dir).join("journal.jsonl");
+        let effect = name();
+        engine::JournalWriter::append_single_event(
+            &journal,
+            &id,
+            "effect_intent",
+            json!({
+                "effect": &effect,
+                "backend": container::Backend::Docker {
+                    binary: "docker".into(),
+                    runtime_flag: None,
+                }
+            }),
+            engine::JournalLimits::default(),
+            None,
+        )
+        .unwrap();
+        daemon.set_instances(&[&effect]);
+        daemon.mode("broken");
+
+        service.resume_recovered_runs().await;
+        join_run_task(&service, &id).await;
+        assert_eq!(
+            service.snapshot(id.clone()).await.unwrap().state,
+            RunStatus::Waiting,
+            "an unresolved cleanup must not fabricate terminal Failed state"
+        );
+        assert!(fold_run_state(&dir).unwrap().effects.contains_key(&effect));
+        assert!(daemon.instances().contains(&effect));
+        assert!(retries.lock().unwrap().contains(&id));
+
+        // Healthy suspended work is deliberately absent from the retry set. Taking
+        // its finished handle lets us detect even a replay that writes no events.
+        let healthy = service
+            .start_run(StartRun {
+                generator_id: "ask-user".into(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        wait_for_snapshot(&service, &healthy, RunStatus::Waiting).await;
+        join_run_task(&service, &healthy).await;
+        let healthy_task = service.inner.runs.read().await[&healthy].task.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        {
+            let mut runs = service.inner.runs.write().await;
+            runs.get_mut(&id).unwrap().preempted = true;
+        }
+        let failed_calls = daemon.log();
+        let resumer = service.start_queued_resumer(shutdown.clone());
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(retries.lock().unwrap().contains(&id));
+        assert_eq!(
+            daemon.log(),
+            failed_calls,
+            "busy runs must not be reconciled"
+        );
+        let task = {
+            let mut runs = service.inner.runs.write().await;
+            let record = runs.get_mut(&id).unwrap();
+            record.preempted = false;
+            record.task.clone()
+        };
+        // A live slot also defers, rather than consumes, the pending retry.
+        *task.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        assert!(retries.lock().unwrap().contains(&id));
+        assert_eq!(
+            daemon.log(),
+            failed_calls,
+            "busy runs must not be reconciled"
+        );
+        let blocker = task.lock().unwrap().take().unwrap();
+        blocker.abort();
+        assert!(blocker.await.unwrap_err().is_cancelled());
+        daemon.mode("ok");
+        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let pending = retries.lock().unwrap().contains(&id);
+                let live =
+                    crate::types::task_slot_is_live(&service.inner.runs.read().await[&id].task);
+                if !pending && !live && fold_run_state(&dir).unwrap().effects.is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-        }),
-        engine::JournalLimits::default(),
-        None,
-    )
-    .unwrap();
-    daemon.set_instances(&[&effect]);
-    daemon.mode("broken");
-
-    service.resume_recovered_runs().await;
-    join_run_task(&service, &id).await;
-    assert_eq!(
-        service.snapshot(id.clone()).await.unwrap().state,
-        RunStatus::Waiting,
-        "an unresolved cleanup must not fabricate terminal Failed state"
-    );
-    assert!(fold_run_state(&dir).unwrap().effects.contains_key(&effect));
-    assert!(daemon.instances().contains(&effect));
-
-    daemon.mode("ok");
-    service.resume_recovered_runs().await;
-    join_run_task(&service, &id).await;
-    assert_eq!(
-        service.snapshot(id).await.unwrap().state,
-        RunStatus::Waiting
-    );
-    assert!(fold_run_state(&dir).unwrap().effects.is_empty());
-    assert!(daemon.instances().is_empty());
+        })
+        .await;
+        // Leave the timer running past successful reconciliation as well: a
+        // recovered Waiting run must leave the retry set, not become periodic work.
+        if recovered.is_ok() {
+            join_run_task(&service, &id).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        shutdown.cancel();
+        resumer.await.unwrap().unwrap();
+        recovered.expect("the production resumer must retry cleanup without manual recovery");
+        assert_eq!(
+            service.snapshot(id.clone()).await.unwrap().state,
+            RunStatus::Waiting
+        );
+        assert!(fold_run_state(&dir).unwrap().effects.is_empty());
+        assert!(daemon.instances().is_empty());
+        assert!(retries.lock().unwrap().is_empty());
+        assert!(
+            service.inner.runs.read().await[&id]
+                .task
+                .lock()
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            healthy_task.lock().unwrap().is_none(),
+            "healthy suspended work was replayed"
+        );
+        assert_eq!(
+            service.snapshot(healthy).await.unwrap().state,
+            RunStatus::Waiting
+        );
+    }
 }
 
 #[tokio::test]

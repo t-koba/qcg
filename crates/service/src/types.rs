@@ -73,9 +73,9 @@ pub struct ServiceDeploymentPolicy {
     pub max_directory_scan_entries: usize,
     /// Shared-store abandoned-run rescan cadence, in seconds.
     pub shared_store_rescan_secs: u64,
-    /// Seconds between queued-run resumes. Includes retrying a pre-execution journal
-    /// observation failure without changing its nonterminal state or executing
-    /// until a later read succeeds.
+    /// Seconds between queued-run resumes, pre-execution journal-observation
+    /// retries, and retries for suspended runs marked after failed cgroup/effect
+    /// reconciliation. Healthy suspended runs are not retried by this resumer.
     pub queued_resumer_secs: u64,
 }
 impl Default for ServiceDeploymentPolicy {
@@ -193,6 +193,10 @@ pub(crate) struct LocalServiceInner {
     /// Recovery candidates retain their strongest evidence across retries and
     /// concurrent scans. Only unverified hints may clear on missing evidence.
     pub(crate) unreconciled_effects: Mutex<crate::effects::EffectCandidates>,
+    /// Suspended runs whose pre-execution cgroup/effect reconciliation failed.
+    /// Cleared on successful reconciliation; the queued resumer prunes missing
+    /// or terminal runs without replaying healthy suspended work.
+    pub(crate) reconciliation_retries: Mutex<std::collections::BTreeSet<String>>,
     pub(crate) llm_runtime: Arc<llm::LlmRuntime>,
     pub(crate) execution_permits: Arc<PriorityPermits>,
     pub(crate) max_active_runs: usize,

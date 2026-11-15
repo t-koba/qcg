@@ -176,6 +176,7 @@ impl LocalService {
                 runs_dir,
                 runs: RwLock::new(runs),
                 unreconciled_effects: Mutex::new(effects),
+                reconciliation_retries: Mutex::new(Default::default()),
                 llm_runtime,
                 execution_permits: Arc::new(PriorityPermits::new(max_active_runs)),
                 max_active_runs,
@@ -939,7 +940,9 @@ impl LocalService {
     /// Periodically resumes queued runs that lost their engine task (lease
     /// contention, crash between registration and spawn). Only runs queued
     /// for longer than the grace period are retried, so freshly registered
-    /// runs are never double-spawned. Runs in both store modes.
+    /// runs are never double-spawned. Also retries suspended runs only after
+    /// failed pre-execution reconciliation, never healthy Waiting/Confirming
+    /// runs. Runs in both store modes.
     pub fn start_queued_resumer(
         &self,
         shutdown: CancellationToken,
@@ -962,8 +965,18 @@ impl LocalService {
         let cutoff = chrono::Utc::now() - chrono::Duration::seconds(10);
         let stuck = {
             let runs = self.inner.runs.read().await;
+            let mut retries = self
+                .inner
+                .reconciliation_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // A live or preempted slot defers the attempt, not the retry.
+            retries.retain(|id| {
+                runs.get(id)
+                    .is_some_and(|record| !record.state.is_terminal())
+            });
             runs.iter()
-                .filter(|(_, record)| {
+                .filter(|(run_id, record)| {
                     !record.ephemeral
                         && !record.preempted
                         && !crate::types::task_slot_is_live(&record.task)
@@ -979,14 +992,37 @@ impl LocalService {
                         && ((record.state == RunStatus::Queued
                             && record.queued_at.is_none_or(|at| at <= cutoff))
                             || record.state == RunStatus::CancelRequested
-                            || record.state == RunStatus::Running)
+                            || record.state == RunStatus::Running
+                            || (matches!(record.state, RunStatus::Waiting | RunStatus::Confirming)
+                                && retries.contains(*run_id)))
                 })
                 .map(|(run_id, record)| SpawnRun::from_record(run_id.clone(), record))
                 .collect::<Vec<_>>()
         };
         for run in stuck {
-            tracing::info!(run_id = %run.run_id, "resuming queued run without an engine task");
+            tracing::info!(run_id = %run.run_id, "resuming run without an engine task");
             self.clone().spawn_engine_run(run).await;
+        }
+    }
+
+    /// Only a failed reconciliation of the current suspended record opts in.
+    /// A stale spawn must not enroll a replacement record or undo cancellation.
+    async fn retry_suspended_reconciliation(
+        &self,
+        run_id: &str,
+        task: &Arc<Mutex<Option<JoinHandle<()>>>>,
+    ) {
+        let runs = self.inner.runs.read().await;
+        if runs.get(run_id).is_some_and(|record| {
+            !record.ephemeral
+                && matches!(record.state, RunStatus::Waiting | RunStatus::Confirming)
+                && Arc::ptr_eq(&record.task, task)
+        }) {
+            self.inner
+                .reconciliation_retries
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(run_id.to_string());
         }
     }
 
@@ -1320,6 +1356,7 @@ impl LocalService {
             let runtime = Arc::clone(&self.inner.llm_runtime);
             let permits = Arc::clone(&self.inner.execution_permits);
             let queue_notify = Arc::clone(&self.inner.queue_notify);
+            let reconciliation_task = Arc::clone(&task);
             let handle = tokio::spawn(async move {
                 let _execution_lock = execution_lock;
                 // Refuse journal-observation failures before cleanup without
@@ -1331,6 +1368,7 @@ impl LocalService {
                         return;
                     }
                 };
+                let nonterminal = state.terminal.is_none();
                 // Host-cgroup reconciliation under the execution lease before
                 // any `Started` replay/refusal. Uses the persisted binding even
                 // when the current delegation was removed (a changed nonempty parent is refused); any
@@ -1345,6 +1383,11 @@ impl LocalService {
                     Ok::<_, ServiceError>(())
                 })() {
                     tracing::error!(run_id = %run_id, %error, "host-cgroup reconciliation refused re-entry; journal retained");
+                    if nonterminal {
+                        service
+                            .retry_suspended_reconciliation(&run_id, &reconciliation_task)
+                            .await;
+                    }
                     return;
                 }
                 // Container effects of the dead previous owner are reclaimed
@@ -1361,9 +1404,20 @@ impl LocalService {
                     Ok(state) => state,
                     Err(error) => {
                         tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
+                        if nonterminal {
+                            service
+                                .retry_suspended_reconciliation(&run_id, &reconciliation_task)
+                                .await;
+                        }
                         return;
                     }
                 };
+                service
+                    .inner
+                    .reconciliation_retries
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .remove(&run_id);
                 if let Some((confirmation_id, _)) =
                     state.confirmations.iter().find(|(_, approved)| !**approved)
                 {

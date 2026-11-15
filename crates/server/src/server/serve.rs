@@ -115,8 +115,8 @@ pub struct ResolvedServerPolicy {
     pub max_directory_scan_entries: usize,
     /// Shared-store abandoned-run rescan cadence, in seconds.
     pub shared_store_rescan_secs: u64,
-    /// Seconds between queued-run resumes, including retries after pre-execution
-    /// journal observation failures.
+    /// Seconds between queued-run resumes, pre-execution journal-observation
+    /// retries, and retries of suspended runs marked after failed reconciliation.
     pub queued_resumer_secs: u64,
     /// `SHUTDOWN_DRAIN_SECS` policy value (default 30, range 1..=3600):
     /// HTTP drain time before settlement proceeds.

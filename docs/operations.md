@@ -69,8 +69,10 @@ executions share the process execution permits with API runs, and warn when
 their runs directory is owned by a live server, whose `max_active_runs`
 otherwise does not apply across processes. A periodic resumer retries queued
 runs that lost their engine task and runs whose pre-execution journal
-observation failed. Those runs remain nonterminal and fail closed: the engine
-does not execute or settle them until a later journal read succeeds.
+observation failed. It also retries suspended runs only after pre-execution
+host-cgroup or container-effect reconciliation fails; healthy suspended runs
+are not periodic replay candidates. A failed reconciliation remains
+nonterminal, and execution does not resume until a later attempt succeeds.
 `QUEUED_RESUMER_SECS` controls the retry cadence (default 5 s, range 1..=3600).
 Queue admission time and position are visible on run snapshots while queued.
 

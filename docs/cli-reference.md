@@ -424,7 +424,8 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   `SHUTDOWN_SETTLE_SECS` (default `150`, range `1..=3600`): deployment
   tuning for the live stream, shared-store cadence, directory scans (including
   `runs list`, `runs costs` and generator-root listing), queued-run
-  recovery and journal-observation retry cadence, and the graceful shutdown
+  recovery plus journal-observation and failed suspended-run reconciliation
+  retry cadence, and the graceful shutdown
   phases. Settle must be at least drain; out-of-range values
   refuse boot. Total shutdown time is the sum of the configured drain and
   settle phases (180 s by default; at most 7200 s).
