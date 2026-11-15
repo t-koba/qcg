@@ -718,8 +718,23 @@ changing the step's ordinary result. Paths and digests stay in private traces,
 not public events or `state.json` (existing step output is unchanged).
 Private trace format v2 rejects v1 evidence, which predates file dependencies.
 No other executor captures file evidence.
-This evidence does not enable continuation or reset, rebind traces across
-forks, or establish external-effect or power-loss safety.
+A private, unwired engine diagnostic can compare a cleanly sealed failed
+source run's captured reads with that same source's folded values and workspace
+bytes. It requires complete event-bound traces for every outcome and separate
+executor attestations for read-only effects and complete runtime-read coverage;
+`check.format` supplies both, while custom/unknown executors default to
+unsupported. The bounded, redacted diagnostic classifies failed retry roots,
+stale successful outcomes and unchanged successful outcomes, preserving the
+exact inherited budget. Unsupported history, state, budget or ambiguous I/O
+refuses analysis. Workspace-file rechecks require an explicit
+`runtime.file_input_limit_bytes` and Unix handle-relative reads; they refuse on
+other platforms.
+Neither the evidence nor this source-only diagnostic enables continuation or
+reset, authorizes a child/fork, rebinds traces across runs, cleans effects, or
+establishes external-effect or power-loss safety. Ordinary fork/replay is
+unchanged; no public continuation/reset endpoint or runtime route was added.
+The additive, default-deny executor-coverage declaration on `StepExecutor` is
+metadata-only.
 
 Journal synchronization mapping (`crates/engine/src/journal/writer.rs`):
 

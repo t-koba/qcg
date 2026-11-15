@@ -1,7 +1,9 @@
 use crate::common::{read_opened_bounded, require};
 use async_trait::async_trait;
 use contract::{Contract, NodeDef, ReadIdentity, ReadKind, ReadOwner};
-use engine::{ContinuationSafety, StepContext, StepError, StepExecutor, StepOutcome};
+use engine::{
+    ContinuationReadCoverage, ContinuationSafety, StepContext, StepError, StepExecutor, StepOutcome,
+};
 use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
@@ -35,6 +37,10 @@ impl StepExecutor for CheckFormatStep {
 
     fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
         ContinuationSafety::ReadOnly
+    }
+
+    fn continuation_read_coverage(&self, _node: &NodeDef) -> ContinuationReadCoverage {
+        ContinuationReadCoverage::Complete
     }
 
     fn validate(&self, node: &NodeDef, _contract: &Contract) -> Result<(), StepError> {
@@ -150,6 +156,10 @@ mod tests {
         .unwrap();
         let mut registry = engine::StepRegistry::new();
         registry.register(CheckFormatStep);
+        assert_eq!(
+            registry.continuation_read_coverage(&node),
+            ContinuationReadCoverage::Complete
+        );
         assert_eq!(
             registry.continuation_safety(&node),
             ContinuationSafety::ReadOnly

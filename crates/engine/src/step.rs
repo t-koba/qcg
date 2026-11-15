@@ -238,6 +238,15 @@ pub enum ContinuationSafety {
     ReadOnly,
 }
 
+/// Independent attestation that every runtime input read is captured in the
+/// owner trace. Read-only effect safety alone does not establish this property.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ContinuationReadCoverage {
+    #[default]
+    Unsupported,
+    Complete,
+}
+
 #[async_trait]
 pub trait StepExecutor: Send + Sync {
     fn type_id(&self) -> &'static str;
@@ -249,6 +258,12 @@ pub trait StepExecutor: Send + Sync {
     /// Undeclared executors are ineligible for per-node continuation.
     fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
         ContinuationSafety::Unsupported
+    }
+
+    /// Opt in only when all runtime input reads are recorded, including reads
+    /// outside ValueBag (for example workspace bytes). Default deny is deliberate.
+    fn continuation_read_coverage(&self, _node: &NodeDef) -> ContinuationReadCoverage {
+        ContinuationReadCoverage::Unsupported
     }
 
     /// Safe/guarded re-entry after an unreported direct node execution; parallel safety is not enough.
@@ -379,6 +394,13 @@ impl StepRegistry {
         self.executors
             .get(node.kind.as_str())
             .map(|executor| executor.continuation_safety(node))
+            .unwrap_or_default()
+    }
+
+    pub fn continuation_read_coverage(&self, node: &NodeDef) -> ContinuationReadCoverage {
+        self.executors
+            .get(node.kind.as_str())
+            .map(|executor| executor.continuation_read_coverage(node))
             .unwrap_or_default()
     }
 
@@ -889,7 +911,24 @@ mod tests {
             CustomStep.continuation_safety(&custom),
             ContinuationSafety::Unsupported
         );
+        assert_eq!(
+            ContinuationReadCoverage::default(),
+            ContinuationReadCoverage::Unsupported
+        );
+        assert_eq!(
+            CustomStep.continuation_read_coverage(&custom),
+            ContinuationReadCoverage::Unsupported
+        );
+        assert_eq!(
+            registry.continuation_read_coverage(&unknown),
+            ContinuationReadCoverage::Unsupported
+        );
         registry.register(CustomStep);
+        assert_eq!(
+            registry.continuation_read_coverage(&custom),
+            ContinuationReadCoverage::Unsupported
+        );
+
         assert_eq!(
             registry.continuation_safety(&custom),
             ContinuationSafety::Unsupported

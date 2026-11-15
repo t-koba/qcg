@@ -397,6 +397,36 @@ impl FsGateway {
         std::fs::File::open(target).map_err(GatewayError::Io)
     }
 
+    /// Private diagnostic read: no workspace creation, no symlink following,
+    /// and no blocking on special files. Only a missing descendant of a known
+    /// source root can be classified as confirmed missing by the planner.
+    #[allow(dead_code)] // Diagnostic planner is intentionally not runtime-wired.
+    pub(crate) fn open_diagnostic_read(&self, path: &str) -> Result<std::fs::File, GatewayError> {
+        if !self.can_read_workspace {
+            return Err(GatewayError::FsReadDenied);
+        }
+        #[cfg(unix)]
+        {
+            let root = dunce::canonicalize(&self.workspace)
+                .and_then(|root| {
+                    if root.is_dir() {
+                        Ok(root)
+                    } else {
+                        Err(std::io::Error::other("invalid source root"))
+                    }
+                })
+                .map_err(|_| std::io::Error::other("source root unavailable"))?;
+            let root = Utf8PathBuf::from_path_buf(root)
+                .map_err(|_| std::io::Error::other("source root unavailable"))?;
+            super::handle::open_diagnostic_read(&root, path).map_err(GatewayError::Io)
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            Err(std::io::Error::other("no handle-relative diagnostic read on this platform").into())
+        }
+    }
+
     pub fn resolve_read(&self, path: &str) -> Result<Utf8PathBuf, GatewayError> {
         if !self.can_read_workspace {
             return Err(GatewayError::FsReadDenied);

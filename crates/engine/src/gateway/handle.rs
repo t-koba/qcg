@@ -243,8 +243,25 @@ fn open_parent(
 }
 
 pub(crate) fn open_read(workspace: &Utf8Path, relative: &str) -> std::io::Result<std::fs::File> {
+    open_read_with_flags(workspace, relative, 0)
+}
+
+/// Nonblocking open lets a diagnostic refuse non-regular inputs without
+/// hanging on a FIFO. The ordinary runtime read path retains its flags.
+pub(crate) fn open_diagnostic_read(
+    workspace: &Utf8Path,
+    relative: &str,
+) -> std::io::Result<std::fs::File> {
+    open_read_with_flags(workspace, relative, libc::O_NONBLOCK)
+}
+
+fn open_read_with_flags(
+    workspace: &Utf8Path,
+    relative: &str,
+    flags: i32,
+) -> std::io::Result<std::fs::File> {
     let (dir, leaf) = open_parent(workspace, relative, false)?;
-    let fd = openat(dir, &leaf, libc::O_RDONLY | libc::O_NOFOLLOW, 0);
+    let fd = openat(dir, &leaf, libc::O_RDONLY | libc::O_NOFOLLOW | flags, 0);
     close(dir);
     // SAFETY: the returned fd is a fresh owned descriptor.
     Ok(unsafe { std::fs::File::from_raw_fd(fd?) })

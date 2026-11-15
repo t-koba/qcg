@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use super::error::ExprError;
 use super::lexer::{ensure_expression_bytes, eval_expression, tokenize};
 use super::parser::{ExpressionNode, Parser};
-use super::read::{ReadIdentity, ReadKind, ReadOwner, ReadRecorder, ReadTrace};
+use super::read::{ReadDependency, ReadIdentity, ReadKind, ReadOwner, ReadRecorder, ReadTrace};
 use schemars::JsonSchema;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema, Default)]
@@ -65,6 +65,75 @@ impl Drop for ValueBagReadScope<'_> {
 }
 
 impl ValueBag {
+    /// Compare captured value evidence without recording reads or interpreting
+    /// dots in stored segments. Workspace-file evidence belongs to the engine.
+    /// None means the evidence has no supported value identity.
+    pub fn matches_dependency(&self, dependency: &ReadDependency) -> Option<bool> {
+        if !matches!(dependency.kind, ReadKind::Lookup | ReadKind::Collection)
+            || dependency.identity == ReadIdentity::Unsupported
+            || (dependency.identity == ReadIdentity::Present && dependency.kind != ReadKind::Lookup)
+        {
+            return None;
+        }
+        use std::borrow::Cow;
+        let parts = dependency
+            .path
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        // These partial paths have two historical read views: expressions
+        // require a child field, while templates expose a collection. Missing
+        // evidence cannot distinguish those views once a collection exists.
+        // Refuse that ambiguity rather than silently preserving a changed read.
+        if dependency.kind == ReadKind::Lookup
+            && dependency.identity == ReadIdentity::Missing
+            && (matches!(parts.as_slice(), ["inputs"] | ["steps"])
+                || matches!(parts.as_slice(), ["steps", id] if self.steps.contains_key(*id)
+                    || self.statuses.contains_key(*id) || self.reasons.contains_key(*id)))
+        {
+            return None;
+        }
+        let current = match parts.as_slice() {
+            [] => Some(Cow::Owned(self.template_snapshot())),
+            ["inputs"] => Some(Cow::Owned(serde_json::json!(self.inputs))),
+            ["inputs", key, rest @ ..] => self
+                .inputs
+                .get(*key)
+                .and_then(|value| Self::descend(value, rest))
+                .map(Cow::Borrowed),
+            ["steps"] => Some(Cow::Owned(self.steps_snapshot())),
+            ["steps", id] => self.step_snapshot(id).map(Cow::Owned),
+            ["steps", id, field, rest @ ..] => {
+                let value = match *field {
+                    "output" => self.steps.get(*id),
+                    "status" => self.statuses.get(*id),
+                    "reason" => self.reasons.get(*id),
+                    _ => None,
+                };
+                value
+                    .and_then(|value| Self::descend(value, rest))
+                    .map(Cow::Borrowed)
+            }
+            ["item", rest @ ..] => {
+                // Expressions see an absent item as missing; templates expose
+                // its null placeholder. The stored identity distinguishes the
+                // two existing read views without inventing a path spelling.
+                let item = self.item.as_ref().or_else(|| {
+                    (dependency.identity != ReadIdentity::Missing).then_some(&Value::Null)
+                });
+                item.and_then(|value| Self::descend(value, rest))
+                    .map(Cow::Borrowed)
+            }
+            _ => return None,
+        };
+        Some(match &dependency.identity {
+            ReadIdentity::Present => {
+                matches!(current.as_deref(), Some(Value::Array(_) | Value::Object(_)))
+            }
+            identity => ReadIdentity::of(current.as_deref()) == *identity,
+        })
+    }
+
     pub fn read_scope(&mut self, owner: ReadOwner) -> ValueBagReadScope<'_> {
         let previous = self.reads.clone();
         self.reads = self.reads.for_owner(owner);
@@ -271,6 +340,14 @@ impl ValueBag {
     /// must use `to_json` so detached reads retain a conservative dependency.
     #[doc(hidden)]
     pub fn template_snapshot(&self) -> Value {
+        serde_json::json!({
+            "inputs": self.inputs,
+            "steps": self.steps_snapshot(),
+            "item": self.item,
+        })
+    }
+
+    fn steps_snapshot(&self) -> Value {
         let mut ids = self
             .steps
             .keys()
@@ -281,25 +358,23 @@ impl ValueBag {
         ids.dedup();
         let steps = ids
             .into_iter()
-            .map(|key| {
-                let mut value = serde_json::Map::new();
-                if let Some(output) = self.steps.get(key) {
-                    value.insert("output".into(), output.clone());
-                }
-                if let Some(status) = self.statuses.get(key) {
-                    value.insert("status".into(), status.clone());
-                }
-                if let Some(reason) = self.reasons.get(key) {
-                    value.insert("reason".into(), reason.clone());
-                }
-                (key.clone(), Value::Object(value))
-            })
+            .filter_map(|key| self.step_snapshot(key).map(|value| (key.clone(), value)))
             .collect::<BTreeMap<_, _>>();
-        serde_json::json!({
-            "inputs": self.inputs,
-            "steps": steps,
-            "item": self.item,
-        })
+        serde_json::json!(steps)
+    }
+
+    fn step_snapshot(&self, id: &str) -> Option<Value> {
+        let mut value = serde_json::Map::new();
+        for (field, map) in [
+            ("output", &self.steps),
+            ("status", &self.statuses),
+            ("reason", &self.reasons),
+        ] {
+            if let Some(entry) = map.get(id) {
+                value.insert(field.into(), entry.clone());
+            }
+        }
+        (!value.is_empty()).then_some(Value::Object(value))
     }
 
     pub fn get_path(&self, path: &str) -> Option<&Value> {
@@ -417,6 +492,108 @@ impl ValueBag {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_dependencies_compare_exact_segments_without_recording() {
+        let mut bag = ValueBag::with_inputs(BTreeMap::from([
+            ("rows".into(), serde_json::json!([{ "a.b": 1 }])),
+            ("unread".into(), serde_json::json!("private")),
+        ]));
+        bag.set_step_output("node.with.dots", serde_json::json!({ "nested": [7] }));
+        let mut dependency = ReadDependency {
+            owner: ReadOwner::Node("consumer".into()),
+            path: vec![
+                "steps".into(),
+                "node.with.dots".into(),
+                "output".into(),
+                "nested".into(),
+                "0".into(),
+            ],
+            kind: ReadKind::Lookup,
+            identity: ReadIdentity::of(Some(&serde_json::json!(7))),
+        };
+        let before = bag.read_trace();
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        dependency.path = ["inputs", "rows", "0", "a.b"].map(str::to_owned).to_vec();
+        dependency.identity = ReadIdentity::of(Some(&serde_json::json!(1)));
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        bag.patch_inputs(BTreeMap::from([(
+            "rows".into(),
+            serde_json::json!([{ "a.b": 2 }]),
+        )]));
+        assert_eq!(bag.matches_dependency(&dependency), Some(false));
+        dependency.path.push("missing".into());
+        dependency.identity = ReadIdentity::Missing;
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        dependency.path = ["inputs", "rows"].map(str::to_owned).to_vec();
+        dependency.identity = ReadIdentity::Present;
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        dependency.kind = ReadKind::Collection;
+        dependency.identity = ReadIdentity::of(Some(&serde_json::json!([{ "a.b": 2 }])));
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        bag.patch_inputs(BTreeMap::from([("rows".into(), serde_json::json!([]))]));
+        assert_eq!(bag.matches_dependency(&dependency), Some(false));
+        dependency.identity = ReadIdentity::Present;
+        assert_eq!(bag.matches_dependency(&dependency), None);
+        dependency.kind = ReadKind::Lookup;
+        assert_eq!(bag.matches_dependency(&dependency), Some(true));
+        bag.patch_inputs(BTreeMap::from([("rows".into(), serde_json::json!(0))]));
+        assert_eq!(bag.matches_dependency(&dependency), Some(false));
+        dependency.identity = ReadIdentity::Unsupported;
+        assert_eq!(bag.matches_dependency(&dependency), None);
+        dependency.kind = ReadKind::WorkspaceFile;
+        assert_eq!(bag.matches_dependency(&dependency), None);
+        let after = bag.read_trace();
+        assert_eq!(before.reads, after.reads);
+        assert_eq!(before.owners, after.owners);
+        assert_eq!(before.retained_bytes, after.retained_bytes);
+    }
+
+    #[test]
+    fn captured_collection_roots_missing_and_item_views_match() {
+        let mut bag = ValueBag::default();
+        bag.set_step_outcome(
+            "node.with.dots",
+            "failed",
+            Some(serde_json::json!({"code":"failed"})),
+        );
+        for path in [
+            vec![],
+            vec!["inputs"],
+            vec!["steps"],
+            vec!["steps", "node.with.dots"],
+        ] {
+            let snapshot = bag.template_snapshot();
+            let value = ValueBag::descend(&snapshot, &path);
+            let read = ReadDependency {
+                owner: ReadOwner::Node("consumer".into()),
+                path: path.into_iter().map(str::to_owned).collect(),
+                kind: ReadKind::Collection,
+                identity: ReadIdentity::of(value),
+            };
+            assert_eq!(bag.matches_dependency(&read), Some(true));
+        }
+        let mut read = ReadDependency {
+            owner: ReadOwner::Node("consumer".into()),
+            path: vec!["item".into()],
+            kind: ReadKind::Lookup,
+            identity: ReadIdentity::Missing,
+        };
+        assert_eq!(bag.matches_dependency(&read), Some(true));
+        read.identity = ReadIdentity::of(Some(&Value::Null));
+        assert_eq!(bag.matches_dependency(&read), Some(true));
+        bag.set_item(Some(serde_json::json!({"nested":[3]})));
+        assert_eq!(bag.matches_dependency(&read), Some(false));
+        read.path.extend(["nested".into(), "0".into()]);
+        read.identity = ReadIdentity::of(Some(&serde_json::json!(3)));
+        assert_eq!(bag.matches_dependency(&read), Some(true));
+        read.path = vec!["steps".into(), "node.with.dots".into()];
+        read.identity = ReadIdentity::Missing;
+        assert_eq!(bag.matches_dependency(&read), None);
+        read.path = vec!["unknown_namespace".into()];
+        read.identity = ReadIdentity::Missing;
+        assert_eq!(bag.matches_dependency(&read), None);
+    }
 
     fn has_read(bag: &ValueBag, path: &[&str], kind: ReadKind, missing: bool) -> bool {
         bag.read_trace().reads.iter().any(|r| {

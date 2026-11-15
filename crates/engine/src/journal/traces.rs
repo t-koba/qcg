@@ -9,6 +9,10 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 mod history;
+// Deliberately no runtime/API caller: this source-only diagnostic grants no
+// reset, child/fork, replay or continuation authority.
+#[allow(dead_code)]
+mod planner;
 mod private_file;
 use private_file::{Access as TraceAccess, open as open_private_trace};
 use std::io::{Read, Seek, SeekFrom, Write};
