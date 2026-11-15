@@ -677,13 +677,46 @@ Directory-entry durability means both file bytes and the naming directory
 entry are synchronized: the file data is synced and its containing directory
 is fsynced. qcg requests that for selected sidecar and replacement paths on
 Unix, including `state.json`, workspace replacements/removals, and idempotency
-records. Journal and checkpoint-fork code syncs file contents and selected
-containing directories as described below, but does not establish a durable
-transaction across the full newly-created run-directory ancestry. On non-Unix,
-`sync_dir_entry` and `sync_parent_dir` are no-ops: call sites may sync file
-contents, but parent-directory entry persistence is not established. These
-are not host-power-loss guarantees; the table below describes the process-crash
+records. Ordinary journal/replay paths sync file contents and selected
+containing directories; they do not establish a whole-tree transaction.
+On non-Unix, `sync_dir_entry` and `sync_parent_dir` are no-ops. These are not
+host-power-loss guarantees; the table below describes the process-crash
 contract covered by native tests.
+
+Fresh **service checkpoint forks** use a separate v1 child-tree commit protocol.
+Their `run_forked` event records `fork_tree_commit_version: 1`. After the child's
+own durable `run_queued`, and before removing `meta/fork-admission.pending`,
+`meta/fork-tree.commit.json` binds the run ID, queue sequence, exact journal
+prefix length/hash, audit prefix length and deterministic SHA-256 tree digest.
+The record also checksums those fields and its durability classification.
+The digest covers sorted relative UTF-8 paths, file/directory types, lengths,
+and regular-file content hashes (including empty directories); symlinks and
+special files in the payload are refused. Journal/audit prefixes are fixed at
+commit, so later legitimate appends do not change the staged identity.
+The only exclusions are commit/visibility metadata (`fork-tree.commit.json`,
+`fork-admission.pending`) and transient coordination under `meta/`:
+`state.json` (the disposable journal-fold cache, never replay truth),
+`.journal.lock`, `execution.lock`, `.clean_shutdown`, and the `control/` mailbox.
+`idempotency.json` and its atomically staged `idempotency.tmp-*` files are the
+separate server-owned reverse association, written outside the service tree-commit
+window and validated by the idempotency reader.
+Package, workspace, checkpoint blobs and private trace files are included.
+
+On supported Unix filesystems the barrier syncs every included file and then
+its directories bottom-up, publishes/syncs the manifest, and syncs metadata,
+the new run directory and its run-store parent. A pending recovery verifies
+and repeats the barrier before clearing visibility. Missing, malformed or
+mismatched new-format commit evidence refuses adoption; the stable tree is
+also checked under execution ownership before the child's first execution.
+After its first start the workspace is mutable and ordinary replay applies;
+the commit identity/checksum and original journal prefix remain checked.
+Legacy forks retain their existing recovery path. Non-Unix or unsupported
+directory fsync records `directory_sync_unsupported`, not `fsync`, while
+preserving ordinary forks. Such a record cannot establish durable-tree
+eligibility for any future continuation mechanism. This proves only the
+requested filesystem fsync ordering and integrity checks, not physical-media
+or power-loss behavior. It neither enables continuation/reset nor completes
+the other continuation safety prerequisites.
 
 Runtime dependency evidence is private run metadata in
 `meta/.dependency-traces.jsonl`, not a public event stream or an API field.

@@ -1954,6 +1954,16 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     .unwrap();
     drop(admission);
     let committed = read_journal_events(&child.run_dir).unwrap();
+    assert!(
+        crate::summaries::rehydrate_runs(&runs, 8, 8).is_err(),
+        "a new-format queue without the tree commit must not recover"
+    );
+    crate::fork_commit::publish(
+        &child.run_dir,
+        "child",
+        committed.last().unwrap()["seq"].as_u64().unwrap(),
+    )
+    .unwrap();
     let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
     assert_eq!(recovered["child"].state, RunStatus::Queued);
     assert_eq!(recovered["child"].priority, 7);

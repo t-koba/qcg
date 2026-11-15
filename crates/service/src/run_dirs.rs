@@ -60,7 +60,7 @@ pub(crate) fn mark_fork_admission_pending(run_dir: &Utf8Path) -> Result<(), Serv
         .create_new(true)
         .open(&marker)?;
     file.sync_all()?;
-    sync_dir_entry(&run_meta_dir(run_dir))?;
+    crate::fork_commit::sync_fork_dir(&run_meta_dir(run_dir))?;
     Ok(())
 }
 
@@ -70,7 +70,7 @@ pub(crate) fn clear_fork_admission_pending(run_dir: &Utf8Path) -> Result<(), Ser
     }
     let marker = fork_admission_marker(run_dir);
     std::fs::remove_file(marker)?;
-    sync_dir_entry(&run_meta_dir(run_dir))?;
+    crate::fork_commit::sync_fork_dir(&run_meta_dir(run_dir))?;
     Ok(())
 }
 
@@ -837,7 +837,7 @@ fn populate_checkpoint_fork(
         }
         std::fs::rename(&tmp, &destination)?;
         if let Some(parent) = destination.parent() {
-            sync_dir_entry(parent).map_err(ServiceError::Io)?;
+            crate::fork_commit::sync_fork_dir(parent).map_err(ServiceError::Io)?;
         }
         if files::hash_file_sha256(&destination, None).map(|(hex, _)| hex)? != digest {
             return Err(ServiceError::Invalid(format!(
@@ -967,6 +967,7 @@ fn populate_checkpoint_fork(
         "span_id": api::span_id_for_seq(next_seq),
         "source_run_id": source_id,
         "source_seq": at_seq,
+        "fork_tree_commit_version": crate::fork_commit::VERSION,
     });
     serde_json::to_writer(&mut journal, &fork_event)?;
     journal.write_all(b"\n")?;
@@ -991,10 +992,9 @@ fn populate_checkpoint_fork(
     if let Some(audit) = audit_writer.as_mut() {
         audit.sync_all()?;
     }
-    // Sync the containing metadata directory on Unix after publishing the
-    // fork journal. `sync_dir_entry` is a non-Unix no-op; neither platform
-    // behavior establishes power-loss safety for the whole new run tree.
-    sync_dir_entry(&target_meta).map_err(ServiceError::Io)?;
+    // Preparation alone is not a committed child tree. The admission path
+    // publishes the tree barrier after appending the child queue identity.
+    crate::fork_commit::sync_fork_dir(&target_meta).map_err(ServiceError::Io)?;
     if let Some(projection) = trace_projection {
         projection.publish(&journal_path);
     }
@@ -1142,7 +1142,7 @@ fn copy_verified_blob(
         return Err(ServiceError::Io(error));
     }
     if let Some(parent) = destination.parent() {
-        sync_dir_entry(parent).map_err(ServiceError::Io)?;
+        crate::fork_commit::sync_fork_dir(parent).map_err(ServiceError::Io)?;
     }
     if files::hash_file_sha256(destination, None).map(|(hex, _)| hex)? != expected_digest {
         return Err(ServiceError::Invalid(format!(
@@ -1401,6 +1401,7 @@ pub(crate) fn check_run_admission(
         wipe_incomplete_run_dir(run_dir)?;
         return Ok(false);
     }
+    crate::fork_commit::verify(run_dir, run_id, events)?;
     // A crash after the child's queue append but before marker removal leaves
     // a complete, adoptable run. Clear visibility only after validating the
     // same admission snapshot under the per-run lock.

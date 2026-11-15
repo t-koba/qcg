@@ -1607,6 +1607,28 @@ impl LocalService {
                             return;
                         }
                     };
+                    let journaled = if journaled
+                        .iter()
+                        .any(|event| event.get("fork_tree_commit_version").is_some())
+                    {
+                        let directory = run_dir.clone();
+                        let identity = run_id.clone();
+                        match service
+                            .blocking_work(move || {
+                                crate::fork_commit::verify(&directory, &identity, &journaled)?;
+                                Ok(journaled)
+                            })
+                            .await
+                        {
+                            Ok(values) => values,
+                            Err(error) => {
+                                tracing::error!(%error, run_id = %run_id, "fork tree verification failed; refusing execution");
+                                return;
+                            }
+                        }
+                    } else {
+                        journaled
+                    };
                     record.state = RunStatus::Running;
                     // Claim shared-store ownership while holding the execution
                     // lease so peers observe the active owner.

@@ -77,14 +77,48 @@ impl LocalService {
             }
             return Err(api_internal(error));
         }
-        if is_fork
-            && fork_payload.is_some()
-            && let Err(error) = crate::run_dirs::clear_fork_admission_pending(&staged.run_dir)
-        {
-            Self::settle_refused_admission(&staged.run_dir).await;
-            return Err(api_internal(format!(
-                "fork queue was committed but its visibility marker could not be cleared: {error}"
-            )));
+        if is_fork && fork_payload.is_some() {
+            // Reuse forks are fresh starts, not checkpoint-tree publications.
+            if snapshot
+                .events
+                .iter()
+                .rev()
+                .find(|event| event["t"] == "run_forked")
+                .is_some_and(|event| {
+                    event["fork_tree_commit_version"].as_u64() == Some(crate::fork_commit::VERSION)
+                })
+            {
+                let queue_seq = snapshot
+                    .events
+                    .iter()
+                    .filter_map(|event| event["seq"].as_u64())
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| api_internal("fork queue sequence overflow"))?;
+                let directory = staged.run_dir.clone();
+                let identity = run_id.clone();
+                if let Err(error) = self
+                    .blocking_work(move || {
+                        crate::fork_commit::publish(&directory, &identity, queue_seq)
+                    })
+                    .await
+                {
+                    // Do not let a queued but uncommitted child be resumed
+                    // after this admission reported failure.
+                    Self::settle_refused_admission(&staged.run_dir).await;
+                    return Err(api_internal(error));
+                }
+            }
+            if let Err(error) = crate::run_dirs::clear_fork_admission_pending(&staged.run_dir) {
+                // A committed queue without a cleared marker must be settled
+                // as refused before returning, preserving the prior admission
+                // contract if the marker removal itself was not durable.
+                Self::settle_refused_admission(&staged.run_dir).await;
+                return Err(api_internal(format!(
+                    "fork queue was committed but its visibility marker could not be cleared: {error}"
+                )));
+            }
         }
         if let Some(membership) = &mut membership {
             membership.admitted(&staged.run_dir);

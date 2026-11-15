@@ -15,6 +15,7 @@ mod idempotency_refs;
 mod invalidation;
 pub use idempotency_refs::MAX_IDEMPOTENCY_FILE_BYTES;
 pub use invalidation::require_run_directory;
+mod fork_commit;
 mod lifecycle;
 mod queue;
 mod read_store;
