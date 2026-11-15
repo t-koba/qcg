@@ -695,8 +695,10 @@ special files in the payload are refused. Journal/audit prefixes are fixed at
 commit, so later legitimate appends do not change the staged identity.
 The only exclusions are commit/visibility metadata (`fork-tree.commit.json`,
 `fork-admission.pending`) and transient coordination under `meta/`:
-`state.json` (the disposable journal-fold cache, never replay truth),
-`.journal.lock`, `execution.lock`, `.clean_shutdown`, and the `control/` mailbox.
+`state.json` and its atomic `.state.json.part-*` staging files (disposable
+journal-fold caches, never replay truth), `.journal.lock`, `execution.lock`,
+`.clean_shutdown`, and the `control/` mailbox. An interrupted cache publication
+before the first start does not change the committed payload identity.
 `idempotency.json` and its atomically staged `idempotency.tmp-*` files are the
 separate server-owned reverse association, written outside the service tree-commit
 window and validated by the idempotency reader.

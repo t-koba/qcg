@@ -108,11 +108,13 @@ fn hash_file(path: &Utf8Path, bytes: u64, sync: bool) -> Result<String, ServiceE
 }
 
 /// These are coordination, not child payload. Keep in sync with operations.md.
-/// state.json is a disposable journal-fold cache, not replay truth. Journal and
-/// audit *prefixes* are bound; later control/queue appends may legitimately grow.
+/// state.json and its atomic staging files are disposable journal-fold caches,
+/// not replay truth. Journal and audit *prefixes* are bound; later control/queue
+/// appends may legitimately grow.
 fn excluded(relative: &str) -> bool {
     relative == "meta/idempotency.json"
         || relative.starts_with("meta/idempotency.tmp-")
+        || relative.starts_with("meta/.state.json.part-")
         || matches!(
             relative,
             "meta/fork-admission.pending"
@@ -126,16 +128,13 @@ fn excluded(relative: &str) -> bool {
 }
 
 fn unsupported(error: &std::io::Error) -> bool {
-    if error.kind() == std::io::ErrorKind::Unsupported {
-        return true;
-    }
     #[cfg(unix)]
-    if error.raw_os_error().is_some_and(|code| {
+    let unsupported_code = error.raw_os_error().is_some_and(|code| {
         code == libc::EINVAL || code == libc::ENOTSUP || code == libc::EOPNOTSUPP
-    }) {
-        return true;
-    }
-    false
+    });
+    #[cfg(not(unix))]
+    let unsupported_code = false;
+    error.kind() == std::io::ErrorKind::Unsupported || unsupported_code
 }
 
 fn required_dir_sync(path: &Utf8Path) -> std::io::Result<()> {
@@ -488,6 +487,36 @@ mod tests {
         );
         assert!(f.adopt().unwrap().adopted);
         assert!(!run_dirs::fork_admission_pending(f.dir()).unwrap());
+        verify(f.dir(), "child", &f.events).unwrap();
+    }
+
+    #[test]
+    fn interrupted_state_cache_publication_does_not_change_the_committed_tree() {
+        let f = Fixture::new();
+        f.publish();
+        // JournalWriter creates this disposable cache before run_resumed. A
+        // process kill inside write_sidecar_atomic leaves the staging name,
+        // with either partial or complete cache bytes, but no new start event.
+        let cache = std::fs::read(run_meta_dir(f.dir()).join("state.json")).unwrap();
+        let name = format!(".state.json.part-{}-0", std::process::id());
+        let staging = run_meta_dir(f.dir()).join(&name);
+        for bytes in [b"{".as_slice(), cache.as_slice()] {
+            std::fs::write(&staging, bytes).unwrap();
+            assert!(f.adopt().unwrap().adopted);
+            verify(f.dir(), "child", &f.events).unwrap();
+        }
+        // Only metadata-cache staging is disposable, not workspace payload or
+        // private trace staging. Neither may disappear from tree verification.
+        for relative in [
+            format!("workspace/{name}"),
+            "meta/.dependency-traces.jsonl.part-1-0".into(),
+        ] {
+            let path = f.dir().join(relative);
+            std::fs::write(&path, b"uncommitted payload").unwrap();
+            assert!(verify(f.dir(), "child", &f.events).is_err());
+            std::fs::remove_file(path).unwrap();
+        }
+        std::fs::remove_file(staging).unwrap();
         verify(f.dir(), "child", &f.events).unwrap();
     }
 
