@@ -565,6 +565,31 @@ async fn workspace_file_requires_explicit_byte_limit() {
 }
 
 #[tokio::test]
+async fn hook_and_foreach_contracts_are_unsupported() {
+    let f = Fixture::new().await;
+
+    let mut hooked = f.contract.clone();
+    hooked.manifest.hooks.run_started.push(contract::HookDef {
+        id: "notice".into(),
+        kind: contract::StepType::literal("test.probe"),
+        on_error: contract::HookErrorPolicy::Fail,
+        retry: None,
+        params: Default::default(),
+    });
+    assert_eq!(
+        supported_state(&f.state, &hooked),
+        Err(Refusal::UnsupportedState)
+    );
+
+    let mut foreach = f.contract.clone();
+    foreach.graph.nodes.get_mut("a").unwrap().kind = contract::StepType::literal("foreach");
+    assert_eq!(
+        supported_state(&f.state, &foreach),
+        Err(Refusal::UnsupportedState)
+    );
+}
+
+#[tokio::test]
 async fn unsupported_state_budget_and_limits_refuse() {
     let mut f = Fixture::new().await;
     let original = f.state.clone();
@@ -601,6 +626,27 @@ async fn unsupported_state_budget_and_limits_refuse() {
         },
         |s| {
             s.foreach_reports.insert("iteration".into(), json!({}));
+        },
+        |s| {
+            s.pending_interactions.insert(
+                model::NodePath::root("a"),
+                crate::state::Interaction::Question {
+                    question: api::FormSpec::default(),
+                },
+            );
+        },
+        |s| {
+            s.interaction_seqs.insert(model::NodePath::root("a"), 1);
+        },
+        |s| {
+            s.answers
+                .insert("question".into(), json!({"answer": "yes"}));
+        },
+        |s| {
+            s.confirmations.insert("confirmation".into(), true);
+        },
+        |s| {
+            s.hooks_settled.insert("hook.run_started.notice".into());
         },
     ];
     for change in changes {
