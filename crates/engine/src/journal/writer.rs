@@ -162,6 +162,42 @@ pub(super) fn sync_parent_dir(journal_path: &Utf8Path) -> Result<(), JournalErro
     Ok(())
 }
 
+/// Events that commit admission, external effects, scheduling checkpoints, or
+/// terminal state must reach the journal before the atomic state projection.
+fn event_requires_journal_sync(kind: &str) -> bool {
+    api::is_terminal_event_kind(kind)
+        || matches!(
+            kind,
+            "run_queued"
+                | "operation_started"
+                | "effect_intent"
+                | "operation_finished"
+                | "run_yielded"
+                | "elapsed_accounted"
+        )
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static FAIL_NEXT_JOURNAL_SYNC: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn fail_next_journal_sync_for_test() {
+    FAIL_NEXT_JOURNAL_SYNC.with(|fail| fail.set(true));
+}
+
+fn sync_journal(file: &File, journal_path: &Utf8Path) -> Result<(), JournalError> {
+    #[cfg(test)]
+    if FAIL_NEXT_JOURNAL_SYNC.with(|fail| fail.replace(false)) {
+        return Err(JournalError::Io(std::io::Error::other(
+            "injected journal sync failure",
+        )));
+    }
+    file.sync_data()?;
+    sync_parent_dir(journal_path)
+}
+
 fn acquire_journal_lock(journal_path: &Utf8Path) -> std::io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
@@ -874,30 +910,12 @@ impl JournalWriter {
             })?;
             append_serialized_json_line(&mut *file, bytes, &mut stats, self.limits)?;
             super::counters::observe(kind, &value, first_queued);
-            // Durability ordering (Q2): terminal events seal the run and
-            // operation mappings (`operation_started`/`operation_finished`)
-            // precede any external send, so both fsync the journal file
-            // before the atomic state persist below. Scheduler yields also
-            // sync: requeue must never expose a checkpoint ahead of its journal.
-            // The state persist
-            // (file plus parent directory sync) follows, so the mapping is
-            // durable in both the journal and state.json before the guard
-            // returns and any gateway is touched. The journal parent
-            // directory is also synced after the file sync (Q2): same
-            // durability bar as mapping persist, so the directory entry is
-            // durable alongside the bytes.
-            if api::is_terminal_event_kind(kind)
-                || matches!(
-                    kind,
-                    "operation_started"
-                        | "effect_intent"
-                        | "operation_finished"
-                        | "run_yielded"
-                        | "elapsed_accounted"
-                )
-            {
-                file.sync_data()?;
-                sync_parent_dir(&self.journal_path)?;
+            // Q2: commit admission, effect/operation mappings, scheduler
+            // checkpoints, and terminal state to the journal before the
+            // atomic state projection. In particular, a queued admission must
+            // be durable before its caller can publish a fork to readers.
+            if event_requires_journal_sync(kind) {
+                sync_journal(&file, &self.journal_path)?;
             }
             *state = next_state;
             crate::RunState::persist_serialized_atomic(&self.state_path, &state_bytes)?;
@@ -1145,23 +1163,11 @@ impl JournalWriter {
             let bytes = serialize_bounded(&value, limits.max_event_bytes, "event")?;
             append_serialized_json_line(&mut file, bytes, &mut stats, limits)?;
             super::counters::observe(kind, &value, first_queued);
-            if api::is_terminal_event_kind(kind)
-                || matches!(
-                    kind,
-                    "operation_started"
-                        | "effect_intent"
-                        | "operation_finished"
-                        | "run_yielded"
-                        | "elapsed_accounted"
-                )
-            {
-                needs_sync = true;
-            }
+            needs_sync |= event_requires_journal_sync(kind);
             appended.push(event);
         }
         if needs_sync {
-            file.sync_data()?;
-            sync_parent_dir(journal_path)?;
+            sync_journal(&file, journal_path)?;
         }
         let state_bytes = serialize_bounded(&state, limits.max_state_bytes, "state")?;
         let state_path = journal_path.with_file_name("state.json");
@@ -1723,6 +1729,61 @@ mod tests {
         assert!(audit.contains("sha256"));
         let durable = std::fs::read_to_string(&path).expect("journal should read");
         assert!(!durable.contains("llm_delta"));
+        std::fs::remove_dir_all(&dir).expect("test dir should be removed");
+    }
+
+    #[test]
+    fn queued_admission_sync_failure_propagates_from_append() {
+        assert!(super::event_requires_journal_sync("run_queued"));
+        assert!(super::event_requires_journal_sync("run_finished"));
+        assert!(super::event_requires_journal_sync("operation_started"));
+        assert!(!super::event_requires_journal_sync("run_started"));
+        assert!(!super::event_requires_journal_sync("step_started"));
+
+        let (dir, path) = marker_fail_dir("queued-sync");
+        JournalWriter::create(&path, "queued-sync", false, None).expect("journal should open");
+        JournalWriter::append_single_event(
+            &path,
+            "queued-sync",
+            "run_started",
+            json!({
+                "generator": "sync-test@0.1.0",
+                "generator_path": "sync-test",
+                "contract_sha256": "abc",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+            }),
+            JournalLimits::default(),
+            None,
+        )
+        .expect("run_started should append");
+
+        super::fail_next_journal_sync_for_test();
+        let error = JournalWriter::append_single_event(
+            &path,
+            "queued-sync",
+            "run_queued",
+            json!({
+                "generator": "sync-test@0.1.0",
+                "generator_path": "sync-test",
+                "contract_sha256": "abc",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                "priority": 0,
+                "parent_run_id": "parent",
+            }),
+            JournalLimits::default(),
+            None,
+        )
+        .expect_err("a failed admission sync must reach the append caller");
+        assert!(
+            matches!(error, super::JournalError::Io(_)),
+            "the injected sync failure must propagate: {error}"
+        );
         std::fs::remove_dir_all(&dir).expect("test dir should be removed");
     }
 
