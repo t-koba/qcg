@@ -19,9 +19,12 @@ pub enum ReadKind {
     /// Exact workspace file bytes. Path segments are a normalized portable
     /// run-workspace-relative path; identity must be a raw-byte SHA-256 digest.
     WorkspaceFile,
+    /// Exact bytes of a normalized generator-package-relative file. This is
+    /// input evidence, not proof of the retained package identity.
+    PackageFile,
 }
 
-/// SHA-256 of canonical JSON for value reads, or exact bytes for workspace
+/// SHA-256 of canonical JSON for value reads, or exact bytes for
 /// file reads. No consumed value or file content is retained in the trace.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub enum ReadIdentity {
@@ -326,7 +329,7 @@ impl ReadRecorder {
         let mut trace = self.lock();
         if matches!(read.owner, ReadOwner::Unscoped)
             || read.identity == ReadIdentity::Unsupported
-            || (read.kind == ReadKind::WorkspaceFile
+            || (matches!(read.kind, ReadKind::WorkspaceFile | ReadKind::PackageFile)
                 && (!matches!(read.identity, ReadIdentity::Digest(_))
                     || read.path.is_empty()
                     || read

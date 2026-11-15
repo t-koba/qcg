@@ -98,6 +98,7 @@ enum Kind {
     Lookup,
     Collection,
     WorkspaceFile,
+    PackageFile,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -202,6 +203,7 @@ impl Record {
                     ReadKind::Lookup => Kind::Lookup,
                     ReadKind::Collection => Kind::Collection,
                     ReadKind::WorkspaceFile => Kind::WorkspaceFile,
+                    ReadKind::PackageFile => Kind::PackageFile,
                 },
                 identity: match read.identity {
                     ReadIdentity::Present => Identity::Present,
@@ -273,6 +275,7 @@ impl Record {
                     Kind::Lookup => ReadKind::Lookup,
                     Kind::Collection => ReadKind::Collection,
                     Kind::WorkspaceFile => ReadKind::WorkspaceFile,
+                    Kind::PackageFile => ReadKind::PackageFile,
                 },
                 match read.identity {
                     Identity::Present => ReadIdentity::Present,

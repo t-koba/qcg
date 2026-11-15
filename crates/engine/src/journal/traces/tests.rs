@@ -812,106 +812,105 @@ fn failed_history_binds_every_retained_trace_to_its_exact_settlement() {
 }
 
 #[test]
-fn workspace_file_evidence_is_private_and_bound_to_the_terminal_event() {
-    let f = Fixture::new();
-    let owner = ReadOwner::Node("format".into());
-    let reads = ReadRecorder::default().for_owner(owner.clone());
-    let identity = ReadIdentity::Digest(Sha256::digest(b"{ \"private-value\": 1 }").into());
-    reads.record(
-        &["private-dir".into(), "source.json".into()],
-        ReadKind::WorkspaceFile,
-        identity.clone(),
-    );
-    let writer = f.writer().with_read_recorder(reads).unwrap();
-    writer
-        .event(
-            "step_started",
-            json!({"node":"format", "type":"check.format", "attempt":1}),
-        )
-        .unwrap();
-    finish(&writer, "format", "success");
-    for state in [writer.state(), f.restore_traces()] {
-        assert_success(&state, "format");
-        let evidence = &state.dependency_traces.owners["format"];
-        assert_eq!(evidence.seq, 2);
-        assert_eq!(
-            evidence.event_digest,
-            digest(
-                &read_journal_values(&f.path, JournalLimits::default())
-                    .unwrap()
-                    .events[1]
+fn file_evidence_is_private_and_bound_to_the_terminal_event() {
+    for kind in [ReadKind::WorkspaceFile, ReadKind::PackageFile] {
+        let f = Fixture::new();
+        let owner = ReadOwner::Node("format".into());
+        let reads = ReadRecorder::default().for_owner(owner.clone());
+        let identity = ReadIdentity::Digest(Sha256::digest(b"{ \"private-value\": 1 }").into());
+        reads.record(
+            &["private-dir".into(), "source.json".into()],
+            kind,
+            identity.clone(),
+        );
+        let writer = f.writer().with_read_recorder(reads).unwrap();
+        writer
+            .event(
+                "step_started",
+                json!({"node":"format", "type":"check.format", "attempt":1}),
             )
-            .unwrap()
-        );
-        let read = evidence.trace.reads.iter().next().unwrap();
-        assert_eq!(read.kind, ReadKind::WorkspaceFile);
-        assert_eq!(read.path, ["private-dir", "source.json"]);
-        assert_eq!(read.identity, identity);
-        assert!(evidence.trace.complete_for(&owner));
+            .unwrap();
+        finish(&writer, "format", "success");
+        for state in [writer.state(), f.restore_traces()] {
+            assert_success(&state, "format");
+            let evidence = &state.dependency_traces.owners["format"];
+            assert_eq!(evidence.seq, 2);
+            assert_eq!(
+                evidence.event_digest,
+                digest(
+                    &read_journal_values(&f.path, JournalLimits::default())
+                        .unwrap()
+                        .events[1]
+                )
+                .unwrap()
+            );
+            let read = evidence.trace.reads.iter().next().unwrap();
+            assert_eq!(read.kind, kind);
+            assert_eq!(read.path, ["private-dir", "source.json"]);
+            assert_eq!(read.identity, identity);
+            assert!(evidence.trace.complete_for(&owner));
+        }
+        for path in [&f.path, &f.path.with_file_name("state.json")] {
+            let public = std::fs::read_to_string(path).unwrap();
+            assert!(!public.contains("private-dir") && !public.contains("source.json"));
+            assert!(!public.contains(
+                &serde_json::to_string(&f.records()[0]["reads"][0]["identity"]).unwrap()
+            ));
+        }
+        // Even a correctly checksummed record cannot bind to a different outcome.
+        let mut record: Record = serde_json::from_value(f.records().remove(0)).unwrap();
+        record.event_digest = [0; 32];
+        record.record_digest = record.calculate_digest().unwrap();
+        f.replace(&[serde_json::to_value(record).unwrap()]);
+        assert_success(&f.restore_traces(), "format");
+        assert!(f.restore_traces().dependency_traces.owners.is_empty());
     }
-    for path in [&f.path, &f.path.with_file_name("state.json")] {
-        let public = std::fs::read_to_string(path).unwrap();
-        assert!(!public.contains("private-dir") && !public.contains("source.json"));
-        assert!(
-            !public
-                .contains(&serde_json::to_string(&f.records()[0]["reads"][0]["identity"]).unwrap())
-        );
-    }
-    // Even a correctly checksummed record cannot bind to a different outcome.
-    let mut record: Record = serde_json::from_value(f.records().remove(0)).unwrap();
-    record.event_digest = [0; 32];
-    record.record_digest = record.calculate_digest().unwrap();
-    f.replace(&[serde_json::to_value(record).unwrap()]);
-    assert_success(&f.restore_traces(), "format");
-    assert!(f.restore_traces().dependency_traces.owners.is_empty());
 }
 
 #[test]
-fn restart_refuses_unsafe_or_missing_workspace_file_identity() {
-    let f = Fixture::new();
-    let reads = ReadRecorder::default().for_owner(ReadOwner::Node("format".into()));
-    reads.record(
-        &["source.json".into()],
-        ReadKind::WorkspaceFile,
-        ReadIdentity::Digest([1; 32]),
-    );
-    let writer = f.writer().with_read_recorder(reads).unwrap();
-    finish(&writer, "format", "success");
-    let original = f.records().remove(0);
-    for (path, identity) in [
-        (vec![], Identity::Digest([1; 32])),
-        (vec![".."], Identity::Digest([1; 32])),
-        (vec!["/absolute"], Identity::Digest([1; 32])),
-        (vec!["a/b"], Identity::Digest([1; 32])),
-        (vec!["C:"], Identity::Digest([1; 32])),
-        (vec!["a\\b"], Identity::Digest([1; 32])),
-        (vec!["source.json"], Identity::Missing),
-        (vec!["source.json"], Identity::Present),
-        (vec!["source.json"], Identity::Unsupported),
-    ] {
-        let mut record: Record = serde_json::from_value(original.clone()).unwrap();
-        record.reads[0].path = path.into_iter().map(str::to_owned).collect();
-        record.reads[0].identity = identity;
-        // Exercise semantic validation, not just checksum rejection.
-        record.record_digest = record.calculate_digest().unwrap();
-        f.replace(&[serde_json::to_value(record).unwrap()]);
-        let state = f.restore_traces();
-        assert_success(&state, "format");
-        assert!(state.dependency_traces.owners.is_empty());
-    }
-    // Old wire versions cannot claim current proof even with a recomputed
-    // checksum and an injected attestation field.
-    for version in [1, 2] {
-        let mut legacy: Record = serde_json::from_value(original.clone()).unwrap();
-        legacy.version = version;
-        legacy.reads.clear();
-        legacy.executor_attestation = Some([1; 32]);
-        legacy.record_digest = legacy.calculate_digest().unwrap();
-        f.replace(&[serde_json::to_value(legacy).unwrap()]);
+fn restart_refuses_unsafe_or_missing_file_identity() {
+    for kind in [ReadKind::WorkspaceFile, ReadKind::PackageFile] {
+        let f = Fixture::new();
+        let reads = ReadRecorder::default().for_owner(ReadOwner::Node("format".into()));
+        reads.record(&["source.json".into()], kind, ReadIdentity::Digest([1; 32]));
+        let writer = f.writer().with_read_recorder(reads).unwrap();
+        finish(&writer, "format", "success");
+        let original = f.records().remove(0);
+        for (path, identity) in [
+            (vec![], Identity::Digest([1; 32])),
+            (vec![".."], Identity::Digest([1; 32])),
+            (vec!["/absolute"], Identity::Digest([1; 32])),
+            (vec!["a/b"], Identity::Digest([1; 32])),
+            (vec!["C:"], Identity::Digest([1; 32])),
+            (vec!["a\\b"], Identity::Digest([1; 32])),
+            (vec!["source.json"], Identity::Missing),
+            (vec!["source.json"], Identity::Present),
+            (vec!["source.json"], Identity::Unsupported),
+        ] {
+            let mut record: Record = serde_json::from_value(original.clone()).unwrap();
+            record.reads[0].path = path.into_iter().map(str::to_owned).collect();
+            record.reads[0].identity = identity;
+            // Exercise semantic validation, not just checksum rejection.
+            record.record_digest = record.calculate_digest().unwrap();
+            f.replace(&[serde_json::to_value(record).unwrap()]);
+            let state = f.restore_traces();
+            assert_success(&state, "format");
+            assert!(state.dependency_traces.owners.is_empty());
+        }
+        // Old wire versions cannot claim current proof even with a recomputed
+        // checksum and an injected attestation field.
+        for version in [1, 2] {
+            let mut legacy: Record = serde_json::from_value(original.clone()).unwrap();
+            legacy.version = version;
+            legacy.reads.clear();
+            legacy.executor_attestation = Some([1; 32]);
+            legacy.record_digest = legacy.calculate_digest().unwrap();
+            f.replace(&[serde_json::to_value(legacy).unwrap()]);
+            assert!(f.restore_traces().dependency_traces.owners.is_empty());
+        }
+        f.replace(&[]);
         assert!(f.restore_traces().dependency_traces.owners.is_empty());
     }
-    f.replace(&[]);
-    assert!(f.restore_traces().dependency_traces.owners.is_empty());
 }
 
 mod projection;

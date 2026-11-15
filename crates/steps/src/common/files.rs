@@ -7,11 +7,45 @@ pub(crate) async fn bounded_transform_text(
     path: &camino::Utf8Path,
     limit: Option<usize>,
 ) -> Result<String, String> {
-    let file = fs
-        .open_read_resolved(path)
-        .map_err(|error| error.to_string())?;
-    let bytes = read_opened_bounded(file, limit, "transform input")?;
-    String::from_utf8(bytes).map_err(|error| format!("transform input is not valid UTF-8: {error}"))
+    captured_transform_text(fs, path, limit, None)
+}
+
+/// Optional evidence covers exactly the buffer decoded and parsed by the
+/// caller, never a second pathname read. Evidence failure does not alter I/O.
+pub(crate) fn captured_transform_text(
+    fs: &engine::FsGateway,
+    path: &camino::Utf8Path,
+    limit: Option<usize>,
+    reads: Option<&contract::ReadRecorder>,
+) -> Result<String, String> {
+    let result = (|| {
+        let file = fs
+            .open_read_resolved(path)
+            .map_err(|error| error.to_string())?;
+        let regular = reads.is_some() && file.metadata().is_ok_and(|meta| meta.is_file());
+        let bytes = read_opened_bounded(file, limit, "transform input")?;
+        if let Some(reads) = reads {
+            if let Some(key) = fs.workspace_relative_key(path).ok().filter(|_| regular) {
+                if reads.is_recording() {
+                    reads.record(
+                        &key.split('/').map(str::to_owned).collect::<Vec<_>>(),
+                        contract::ReadKind::WorkspaceFile,
+                        contract::ReadIdentity::Digest(Sha256::digest(&bytes).into()),
+                    );
+                }
+            } else {
+                reads.unsupported();
+            }
+        }
+        String::from_utf8(bytes)
+            .map_err(|error| format!("transform input is not valid UTF-8: {error}"))
+    })();
+    if result.is_err()
+        && let Some(reads) = reads
+    {
+        reads.unsupported();
+    }
+    result
 }
 
 pub(crate) fn ensure_bounded_file_tree(

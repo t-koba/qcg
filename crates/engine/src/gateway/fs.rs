@@ -400,14 +400,23 @@ impl FsGateway {
     /// Private diagnostic read: no workspace creation, no symlink following,
     /// and no blocking on special files. Only a missing descendant of a known
     /// source root can be classified as confirmed missing by the planner.
-    #[allow(dead_code)] // Diagnostic planner is intentionally not runtime-wired.
     pub(crate) fn open_diagnostic_read(&self, path: &str) -> Result<std::fs::File, GatewayError> {
         if !self.can_read_workspace {
             return Err(GatewayError::FsReadDenied);
         }
+        Self::open_diagnostic_read_under_root(&self.workspace, path)
+    }
+
+    /// Opens a diagnostic input below a separately source-bound root, using
+    /// the same no-follow handle walk as workspace diagnostics. Non-Unix
+    /// builds refuse because they lack this handle-relative guarantee.
+    pub(crate) fn open_diagnostic_read_under_root(
+        root: &Utf8Path,
+        path: &str,
+    ) -> Result<std::fs::File, GatewayError> {
         #[cfg(unix)]
         {
-            let root = dunce::canonicalize(&self.workspace)
+            let root = dunce::canonicalize(root)
                 .and_then(|root| {
                     if root.is_dir() {
                         Ok(root)
@@ -422,7 +431,7 @@ impl FsGateway {
         }
         #[cfg(not(unix))]
         {
-            let _ = path;
+            let _ = (root, path);
             Err(std::io::Error::other("no handle-relative diagnostic read on this platform").into())
         }
     }

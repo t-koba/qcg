@@ -46,6 +46,20 @@ impl StepExecutor for Probe {
                     ReadIdentity::Digest(Sha256::digest(&bytes).into()),
                 );
         }
+        if ctx.run.contract.root.file_name() == Some("generator-package") {
+            let mut file =
+                files::open_read_nofollow(&ctx.run.contract.root.join("schema.json")).unwrap();
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes).unwrap();
+            ctx.vars
+                .read_recorder()
+                .for_owner(ReadOwner::Node(node.id.clone()))
+                .record(
+                    &["schema.json".into()],
+                    ReadKind::PackageFile,
+                    ReadIdentity::Digest(Sha256::digest(&bytes).into()),
+                );
+        }
         if node.id == "b" {
             Ok(StepOutcome::check_failed(vec![model::Finding::error(
                 "probe check failure".into(),
@@ -96,10 +110,21 @@ impl Fixture {
         Self::with_version(Some("1")).await
     }
     async fn with_version(version: Option<&'static str>) -> Self {
+        Self::with_package(version, false).await
+    }
+    async fn with_package(version: Option<&'static str>, package: bool) -> Self {
         let dir = crate::test_support::TestDir::create("source-diagnostic");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        let run_dir = root.join("source-probe");
+        let package_root = if package {
+            run_dir.join("generator-package")
+        } else {
+            root.clone()
+        };
+        std::fs::create_dir_all(&package_root).unwrap();
+        std::fs::write(package_root.join("schema.json"), b"{}").unwrap();
         std::fs::write(
-            root.join(contract::MANIFEST_FILE),
+            package_root.join(contract::MANIFEST_FILE),
             r#"
 [generator]
 id = "probe"
@@ -127,8 +152,7 @@ type = "test.probe"
 "#,
         )
         .unwrap();
-        let contract = Contract::load(&root).unwrap();
-        let run_dir = root.join("source-probe");
+        let contract = Contract::load(&package_root).unwrap();
         let metadata = run_dir.join("meta");
         let workspace = run_dir.join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -620,4 +644,56 @@ async fn unsupported_state_budget_and_limits_refuse() {
     // A newline alone is not a clean shutdown proof.
     std::fs::remove_file(crate::journal::writer::clean_shutdown_marker_path(&f.path)).unwrap();
     assert_eq!(f.analyze().unwrap_err(), Refusal::Unsealed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn package_file_currentness_uses_exact_consumed_bytes_under_source_root() {
+    let mut f = Fixture::with_package(Some("1"), true).await;
+    assert!(
+        f.state.dependency_traces.owners["a"]
+            .trace
+            .reads
+            .iter()
+            .any(|read| read.kind == ReadKind::PackageFile)
+    );
+    let plan = f.analyze().expect("unchanged package file is current");
+    assert_eq!(plan.preserved_outcomes, ["a"]);
+    assert_eq!(plan.retry_roots, ["b"]);
+    assert!(plan.stale_outcomes.is_empty());
+
+    // The contract hash covers the manifest, not this schema. The private
+    // package-file trace is the exact dependency proof for this executor.
+    let original_contract = f.contract.sha256.clone();
+    std::fs::write(f.contract.root.join("schema.json"), b"{ }").unwrap();
+    assert_eq!(
+        Contract::load(&f.contract.root).unwrap().sha256,
+        original_contract
+    );
+    let plan = f.analyze().expect("changed file is a known stale input");
+    assert_eq!(plan.stale_outcomes, ["a"]);
+    assert_eq!(plan.retry_roots, ["b"]);
+
+    // Workspace and package inputs are independent; an unchanged schema does
+    // not hide a changed workspace source.
+    std::fs::write(f.contract.root.join("schema.json"), b"{}").unwrap();
+    std::fs::write(f.workspace.join("private.json"), b"changed workspace").unwrap();
+    let plan = f.analyze().expect("changed workspace file is stale");
+    assert_eq!(plan.stale_outcomes, ["a"]);
+
+    std::fs::write(f.workspace.join("private.json"), b"{}").unwrap();
+    std::fs::remove_file(f.contract.root.join("schema.json")).unwrap();
+    assert_eq!(f.analyze().unwrap().stale_outcomes, ["a"]);
+
+    // A symlink substitution is not treated as a content match, even when it
+    // points at bytes equal to the captured schema.
+    let schema = f.contract.root.join("schema.json");
+    let target = f.contract.root.join("schema-target.json");
+    std::fs::write(&target, b"{}").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(&target, &schema).unwrap();
+    assert_eq!(f.analyze().unwrap_err(), Refusal::InputIo);
+
+    f.contract.root = f.workspace.clone();
+    assert_eq!(f.analyze().unwrap_err(), Refusal::SourceBinding);
 }

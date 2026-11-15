@@ -1,6 +1,6 @@
-use crate::common::{read_opened_bounded, require};
+use crate::common::{captured_transform_text, require};
 use async_trait::async_trait;
-use contract::{Contract, NodeDef, ReadIdentity, ReadKind, ReadOwner};
+use contract::{Contract, NodeDef, ReadOwner};
 use engine::{
     ContinuationReadCoverage, ContinuationSafety, StepContext, StepError, StepExecutor, StepOutcome,
 };
@@ -8,7 +8,6 @@ use model::Finding;
 use policy::{params_schema, string_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
 pub(crate) struct CheckFormatStep;
 
@@ -71,33 +70,12 @@ impl StepExecutor for CheckFormatStep {
                 .fs
                 .resolve_read(&source)
                 .map_err(|error| format!("source path is not in workspace: {error}"))?;
-            let file = ctx
-                .run
-                .fs
-                .open_read_resolved(&source_path)
-                .map_err(|error| error.to_string())?;
-            // Evidence is optional. Do not re-open or re-read the path: the
-            // digest covers precisely the buffer passed to the parser below.
-            let regular = file.metadata().is_ok_and(|meta| meta.is_file());
-            let key = ctx.run.fs.workspace_relative_key(&source_path).ok();
-            let bytes = read_opened_bounded(
-                file,
+            captured_transform_text(
+                &ctx.run.fs,
+                &source_path,
                 ctx.run.contract.manifest.runtime.file_input_limit_bytes,
-                "transform input",
-            )?;
-            if let Some(key) = key.filter(|_| regular) {
-                if reads.is_recording() {
-                    reads.record(
-                        &key.split('/').map(str::to_owned).collect::<Vec<_>>(),
-                        ReadKind::WorkspaceFile,
-                        ReadIdentity::Digest(Sha256::digest(&bytes).into()),
-                    );
-                }
-            } else {
-                reads.unsupported();
-            }
-            String::from_utf8(bytes)
-                .map_err(|error| format!("transform input is not valid UTF-8: {error}"))
+                Some(&reads),
+            )
         })()
         .map_err(|error| {
             reads.unsupported();
@@ -150,6 +128,8 @@ fn check_format_params(node: &NodeDef) -> Result<CheckFormatParams, StepError> {
 mod tests {
     use super::*;
     use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
+    use contract::{ReadIdentity, ReadKind};
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn continuation_safety_is_read_only() {

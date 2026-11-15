@@ -1,10 +1,13 @@
-use crate::common::{bounded_transform_text, open_package_read, package_file, parse_json, require};
+use crate::common::{
+    captured_transform_text, open_package_read, package_file, parse_json, require,
+};
 use async_trait::async_trait;
-use contract::{Contract, NodeDef};
+use contract::{Contract, NodeDef, ReadIdentity, ReadKind, ReadOwner, ReadRecorder};
 use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_findings};
 use policy::{MAX_JSON_SCHEMA_BYTES, params_schema, string_schema, validate_bounded_json_schema};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::io::Read as _;
 
 pub(crate) struct CheckSchemaStep;
@@ -32,9 +35,30 @@ impl StepExecutor for CheckSchemaStep {
 
     engine::parallel_step_traits!();
 
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        Some("1")
+    }
+
+    fn continuation_safety(&self, _node: &NodeDef) -> engine::ContinuationSafety {
+        engine::ContinuationSafety::ReadOnly
+    }
+
+    fn continuation_read_coverage(&self, _node: &NodeDef) -> engine::ContinuationReadCoverage {
+        #[cfg(unix)]
+        {
+            engine::ContinuationReadCoverage::Complete
+        }
+        #[cfg(not(unix))]
+        {
+            // The package reader and workspace gateway cannot provide the
+            // handle-relative no-follow proof required by the diagnostic.
+            engine::ContinuationReadCoverage::Unsupported
+        }
+    }
+
     fn validate(&self, node: &NodeDef, contract: &Contract) -> Result<(), StepError> {
         let params = check_schema_params(node)?;
-        load_package_schema(contract, node, &params.schema)?;
+        load_package_schema(contract, node, &params.schema, None)?;
         Ok(())
     }
 
@@ -43,24 +67,47 @@ impl StepExecutor for CheckSchemaStep {
         ctx: &mut StepContext<'_>,
         node: &NodeDef,
     ) -> Result<StepOutcome, StepError> {
-        let params = check_schema_params(node)?;
-        let source = ctx.render_inline(node, &params.source)?;
+        let reads = ctx
+            .vars
+            .read_recorder()
+            .for_owner(ReadOwner::Node(node.id.clone()));
+        let params = check_schema_params(node).inspect_err(|_| reads.unsupported())?;
+        let source = ctx
+            .render_inline(node, &params.source)
+            .inspect_err(|_| reads.unsupported())?;
         let source_path = ctx.run.fs.resolve_read(&source).map_err(|error| {
+            reads.unsupported();
             StepError::failed(
                 &node.id,
                 format!("source path is not in workspace: {error}"),
             )
         })?;
-        let value_source = bounded_transform_text(
+        // Workspace resolution can canonicalize an in-workspace alias too.
+        // Keep that execution behavior, but a changed alias target is not
+        // proven by a read of its old canonical target.
+        let requested_key = ctx
+            .run
+            .fs
+            .workspace_relative_key(&ctx.run.fs.workspace().join(&source))
+            .ok();
+        if requested_key.is_none()
+            || requested_key != ctx.run.fs.workspace_relative_key(&source_path).ok()
+        {
+            reads.unsupported();
+        }
+        let value_source = captured_transform_text(
             &ctx.run.fs,
             &source_path,
             ctx.run.contract.manifest.runtime.file_input_limit_bytes,
+            Some(&reads),
         )
-        .await
         .map_err(|error| StepError::failed(&node.id, error))?;
-        let value: Value = parse_json(value_source.as_bytes())
-            .map_err(|error| StepError::failed(&node.id, format!("invalid JSON: {error}")))?;
-        let schema = load_package_schema(&ctx.run.contract, node, &params.schema)?;
+        let value: Value = parse_json(value_source.as_bytes()).map_err(|error| {
+            reads.unsupported();
+            StepError::failed(&node.id, format!("invalid JSON: {error}"))
+        })?;
+        let schema = load_package_schema(&ctx.run.contract, node, &params.schema, Some(&reads))
+            .inspect_err(|_| reads.unsupported())?;
         let findings = validate_json_schema_findings(&schema, &value, "$");
         if findings.is_empty() {
             Ok(StepOutcome::success(Some(
@@ -83,15 +130,29 @@ fn load_package_schema(
     contract: &Contract,
     node: &NodeDef,
     relative: &str,
+    reads: Option<&ReadRecorder>,
 ) -> Result<Value, StepError> {
     let path = package_file(contract, node, relative, "schema")?;
-    read_package_schema(node, &path, relative)
+    // Resolution can follow an in-package alias. Preserve that ordinary
+    // behavior, but do not claim a portable direct-file identity for it.
+    let reads = reads.filter(|reads| {
+        let direct = std::fs::canonicalize(&contract.root)
+            .ok()
+            .and_then(|root| camino::Utf8PathBuf::from_path_buf(root).ok())
+            .is_some_and(|root| root.join(relative) == path);
+        if !direct {
+            reads.unsupported();
+        }
+        direct
+    });
+    read_package_schema(node, &path, relative, reads)
 }
 
 fn read_package_schema(
     node: &NodeDef,
     path: &camino::Utf8Path,
     relative: &str,
+    reads: Option<&ReadRecorder>,
 ) -> Result<Value, StepError> {
     // `package_file` checks the pathname for useful diagnostics; only this
     // opened-handle no-follow check is authoritative against a swapped leaf.
@@ -112,6 +173,13 @@ fn read_package_schema(
                 "schema package file `{relative}` exceeds the {MAX_JSON_SCHEMA_BYTES}-byte limit"
             ),
         ));
+    }
+    if let Some(reads) = reads.filter(|reads| reads.is_recording()) {
+        reads.record(
+            &relative.split('/').map(str::to_owned).collect::<Vec<_>>(),
+            ReadKind::PackageFile,
+            ReadIdentity::Digest(Sha256::digest(&bytes).into()),
+        );
     }
     let schema: Value = parse_json(&bytes).map_err(|error| {
         StepError::failed(
@@ -153,7 +221,7 @@ mod tests {
         // `package_file` normally rejects this symlink during its pathname
         // probe. Calling the handle reader directly models replacement after
         // that probe and verifies that the authoritative open still refuses it.
-        let error = read_package_schema(&node, &link, "schema-link.json")
+        let error = read_package_schema(&node, &link, "schema-link.json", None)
             .expect_err("terminal schema symlink must not be followed");
         assert!(
             error
@@ -232,3 +300,6 @@ mod tests {
         };
     }
 }
+
+#[cfg(test)]
+mod capture_tests;

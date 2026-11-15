@@ -178,6 +178,9 @@ fn analyze_source(
                     .vars
                     .matches_dependency(read)
                     .ok_or(Refusal::InputIdentity)?,
+                ReadKind::PackageFile => {
+                    package_currentness(path, contract, read, policy::MAX_JSON_SCHEMA_BYTES)?
+                }
                 ReadKind::WorkspaceFile => file_matches(
                     workspace,
                     read,
@@ -244,6 +247,33 @@ fn source_layout_matches(path: &Utf8Path, state: &RunState, workspace: &FsGatewa
         && metadata_dir.file_name() == Some("meta")
         && run_dir.file_name() == Some(run_id)
         && workspace.workspace() == expected_workspace.as_path()
+}
+
+/// Check the exact package file consumed by an executor. `contract.sha256`
+/// binds the manifest and therefore the requested relative schema path; the
+/// private read trace binds the raw bytes actually parsed. Unrelated package
+/// files do not affect this executor's result.
+fn package_currentness(
+    path: &Utf8Path,
+    contract: &Contract,
+    read: &ReadDependency,
+    limit: usize,
+) -> Result<bool, Refusal> {
+    let run_dir = path
+        .parent()
+        .and_then(Utf8Path::parent)
+        .ok_or(Refusal::SourceBinding)?;
+    let package_root = run_dir.join("generator-package");
+    if contract.root != package_root {
+        return Err(Refusal::SourceBinding);
+    }
+    let (expected, relative) = file_read_identity(read)?;
+    let file = match FsGateway::open_diagnostic_read_under_root(&contract.root, &relative) {
+        Ok(file) => file,
+        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(Refusal::InputIo),
+    };
+    opened_file_matches(file, expected, limit)
 }
 
 fn supported_state(state: &RunState, contract: &Contract) -> Result<(), Refusal> {
@@ -327,6 +357,17 @@ fn file_matches(
     read: &ReadDependency,
     limit: Option<usize>,
 ) -> Result<bool, Refusal> {
+    let (expected, relative) = file_read_identity(read)?;
+    let limit = limit.ok_or(Refusal::Limit)?;
+    let file = match fs.open_diagnostic_read(&relative) {
+        Ok(file) => file,
+        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(Refusal::InputIo),
+    };
+    opened_file_matches(file, expected, limit)
+}
+
+fn file_read_identity(read: &ReadDependency) -> Result<([u8; 32], String), Refusal> {
     let ReadIdentity::Digest(expected) = &read.identity else {
         return Err(Refusal::InputIdentity);
     };
@@ -338,12 +379,14 @@ fn file_matches(
     {
         return Err(Refusal::InputIdentity);
     }
-    let limit = limit.ok_or(Refusal::Limit)?;
-    let mut file = match fs.open_diagnostic_read(&read.path.join("/")) {
-        Ok(file) => file,
-        Err(GatewayError::Io(error)) if error.kind() == ErrorKind::NotFound => return Ok(false),
-        Err(_) => return Err(Refusal::InputIo),
-    };
+    Ok((*expected, read.path.join("/")))
+}
+
+fn opened_file_matches(
+    mut file: std::fs::File,
+    expected: [u8; 32],
+    limit: usize,
+) -> Result<bool, Refusal> {
     if !file.metadata().map_err(|_| Refusal::InputIo)?.is_file() {
         return Err(Refusal::InputIo);
     }
@@ -361,7 +404,7 @@ fn file_matches(
         }
         hash.update(&bytes[..count]);
     }
-    Ok(<[u8; 32]>::from(hash.finalize()) == *expected)
+    Ok(<[u8; 32]>::from(hash.finalize()) == expected)
 }
 
 #[cfg(test)]
