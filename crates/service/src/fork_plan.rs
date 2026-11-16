@@ -181,16 +181,17 @@ impl PreparedForkPlan {
             if observation.map(|file| file.sha256.as_str()) != sha256 {
                 return Err(invalid("manifest does not match reset file observations"));
             }
-            // An absent file must not be recreated as a directory by staging a
-            // descendant, which would change the read from NotFound to a
-            // directory error. Paths are component-normalized before binding.
+            // Preserve NotFound for absent reads: a staged descendant would
+            // create a directory at the path, while a staged file ancestor
+            // would change the lookup to NotADirectory. Paths are normalized
+            // before these component-aware prefix checks.
             if sha256.is_none()
-                && plan
-                    .files
-                    .iter()
-                    .any(|file| file.path.as_path() != path && file.path.starts_with(path))
+                && plan.files.iter().any(|file| {
+                    file.path.as_path() != path
+                        && (file.path.starts_with(path) || path.starts_with(&file.path))
+                })
             {
-                return Err(invalid("manifest creates a path observed missing"));
+                return Err(invalid("manifest changes a path observed missing"));
             }
         }
         let candidate_wire = serde_json::to_value(candidate)?;
@@ -499,6 +500,17 @@ mod tests {
         assert!(bind_negative(Vec::new()).is_ok());
         assert!(bind_negative(vec![extra.clone()]).is_ok());
         assert!(bind_negative(vec![forbidden.clone()]).is_err());
+        let ancestor = ForkFileObservation {
+            path: "workspace/files/upload".into(),
+            length: 2,
+            sha256: "d".repeat(64),
+        };
+        assert!(bind_negative(vec![ancestor.clone()]).is_err());
+        // The same conflict is refused when the manifest also has matching
+        // positive observations elsewhere in the missing path's subtree.
+        let mut shadowed = full.clone();
+        shadowed.push(ancestor);
+        assert!(bind(shadowed).is_err());
         let descendant = ForkFileObservation {
             path: "workspace/files/upload/missing.json/child".into(),
             length: 2,
