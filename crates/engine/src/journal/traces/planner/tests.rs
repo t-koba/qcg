@@ -515,6 +515,7 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
         preserved_outcomes: vec!["a".into(), "c".into()],
         inherited_budget: f.state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
 
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
@@ -587,6 +588,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
         .into(),
         inherited_budget: f.state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
     // First isolate the already-stale seed, then the failed retry root.
     // Either prerequisite changing must invalidate C without a captured read.
@@ -605,6 +607,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
             source_last_seq: result.source_last_seq,
             inherited_budget: result.inherited_budget.clone(),
             reset_nodes: BTreeMap::new(),
+            expected_executor_attestations: BTreeMap::new(),
         };
         if preserved_a {
             seeded.preserved_outcomes.push("a".into());
@@ -685,6 +688,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
@@ -702,6 +706,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
@@ -760,6 +765,7 @@ async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
         preserved_outcomes: vec!["a".into()],
         inherited_budget: f.state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
     propagate_step_invalidation(&contract, &mut result, &readers_by_step, &aggregate_readers)
         .unwrap();
@@ -1697,11 +1703,18 @@ async fn child_reset_overlay_clears_only_exact_projection_and_suppresses_replay(
         state
             .vars
             .set_step_outcome("a", "success", Some(json!("old reason")));
+        state
+            .reset_expected_attestations
+            .insert("obsolete_owner".into(), [0; 32]);
         let before = serde_json::to_value(&state).unwrap();
         let traces = format!("{:?}", state.dependency_traces);
         state.apply(&events[events.len() - 2]).unwrap();
         state.apply(overlay).unwrap();
         assert!(!state.reset_gates.contains_key("obsolete_gate"));
+        assert_eq!(
+            state.reset_expected_attestations,
+            candidate.expected_executor_attestations
+        );
         let after = serde_json::to_value(&state).unwrap();
         for (key, value) in before.as_object().unwrap() {
             if !["nodes", "vars", "last_seq"].contains(&key.as_str()) {
@@ -1817,7 +1830,8 @@ async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_wind
         (fork_index, "/binding/plan_digest", json!("b".repeat(64))),
         (fork_index, "/reset_overlay_sha256", Value::Null),
         (overlay_index, "/run_id", json!("foreign")),
-        (overlay_index, "/overlay/version", json!(2)),
+        (overlay_index, "/overlay/version", json!(1)),
+        (overlay_index, "/overlay/version", json!(3)),
         (
             overlay_index,
             "/overlay/candidate/source_last_seq",
@@ -2030,6 +2044,15 @@ async fn child_reset_overlay_scheduler_runs_captured_predecessor_before_reader()
         fn type_id(&self) -> &'static str {
             "test.probe"
         }
+        fn continuation_semantics_version(&self) -> Option<&'static str> {
+            Some("1")
+        }
+        fn continuation_safety(&self, _: &NodeDef) -> ContinuationSafety {
+            ContinuationSafety::ReadOnly
+        }
+        fn continuation_read_coverage(&self, _: &NodeDef) -> ContinuationReadCoverage {
+            ContinuationReadCoverage::Complete
+        }
         async fn execute(
             &self,
             ctx: &mut StepContext<'_>,
@@ -2046,21 +2069,8 @@ async fn child_reset_overlay_scheduler_runs_captured_predecessor_before_reader()
     let f = Fixture::with_output_dependency().await;
     let mut events = reset_child_events(&f, &f.analyze().unwrap());
     append_child_queue(&f, &mut events);
-    let child = f
-        .workspace
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("child");
-    let meta = child.join("meta");
-    std::fs::create_dir_all(&meta).unwrap();
+    let (meta, workspace) = stage_child(&f, &events);
     let path = meta.join("journal.jsonl");
-    std::fs::write(
-        &path,
-        events.iter().map(|e| format!("{e}\n")).collect::<String>(),
-    )
-    .unwrap();
     let mut registry = StepRegistry::new();
     registry.register(Retry);
     let result = Engine::new(registry)
@@ -2069,7 +2079,7 @@ async fn child_reset_overlay_scheduler_runs_captured_predecessor_before_reader()
             meta,
             f.contract.clone(),
             BTreeMap::new(),
-            probe_options(child.join("workspace")),
+            probe_options(workspace),
         )
         .await;
     let after = read_journal_values(&path, JournalLimits::default())
@@ -2086,4 +2096,239 @@ async fn child_reset_overlay_scheduler_runs_captured_predecessor_before_reader()
     let state = RunState::fold_values(&after).unwrap();
     assert_eq!(state.node_executions["a"], 2);
     assert_eq!(state.node_executions["b"], 2);
+}
+
+/// Node-specific declarations let preserved-only and reset-only downgrades be
+/// distinguished, while semantics tokens remain executor-wide by design.
+struct ResetProbe {
+    version: Option<&'static str>,
+    safety: ContinuationSafety,
+    coverage: ContinuationReadCoverage,
+    changed_owner: &'static str,
+    executed: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+}
+#[async_trait]
+impl StepExecutor for ResetProbe {
+    fn type_id(&self) -> &'static str {
+        "test.probe"
+    }
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        self.version
+    }
+    fn continuation_safety(&self, node: &NodeDef) -> ContinuationSafety {
+        if node.id == self.changed_owner {
+            self.safety
+        } else {
+            ContinuationSafety::ReadOnly
+        }
+    }
+    fn continuation_read_coverage(&self, node: &NodeDef) -> ContinuationReadCoverage {
+        if node.id == self.changed_owner {
+            self.coverage
+        } else {
+            ContinuationReadCoverage::Complete
+        }
+    }
+    async fn execute(
+        &self,
+        _: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.executed.lock().unwrap().push(node.id.clone());
+        Ok(StepOutcome::success(Some(json!(42))))
+    }
+}
+
+fn stage_child(f: &Fixture, events: &[Value]) -> (Utf8PathBuf, Utf8PathBuf) {
+    let child = f
+        .workspace
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("child");
+    let meta = child.join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    std::fs::write(
+        meta.join("journal.jsonl"),
+        events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    (meta, child.join("workspace"))
+}
+
+#[tokio::test]
+async fn reset_executor_proofs_revalidate_after_full_refold_before_execution() {
+    use ContinuationReadCoverage::{Complete, Unsupported as Incomplete};
+    use ContinuationSafety::{ReadOnly, Unsupported as Unsafe};
+    // Each case starts from journal bytes, without a usable state cache. The
+    // corrupt-cache cases reproduce process restart without cache assistance.
+    for corrupt_cache in [false, true] {
+        for (version, safety, coverage) in [
+            (Some("1"), ReadOnly, Complete),
+            (Some("2"), ReadOnly, Complete),
+            (None, ReadOnly, Complete),
+            (Some(""), ReadOnly, Complete),
+            (Some("1"), Unsafe, Complete),
+            (Some("1"), ReadOnly, Incomplete),
+        ] {
+            for owner in ["a", "b"] {
+                let f = Fixture::new().await;
+                let candidate = f.analyze().unwrap();
+                assert_eq!(
+                    candidate
+                        .expected_executor_attestations
+                        .keys()
+                        .map(String::as_str)
+                        .collect::<Vec<_>>(),
+                    ["a", "b"]
+                );
+                let mut events = reset_child_events(&f, &candidate);
+                append_child_queue(&f, &mut events);
+                let (meta, workspace) = stage_child(&f, &events);
+                let folded = RunState::fold_journal(&meta.join("journal.jsonl")).unwrap();
+                assert_eq!(
+                    folded.reset_expected_attestations,
+                    candidate.expected_executor_attestations
+                );
+                let cached: RunState =
+                    serde_json::from_value(serde_json::to_value(&folded).unwrap()).unwrap();
+                assert!(cached.reset_expected_attestations.is_empty());
+                if corrupt_cache {
+                    std::fs::write(meta.join("state.json"), b"unusable").unwrap();
+                }
+                let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                let mut registry = StepRegistry::new();
+                registry.register(ResetProbe {
+                    version,
+                    safety,
+                    coverage,
+                    changed_owner: owner,
+                    executed: executed.clone(),
+                });
+                let matches = version == Some("1") && safety == ReadOnly && coverage == Complete;
+                // Node-specific downgrade affects only the selected owner.
+                if version == Some("1") && !matches {
+                    let other = if owner == "a" { "b" } else { "a" };
+                    assert_eq!(
+                        registry.continuation_attestation(&f.contract.graph.nodes[other]),
+                        Some(candidate.expected_executor_attestations[other])
+                    );
+                }
+                let result = Engine::new(registry)
+                    .run_with_id(
+                        "child".into(),
+                        meta.clone(),
+                        f.contract.clone(),
+                        BTreeMap::new(),
+                        probe_options(workspace),
+                    )
+                    .await;
+                let after =
+                    read_journal_values(&meta.join("journal.jsonl"), JournalLimits::default())
+                        .unwrap()
+                        .events;
+                if matches {
+                    assert!(result.is_ok(), "{result:?}");
+                    assert_eq!(*executed.lock().unwrap(), ["b"]); // a remains preserved
+                } else {
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("reset executor proof")
+                    );
+                    assert!(executed.lock().unwrap().is_empty());
+                    assert_eq!(after, events); // no execution/hook events before refusal
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn reset_executor_proofs_require_exact_overlay_owner_coverage() {
+    let f = Fixture::new().await;
+    for mutation in [
+        "missing-preserved",
+        "missing-reset",
+        "extra",
+        "empty",
+        "none",
+    ] {
+        let mut candidate = f.analyze().unwrap();
+        match mutation {
+            "missing-preserved" => {
+                candidate.expected_executor_attestations.remove("a");
+            }
+            "missing-reset" => {
+                candidate.expected_executor_attestations.remove("b");
+            }
+            "extra" => {
+                candidate
+                    .expected_executor_attestations
+                    .insert("extra".into(), [0; 32]);
+            }
+            "empty" => {
+                candidate
+                    .expected_executor_attestations
+                    .insert(String::new(), [0; 32]);
+            }
+            "none" => candidate.expected_executor_attestations.clear(),
+            _ => unreachable!(),
+        }
+        // Rebind all hashes so coverage, rather than a stale digest, refuses.
+        assert!(
+            RunState::fold_admission_values(&reset_child_events(&f, &candidate)).is_err(),
+            "{mutation}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn ordinary_fork_does_not_require_reset_executor_proofs() {
+    let f = Fixture::new().await;
+    let mut events = reset_child_events(&f, &f.analyze().unwrap());
+    events.pop(); // ordinary fork: no reset binding or overlay
+    let fork = events.last_mut().unwrap().as_object_mut().unwrap();
+    fork.remove("binding");
+    fork.remove("reset_overlay_sha256");
+    append_child_queue(&f, &mut events);
+    let (meta, workspace) = stage_child(&f, &events);
+    assert!(
+        RunState::fold_journal(&meta.join("journal.jsonl"))
+            .unwrap()
+            .reset_expected_attestations
+            .is_empty()
+    );
+    let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = StepRegistry::new();
+    registry.register(ResetProbe {
+        version: None,
+        safety: ContinuationSafety::Unsupported,
+        coverage: ContinuationReadCoverage::Unsupported,
+        changed_owner: "b",
+        executed: executed.clone(),
+    });
+    let result = Engine::new(registry)
+        .run_with_id(
+            "child".into(),
+            meta,
+            f.contract,
+            BTreeMap::new(),
+            probe_options(workspace),
+        )
+        .await;
+    // Ordinary replay retains the failed outcome too; it must not silently
+    // acquire reset semantics or impose continuation declarations.
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("b: probe check failure")
+    );
+    assert!(executed.lock().unwrap().is_empty());
 }

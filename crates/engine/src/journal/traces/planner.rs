@@ -63,6 +63,8 @@ pub struct ResetPlanCandidate {
     preserved_outcomes: Vec<String>,
     inherited_budget: BudgetState,
     reset_nodes: BTreeMap<String, ResetNode>,
+    // Point-in-time evidence for every outcome owner, not authorization.
+    expected_executor_attestations: BTreeMap<String, [u8; 32]>,
 }
 
 impl ResetPlanCandidate {
@@ -236,6 +238,7 @@ fn analyze_source(
         preserved_outcomes: Vec::new(),
         inherited_budget: state.budget.clone(),
         reset_nodes: BTreeMap::new(),
+        expected_executor_attestations: BTreeMap::new(),
     };
     let mut outcomes = 0;
     // Index only current successes by the exact step path they consumed. The
@@ -264,6 +267,13 @@ fn analyze_source(
         if registry.continuation_safety(node) != ContinuationSafety::ReadOnly
             || registry.continuation_read_coverage(node) != ContinuationReadCoverage::Complete
             || (event["t"] == "step_started" && event["type"].as_str() != Some(node.kind.as_str()))
+        {
+            return Err(Refusal::Executor);
+        }
+        if result
+            .expected_executor_attestations
+            .insert(owner.to_owned(), attestation)
+            .is_some_and(|previous| previous != attestation)
         {
             return Err(Refusal::Executor);
         }
@@ -381,6 +391,20 @@ fn analyze_source(
     propagate_step_invalidation(contract, &mut result, &readers_by_step, &aggregate_readers)?;
     if outcomes != state.nodes.len() || outcomes != state.dependency_traces.owners.len() {
         return Err(Refusal::IncompleteTrace);
+    }
+    let outcome_owners = result
+        .retry_roots
+        .iter()
+        .chain(&result.stale_outcomes)
+        .chain(&result.preserved_outcomes)
+        .collect::<BTreeSet<_>>();
+    if result
+        .expected_executor_attestations
+        .keys()
+        .collect::<BTreeSet<_>>()
+        != outcome_owners
+    {
+        return Err(Refusal::Executor);
     }
     result.reset_nodes = reset_schedule(
         contract,

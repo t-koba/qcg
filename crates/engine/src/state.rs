@@ -146,6 +146,9 @@ pub struct RunState {
     pub(crate) pending_reset: Option<Value>,
     #[serde(skip)]
     pub(crate) reset_gates: BTreeMap<String, BTreeSet<String>>,
+    /// Fold-only executor evidence for the reset child; never trusted from caches.
+    #[serde(skip)]
+    pub(crate) reset_expected_attestations: BTreeMap<String, [u8; 32]>,
     #[serde(skip)]
     pub(crate) reset_queue_required: bool,
     #[serde(skip)]
@@ -263,6 +266,7 @@ impl Default for RunState {
         Self {
             pending_reset: None,
             reset_gates: BTreeMap::new(),
+            reset_expected_attestations: BTreeMap::new(),
             reset_queue_required: false,
             reset_patch_forbidden: false,
             dependency_traces: Default::default(),

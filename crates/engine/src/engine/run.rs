@@ -1,7 +1,8 @@
 use crate::{
-    CmdGateway, CommandBounds, FsGateway, HttpGateway, JournalLimits, JournalWriter, NodeOutcome,
-    SecretStore, StepError, StepOutcome, StepRegistry, TemplateService, collect_outputs,
-    collect_resource_hashes, required_input_field, write_output_manifest_with_limits,
+    CmdGateway, CommandBounds, ContinuationReadCoverage, ContinuationSafety, FsGateway,
+    HttpGateway, JournalLimits, JournalWriter, NodeOutcome, SecretStore, StepError, StepOutcome,
+    StepRegistry, TemplateService, collect_outputs, collect_resource_hashes, required_input_field,
+    write_output_manifest_with_limits,
 };
 use api::{FormSpec, RunNodeFailureEventData};
 use camino::Utf8PathBuf;
@@ -490,6 +491,24 @@ impl Engine {
             audit_limits,
         )?;
         let mut replay = JournalReplay::from_state(journal.state());
+        // Revalidate private reset evidence against the registry used below for
+        // execution, before hooks, resources or preserved outputs are consumed.
+        // This point-in-time check is not a lease or TOCTOU closure.
+        for (owner, expected) in &replay.state.reset_expected_attestations {
+            let proven = contract.graph.nodes.get(owner).is_some_and(|node| {
+                self.registry.get(&node.kind).is_some_and(|executor| {
+                    StepRegistry::attest_executor(executor.as_ref(), node) == Some(*expected)
+                        && executor.continuation_safety(node) == ContinuationSafety::ReadOnly
+                        && executor.continuation_read_coverage(node)
+                            == ContinuationReadCoverage::Complete
+                })
+            });
+            if !proven {
+                return Err(EngineError::Failed(
+                    "reset executor proof no longer matches the execution registry".into(),
+                ));
+            }
+        }
         if replay.state.budget.legacy_step_budget_unknown
             || (replay.state.execution_started
                 && replay.state.budget.step_budget_seed.is_none()

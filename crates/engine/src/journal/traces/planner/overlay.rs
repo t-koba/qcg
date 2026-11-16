@@ -48,6 +48,7 @@ fn decode_candidate<'de, D: serde::Deserializer<'de>>(
         preserved_outcomes: Vec<String>,
         inherited_budget: crate::BudgetState,
         reset_nodes: BTreeMap<String, ResetNode>,
+        expected_executor_attestations: BTreeMap<String, [u8; 32]>,
     }
     let w = Wire::deserialize(d)?;
     Ok(ResetPlanCandidate {
@@ -61,6 +62,7 @@ fn decode_candidate<'de, D: serde::Deserializer<'de>>(
         preserved_outcomes: w.preserved_outcomes,
         inherited_budget: w.inherited_budget,
         reset_nodes: w.reset_nodes,
+        expected_executor_attestations: w.expected_executor_attestations,
     })
 }
 
@@ -80,7 +82,7 @@ impl ResetPlanCandidate {
     #[doc(hidden)]
     pub fn fork_overlay_evidence(&self, binding: Value) -> Result<Value, JournalError> {
         let overlay = Overlay {
-            version: 1,
+            version: 2,
             candidate: self.clone(),
             binding: serde_json::from_value(binding)?,
         };
@@ -91,7 +93,7 @@ impl ResetPlanCandidate {
 
 impl Overlay {
     fn validate_binding(&self) -> Result<(), JournalError> {
-        if self.version != 1
+        if self.version != 2
             || self.binding.binding_version != 1
             || self.binding.plan_digest.len() != 64
             || !self
@@ -259,6 +261,15 @@ fn checked_overlay(state: &RunState, event: &Value, fork: &Value) -> Result<Over
         || reset.len() != candidate.retry_roots.len() + candidate.stale_outcomes.len()
         || preserved.len() != candidate.preserved_outcomes.len()
         || !reset.is_disjoint(&preserved)
+        || candidate
+            .expected_executor_attestations
+            .keys()
+            .any(String::is_empty)
+        || candidate
+            .expected_executor_attestations
+            .keys()
+            .collect::<BTreeSet<_>>()
+            != reset.union(&preserved).collect::<BTreeSet<_>>()
         || reset != candidate.reset_nodes.keys().cloned().collect()
         || reset
             .union(&preserved)
@@ -301,6 +312,7 @@ fn checked_overlay(state: &RunState, event: &Value, fork: &Value) -> Result<Over
 fn apply_overlay(state: &mut RunState, overlay: Overlay) {
     // A newer reset plan supersedes transient gates from earlier reset episodes.
     state.reset_gates.clear();
+    state.reset_expected_attestations = overlay.candidate.expected_executor_attestations;
     // Nothing outside the current outcome/value projection is touched.
     for (
         owner,

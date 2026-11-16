@@ -838,7 +838,7 @@ observed-file subset. Missing required files fail projection.
 
 A candidate-backed prepared plan retains the typed reset candidate and binds its
 complete payload with that same sorted manifest. Its child writes one versioned,
-private `child_reset_overlay` immediately after `run_forked`, before queue
+private `child_reset_overlay` (version 2) immediately after `run_forked`, before queue
 admission. Non-empty state patches are rejected before preparing a reset-bound
 child: the candidate was analyzed against the original inputs and outcomes. An
 empty patch emits no event; folding and adoption reject any `state_patched` event
@@ -856,8 +856,15 @@ reset-predecessor gates, evaluated before dependency skips, needs and expression
 missing targets do not count as settled. History, execution counts, file pins,
 trace evidence, elapsed accounting and all budget/cost liabilities remain intact.
 Replay therefore omits cleared successes without rewriting copied history.
-Recovery and peer-writer resync derive these projections/gates from durable events,
-never from `state.json` authority. No public/CLI/runtime reset caller is enabled.
+The candidate binds executor attestations for exactly all reset and preserved
+outcome owners. Child run entry rechecks these against the execution registry,
+requiring matching nonempty semantics tokens, read-only safety and complete read
+coverage before hooks, resource acquisition, output reuse or execution. Missing
+owners/executors and changed declarations refuse the child. Recovery and
+peer-writer resync derive these projections, gates and attestations from journal
+events, never from `state.json` authority. This point-in-time revalidation is not
+TOCTOU closure or a power-loss durability guarantee. No public/CLI/runtime reset
+caller is enabled.
 
 The copy stages the exact no-follow source streams while hashing those same
 bytes, then projects checkpoint history and the pinned package from that tree.
