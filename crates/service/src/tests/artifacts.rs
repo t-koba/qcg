@@ -1463,3 +1463,93 @@ fn dedicated_zip_same_length_mutation_after_preflight_aborts_archive() {
     assert!(zip::ZipArchive::new(Cursor::new(writer.output)).is_err());
     let _ = std::fs::remove_dir_all(run_dir);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn artifact_parent_swap_never_reads_outside_sentinel() {
+    use sha2::Digest as _;
+    use std::io::{Read as _, Write};
+    use std::os::unix::fs::symlink;
+
+    // Swap on the first ZIP header, after resolution and hash preflight but
+    // before archive copy. No production hook or timing-dependent race.
+    struct SwapOnWrite {
+        parent: camino::Utf8PathBuf,
+        outside: camino::Utf8PathBuf,
+        output: Vec<u8>,
+        swapped: bool,
+    }
+    impl Write for SwapOnWrite {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.swapped {
+                std::fs::rename(&self.parent, self.parent.with_file_name("pinned"))?;
+                symlink(&self.outside, &self.parent)?;
+                self.swapped = true;
+            }
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let root = temp_run_dir("artifact-parent-swap");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let service = test_service(Vec::new(), runs.clone());
+    let run_dir = write_running_run(&runs, "swap");
+    let workspace = run_workspace_dir(&run_dir);
+    let parent = workspace.join("reports");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&parent).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(parent.join("result.txt"), b"inside").unwrap();
+    std::fs::write(outside.join("result.txt"), b"SECRET").unwrap();
+    std::fs::write(
+        run_meta_dir(&run_dir).join("outputs.json"),
+        serde_json::to_vec(&json!({"artifacts": [{
+            "path": "reports/result.txt", "bytes": 6,
+            "sha256": hex::encode(sha2::Sha256::digest(b"inside")),
+            "label": "Result", "required": true
+        }]}))
+        .unwrap(),
+    )
+    .unwrap();
+    let (_, mut download) = service
+        .read_artifact("swap".into(), "reports/result.txt".into())
+        .await
+        .expect("ordinary nested download opens");
+    let mut content = String::new();
+    download.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "inside");
+    std::io::Seek::rewind(&mut download).unwrap();
+
+    let mut writer = SwapOnWrite {
+        parent: parent.clone(),
+        outside,
+        output: Vec::new(),
+        swapped: false,
+    };
+    write_artifacts_zip_stream_with_limits(&run_dir, &mut writer, &ArtifactZipLimits::default())
+        .expect("archive copies its pinned nested artifact after the swap");
+    assert!(writer.swapped);
+    let mut archive = zip::ZipArchive::new(Cursor::new(writer.output)).unwrap();
+    content.clear();
+    archive
+        .by_name("reports/result.txt")
+        .unwrap()
+        .read_to_string(&mut content)
+        .unwrap();
+    assert_eq!(
+        content, "inside",
+        "archive must never read the outside sentinel"
+    );
+    content.clear();
+    download.read_to_string(&mut content).unwrap();
+    assert_eq!(content, "inside", "download keeps the same pinned object");
+    assert!(
+        engine::open_artifact_file(&workspace, "reports/result.txt").is_err(),
+        "a new open must refuse the swapped parent"
+    );
+}

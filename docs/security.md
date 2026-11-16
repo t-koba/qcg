@@ -139,11 +139,14 @@ silently retried.
 
 Workspace filesystem isolation is handle-relative on Unix for atomic
 replacements and for the reads that feed command input, HTTP body, prompt,
-media, transform sources, and `check.format`/`check.schema`: they walk
-directory handles with `O_NOFOLLOW` at every component from the workspace
-root, so a parent directory swapped after validation cannot redirect the open
-or the rename outside the workspace. This covers step output writers (render/copy/write/transform base64/zip
-and HTTP file outputs). Directory-tree consumers that must parse the tree
+media, transform sources, artifact downloads/archives, and
+`check.format`/`check.schema`: they walk directory handles with `O_NOFOLLOW`
+at every component from the workspace root, so a parent directory swapped
+after validation cannot redirect the open or the rename outside the
+workspace. Artifact reads open nonblocking and refuse non-regular files;
+size checks, hashing, and delivery use the same pinned file, rewinding it
+for archive preflight rather than reopening its pathname. This covers step
+output writers (render/copy/write/transform base64/zip and HTTP file outputs). Directory-tree consumers that must parse the tree
 (`check.contract`, `check.tool`, zip sources) read a private handle-relative snapshot under
 the run metadata; the external tool process reads the snapshot, never the
 live workspace, so a parent swapped after validation cannot redirect it

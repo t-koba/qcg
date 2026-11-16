@@ -696,7 +696,7 @@ pub(crate) async fn read_artifact(
     headers: HeaderMap,
 ) -> Result<Response, ApiHttpError> {
     let content_disposition = content_disposition_attachment(&path);
-    let (artifact, resolved) = state
+    let (artifact, file) = state
         .service
         .read_artifact_with_limits(id, path, &state.artifact_limits)
         .await
@@ -706,9 +706,7 @@ pub(crate) async fn read_artifact(
     let not_modified = if_none_match_matches(&precondition, &artifact.sha256);
     // Read and verify one bounded snapshot from an open file; its strong ETag
     // names the served bytes, not a later path read.
-    let mut file = tokio::fs::File::open(&resolved)
-        .await
-        .map_err(ApiHttpError::internal)?;
+    let mut file = tokio::fs::File::from_std(file);
     let metadata = file.metadata().await.map_err(ApiHttpError::internal)?;
     if let Some(limit) = state.artifact_limits.effective().max_bytes
         && metadata.len() > limit
@@ -1685,7 +1683,7 @@ mod tests {
         })
         .await
         .expect("run should settle");
-        let (artifact, resolved) = state
+        let (artifact, mut file) = state
             .service
             .read_artifact_with_limits(
                 run_id.clone(),
@@ -1694,7 +1692,9 @@ mod tests {
             )
             .await
             .expect("artifact should resolve");
-        let original = std::fs::read(&resolved).expect("artifact bytes should read");
+        let resolved = runs.join(&run_id).join("workspace").join(&artifact.path);
+        let mut original = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut original).expect("artifact bytes should read");
         assert_eq!(
             hex::encode(sha2::Sha256::digest(&original)),
             artifact.sha256

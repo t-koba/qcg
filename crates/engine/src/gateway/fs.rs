@@ -15,6 +15,36 @@ use super::staging::AsyncStagingGuard;
 #[cfg(not(unix))]
 use super::staging::AsyncStreamGuard;
 
+/// Opens a regular manifest artifact and pins the object used for metadata,
+/// hashing and delivery. Unix walks from the canonical workspace root with
+/// `O_NOFOLLOW` at every component; `O_NONBLOCK` prevents a swapped FIFO from
+/// hanging before the handle's file type can be checked. Non-Unix retains the
+/// best-effort canonicalize-based boundary.
+pub fn open_artifact_file(
+    workspace: &Utf8Path,
+    artifact_path: &str,
+) -> std::io::Result<std::fs::File> {
+    let open = || {
+        crate::artifact::validate_relative_artifact_path(artifact_path, false)?;
+        #[cfg(unix)]
+        let file = {
+            let root = dunce::canonicalize(workspace)?;
+            let root = Utf8PathBuf::from_path_buf(root)
+                .map_err(|_| std::io::Error::other("invalid workspace root"))?;
+            super::handle::open_diagnostic_read(&root, artifact_path)?
+        };
+        #[cfg(not(unix))]
+        let file = std::fs::File::open(crate::resolve_artifact_path(workspace, artifact_path)?)?;
+        if !file.metadata()?.is_file() {
+            return Err(std::io::Error::other("artifact is not a regular file"));
+        }
+        Ok(file)
+    };
+    open().map_err(|error: std::io::Error| {
+        std::io::Error::new(error.kind(), "artifact could not be opened")
+    })
+}
+
 /// Q01: effective patch target ceiling for the commit-time base re-check.
 /// A patch target larger than this is refused instead of replaced, because a
 /// node must never overwrite a file it could not re-read within the same

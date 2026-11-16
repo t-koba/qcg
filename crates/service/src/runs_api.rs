@@ -22,7 +22,7 @@ use api::{
 use api::{RunEvent, RunEventData};
 use camino::{Utf8Path, Utf8PathBuf};
 use contract::{Contract, ContractError, validate_form_values};
-use engine::{JournalLimits, RunState, resolve_artifact_path};
+use engine::{JournalLimits, RunState};
 use futures_util::{StreamExt as _, stream::BoxStream};
 use model::{FailureCode, FailureDetail, OutputArtifact, OutputManifest};
 use serde_json::{Value, json};

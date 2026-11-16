@@ -8,7 +8,7 @@ impl LocalService {
         &self,
         id: String,
         path: String,
-    ) -> Result<(OutputArtifact, Utf8PathBuf), ApiError> {
+    ) -> Result<(OutputArtifact, std::fs::File), ApiError> {
         self.read_artifact_inner(id, path, None).await
     }
     pub async fn artifact_manifest_with_limits(
@@ -101,7 +101,7 @@ impl LocalService {
         id: String,
         path: String,
         limits: &crate::package::ArtifactZipLimits,
-    ) -> Result<(OutputArtifact, Utf8PathBuf), ApiError> {
+    ) -> Result<(OutputArtifact, std::fs::File), ApiError> {
         self.read_artifact_inner(id, path, Some(limits)).await
     }
     async fn read_artifact_inner(
@@ -109,7 +109,7 @@ impl LocalService {
         id: String,
         path: String,
         limits: Option<&crate::package::ArtifactZipLimits>,
-    ) -> Result<(OutputArtifact, Utf8PathBuf), ApiError> {
+    ) -> Result<(OutputArtifact, std::fs::File), ApiError> {
         let (manifest, run_dir) = self.artifact_manifest_with_limits(&id, limits).await?;
         let artifact = manifest
             .artifacts
@@ -124,9 +124,9 @@ impl LocalService {
                 limit_bytes: limit as usize,
             });
         }
-        let resolved = resolve_artifact_path(&run_workspace_dir(&run_dir), &artifact.path)
+        let file = engine::open_artifact_file(&run_workspace_dir(&run_dir), &artifact.path)
             .map_err(api_internal)?;
-        Ok((artifact, resolved))
+        Ok((artifact, file))
     }
 
     /// Opens the run journal for constant-memory streaming delivery. Limits

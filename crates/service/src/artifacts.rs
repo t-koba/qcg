@@ -3,12 +3,13 @@ use crate::summaries::{run_meta_dir, run_workspace_dir};
 use crate::types::ServiceError;
 use api::{ApiError, RunEvent};
 use camino::{Utf8Path, Utf8PathBuf};
-use engine::resolve_artifact_path;
+use engine::open_artifact_file;
 use model::OutputManifest;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
 use std::fs::File;
-use std::io::{Cursor, Read as _, Write};
+use std::io::{Cursor, Read as _, Seek as _, Write};
+use std::sync::{Arc, Mutex, MutexGuard};
 use zip::write::SimpleFileOptions;
 
 pub fn read_artifacts_zip(run_dir: &Utf8Path) -> Result<Vec<u8>, ServiceError> {
@@ -24,14 +25,28 @@ pub fn read_artifacts_zip_with_limits(
     Ok(cursor.into_inner())
 }
 
-/// Verified workspace files behind an output manifest: logical path,
-/// filesystem path, byte size, and expected SHA-256.
+/// Manifest artifacts with pinned regular-file handles. The filesystem path
+/// is retained only for bundle output alias preflight, never for reading.
 #[derive(Debug, Clone)]
 pub struct VerifiedArtifact {
     pub path: String,
     pub fs_path: Utf8PathBuf,
+    file: Arc<Mutex<File>>,
     pub bytes: u64,
     pub sha256: String,
+}
+
+impl VerifiedArtifact {
+    // Cloned bundle preparations share the pinned file and its cursor. Hold
+    // the lock through each read, rewinding rather than reopening by name.
+    fn reader(&self) -> Result<MutexGuard<'_, File>, ServiceError> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| ServiceError::Invalid("artifact reader unavailable".into()))?;
+        file.rewind()?;
+        Ok(file)
+    }
 }
 
 pub(crate) fn collect_verified_with_limits(
@@ -67,8 +82,9 @@ pub(crate) fn verify_manifest_artifacts(
     engine::validate_output_manifest_paths(manifest)?;
     let mut verified = Vec::new();
     for artifact in &manifest.artifacts {
-        let fs_path = resolve_artifact_path(&run_workspace_dir(run_dir), &artifact.path)?;
-        let bytes = std::fs::metadata(&fs_path)?.len();
+        let workspace = run_workspace_dir(run_dir);
+        let file = open_artifact_file(&workspace, &artifact.path)?;
+        let bytes = file.metadata()?.len();
         if bytes != artifact.bytes {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` bytes mismatch: manifest={}, actual={bytes}",
@@ -77,7 +93,8 @@ pub(crate) fn verify_manifest_artifacts(
         }
         verified.push(VerifiedArtifact {
             path: artifact.path.clone(),
-            fs_path,
+            fs_path: workspace.join(&artifact.path),
+            file: Arc::new(Mutex::new(file)),
             bytes,
             sha256: artifact.sha256.clone(),
         });
@@ -89,9 +106,12 @@ pub(crate) fn check_verified_artifact_hashes(
     verified: &[VerifiedArtifact],
 ) -> Result<(), ServiceError> {
     for artifact in verified {
-        let (actual_sha256, _) =
-            files::hash_file_sha256(&artifact.fs_path, Some(artifact.bytes.saturating_add(1)))?;
-        if actual_sha256 != artifact.sha256 {
+        let (actual_sha256, bytes) = files::hash_opened_file_sha256(
+            &mut *artifact.reader()?,
+            Some(artifact.bytes.saturating_add(1)),
+            |_| std::io::Error::other("artifact exceeds manifest size"),
+        )?;
+        if bytes != artifact.bytes || actual_sha256 != artifact.sha256 {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` sha256 mismatch: manifest={}, actual={actual_sha256}",
                 artifact.path, artifact.sha256
@@ -149,8 +169,9 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
             .map_err(artifact_zip_error)?;
         }
         for artifact in verified {
-            let metadata = std::fs::metadata(&artifact.fs_path)?;
-            let mut file = File::open(&artifact.fs_path)?.take(artifact.bytes.saturating_add(1));
+            let mut file = artifact.reader()?;
+            let metadata = file.metadata()?;
+            let mut file = (&mut *file).take(artifact.bytes.saturating_add(1));
             zip.start_file(&artifact.path, artifact_zip_options(&metadata, false)?)
                 .map_err(artifact_zip_error)?;
             copy_verified_artifact(&mut file, zip, &artifact)?;
@@ -256,7 +277,8 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
                 .map_err(artifact_zip_error)?;
         }
         for artifact in &parts.verified {
-            let mut src = File::open(&artifact.fs_path)?.take(artifact.bytes);
+            let mut file = artifact.reader()?;
+            let mut src = (&mut *file).take(artifact.bytes);
             zip.start_file(
                 format!("artifacts/{}", artifact.path),
                 bundle_entry_options(false),
