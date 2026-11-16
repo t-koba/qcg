@@ -1300,17 +1300,17 @@ async fn reset_file_requirements_bind_present_reads_without_publishing_paths() {
         candidate
             .required_file_observations()
             .unwrap()
-            .map(|(path, sha256)| (path.to_owned(), sha256.to_owned()))
+            .map(|(path, sha256)| (path.to_owned(), sha256.map(str::to_owned)))
             .collect::<BTreeMap<_, _>>()
     };
     let expected = BTreeMap::from([
         (
             Utf8PathBuf::from("generator-package/schema.json"),
-            hex::encode(Sha256::digest(b"{}")),
+            Some(hex::encode(Sha256::digest(b"{}"))),
         ),
         (
             Utf8PathBuf::from("workspace/files/upload/private.json"),
-            hex::encode(Sha256::digest(b"{}")),
+            Some(hex::encode(Sha256::digest(b"{}"))),
         ),
     ]);
     // Both outcomes consumed both files: identical observations are deduplicated.
@@ -1337,13 +1337,45 @@ async fn reset_file_requirements_bind_present_reads_without_publishing_paths() {
         let changed = f.analyze().unwrap();
         assert_eq!(
             requirements(&changed)[relative],
-            hex::encode(Sha256::digest(b"changed"))
+            Some(hex::encode(Sha256::digest(b"changed")))
         );
         assert_ne!(changed.identity, candidate.identity);
         assert_eq!(changed.stale_outcomes, ["a"]);
         std::fs::remove_file(&path).unwrap();
         let missing = f.analyze().unwrap();
-        assert!(!requirements(&missing).contains_key(relative));
+        let missing_requirements = requirements(&missing);
+        assert_eq!(missing_requirements[relative], None);
+        let read_kind = if relative.starts_with("generator-package") {
+            ReadKind::PackageFile
+        } else {
+            ReadKind::WorkspaceFile
+        };
+        let read = f.state.dependency_traces.owners["b"]
+            .trace
+            .reads
+            .iter()
+            .find(|read| read.kind == read_kind)
+            .unwrap();
+        let mut missing = missing;
+        missing.require_file(read, None).unwrap();
+        assert_eq!(
+            missing.require_file(read, Some(Sha256::digest(b"{}").into())),
+            Err(Refusal::InputIdentity)
+        );
+        assert_eq!(requirements(&missing), missing_requirements);
+        let mut present = candidate.clone();
+        assert_eq!(
+            present.require_file(read, None),
+            Err(Refusal::InputIdentity)
+        );
+        assert_eq!(requirements(&present), expected);
+        for text in [
+            serde_json::to_string(&missing).unwrap(),
+            format!("{missing:?}"),
+        ] {
+            assert!(!text.contains("required_files"));
+            assert!(!text.contains(relative.as_str()));
+        }
         assert_eq!(missing.stale_outcomes, ["a"]);
         std::fs::write(&path, b"{}").unwrap();
     }
@@ -1358,10 +1390,10 @@ async fn reset_file_requirements_bind_present_reads_without_publishing_paths() {
         .find(|read| read.kind == ReadKind::PackageFile)
         .unwrap();
     conflicting
-        .require_file(read, Sha256::digest(b"{}").into())
+        .require_file(read, Some(Sha256::digest(b"{}").into()))
         .unwrap();
     assert_eq!(
-        conflicting.require_file(read, Sha256::digest(b"different").into()),
+        conflicting.require_file(read, Some(Sha256::digest(b"different").into())),
         Err(Refusal::InputIdentity)
     );
     assert_eq!(requirements(&conflicting), expected);

@@ -54,7 +54,7 @@ pub struct ResetPlanCandidate {
     // Only live analysis retains staging requirements. The evidence identity
     // already commits to these reads; child overlays must not publish paths.
     #[serde(skip)]
-    required_files: Option<BTreeMap<Utf8PathBuf, String>>,
+    required_files: Option<BTreeMap<Utf8PathBuf, Option<String>>>,
     source_run_id: String,
     source_contract_sha256: String,
     source_last_seq: u64,
@@ -67,18 +67,25 @@ pub struct ResetPlanCandidate {
 
 impl ResetPlanCandidate {
     /// Exact source-relative staging requirements from live source analysis.
+    /// Some(SHA) requires those bytes; None requires the path to remain absent.
     /// Private overlay decoding cannot reconstruct these requirements and must
     /// not be used to prepare another fork. No candidate construction is exposed.
     #[doc(hidden)]
-    pub fn required_file_observations(&self) -> Option<impl Iterator<Item = (&Utf8Path, &str)>> {
+    pub fn required_file_observations(
+        &self,
+    ) -> Option<impl Iterator<Item = (&Utf8Path, Option<&str>)>> {
         self.required_files.as_ref().map(|files| {
             files
                 .iter()
-                .map(|(path, sha256)| (path.as_path(), sha256.as_str()))
+                .map(|(path, sha256)| (path.as_path(), sha256.as_deref()))
         })
     }
 
-    fn require_file(&mut self, read: &ReadDependency, digest: [u8; 32]) -> Result<(), Refusal> {
+    fn require_file(
+        &mut self,
+        read: &ReadDependency,
+        digest: Option<[u8; 32]>,
+    ) -> Result<(), Refusal> {
         let root = match read.kind {
             ReadKind::PackageFile => "generator-package",
             ReadKind::WorkspaceFile => "workspace",
@@ -87,7 +94,7 @@ impl ResetPlanCandidate {
         let (_, relative) = file_read_identity(read)?;
         let path = Utf8Path::new(root).join(relative);
         let files = self.required_files.as_mut().ok_or(Refusal::InputIdentity)?;
-        let sha256 = hex::encode(digest);
+        let sha256 = digest.map(hex::encode);
         match files.entry(path) {
             std::collections::btree_map::Entry::Vacant(entry) => {
                 entry.insert(sha256);
@@ -351,9 +358,7 @@ fn analyze_source(
                         &observed,
                         limits.max_event_bytes,
                     )?;
-                    if let Some(digest) = observed {
-                        result.require_file(read, digest)?;
-                    }
+                    result.require_file(read, observed)?;
                     observed.is_some_and(|digest| read.identity == ReadIdentity::Digest(digest))
                 }
             };

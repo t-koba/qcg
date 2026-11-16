@@ -150,7 +150,8 @@ impl PreparedForkPlan {
     /// This retains the candidate for an internal child overlay; it does not
     /// authorize continuation. A digest alone cannot supply the reset payload.
     /// Every present file read by analysis must occur at its exact source-relative
-    /// path and SHA in the full manifest; unrelated projection inputs remain bound.
+    /// path and SHA in the full manifest; every observed missing path must remain
+    /// absent. Unrelated projection inputs remain bound.
     /// This is not an analysis-to-copy TOCTOU guarantee.
     #[doc(hidden)]
     pub fn from_reset_candidate(
@@ -168,7 +169,7 @@ impl PreparedForkPlan {
     fn bind_reset_evidence<'a, T: Serialize>(
         candidate: &T,
         files: Vec<ForkFileObservation>,
-        requirements: impl Iterator<Item = (&'a Utf8Path, &'a str)>,
+        requirements: impl Iterator<Item = (&'a Utf8Path, Option<&'a str>)>,
     ) -> Result<Self, crate::ServiceError> {
         let mut plan = Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)?;
         for (path, sha256) in requirements {
@@ -177,7 +178,7 @@ impl PreparedForkPlan {
                 .binary_search_by(|file| file.path.as_path().cmp(path))
                 .ok()
                 .map(|index| &plan.files[index]);
-            if observation.is_none_or(|file| file.sha256 != sha256) {
+            if observation.map(|file| file.sha256.as_str()) != sha256 {
                 return Err(invalid("manifest does not match reset file observations"));
             }
         }
@@ -416,12 +417,13 @@ mod tests {
         let requirements = [
             (
                 Utf8Path::new("generator-package/schema.json"),
-                "b".repeat(64),
+                Some("b".repeat(64)),
             ),
             (
                 Utf8Path::new("workspace/files/upload/input.json"),
-                "c".repeat(64),
+                Some("c".repeat(64)),
             ),
+            (Utf8Path::new("workspace/files/upload/missing.json"), None),
         ];
         // Exercise the private reset binder without opening candidate construction
         // or decoding to callers. Engine tests cover requirements from real analysis.
@@ -432,15 +434,17 @@ mod tests {
                 files,
                 requirements
                     .iter()
-                    .map(|(path, sha256)| (*path, sha256.as_str())),
+                    .map(|(path, sha256)| (*path, sha256.as_deref())),
             )
         };
         let required = requirements
             .iter()
-            .map(|(path, sha256)| ForkFileObservation {
-                path: (*path).to_owned(),
-                length: 2,
-                sha256: sha256.clone(),
+            .filter_map(|(path, sha256)| {
+                sha256.as_ref().map(|sha256| ForkFileObservation {
+                    path: (*path).to_owned(),
+                    length: 2,
+                    sha256: sha256.clone(),
+                })
             })
             .collect::<Vec<_>>();
         let extra = ForkFileObservation {
@@ -456,7 +460,7 @@ mod tests {
         assert!(plan.files.iter().any(|file| file.path == extra.path));
         assert!(plan.reset_bound());
         assert_ne!(plan.binding(), bind(required.clone()).unwrap().binding());
-        for index in 0..requirements.len() {
+        for index in 0..required.len() {
             let mut missing = required.clone();
             missing.remove(index);
             assert!(bind(missing).is_err());
@@ -468,6 +472,26 @@ mod tests {
             assert!(bind(wrong_path).is_err());
         }
         assert!(bind(Vec::new()).is_err());
+        let forbidden = ForkFileObservation {
+            path: "workspace/files/upload/missing.json".into(),
+            length: 2,
+            sha256: "f".repeat(64),
+        };
+        // Negative-only evidence requires absence, not an arbitrary digest.
+        let bind_negative = |files| {
+            PreparedForkPlan::bind_reset_evidence(
+                &diagnostic,
+                files,
+                std::iter::once((forbidden.path.as_path(), None)),
+            )
+        };
+        assert!(bind_negative(Vec::new()).is_ok());
+        assert!(bind_negative(vec![extra.clone()]).is_ok());
+        assert!(bind_negative(vec![forbidden.clone()]).is_err());
+        // All positive reads match, but a forbidden extra still refuses.
+        let mut reintroduced = full.clone();
+        reintroduced.push(forbidden);
+        assert!(bind(reintroduced).is_err());
         // Even an unrequired extra participates in identity and validation.
         full[0].length += 1;
         assert_ne!(plan.binding(), bind(full.clone()).unwrap().binding());
