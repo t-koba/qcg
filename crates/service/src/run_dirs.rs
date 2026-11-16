@@ -644,6 +644,13 @@ pub(crate) fn prepare_checkpoint_fork_prepared_with_limits(
     prepared: Option<&crate::PreparedForkPlan>,
     limits: JournalLimits,
 ) -> Result<(bool, Option<crate::fork_plan::StagedSource>), ServiceError> {
+    // A reset candidate was analyzed against the original inputs and outcomes.
+    // Reject changes before creating or writing any child admission state.
+    if prepared.is_some_and(crate::PreparedForkPlan::reset_bound) && !fork_patch_is_empty(patch) {
+        return Err(ServiceError::Invalid(
+            "reset-bound fork cannot accept a state patch".into(),
+        ));
+    }
     // An incomplete admission may retain its directory for a cancel mailbox.
     // Record actual create-dir ownership before populating; whole-directory
     // cleanup is permitted only for a fresh target, never a pre-existing one.
@@ -689,6 +696,10 @@ pub(crate) fn prepare_checkpoint_fork_prepared_with_limits(
         error
     })?;
     Ok((created_fresh, staged))
+}
+
+fn fork_patch_is_empty(patch: &ForkStatePatch) -> bool {
+    patch.inputs.is_empty() && patch.step_outputs.is_empty() && patch.step_statuses.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)] // These source, target and policy inputs define one fork projection.
@@ -1043,8 +1054,7 @@ fn populate_checkpoint_fork(
     }
     serde_json::to_writer(&mut journal, &fork_event)?;
     journal.write_all(b"\n")?;
-    if !patch.inputs.is_empty() || !patch.step_outputs.is_empty() || !patch.step_statuses.is_empty()
-    {
+    if !fork_patch_is_empty(patch) {
         next_seq = next_seq.saturating_add(1);
         let patch_event = json!({
             "t": "state_patched",
@@ -1473,8 +1483,8 @@ pub(crate) fn check_run_admission(
         });
     if !initialized {
         if let Some(fork_seq) = last_fork_seq {
-            // Preparation writes the fork marker, at most one state patch,
-            // and (only for a typed reset binding) one private overlay before
+            // Preparation writes the fork marker, then either an ordinary
+            // state patch or a typed reset overlay (never both) before
             // admission. Any other post-marker record may represent execution
             // or effects, so preserve it and refuse cleanup.
             let reset_bound = events
@@ -1491,7 +1501,7 @@ pub(crate) fn check_run_admission(
                 .filter(|event| event["seq"].as_u64().is_some_and(|seq| seq > fork_seq))
             {
                 match event["t"].as_str() {
-                    Some("state_patched") if !state_patched && !overlay_seen => {
+                    Some("state_patched") if !reset_bound && !state_patched && !overlay_seen => {
                         state_patched = true;
                     }
                     Some("child_reset_overlay") if reset_bound && !overlay_seen => {

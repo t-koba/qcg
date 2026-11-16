@@ -838,9 +838,13 @@ observed-file subset. Missing required files fail projection.
 
 A candidate-backed prepared plan retains the typed reset candidate and binds its
 complete payload with that same sorted manifest. Its child writes one versioned,
-private `child_reset_overlay` after `run_forked` and any state patch, before queue
-admission. The fork marker binds the canonical-JSON SHA-256 of the candidate,
-the full payload digest, source run/checkpoint, source contract and composite
+private `child_reset_overlay` immediately after `run_forked`, before queue
+admission. Non-empty state patches are rejected before preparing a reset-bound
+child: the candidate was analyzed against the original inputs and outcomes. An
+empty patch emits no event; folding and adoption reject any `state_patched` event
+in the reset admission window. Ordinary fork patches remain supported. The fork
+marker binds the canonical-JSON SHA-256 of the candidate, the full payload digest,
+source run/checkpoint, source contract and composite
 plan identity; the child-tree commit covers the journal prefix through queue
 admission. Ordinary forks and digest-only prepared plans write no overlay. This
 record has no public event projection or schema.

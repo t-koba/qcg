@@ -1774,22 +1774,6 @@ async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_wind
         "ts": "2026-01-01T00:00:00Z", "run_id": "child", "trace_id": "trace", "span_id": "span"}),
     );
     assert!(RunState::fold_admission_values(&outside).is_err());
-    // Exactly one optional patch is admitted BEFORE, never used for removals.
-    let mut patched = events.clone();
-    patched[overlay_index]["seq"] = json!(f.state.last_seq + 3);
-    patched.insert(
-        overlay_index,
-        json!({"t": "state_patched", "seq": f.state.last_seq+2,
-        "ts": "2026-01-01T00:00:00Z", "run_id": "child", "trace_id": "trace", "span_id": "span",
-        "step_outputs": {"unrelated": 12}}),
-    );
-    assert_eq!(
-        RunState::fold_admission_values(&patched)
-            .unwrap()
-            .vars
-            .template_snapshot()["steps"]["unrelated"]["output"],
-        12
-    );
     let mut reintroduced = events.clone();
     append_child_queue(&f, &mut reintroduced);
     let queue_seq = reintroduced.last().unwrap()["seq"].as_u64().unwrap();
@@ -1802,6 +1786,73 @@ async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_wind
     assert_eq!(state.vars.template_snapshot(), before);
     reintroduced.push(patch);
     assert!(RunState::fold_values(&reintroduced).is_err());
+}
+
+#[tokio::test]
+async fn child_reset_overlay_refuses_state_patches_without_changing_ordinary_forks() {
+    let f = Fixture::with_output_dependency().await;
+    let candidate = f.analyze().unwrap();
+    let events = reset_child_events(&f, &candidate);
+    let fork_index = events.len() - 2;
+    let overlay_index = events.len() - 1;
+    RunState::fold_admission_values(&events).unwrap();
+    let mut queued = events.clone();
+    append_child_queue(&f, &mut queued);
+    RunState::fold_values(&queued).unwrap();
+
+    for payload in [
+        json!({"inputs": {"changed": "new input"}}),
+        json!({"step_outputs": {"unrelated": "new output"}}),
+        json!({"step_statuses": {"unrelated": "success"}}),
+        // Even an empty forged event is not part of reset admission: the
+        // service represents an empty patch by emitting no event at all.
+        json!({}),
+    ] {
+        let mut patch = json!({"t": "state_patched", "seq": f.state.last_seq + 2,
+            "ts": "2026-01-01T00:00:00Z", "run_id": "child",
+            "trace_id": "trace", "span_id": "span"});
+        patch
+            .as_object_mut()
+            .unwrap()
+            .extend(payload.as_object().unwrap().clone());
+        let mut state = RunState::fold_admission_values(&events[..overlay_index]).unwrap();
+        let before_vars = state.vars.template_snapshot();
+        let before_inputs = state.inputs.clone();
+        assert!(state.apply(&patch).is_err(), "{payload}");
+        assert_eq!(state.vars.template_snapshot(), before_vars);
+        assert_eq!(state.inputs, before_inputs);
+
+        let mut patched = events.clone();
+        patched[overlay_index]["seq"] = json!(f.state.last_seq + 3);
+        patched.insert(overlay_index, patch.clone());
+        assert!(
+            RunState::fold_admission_values(&patched).is_err(),
+            "{payload}"
+        );
+        append_child_queue(&f, &mut patched);
+        assert!(RunState::fold_values(&patched).is_err(), "{payload}");
+
+        // The same patch is still accepted by an ordinary fork, with no
+        // reset binding or overlay to constrain its admission.
+        let mut ordinary = events[..overlay_index].to_vec();
+        let fork = ordinary[fork_index].as_object_mut().unwrap();
+        fork.remove("binding");
+        fork.remove("reset_overlay_sha256");
+        ordinary.push(patch);
+        let state = RunState::fold_admission_values(&ordinary).unwrap();
+        let snapshot = state.vars.template_snapshot();
+        if payload.get("inputs").is_some() {
+            assert_eq!(state.inputs.as_ref().unwrap()["changed"], "new input");
+        }
+        if payload.get("step_outputs").is_some() {
+            assert_eq!(snapshot["steps"]["unrelated"]["output"], "new output");
+        }
+        if payload.get("step_statuses").is_some() {
+            assert_eq!(snapshot["steps"]["unrelated"]["status"], "success");
+        }
+        append_child_queue(&f, &mut ordinary);
+        RunState::fold_values(&ordinary).unwrap();
+    }
 }
 
 #[tokio::test]

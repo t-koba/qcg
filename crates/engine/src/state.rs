@@ -141,8 +141,9 @@ impl BudgetState {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunState {
+    /// Fold-only fork evidence awaiting its reset overlay; never restored from caches.
     #[serde(skip)]
-    pub(crate) pending_reset: Option<crate::journal::traces::overlay::Pending>,
+    pub(crate) pending_reset: Option<Value>,
     #[serde(skip)]
     pub(crate) reset_gates: BTreeMap<String, BTreeSet<String>>,
     #[serde(skip)]

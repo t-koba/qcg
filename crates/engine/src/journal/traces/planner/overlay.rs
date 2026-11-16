@@ -107,13 +107,6 @@ impl Overlay {
     }
 }
 
-/// Fold-only admission window. Skipped in caches: only journal events grant it.
-#[derive(Debug, Clone)]
-pub(crate) struct Pending {
-    fork: Value,
-    patched: bool,
-}
-
 pub(crate) fn validate(state: &RunState, event: &Value) -> Result<(), JournalError> {
     let kind = event["t"].as_str().ok_or_else(invalid)?;
     if state.reset_patch_forbidden && kind == "state_patched" {
@@ -126,14 +119,11 @@ pub(crate) fn validate(state: &RunState, event: &Value) -> Result<(), JournalErr
     {
         return Err(invalid());
     }
-    if let Some(pending) = state.pending_reset.as_ref() {
-        if kind == "state_patched" && !pending.patched {
-            return Ok(());
-        }
+    if let Some(fork) = state.pending_reset.as_ref() {
         if kind != KIND {
             return Err(invalid());
         }
-        checked_overlay(state, event, &pending.fork)?;
+        checked_overlay(state, event, fork)?;
         return Ok(());
     }
     if kind == KIND {
@@ -179,18 +169,12 @@ pub(crate) fn observe(state: &mut RunState, event: &Value) -> Result<(), Journal
         state.reset_queue_required = false;
         state.reset_patch_forbidden = true;
     }
-    if let Some(pending) = state.pending_reset.as_mut() {
-        if kind == "state_patched" {
-            pending.patched = true;
-            return Ok(());
-        }
-        if kind == KIND {
-            let pending = state.pending_reset.take().ok_or_else(invalid)?;
-            let overlay = checked_overlay(state, event, &pending.fork)?;
-            apply_overlay(state, overlay);
-            state.reset_queue_required = true;
-            return Ok(());
-        }
+    if state.pending_reset.is_some() && kind == KIND {
+        let fork = state.pending_reset.take().ok_or_else(invalid)?;
+        let overlay = checked_overlay(state, event, &fork)?;
+        apply_overlay(state, overlay);
+        state.reset_queue_required = true;
+        return Ok(());
     }
     if kind == "run_forked" {
         let candidate_hash = event
@@ -201,10 +185,7 @@ pub(crate) fn observe(state: &mut RunState, event: &Value) -> Result<(), Journal
             (candidate_hash, overlay_hash),
             (Some(Value::String(_)), Some(Value::String(_)))
         ) {
-            state.pending_reset = Some(Pending {
-                fork: event.clone(),
-                patched: false,
-            });
+            state.pending_reset = Some(event.clone());
         }
     }
     Ok(())

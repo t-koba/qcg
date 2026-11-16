@@ -464,13 +464,9 @@ fn validate_reset_admission(
     if !has_candidate || !has_overlay_digest {
         return Err(invalid("reset binding or overlay digest is missing"));
     }
-    let mut patch_seen = false;
     let mut overlay_index = None;
     for (index, event) in window {
         match event["t"].as_str() {
-            Some("state_patched") if !patch_seen && overlay_index.is_none() => {
-                patch_seen = true;
-            }
             Some("child_reset_overlay") if overlay_index.is_none() => {
                 overlay_index = Some(index);
             }
@@ -835,6 +831,83 @@ mod tests {
         let error = verify(f.dir(), "child", &f.events).unwrap_err();
         assert!(error.to_string().contains("reset overlay event is missing"));
         assert!(!f.manifest().exists());
+    }
+
+    #[test]
+    fn reset_bound_patched_history_is_refused_and_preserved_on_adoption() {
+        for payload in [
+            json!({"inputs": {"changed": "new input"}}),
+            json!({"step_outputs": {"unrelated": "new output"}}),
+            json!({"step_statuses": {"unrelated": "success"}}),
+            json!({}),
+        ] {
+            let (_root, mut reset_events) = reset_tree();
+            let mut patch = json!({"t": "state_patched", "seq": 2, "run_id": "child"});
+            patch
+                .as_object_mut()
+                .unwrap()
+                .extend(payload.as_object().unwrap().clone());
+            reset_events.insert(1, patch);
+            reset_events[2]["seq"] = json!(3);
+            reset_events[3]["seq"] = json!(4);
+            let error =
+                validate_reset_admission(&reset_events[0], &reset_events[3], &reset_events, 0, 3)
+                    .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("unexpected event in fork reset admission window")
+            );
+
+            for queued in [false, true] {
+                let f = Fixture::new();
+                let mut events = f.events.clone();
+                let fork_index = events.iter().position(|e| e["t"] == "run_forked").unwrap();
+                let fork = &mut events[fork_index];
+                fork["binding"] = json!({"binding_version": 1,
+                    "plan_digest": "b".repeat(64), "reset_candidate_sha256": "c".repeat(64)});
+                fork["reset_overlay_sha256"] = json!("a".repeat(64));
+                let seq = fork["seq"].as_u64().unwrap() + 1;
+                let mut patch = json!({"t": "state_patched", "seq": seq,
+                    "ts": "2026-01-01T00:00:00Z", "run_id": "child",
+                    "trace_id": "trace", "span_id": "span"});
+                patch
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(payload.as_object().unwrap().clone());
+                events.insert(fork_index + 1, patch);
+                events[fork_index + 2]["seq"] = json!(seq + 1);
+                if !queued {
+                    events.truncate(fork_index + 2);
+                }
+                let journal = events.iter().map(|e| format!("{e}\n")).collect::<String>();
+                let path = run_meta_dir(f.dir()).join("journal.jsonl");
+                std::fs::write(&path, &journal).unwrap();
+                // Check both the service snapshot gate and the actual journal
+                // adoption fold, including pending children before queue.
+                let mut state = engine::RunState::default();
+                state.run_id = Some("child".into());
+                let error =
+                    run_dirs::check_run_admission(f.dir(), "child", &events, &state).unwrap_err();
+                assert!(error.to_string().contains(if queued {
+                    "unexpected event in fork reset admission window"
+                } else {
+                    "unexpected post-marker history"
+                }));
+                let error = match f.adopt() {
+                    Err(error) => error,
+                    Ok(_) => panic!("patched reset child was adopted or removed"),
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("invalid child reset overlay evidence"),
+                    "{error}"
+                );
+                assert_eq!(std::fs::read_to_string(path).unwrap(), journal);
+                assert!(run_dirs::fork_admission_pending(f.dir()).unwrap());
+            }
+        }
     }
 
     #[test]

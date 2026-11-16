@@ -204,6 +204,10 @@ impl PreparedForkPlan {
         })
     }
 
+    pub(crate) fn reset_bound(&self) -> bool {
+        self.binding.reset_candidate_sha256.is_some()
+    }
+
     pub(crate) fn reset_overlay(&self) -> Result<Option<serde_json::Value>, crate::ServiceError> {
         self.candidate
             .as_ref()
@@ -519,6 +523,93 @@ mod tests {
     }
 
     #[test]
+    fn reset_bound_preparation_refuses_state_patches_before_writing() {
+        let root = temp_run_dir("prepared-patch");
+        let _guard = TempGuard(root.clone());
+        let source = synthetic_hitl_record(&root, "source");
+        let files = observe_tree(&source.run_dir, &source.run_dir);
+        for (index, payload) in [
+            json!({"inputs": {"changed": "new input"}}),
+            json!({"step_outputs": {"unrelated": "new output"}}),
+            json!({"step_statuses": {"unrelated": "success"}}),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let patch: api::ForkStatePatch = serde_json::from_value(payload).unwrap();
+            let mut plan = PreparedForkPlan::new(&"a".repeat(64), files.clone()).unwrap();
+            let ordinary = root.join(format!("runs/ordinary-{index}"));
+            let (_, staged) = crate::run_dirs::prepare_checkpoint_fork_prepared(
+                &source.run_dir,
+                "source",
+                &ordinary,
+                "ordinary",
+                1,
+                &patch,
+                Some(&plan),
+            )
+            .unwrap();
+            drop(staged);
+            let events = crate::summaries::read_journal_events(&ordinary).unwrap();
+            let patches = events
+                .iter()
+                .filter(|e| e["t"] == "state_patched")
+                .collect::<Vec<_>>();
+            assert_eq!(patches.len(), 1);
+            assert_eq!(
+                patches[0]["inputs"],
+                serde_json::to_value(&patch.inputs).unwrap()
+            );
+            assert_eq!(
+                patches[0]["step_outputs"],
+                serde_json::to_value(&patch.step_outputs).unwrap()
+            );
+            assert_eq!(
+                patches[0]["step_statuses"],
+                serde_json::to_value(&patch.step_statuses).unwrap()
+            );
+            engine::RunState::fold_admission_values(&events).unwrap();
+
+            // Test the private binding guard without constructing/decoding an
+            // opaque engine candidate. This is not a positive reset-plan fixture.
+            plan.binding.reset_candidate_sha256 = Some("b".repeat(64));
+            for existing in [false, true] {
+                let target = root.join(format!("runs/reset-{index}-{existing}"));
+                if existing {
+                    std::fs::create_dir(&target).unwrap();
+                    std::fs::write(target.join("sentinel"), "untouched").unwrap();
+                }
+                let error = match crate::run_dirs::prepare_checkpoint_fork_prepared(
+                    &source.run_dir,
+                    "source",
+                    &target,
+                    "child",
+                    1,
+                    &patch,
+                    Some(&plan),
+                ) {
+                    Err(error) => error,
+                    Ok(_) => panic!("reset-bound patch was prepared"),
+                };
+                assert!(
+                    error
+                        .to_string()
+                        .contains("reset-bound fork cannot accept a state patch")
+                );
+                if existing {
+                    assert_eq!(
+                        std::fs::read_to_string(target.join("sentinel")).unwrap(),
+                        "untouched"
+                    );
+                    assert_eq!(std::fs::read_dir(&target).unwrap().count(), 1);
+                } else {
+                    assert!(!target.exists());
+                }
+            }
+        }
+    }
+
+    #[test]
     fn child_lineage_and_crash_staging_share_incomplete_admission_ownership() {
         let root = temp_run_dir("prepared-lineage");
         let _guard = TempGuard(root.clone());
@@ -547,6 +638,7 @@ mod tests {
             lineage["binding"],
             serde_json::to_value(plan.binding()).unwrap()
         );
+        assert!(!events.iter().any(|e| e["t"] == "state_patched"));
         assert!(lineage.get("files").is_none());
         assert!(plan.candidate.is_none());
         assert!(plan.reset_overlay().unwrap().is_none());
