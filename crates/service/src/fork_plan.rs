@@ -181,6 +181,17 @@ impl PreparedForkPlan {
             if observation.map(|file| file.sha256.as_str()) != sha256 {
                 return Err(invalid("manifest does not match reset file observations"));
             }
+            // An absent file must not be recreated as a directory by staging a
+            // descendant, which would change the read from NotFound to a
+            // directory error. Paths are component-normalized before binding.
+            if sha256.is_none()
+                && plan
+                    .files
+                    .iter()
+                    .any(|file| file.path.as_path() != path && file.path.starts_with(path))
+            {
+                return Err(invalid("manifest creates a path observed missing"));
+            }
         }
         let candidate_wire = serde_json::to_value(candidate)?;
         plan.binding.reset_candidate_sha256 = Some(hex::encode(Sha256::digest(
@@ -488,6 +499,15 @@ mod tests {
         assert!(bind_negative(Vec::new()).is_ok());
         assert!(bind_negative(vec![extra.clone()]).is_ok());
         assert!(bind_negative(vec![forbidden.clone()]).is_err());
+        let descendant = ForkFileObservation {
+            path: "workspace/files/upload/missing.json/child".into(),
+            length: 2,
+            sha256: "e".repeat(64),
+        };
+        assert!(bind_negative(vec![descendant.clone()]).is_err());
+        let mut nested = full.clone();
+        nested.push(descendant);
+        assert!(bind(nested).is_err());
         // All positive reads match, but a forbidden extra still refuses.
         let mut reintroduced = full.clone();
         reintroduced.push(forbidden);
