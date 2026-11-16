@@ -201,6 +201,31 @@ mod tests {
     use super::*;
     use crate::common::{json_test_helpers::Harness, test_helpers::package_node};
 
+    #[test]
+    fn continuation_coverage_is_platform_gated() {
+        let node: NodeDef = serde_json::from_value(json!({
+            "id": "schema",
+            "type": "check.schema"
+        }))
+        .unwrap();
+        let mut registry = engine::StepRegistry::new();
+        registry.register(CheckSchemaStep);
+
+        assert_eq!(CheckSchemaStep.continuation_semantics_version(), Some("1"));
+        assert_eq!(
+            registry.continuation_safety(&node),
+            engine::ContinuationSafety::ReadOnly
+        );
+        assert_eq!(
+            registry.continuation_read_coverage(&node),
+            if cfg!(unix) {
+                engine::ContinuationReadCoverage::Complete
+            } else {
+                engine::ContinuationReadCoverage::Unsupported
+            }
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn schema_reader_refuses_a_terminal_symlink_after_path_resolution() {
