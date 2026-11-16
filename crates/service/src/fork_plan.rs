@@ -415,7 +415,10 @@ mod tests {
             } else {
                 let bytes = std::fs::read(&path).unwrap();
                 files.push(ForkFileObservation {
-                    path: path.strip_prefix(root).unwrap().into(),
+                    // Manifest paths are canonical source-relative, forward-slash
+                    // paths on every platform; native separators (Windows `\\`)
+                    // are rejected by the binder by design.
+                    path: policy::portable_relative_path(path.strip_prefix(root).unwrap()).into(),
                     length: bytes.len() as u64,
                     sha256: hex::encode(Sha256::digest(&bytes)),
                 });
