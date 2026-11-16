@@ -1482,10 +1482,11 @@ fn reset_child_events(f: &Fixture, candidate: &ResetPlanCandidate) -> Vec<Value>
         length: 42,
         sha256: "a".repeat(64),
     }];
+    let candidate_wire = serde_json::to_value(candidate).unwrap();
     let binding = json!({"binding_version": 1, "plan_digest": hex::encode(Sha256::digest(
         serde_json::to_vec(&("qcg-prepared-reset-candidate-v1", candidate, &files)).unwrap()
     )), "reset_candidate_sha256": hex::encode(Sha256::digest(
-        serde_json::to_vec(candidate).unwrap()
+        serde_json::to_vec(&candidate_wire).unwrap()
     ))});
     let payload = candidate.fork_overlay_evidence(binding.clone()).unwrap();
     let mut events = f

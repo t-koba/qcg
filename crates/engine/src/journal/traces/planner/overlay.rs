@@ -68,7 +68,10 @@ pub(crate) fn digest(value: &Value) -> Result<String, JournalError> {
 }
 
 fn candidate_digest(candidate: &ResetPlanCandidate) -> Result<String, JournalError> {
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(candidate)?)))
+    // Hash the canonical wire object so service and engine validate exactly
+    // the same bytes, independent of Rust struct field order.
+    let value = serde_json::to_value(candidate)?;
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&value)?)))
 }
 
 impl ResetPlanCandidate {

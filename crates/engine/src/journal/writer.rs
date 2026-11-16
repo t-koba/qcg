@@ -1080,7 +1080,11 @@ impl JournalWriter {
         }
         let _journal_guard = acquire_journal_lock(journal_path)?;
         repair_truncated_tail_locked(journal_path, limits)?;
-        let mut state = crate::RunState::fold_journal_with_limits(journal_path, limits)?;
+        let mut state = crate::RunState::fold_journal_admission_with_limits(journal_path, limits)?;
+        let reset_queue_required = state.reset_queue_required;
+        if !reset_queue_required || state.pending_reset.is_some() {
+            super::traces::overlay::complete(&state)?;
+        }
         if let Some(existing) = state.run_id.as_deref()
             && existing != run_id
         {
@@ -1102,6 +1106,11 @@ impl JournalWriter {
             state.audit_seq = state.audit_seq.max(audit_tail);
         }
         let events = select(&state)?;
+        if reset_queue_required && (events.len() != 1 || events[0].0 != "run_queued") {
+            return Err(JournalError::InvalidEvent(
+                "reset admission requires exactly one run_queued event".into(),
+            ));
+        }
         if events.is_empty() {
             return Ok(Vec::new());
         }

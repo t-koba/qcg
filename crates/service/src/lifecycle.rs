@@ -1607,10 +1607,10 @@ impl LocalService {
                             return;
                         }
                     };
-                    let journaled = if journaled
-                        .iter()
-                        .any(|event| event.get("fork_tree_commit_version").is_some())
-                    {
+                    let journaled = if journaled.iter().any(|event| {
+                        event.get("fork_tree_commit_version").is_some()
+                            || crate::fork_commit::reset_bound(event)
+                    }) {
                         let directory = run_dir.clone();
                         let identity = run_id.clone();
                         match service

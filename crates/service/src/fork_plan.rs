@@ -155,8 +155,10 @@ impl PreparedForkPlan {
         files: Vec<ForkFileObservation>,
     ) -> Result<Self, crate::ServiceError> {
         let mut plan = Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)?;
-        plan.binding.reset_candidate_sha256 =
-            Some(hex::encode(Sha256::digest(serde_json::to_vec(candidate)?)));
+        let candidate_wire = serde_json::to_value(candidate)?;
+        plan.binding.reset_candidate_sha256 = Some(hex::encode(Sha256::digest(
+            serde_json::to_vec(&candidate_wire)?,
+        )));
         plan.candidate = Some(candidate.clone());
         Ok(plan)
     }

@@ -1962,6 +1962,7 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
         &child.run_dir,
         "child",
         committed.last().unwrap()["seq"].as_u64().unwrap(),
+        false,
     )
     .unwrap();
     let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();

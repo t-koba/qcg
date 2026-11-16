@@ -454,6 +454,25 @@ impl RunState {
         through_seq: Option<u64>,
         limits: JournalLimits,
     ) -> Result<Self, crate::JournalError> {
+        Self::fold_journal_through_with_limits_mode(path, through_seq, limits, true)
+    }
+
+    /// Writer-only fold that can represent the single pre-queue reset
+    /// admission state. Writers must accept only its required `run_queued`
+    /// transition; ordinary recovery and replay use the strict fold above.
+    pub(crate) fn fold_journal_admission_with_limits(
+        path: &Utf8Path,
+        limits: JournalLimits,
+    ) -> Result<Self, crate::JournalError> {
+        Self::fold_journal_through_with_limits_mode(path, None, limits, false)
+    }
+
+    fn fold_journal_through_with_limits_mode(
+        path: &Utf8Path,
+        through_seq: Option<u64>,
+        limits: JournalLimits,
+        require_complete_overlay: bool,
+    ) -> Result<Self, crate::JournalError> {
         let mut state = Self::default();
         let events = read_journal_values_through(path, through_seq, limits)?.events;
         for event in &events {
@@ -465,7 +484,9 @@ impl RunState {
             }
             state.apply(event)?;
         }
-        crate::journal::traces::overlay::complete(&state)?;
+        if require_complete_overlay {
+            crate::journal::traces::overlay::complete(&state)?;
+        }
         crate::journal::traces::TraceJournal::restore(&mut state, &events, path, limits);
         Ok(state)
     }

@@ -39,6 +39,22 @@ fn refused_capacity(
     })
 }
 
+fn fold_prepared_fork_snapshot(events: &[Value]) -> Result<engine::RunState, engine::JournalError> {
+    let reset_prefix = events.last().is_some_and(|event| {
+        event["t"] == "child_reset_overlay"
+            && events
+                .iter()
+                .rev()
+                .find(|candidate| candidate["t"] == "run_forked")
+                .is_some_and(crate::fork_commit::reset_bound)
+    });
+    if reset_prefix {
+        engine::RunState::fold_admission_values(events)
+    } else {
+        engine::RunState::fold_values(events)
+    }
+}
+
 impl LocalService {
     /// Complete start/fork admission after the allocation-free probe (E03).
     /// The channel predates the journal append. Only the registered winner
@@ -60,6 +76,23 @@ impl LocalService {
         } else {
             None
         };
+        let checkpoint_fork = (is_fork && fork_payload.is_some())
+            .then(|| {
+                snapshot
+                    .events
+                    .iter()
+                    .rev()
+                    .find(|event| event["t"] == "run_forked")
+            })
+            .flatten();
+        if let Some(fork) = checkpoint_fork
+            && crate::fork_commit::reset_bound(fork)
+            && fork["fork_tree_commit_version"].as_u64() != Some(crate::fork_commit::VERSION)
+        {
+            return Err(api_internal(
+                "reset-bound fork requires a supported fork tree commit protocol",
+            ));
+        }
         // Fence only the durable membership append, not preparation or
         // idempotent/rejected admissions that never write a new identity.
         let mut membership = (self.inner.run_store_mode == RunStoreMode::Exclusive)
@@ -79,15 +112,10 @@ impl LocalService {
         }
         if is_fork && fork_payload.is_some() {
             // Reuse forks are fresh starts, not checkpoint-tree publications.
-            if snapshot
-                .events
-                .iter()
-                .rev()
-                .find(|event| event["t"] == "run_forked")
-                .is_some_and(|event| {
-                    event["fork_tree_commit_version"].as_u64() == Some(crate::fork_commit::VERSION)
-                })
+            if let Some(fork) = checkpoint_fork
+                && fork["fork_tree_commit_version"].as_u64() == Some(crate::fork_commit::VERSION)
             {
+                let reset_bound = crate::fork_commit::reset_bound(fork);
                 let queue_seq = snapshot
                     .events
                     .iter()
@@ -100,7 +128,7 @@ impl LocalService {
                 let identity = run_id.clone();
                 if let Err(error) = self
                     .blocking_work(move || {
-                        crate::fork_commit::publish(&directory, &identity, queue_seq)
+                        crate::fork_commit::publish(&directory, &identity, queue_seq, reset_bound)
                     })
                     .await
                 {
@@ -963,7 +991,7 @@ impl LocalService {
             adopt_snapshot
         } else {
             let events = crate::summaries::read_journal_events(&run_dir).map_err(api_internal)?;
-            let state = engine::RunState::fold_values(&events).map_err(api_internal)?;
+            let state = fold_prepared_fork_snapshot(&events).map_err(api_internal)?;
             crate::run_dirs::AdoptSnapshot {
                 adopted: false,
                 events,
@@ -1116,5 +1144,392 @@ impl LocalService {
         staged.queued_at = adopted_queued_at.or(fresh_queued_at);
         self.finish_prepared_admission(run_id, staged, fork_snapshot, created_fresh, queued_payload)
             .await
+    }
+}
+
+#[cfg(test)]
+mod fork_protocol_tests {
+    use super::*;
+    use crate::{run_dirs, summaries, tests::support::*};
+
+    fn prepared_fork(markers: Value) -> (TempGuard, LocalService, RunRecord, Vec<Value>, Value) {
+        let root = TempGuard(temp_run_dir("fork-admission-protocol"));
+        let source = synthetic_hitl_record(&root.0, "source");
+        let service = test_service(vec![], root.0.join("runs"));
+        let mut child = source.clone();
+        child.run_dir = root.0.join("runs/child");
+        child.parent_run_id = Some("source".into());
+        run_dirs::prepare_checkpoint_fork(
+            &source.run_dir,
+            "source",
+            &child.run_dir,
+            "child",
+            1,
+            &api::ForkStatePatch::default(),
+        )
+        .unwrap();
+        crate::run_package::copy(
+            &crate::run_package::package_dir(&source.run_dir),
+            &child.run_dir,
+            source.package_sha256.as_deref().unwrap(),
+        )
+        .unwrap();
+        let mut events = summaries::read_journal_events(&child.run_dir).unwrap();
+        let fork = events.last_mut().unwrap().as_object_mut().unwrap();
+        assert_eq!(fork["t"], "run_forked");
+        fork.remove("fork_tree_commit_version");
+        fork.extend(markers.as_object().unwrap().clone());
+        write_journal(&child, &events);
+        let mut queue = events[0].clone();
+        for key in ["seq", "ts", "trace_id", "span_id", "t"] {
+            queue.as_object_mut().unwrap().remove(key);
+        }
+        queue["run_id"] = json!("child");
+        queue["parent_run_id"] = json!("source");
+        let effective = crate::types::ResolvedExecutionPolicy::resolve(
+            child.contract.manifest.budget.max_steps,
+            service.inner.deployment_policy.max_total_steps,
+            service.inner.deployment_policy.max_parallel_steps,
+        );
+        queue["effective_max_total_steps"] = json!(effective.max_total_steps);
+        queue["effective_policy_origin"] = json!(effective.origin);
+        (root, service, child, events, queue)
+    }
+
+    fn write_journal(child: &RunRecord, events: &[Value]) {
+        std::fs::write(
+            summaries::run_meta_dir(&child.run_dir).join("journal.jsonl"),
+            events
+                .iter()
+                .map(|event| format!("{event}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+
+    async fn join_engine(child: &RunRecord) {
+        let handle = child.task.lock().unwrap().take().expect("spawned task");
+        tokio::time::timeout(std::time::Duration::from_secs(5), handle)
+            .await
+            .expect("engine must return")
+            .expect("engine task must not panic");
+    }
+
+    fn assert_not_executed(events: &[Value]) {
+        assert!(!events.iter().any(|event| matches!(
+            event["t"].as_str(),
+            Some("run_started" | "run_resumed" | "step_started")
+        )));
+    }
+
+    #[tokio::test]
+    async fn reset_bound_admission_requires_supported_protocol() {
+        // Presence of either marker (even malformed) must fail closed.
+        for marker in [
+            json!({"binding": {"reset_candidate_sha256": null}}),
+            json!({"reset_overlay_sha256": null}),
+        ] {
+            for version in [None, Some(json!(999)), Some(Value::Null)] {
+                let mut markers = marker.clone();
+                if let Some(version) = version {
+                    markers["fork_tree_commit_version"] = version;
+                }
+                let (_root, service, child, events, queue) = prepared_fork(markers);
+                let before = events.clone();
+                let error = service
+                    .finish_prepared_admission(
+                        "child".into(),
+                        child.clone(),
+                        run_dirs::AdoptSnapshot {
+                            adopted: false,
+                            events,
+                            state: None,
+                        },
+                        true,
+                        Some(queue),
+                    )
+                    .await
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("requires a supported fork tree commit protocol")
+                );
+                assert!(run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+                assert!(!service.inner.runs.read().await.contains_key("child"));
+                assert!(child.task.lock().unwrap().is_none());
+                assert_eq!(
+                    summaries::read_journal_events(&child.run_dir).unwrap(),
+                    before
+                );
+                assert_not_executed(&before);
+            }
+        }
+    }
+
+    // Wire-only fixture kept inside this test module: it creates no public
+    // reset candidate constructor or production admission caller.
+    fn prepared_reset_bound_fork(
+        version: Option<Value>,
+    ) -> (TempGuard, LocalService, RunRecord, Vec<Value>, Value) {
+        let (_root, service, child, mut before, mut queue) = prepared_fork(json!({}));
+        // The completed admission folds successfully, including when protocol
+        // metadata is missing: rejection tests must reach the service gate.
+        let mut fork = before.pop().unwrap();
+        let mut failed = fork.clone();
+        for key in ["source_run_id", "source_seq"] {
+            failed.as_object_mut().unwrap().remove(key);
+        }
+        failed["t"] = json!("step_finished");
+        failed["node"] = json!("ask");
+        failed["status"] = json!("failed");
+        before.push(failed);
+        let state = engine::RunState::fold_values(&before).unwrap();
+        let digest = |value: &Value| {
+            use sha2::{Digest, Sha256};
+            hex::encode(Sha256::digest(serde_json::to_vec(value).unwrap()))
+        };
+        let candidate = json!({
+            "identity": vec![0u8; 32],
+            "source_run_id": "source",
+            "source_contract_sha256": child.contract_sha256,
+            "source_last_seq": state.last_seq,
+            "retry_roots": ["ask"],
+            "stale_outcomes": [],
+            "preserved_outcomes": [],
+            "inherited_budget": state.budget,
+            "reset_nodes": {
+                "ask": {"output_alias": "ask", "predecessors": []}
+            }
+        });
+        let candidate_digest = digest(&candidate);
+        let binding = json!({"binding_version": 1, "plan_digest": "a".repeat(64),
+            "reset_candidate_sha256": candidate_digest});
+        let overlay = json!({"version": 1, "candidate": candidate, "binding": binding});
+        fork["seq"] = json!(state.last_seq + 1);
+        fork["source_seq"] = json!(state.last_seq);
+        fork["source_contract_sha256"] = json!(child.contract_sha256);
+        fork["binding"] = binding;
+        fork["reset_overlay_sha256"] = json!(digest(&overlay));
+        if let Some(version) = version {
+            fork["fork_tree_commit_version"] = version;
+        }
+        let mut overlay_event = fork.clone();
+        for key in [
+            "source_run_id",
+            "source_seq",
+            "source_contract_sha256",
+            "binding",
+            "reset_overlay_sha256",
+            "fork_tree_commit_version",
+        ] {
+            overlay_event.as_object_mut().unwrap().remove(key);
+        }
+        overlay_event["t"] = json!("child_reset_overlay");
+        overlay_event["seq"] = json!(state.last_seq + 2);
+        overlay_event["overlay"] = overlay;
+        for key in ["ts", "trace_id", "span_id"] {
+            queue[key] = overlay_event[key].clone();
+        }
+        queue["t"] = json!("run_queued");
+        queue["seq"] = json!(state.last_seq + 3);
+        before.extend([fork, overlay_event, queue]);
+        assert!(
+            engine::RunState::fold_values(&before)
+                .unwrap()
+                .terminal
+                .is_none()
+        );
+        let queue = before.pop().unwrap();
+        write_journal(&child, &before);
+        (_root, service, child, before, queue)
+    }
+
+    #[tokio::test]
+    async fn reset_bound_lifecycle_requires_supported_protocol() {
+        for version in [None, Some(json!(999)), Some(Value::Null)] {
+            let (_root, service, child, mut before, queue) = prepared_reset_bound_fork(version);
+            before.push(queue);
+            write_journal(&child, &before);
+            // Model a registered run with its pending marker already cleared.
+            run_dirs::clear_fork_admission_pending(&child.run_dir).unwrap();
+            service
+                .inner
+                .runs
+                .write()
+                .await
+                .insert("child".into(), child.clone());
+            service
+                .clone()
+                .spawn_engine_run(SpawnRun {
+                    run_id: "child".into(),
+                    contract: child.contract.clone(),
+                    inputs: child.inputs.clone(),
+                    run_dir: child.run_dir.clone(),
+                    events: child.events.clone(),
+                    answers: child.answers.clone(),
+                    confirmations: child.confirmations.clone(),
+                    journal_snapshot: Some(before.clone()),
+                    cancellation: child.cancellation.clone(),
+                    task: child.task.clone(),
+                })
+                .await;
+            join_engine(&child).await;
+            assert_eq!(
+                service.inner.runs.read().await["child"].state,
+                RunStatus::Queued
+            );
+            assert_eq!(
+                summaries::read_journal_events(&child.run_dir).unwrap(),
+                before
+            );
+            assert_not_executed(&before);
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reset_bound_fork_admits_executes_and_adopts_with_fsync_commit() {
+        let (_root, service, child, events, mut queue) =
+            prepared_reset_bound_fork(Some(json!(crate::fork_commit::VERSION)));
+        assert!(run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        let queue_seq = queue["seq"].as_u64().unwrap();
+        assert!(engine::RunState::fold_values(&events).is_err());
+        let state = fold_prepared_fork_snapshot(&events).unwrap();
+        let journal_path = summaries::run_meta_dir(&child.run_dir).join("journal.jsonl");
+        let before = summaries::read_journal_events(&child.run_dir).unwrap();
+        let error =
+            run_dirs::write_run_event(&child, "step_started", json!({"node":"ask"})).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reset admission requires exactly one run_queued event")
+        );
+        assert_eq!(
+            summaries::read_journal_events(&child.run_dir).unwrap(),
+            before
+        );
+        assert!(run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        let mut queued_payload = queue.clone();
+        for key in ["seq", "ts", "trace_id", "span_id", "t"] {
+            queued_payload.as_object_mut().unwrap().remove(key);
+        }
+        let error = engine::JournalWriter::append_events_if(
+            &journal_path,
+            "child",
+            vec![("run_queued", queued_payload), ("run_started", json!({}))],
+            engine::JournalLimits::from(&child.contract.manifest.runtime),
+            None,
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("reset admission requires exactly one run_queued event")
+        );
+        assert_eq!(
+            summaries::read_journal_events(&child.run_dir).unwrap(),
+            before
+        );
+        assert!(run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        assert!(
+            engine::RunState::fold_journal_with_limits(
+                &journal_path,
+                engine::JournalLimits::from(&child.contract.manifest.runtime)
+            )
+            .is_err()
+        );
+        for key in ["seq", "ts", "trace_id", "span_id", "t"] {
+            queue.as_object_mut().unwrap().remove(key);
+        }
+        let admitted = service
+            .finish_prepared_admission(
+                "child".into(),
+                child.clone(),
+                run_dirs::AdoptSnapshot {
+                    adopted: false,
+                    events,
+                    state: Some(state),
+                },
+                true,
+                Some(queue),
+            )
+            .await
+            .unwrap();
+        assert_eq!(admitted, "child");
+        assert!(!run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        assert!(service.inner.runs.read().await.contains_key("child"));
+        join_engine(&child).await;
+
+        let events = summaries::read_journal_events(&child.run_dir).unwrap();
+        let queue = events
+            .iter()
+            .find(|event| {
+                event["t"] == "run_queued"
+                    && event["run_id"] == "child"
+                    && event["seq"].as_u64() == Some(queue_seq)
+            })
+            .expect("durable reset admission queue");
+        assert_eq!(queue["seq"], queue_seq);
+        let commit: Value = serde_json::from_slice(
+            &std::fs::read(summaries::run_meta_dir(&child.run_dir).join("fork-tree.commit.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(commit["durability"], "fsync");
+        assert_eq!(commit["run_id"], "child");
+        assert_eq!(commit["queue_seq"], queue_seq);
+        let verification = crate::fork_commit::verify(&child.run_dir, "child", &events);
+        assert!(
+            verification.is_ok(),
+            "commit verification failed: {verification:?}"
+        );
+        assert!(
+            events.iter().any(|event| {
+                event["t"] == "run_started"
+                    && event["run_id"] == "child"
+                    && event["seq"].as_u64().unwrap() > queue_seq
+            }),
+            "child did not start; state={:?}; events={events:#?}",
+            service.inner.runs.read().await["child"].state
+        );
+        let adopted = run_dirs::try_adopt_run_dir_with_snapshot(&child.run_dir, "child")
+            .expect("settled reset-bound fork must remain adoptable");
+        assert!(adopted.adopted);
+        assert_eq!(adopted.events, events);
+        assert_eq!(adopted.state.unwrap().run_id.as_deref(), Some("child"));
+        assert!(!run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+    }
+
+    #[tokio::test]
+    async fn ordinary_legacy_fork_admits_and_executes_without_commit_protocol() {
+        let (_root, service, child, events, queue) = prepared_fork(json!({}));
+        service
+            .finish_prepared_admission(
+                "child".into(),
+                child.clone(),
+                run_dirs::AdoptSnapshot {
+                    adopted: false,
+                    events,
+                    state: None,
+                },
+                true,
+                Some(queue),
+            )
+            .await
+            .unwrap();
+        join_engine(&child).await;
+        assert!(!run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        assert!(service.inner.runs.read().await.contains_key("child"));
+        assert!(
+            summaries::read_journal_events(&child.run_dir)
+                .unwrap()
+                .iter()
+                .any(
+                    |event| matches!(event["t"].as_str(), Some("run_started" | "run_resumed"))
+                        && event["run_id"] == "child"
+                )
+        );
     }
 }
