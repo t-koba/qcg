@@ -145,7 +145,14 @@ at every component from the workspace root, so a parent directory swapped
 after validation cannot redirect the open or the rename outside the
 workspace. Artifact reads open nonblocking and refuse non-regular files;
 size checks, hashing, and delivery use the same pinned file, rewinding it
-for archive preflight rather than reopening its pathname. This covers step
+for archive preflight rather than reopening its pathname. Artifact paths
+reject trailing separators and empty components before the no-follow walk,
+so a final component cannot lose `O_NOFOLLOW` to a trailing slash. A hard
+link created inside the workspace to an inode outside the trust boundary is
+a regular file with a contained path and is not refused by these checks;
+creating one requires a non-cooperative same-user writer and stays outside
+the guaranteed boundary (documented here rather than probed via link count).
+This covers step
 output writers (render/copy/write/transform base64/zip and HTTP file outputs). Directory-tree consumers that must parse the tree
 (`check.contract`, `check.tool`, zip sources) read a private handle-relative snapshot under
 the run metadata; the external tool process reads the snapshot, never the
