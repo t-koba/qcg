@@ -405,6 +405,7 @@ mod tests {
         assert!(linked.stage(&source, &target).is_err());
         assert!(!target.join(".prepared-source").exists());
     }
+    #[cfg(unix)]
     fn observe_tree(root: &Utf8Path, dir: &Utf8Path) -> Vec<ForkFileObservation> {
         let mut files = Vec::new();
         for entry in std::fs::read_dir(dir).unwrap() {
