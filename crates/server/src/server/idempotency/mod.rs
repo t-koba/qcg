@@ -1782,7 +1782,14 @@ mod tests {
                 } else if entry.file_type().unwrap().is_file() {
                     let bytes = std::fs::read(&path).unwrap();
                     files.push(service::ForkFileObservation {
-                        path: path.strip_prefix(root).unwrap().into(),
+                        path: path
+                            .strip_prefix(root)
+                            .unwrap()
+                            .components()
+                            .map(|component| component.as_str())
+                            .collect::<Vec<_>>()
+                            .join("/")
+                            .into(),
                         length: bytes.len() as u64,
                         sha256: hex::encode(Sha256::digest(&bytes)),
                     });
