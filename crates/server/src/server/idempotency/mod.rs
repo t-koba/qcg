@@ -1054,6 +1054,36 @@ mod tests {
     use super::*;
     use std::collections::{BTreeMap, BTreeSet};
 
+    fn observation_path(root: &camino::Utf8Path, path: &camino::Utf8Path) -> camino::Utf8PathBuf {
+        path.strip_prefix(root)
+            .unwrap()
+            .components()
+            .map(|component| component.as_str())
+            .collect::<Vec<_>>()
+            .join("/")
+            .into()
+    }
+
+    #[test]
+    fn prepared_fork_observation_paths_are_host_independent() {
+        let root = camino::Utf8Path::new("source-run");
+        let path = root.join("workspace").join("files").join("private.json");
+        let observed_path = observation_path(root, &path);
+        assert_eq!(
+            observed_path,
+            camino::Utf8PathBuf::from("workspace/files/private.json")
+        );
+        let _plan = service::PreparedForkPlan::new(
+            &"a".repeat(64),
+            vec![service::ForkFileObservation {
+                path: observed_path,
+                length: 1,
+                sha256: "b".repeat(64),
+            }],
+        )
+        .unwrap();
+    }
+
     // Task-local one-shot boundary: no global hook or wall-clock scheduling race.
     tokio::task_local! {
         static OWNER_RECHECK: std::cell::RefCell<Option<(
@@ -1730,6 +1760,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn prepared_fork_binds_lineage_and_replays_ready_without_source() {
         let runs = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
@@ -1782,14 +1813,7 @@ mod tests {
                 } else if entry.file_type().unwrap().is_file() {
                     let bytes = std::fs::read(&path).unwrap();
                     files.push(service::ForkFileObservation {
-                        path: path
-                            .strip_prefix(root)
-                            .unwrap()
-                            .components()
-                            .map(|component| component.as_str())
-                            .collect::<Vec<_>>()
-                            .join("/")
-                            .into(),
+                        path: observation_path(root, &path),
                         length: bytes.len() as u64,
                         sha256: hex::encode(Sha256::digest(&bytes)),
                     });
