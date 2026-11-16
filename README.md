@@ -90,10 +90,13 @@ Each API run receives a UUID-based ID and its own workspace and journal below
 `--run-store shared-filesystem` enables multiple services using run-level
 execution leases and periodic abandoned-run recovery on storage with reliable
 advisory locks. `--max-active-runs` (also `MAX_ACTIVE_RUNS`)
-defaults to 8. Additional accepted runs enter the durable FIFO execution queue
-instead of failing under temporary saturation. A run waiting for human input
-or confirmation releases its execution slot until it resumes. Queued and active
-runs resume from their verified journal after a service restart.
+defaults to 8. Additional accepted runs enter a durable priority queue,
+ordered by priority with FIFO ties among equal priorities, instead of failing
+under temporary saturation (see the [HTTP server guide](docs/http-server-guide.md)
+and [operations guide](docs/operations.md) for priority ordering and
+preemption). A run waiting for human input or confirmation releases its
+execution slot until it resumes. Queued and active runs resume from
+their verified journal after a service restart.
 
 `fixtures/generators/` contains test-only fixtures and is never bundled.
 Installed generator packages under `--generators-dir` appear alongside the
