@@ -352,6 +352,52 @@ fn dedicated_raw_manifest_bound_rejects_before_deserialization() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
+/// Synthetic ZIP directory entries must carry fixed metadata, never the
+/// mode/mtime of the on-disk directory: that read is by pathname after the
+/// source files were pinned and would follow a parent swapped to a symlink,
+/// leaking an outside directory's metadata across the isolation boundary.
+#[cfg(unix)]
+#[test]
+fn artifact_zip_directory_metadata_is_fixed_not_from_disk() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let run_dir = temp_run_dir("zip-dir-fixed-meta");
+    let _ = std::fs::remove_dir_all(&run_dir);
+    std::fs::create_dir_all(run_meta_dir(&run_dir)).expect("meta should be created");
+    let parent = run_workspace_dir(&run_dir).join("reports");
+    std::fs::create_dir_all(&parent).expect("artifact directory should be created");
+    let artifact_path = parent.join("result.txt");
+    std::fs::write(&artifact_path, "ok").expect("artifact should be written");
+    // A distinctive on-disk directory mode that must NOT appear in the ZIP.
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700))
+        .expect("directory mode should be set");
+
+    std::fs::write(
+        run_meta_dir(&run_dir).join("outputs.json"),
+        serde_json::to_string(&json!({
+            "artifacts": [{
+                "path": "reports/result.txt",
+                "sha256": "2689367b205c16ce32ed4200942b8b8b1e262dfc70d9bc9fbc77c49699a4f1df",
+                "bytes": 2,
+                "label": "Result",
+                "required": true
+            }]
+        }))
+        .expect("manifest should serialize"),
+    )
+    .expect("manifest should be written");
+
+    let bytes = read_artifacts_zip(&run_dir).expect("zip should be written");
+    let mut archive = zip::ZipArchive::new(Cursor::new(bytes)).expect("zip archive should parse");
+    let dir = archive.by_name("reports/").expect("directory entry");
+    assert_eq!(
+        dir.unix_mode().expect("directory mode") & 0o777,
+        0o755,
+        "directory entry must use fixed mode, not the on-disk directory mode"
+    );
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
 #[test]
 fn dedicated_nested_zip_directories_count_toward_entry_cap() {
     let run_dir = temp_run_dir("dedicated-nested-entries");

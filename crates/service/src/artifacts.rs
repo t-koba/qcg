@@ -138,7 +138,6 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
             "artifact zip source bytes exceed limit: {total_bytes} > {limit}"
         )));
     }
-    let workspace = run_workspace_dir(run_dir);
     let mut directories = std::collections::BTreeMap::new();
     for artifact in &verified {
         let mut parent = Utf8Path::new(&artifact.path).parent();
@@ -161,18 +160,18 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
     check_verified_artifact_hashes(&verified)?;
     write_artifact_archive(writer, limits, "artifact zip", |zip| {
         for directory in directories {
-            let metadata = std::fs::metadata(workspace.join(&directory))?;
-            zip.add_directory(
-                format!("{directory}/"),
-                artifact_zip_options(&metadata, true)?,
-            )
-            .map_err(artifact_zip_error)?;
+            // Synthetic directory entries carry fixed metadata, matching the
+            // bundle path. Reading directory metadata from a pathname here
+            // would follow a parent swapped to a symlink after pinning and
+            // leak the outside directory's mode/mtime across the boundary.
+            zip.add_directory(format!("{directory}/"), bundle_entry_options(true))
+                .map_err(artifact_zip_error)?;
         }
         for artifact in verified {
             let mut file = artifact.reader()?;
             let metadata = file.metadata()?;
             let mut file = (&mut *file).take(artifact.bytes.saturating_add(1));
-            zip.start_file(&artifact.path, artifact_zip_options(&metadata, false)?)
+            zip.start_file(&artifact.path, artifact_zip_options(&metadata)?)
                 .map_err(artifact_zip_error)?;
             copy_verified_artifact(&mut file, zip, &artifact)?;
         }
@@ -405,14 +404,13 @@ impl<W: Write> Write for CountingWriter<W> {
     }
 }
 
-/// Explicit zip modes for artifact entries. Unix file modes come from the
-/// source file itself; synthesized bundle entries carry fixed modes. No
-/// path relies on the zip default and no platform synthesizes a different
-/// readonly fallback: every entry declares its mode explicitly (E15).
-fn artifact_zip_options(
-    metadata: &std::fs::Metadata,
-    directory: bool,
-) -> Result<SimpleFileOptions, ServiceError> {
+/// Explicit zip options for a file artifact, built from the metadata of its
+/// pinned handle. Unix file modes come from the source file itself; no path
+/// relies on the zip default and no platform synthesizes a different readonly
+/// fallback: every entry declares its mode explicitly (E15). Synthetic
+/// directory entries use `bundle_entry_options` instead and never consult a
+/// workspace pathname.
+fn artifact_zip_options(metadata: &std::fs::Metadata) -> Result<SimpleFileOptions, ServiceError> {
     // Share the explicit platform/compression defaults, then apply source metadata.
     let modified = chrono::DateTime::<chrono::Utc>::from(metadata.modified()?).naive_utc();
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
@@ -420,7 +418,7 @@ fn artifact_zip_options(
             "artifact modification time is not representable in ZIP: {error}"
         ))
     })?;
-    let options = bundle_entry_options(directory).last_modified_time(modified);
+    let options = bundle_entry_options(false).last_modified_time(modified);
     #[cfg(unix)]
     let mode = {
         use std::os::unix::fs::PermissionsExt as _;
@@ -433,12 +431,10 @@ fn artifact_zip_options(
         mode
     };
     // No silent default: non-Unix metadata carries no Unix mode, so
-    // declare the entry mode from the file type and readonly bit
-    // instead of letting the zip writer synthesize one (E15).
+    // declare the entry mode from the readonly bit instead of letting the
+    // zip writer synthesize one (E15).
     #[cfg(not(unix))]
-    let mode = if directory {
-        0o755
-    } else if metadata.permissions().readonly() {
+    let mode = if metadata.permissions().readonly() {
         0o444
     } else {
         0o644
