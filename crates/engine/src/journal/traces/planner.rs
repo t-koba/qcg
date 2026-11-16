@@ -6,7 +6,7 @@ use crate::{
     JournalLimits, NodeOutcome, RunState, StepRegistry, TerminalState, read_journal_values,
     serialize_bounded,
 };
-use camino::Utf8Path;
+use camino::{Utf8Path, Utf8PathBuf};
 use contract::{Contract, FieldType, ReadDependency, ReadIdentity, ReadKind, ReadOwner};
 use serde::{Deserialize, Serialize};
 
@@ -51,6 +51,10 @@ impl std::fmt::Debug for DiagnosticIdentity {
 #[derive(Clone, Serialize)]
 pub struct ResetPlanCandidate {
     identity: DiagnosticIdentity,
+    // Only live analysis retains staging requirements. The evidence identity
+    // already commits to these reads; child overlays must not publish paths.
+    #[serde(skip)]
+    required_files: Option<BTreeMap<Utf8PathBuf, String>>,
     source_run_id: String,
     source_contract_sha256: String,
     source_last_seq: u64,
@@ -59,6 +63,42 @@ pub struct ResetPlanCandidate {
     preserved_outcomes: Vec<String>,
     inherited_budget: BudgetState,
     reset_nodes: BTreeMap<String, ResetNode>,
+}
+
+impl ResetPlanCandidate {
+    /// Exact source-relative staging requirements from live source analysis.
+    /// Private overlay decoding cannot reconstruct these requirements and must
+    /// not be used to prepare another fork. No candidate construction is exposed.
+    #[doc(hidden)]
+    pub fn required_file_observations(&self) -> Option<impl Iterator<Item = (&Utf8Path, &str)>> {
+        self.required_files.as_ref().map(|files| {
+            files
+                .iter()
+                .map(|(path, sha256)| (path.as_path(), sha256.as_str()))
+        })
+    }
+
+    fn require_file(&mut self, read: &ReadDependency, digest: [u8; 32]) -> Result<(), Refusal> {
+        let root = match read.kind {
+            ReadKind::PackageFile => "generator-package",
+            ReadKind::WorkspaceFile => "workspace",
+            _ => return Err(Refusal::InputIdentity),
+        };
+        let (_, relative) = file_read_identity(read)?;
+        let path = Utf8Path::new(root).join(relative);
+        let files = self.required_files.as_mut().ok_or(Refusal::InputIdentity)?;
+        let sha256 = hex::encode(digest);
+        match files.entry(path) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(sha256);
+            }
+            std::collections::btree_map::Entry::Occupied(entry) if entry.get() != &sha256 => {
+                return Err(Refusal::InputIdentity);
+            }
+            _ => {}
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +220,7 @@ fn analyze_source(
     )?;
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: state.run_id.clone().ok_or(Refusal::SourceBinding)?,
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: state.last_seq,
@@ -310,6 +351,9 @@ fn analyze_source(
                         &observed,
                         limits.max_event_bytes,
                     )?;
+                    if let Some(digest) = observed {
+                        result.require_file(read, digest)?;
+                    }
                     observed.is_some_and(|digest| read.identity == ReadIdentity::Digest(digest))
                 }
             };

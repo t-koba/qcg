@@ -506,6 +506,7 @@ async fn stale_output_propagates_to_transitive_alias_consumers() {
     );
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -568,6 +569,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
     // Neither C nor D captured any data read of its gate prerequisites.
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -594,6 +596,7 @@ async fn any_succeeded_gate_invalidation_reaches_gates_and_captured_readers() {
     ] {
         let mut seeded = ResetPlanCandidate {
             identity: DiagnosticIdentity([0; 32]),
+            required_files: Some(BTreeMap::new()),
             retry_roots,
             stale_outcomes,
             preserved_outcomes: result.preserved_outcomes.clone(),
@@ -673,6 +676,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
 
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -689,6 +693,7 @@ async fn steps_ancestor_presence_does_not_invalidate_an_unrelated_precise_read()
 
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -746,6 +751,7 @@ async fn actual_steps_collection_read_is_invalidated_by_any_retry() {
 
     let mut result = ResetPlanCandidate {
         identity: DiagnosticIdentity([0; 32]),
+        required_files: Some(BTreeMap::new()),
         source_run_id: "synthetic".into(),
         source_contract_sha256: contract.sha256.clone(),
         source_last_seq: 0,
@@ -1283,6 +1289,82 @@ async fn unsupported_state_budget_and_limits_refuse() {
     // A newline alone is not a clean shutdown proof.
     std::fs::remove_file(crate::journal::writer::clean_shutdown_marker_path(&f.path)).unwrap();
     assert_eq!(f.analyze().unwrap_err(), Refusal::Unsealed);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn reset_file_requirements_bind_present_reads_without_publishing_paths() {
+    let f = Fixture::with_package(Some("1"), true).await;
+    let candidate = f.analyze().unwrap();
+    let requirements = |candidate: &ResetPlanCandidate| {
+        candidate
+            .required_file_observations()
+            .unwrap()
+            .map(|(path, sha256)| (path.to_owned(), sha256.to_owned()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    let expected = BTreeMap::from([
+        (
+            Utf8PathBuf::from("generator-package/schema.json"),
+            hex::encode(Sha256::digest(b"{}")),
+        ),
+        (
+            Utf8PathBuf::from("workspace/files/upload/private.json"),
+            hex::encode(Sha256::digest(b"{}")),
+        ),
+    ]);
+    // Both outcomes consumed both files: identical observations are deduplicated.
+    assert_eq!(requirements(&candidate), expected);
+    assert_eq!(requirements(&candidate.clone()), expected);
+    let wire = serde_json::to_string(&candidate).unwrap();
+    let debug = format!("{candidate:?}");
+    let overlay = reset_child_events(&f, &candidate)
+        .pop()
+        .unwrap()
+        .to_string();
+    for text in [&wire, &debug, &overlay] {
+        assert!(!text.contains("required_files"));
+        for path in expected.keys() {
+            assert!(!text.contains(path.as_str()));
+        }
+    }
+
+    // Retain the observed current bytes, even when different from the captured
+    // read and therefore stale. Failed roots' reads are requirements as well.
+    for relative in expected.keys() {
+        let path = f.path.parent().unwrap().parent().unwrap().join(relative);
+        std::fs::write(&path, b"changed").unwrap();
+        let changed = f.analyze().unwrap();
+        assert_eq!(
+            requirements(&changed)[relative],
+            hex::encode(Sha256::digest(b"changed"))
+        );
+        assert_ne!(changed.identity, candidate.identity);
+        assert_eq!(changed.stale_outcomes, ["a"]);
+        std::fs::remove_file(&path).unwrap();
+        let missing = f.analyze().unwrap();
+        assert!(!requirements(&missing).contains_key(relative));
+        assert_eq!(missing.stale_outcomes, ["a"]);
+        std::fs::write(&path, b"{}").unwrap();
+    }
+
+    // Bounded deterministic reproduction of two reads observing different
+    // bytes for the same source path; refusal must not overwrite the first.
+    let mut conflicting = candidate.clone();
+    let read = f.state.dependency_traces.owners["b"]
+        .trace
+        .reads
+        .iter()
+        .find(|read| read.kind == ReadKind::PackageFile)
+        .unwrap();
+    conflicting
+        .require_file(read, Sha256::digest(b"{}").into())
+        .unwrap();
+    assert_eq!(
+        conflicting.require_file(read, Sha256::digest(b"different").into()),
+        Err(Refusal::InputIdentity)
+    );
+    assert_eq!(requirements(&conflicting), expected);
 }
 
 #[cfg(unix)]

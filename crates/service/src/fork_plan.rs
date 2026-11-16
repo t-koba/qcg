@@ -149,17 +149,42 @@ impl PreparedForkPlan {
     /// Bind opaque source diagnostic evidence and the complete file manifest.
     /// This retains the candidate for an internal child overlay; it does not
     /// authorize continuation. A digest alone cannot supply the reset payload.
+    /// Every present file read by analysis must occur at its exact source-relative
+    /// path and SHA in the full manifest; unrelated projection inputs remain bound.
+    /// This is not an analysis-to-copy TOCTOU guarantee.
     #[doc(hidden)]
     pub fn from_reset_candidate(
         candidate: &engine::ResetPlanCandidate,
         files: Vec<ForkFileObservation>,
     ) -> Result<Self, crate::ServiceError> {
+        let requirements = candidate
+            .required_file_observations()
+            .ok_or_else(|| invalid("reset candidate lacks live file observations"))?;
+        let mut plan = Self::bind_reset_evidence(candidate, files, requirements)?;
+        plan.candidate = Some(candidate.clone());
+        Ok(plan)
+    }
+
+    fn bind_reset_evidence<'a, T: Serialize>(
+        candidate: &T,
+        files: Vec<ForkFileObservation>,
+        requirements: impl Iterator<Item = (&'a Utf8Path, &'a str)>,
+    ) -> Result<Self, crate::ServiceError> {
         let mut plan = Self::bind("qcg-prepared-reset-candidate-v1", candidate, files)?;
+        for (path, sha256) in requirements {
+            let observation = plan
+                .files
+                .binary_search_by(|file| file.path.as_path().cmp(path))
+                .ok()
+                .map(|index| &plan.files[index]);
+            if observation.is_none_or(|file| file.sha256 != sha256) {
+                return Err(invalid("manifest does not match reset file observations"));
+            }
+        }
         let candidate_wire = serde_json::to_value(candidate)?;
         plan.binding.reset_candidate_sha256 = Some(hex::encode(Sha256::digest(
             serde_json::to_vec(&candidate_wire)?,
         )));
-        plan.candidate = Some(candidate.clone());
         Ok(plan)
     }
 
@@ -384,6 +409,70 @@ mod tests {
             }
         }
         files
+    }
+
+    #[test]
+    fn reset_binding_requires_exact_reads_and_keeps_full_manifest_extras() {
+        let requirements = [
+            (
+                Utf8Path::new("generator-package/schema.json"),
+                "b".repeat(64),
+            ),
+            (
+                Utf8Path::new("workspace/files/upload/input.json"),
+                "c".repeat(64),
+            ),
+        ];
+        // Exercise the private reset binder without opening candidate construction
+        // or decoding to callers. Engine tests cover requirements from real analysis.
+        let diagnostic = json!({"identity": "opaque evidence"});
+        let bind = |files| {
+            PreparedForkPlan::bind_reset_evidence(
+                &diagnostic,
+                files,
+                requirements
+                    .iter()
+                    .map(|(path, sha256)| (*path, sha256.as_str())),
+            )
+        };
+        let required = requirements
+            .iter()
+            .map(|(path, sha256)| ForkFileObservation {
+                path: (*path).to_owned(),
+                length: 2,
+                sha256: sha256.clone(),
+            })
+            .collect::<Vec<_>>();
+        let extra = ForkFileObservation {
+            path: "meta/journal.jsonl".into(),
+            length: 10,
+            sha256: "d".repeat(64),
+        };
+        let mut full = required.clone();
+        full.push(extra.clone());
+        full.reverse(); // The whole manifest is canonicalized before lookup.
+        let plan = bind(full.clone()).unwrap();
+        assert_eq!(plan.files.len(), 3);
+        assert!(plan.files.iter().any(|file| file.path == extra.path));
+        assert!(plan.reset_bound());
+        assert_ne!(plan.binding(), bind(required.clone()).unwrap().binding());
+        for index in 0..requirements.len() {
+            let mut missing = required.clone();
+            missing.remove(index);
+            assert!(bind(missing).is_err());
+            let mut mismatched = required.clone();
+            mismatched[index].sha256 = "e".repeat(64);
+            assert!(bind(mismatched).is_err());
+            let mut wrong_path = required.clone();
+            wrong_path[index].path = "unrelated/input.json".into();
+            assert!(bind(wrong_path).is_err());
+        }
+        assert!(bind(Vec::new()).is_err());
+        // Even an unrequired extra participates in identity and validation.
+        full[0].length += 1;
+        assert_ne!(plan.binding(), bind(full.clone()).unwrap().binding());
+        full.push(extra);
+        assert!(bind(full).is_err());
     }
 
     #[test]

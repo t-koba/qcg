@@ -52,6 +52,7 @@ fn decode_candidate<'de, D: serde::Deserializer<'de>>(
     let w = Wire::deserialize(d)?;
     Ok(ResetPlanCandidate {
         identity: w.identity,
+        required_files: None,
         source_run_id: w.source_run_id,
         source_contract_sha256: w.source_contract_sha256,
         source_last_seq: w.source_last_seq,
