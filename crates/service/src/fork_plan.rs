@@ -671,6 +671,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn reset_bound_preparation_refuses_state_patches_before_writing() {
         let root = temp_run_dir("prepared-patch");
         let _guard = TempGuard(root.clone());
@@ -758,6 +759,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn child_lineage_and_crash_staging_share_incomplete_admission_ownership() {
         let root = temp_run_dir("prepared-lineage");
         let _guard = TempGuard(root.clone());
