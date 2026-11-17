@@ -21,6 +21,7 @@ futures-util.workspace = true
 flate2.workspace = true
 rawzip.workspace = true
 hex.workspace = true
+jiff.workspace = true
 api = { path = "../api" }
 container = { path = "../container" }
 contract = { path = "../contract" }

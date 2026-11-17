@@ -420,7 +420,9 @@ fn with_zip_modified_time(
     mut options: SimpleFileOptions,
     modified: SystemTime,
 ) -> Result<SimpleFileOptions> {
-    let modified = chrono::DateTime::<chrono::Utc>::from(modified).naive_utc();
+    let modified = jiff::Timestamp::try_from(modified)
+        .map_err(|error| anyhow::anyhow!("modification time is not a valid timestamp: {error}"))?;
+    let modified = jiff::tz::Offset::UTC.to_datetime(modified);
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
         anyhow::anyhow!("modification time is not representable in ZIP: {error}")
     })?;

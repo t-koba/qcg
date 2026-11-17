@@ -261,7 +261,13 @@ pub(crate) fn zip_entry_options(
             format!("failed to read source modification time: {error}"),
         )
     })?;
-    let modified = chrono::DateTime::<chrono::Utc>::from(modified).naive_utc();
+    let modified = jiff::Timestamp::try_from(modified).map_err(|error| {
+        StepError::failed(
+            node_id,
+            format!("failed to convert source modification time: {error}"),
+        )
+    })?;
+    let modified = jiff::tz::Offset::UTC.to_datetime(modified);
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
         StepError::failed(
             node_id,

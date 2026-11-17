@@ -412,7 +412,12 @@ impl<W: Write> Write for CountingWriter<W> {
 /// workspace pathname.
 fn artifact_zip_options(metadata: &std::fs::Metadata) -> Result<SimpleFileOptions, ServiceError> {
     // Share the explicit platform/compression defaults, then apply source metadata.
-    let modified = chrono::DateTime::<chrono::Utc>::from(metadata.modified()?).naive_utc();
+    let modified = jiff::Timestamp::try_from(metadata.modified()?).map_err(|error| {
+        ServiceError::Invalid(format!(
+            "artifact modification time is not a valid timestamp: {error}"
+        ))
+    })?;
+    let modified = jiff::tz::Offset::UTC.to_datetime(modified);
     let modified = zip::DateTime::try_from(modified).map_err(|error| {
         ServiceError::Invalid(format!(
             "artifact modification time is not representable in ZIP: {error}"
