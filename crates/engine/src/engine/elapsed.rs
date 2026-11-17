@@ -368,6 +368,46 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Golden characterization of the exact RFC3339 timestamp bytes qcg emits
+    /// and persists (journal `ts`, `active_started_at`, `queued_at`, `fetched_at`).
+    /// This is the oracle for the staged chrono->jiff migration: any replacement
+    /// must reproduce these bytes exactly. chrono's `to_rfc3339` uses AutoSi
+    /// fractional digits (0/3/6/9 by trailing-zero divisibility) and a numeric
+    /// `+00:00` offset, never `Z`; fixed instants keep this test deterministic.
+    #[test]
+    fn rfc3339_emit_contract_is_autosi_with_numeric_offset() {
+        for (instant, expected) in [
+            ("2026-01-01T00:00:00+00:00", "2026-01-01T00:00:00+00:00"),
+            (
+                "2026-01-01T00:00:00.123+00:00",
+                "2026-01-01T00:00:00.123+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.123456+00:00",
+                "2026-01-01T00:00:00.123456+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.123456789+00:00",
+                "2026-01-01T00:00:00.123456789+00:00",
+            ),
+        ] {
+            let parsed = DateTime::parse_from_rfc3339(instant)
+                .unwrap()
+                .with_timezone(&Utc);
+            assert_eq!(parsed.to_rfc3339(), expected);
+        }
+        // A `Z`-suffixed input is re-emitted with the numeric offset, never `Z`.
+        let z = DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(z.to_rfc3339(), "2026-01-01T00:00:00+00:00");
+        // Nanoseconds outside the 3/6/9-digit grid force the 9-digit AutoSi form.
+        let precise = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.000000123+00:00")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(precise.to_rfc3339(), "2026-01-01T00:00:00.000000123+00:00");
+    }
+
     #[test]
     fn open_crash_charges_downtime_exactly_once_across_recovery() {
         let (dir, writer) = journal("recovery");
