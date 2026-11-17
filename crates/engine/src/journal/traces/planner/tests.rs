@@ -1227,6 +1227,20 @@ async fn unsupported_state_budget_and_limits_refuse() {
             s.cancel_requested = true;
         },
         |s| {
+            s.cancel_operations.insert("operation".into());
+        },
+        |s| {
+            s.mcp_pending.insert("server".into(), json!({}));
+        },
+        |s| {
+            s.mcp_resumed.insert("server".into(), "question".into());
+        },
+        |s| {
+            s.pending = Some(crate::state::Interaction::Question {
+                question: api::FormSpec::default(),
+            });
+        },
+        |s| {
             s.pending_seq = Some(1);
         },
         |s| {
