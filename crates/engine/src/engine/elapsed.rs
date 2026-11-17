@@ -390,6 +390,27 @@ mod tests {
                 "2026-01-01T00:00:00.123456789+00:00",
                 "2026-01-01T00:00:00.123456789+00:00",
             ),
+            // Trailing-zero cases: AutoSi pads to the coarsest exact 3/6/9-digit
+            // grid, it does not trim to the fewest significant digits. These are
+            // the points where jiff's default `FractionalSecond::Auto` diverges
+            // (emitting .1 / .5 / .1234 / .00000001), so they are what actually
+            // distinguishes a byte-compatible formatter from a naive swap.
+            (
+                "2026-01-01T00:00:00.100+00:00",
+                "2026-01-01T00:00:00.100+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.500+00:00",
+                "2026-01-01T00:00:00.500+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.1234+00:00",
+                "2026-01-01T00:00:00.123400+00:00",
+            ),
+            (
+                "2026-01-01T00:00:00.000000010+00:00",
+                "2026-01-01T00:00:00.000000010+00:00",
+            ),
         ] {
             let parsed = DateTime::parse_from_rfc3339(instant)
                 .unwrap()
