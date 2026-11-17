@@ -1275,72 +1275,18 @@ mod fork_protocol_tests {
         }
     }
 
-    fn synthetic_format_record(root: &Utf8Path, run_id: &str) -> RunRecord {
-        let generators =
-            Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
-        let service = test_service(vec![generators], root.join("runs"));
-        let contract = service
-            .load_generator("format-check")
-            .expect("format-check fixture should load");
-        let run_dir = root.join("runs").join(run_id);
-        prepare_api_run_directory(&run_dir).expect("run directory should prepare");
-        let package_sha256 = pin_test_package(&contract.root, &run_dir);
-        let (events, _) = broadcast::channel(512);
-        let record = RunRecord {
-            contract: contract.clone(),
-            contract_sha256: contract.sha256.clone(),
-            package_sha256: Some(package_sha256.clone()),
-            inputs: BTreeMap::new(),
-            answers: BTreeMap::new(),
-            confirmations: BTreeMap::new(),
-            priority: 0,
-            parent_run_id: None,
-            preempted: false,
-            state: RunStatus::Queued,
-            run_dir: run_dir.clone(),
-            artifacts: None,
-            question: None,
-            confirm: None,
-            events,
-            cancellation: CancellationToken::new(),
-            scheduler_yield: CancellationToken::new(),
-            task: Arc::new(Mutex::new(None)),
-            queued_at: Some(chrono::Utc::now()),
-            owner_id: String::new(),
-            ephemeral: false,
-        };
-        write_run_event(
-            &record,
-            "run_queued",
-            json!({
-                "run_id": run_id,
-                "generator": "format-check@0.1.0",
-                "generator_path": contract.root,
-                "contract_sha256": contract.sha256,
-                "package_sha256": package_sha256,
-                "inputs": {},
-                "answers": {},
-                "confirmations": {},
-                "schema_version": api::JOURNAL_SCHEMA_VERSION,
-                "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
-            }),
-        )
-        .expect("queued event should append");
-        record
-    }
-
     // Wire-only fixture kept inside this test module: it creates no public
     // reset candidate constructor or production admission caller.
     fn prepared_reset_bound_fork(
         version: Option<Value>,
     ) -> (TempGuard, LocalService, RunRecord, Vec<Value>, Value) {
         let root = TempGuard(temp_run_dir("reset-fork-admission-protocol"));
-        let source = synthetic_format_record(&root.0, "source");
+        let source = synthetic_record(&root.0, "source", "format-check");
         let (_root, service, child, mut before, mut queue) =
             prepared_fork_from(root, source, json!({}));
         let registry = run_dirs::app_registry(run_dirs::load_llm_runtime(None).unwrap());
         let attestation = registry
-            .continuation_attestation(&child.contract.graph.nodes["check_json"])
+            .continuation_attestation_for_tests(&child.contract.graph.nodes["check_json"])
             .expect("format check executor must be continuation-safe");
         // The completed admission folds successfully, including when protocol
         // metadata is missing: rejection tests must reach the service gate.

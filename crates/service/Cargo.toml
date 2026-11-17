@@ -47,4 +47,5 @@ zip.workspace = true
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+engine = { path = "../engine", features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }

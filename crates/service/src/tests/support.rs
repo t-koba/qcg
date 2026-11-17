@@ -464,12 +464,16 @@ pub(crate) async fn start_ask_user_and_answer(service: &LocalService, mode: &str
 }
 
 pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord {
+    synthetic_record(root, run_id, "ask-user")
+}
+
+pub(crate) fn synthetic_record(root: &Utf8Path, run_id: &str, generator: &str) -> RunRecord {
     let generators =
         Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
     let service = test_service(vec![generators], root.join("runs"));
     let contract = service
-        .load_generator("ask-user")
-        .expect("ask-user fixture should load");
+        .load_generator(generator)
+        .expect("generator fixture should load");
     let run_dir = root.join("runs").join(run_id);
     prepare_api_run_directory(&run_dir).expect("run directory should prepare");
     let package_sha256 = pin_test_package(&contract.root, &run_dir);
@@ -502,7 +506,7 @@ pub(crate) fn synthetic_hitl_record(root: &Utf8Path, run_id: &str) -> RunRecord 
         "run_queued",
         json!({
             "run_id": run_id,
-            "generator": "ask-user@0.1.0",
+            "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
             "generator_path": contract.root,
             "contract_sha256": contract.sha256,
             "package_sha256": package_sha256,

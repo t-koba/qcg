@@ -413,9 +413,14 @@ impl StepRegistry {
     }
 
     /// Canonical private proof for the currently registered executor.
-    #[doc(hidden)]
-    pub fn continuation_attestation(&self, node: &NodeDef) -> Option<[u8; 32]> {
+    pub(crate) fn continuation_attestation(&self, node: &NodeDef) -> Option<[u8; 32]> {
         Self::attest_executor(self.executors.get(node.kind.as_str())?.as_ref(), node)
+    }
+
+    /// Test-only access to the private executor proof for downstream fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn continuation_attestation_for_tests(&self, node: &NodeDef) -> Option<[u8; 32]> {
+        self.continuation_attestation(node)
     }
 
     /// Use the same entry that will execute, never a later registry lookup.
