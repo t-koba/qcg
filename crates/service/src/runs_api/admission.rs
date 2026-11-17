@@ -1405,6 +1405,70 @@ mod fork_protocol_tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn reset_bound_first_execution_rechecks_committed_tree_after_queue_delay() {
+        let (_root, service, child, events, mut queue) =
+            prepared_reset_bound_fork(Some(json!(crate::fork_commit::VERSION)));
+        let state = fold_prepared_fork_snapshot(&events).unwrap();
+        let probe = QueueProbe(child.run_dir.clone());
+        let (admitted, release) = probe.gate("admitted");
+        for key in ["seq", "ts", "trace_id", "span_id", "t"] {
+            queue.as_object_mut().unwrap().remove(key);
+        }
+        service
+            .finish_prepared_admission(
+                "child".into(),
+                child.clone(),
+                run_dirs::AdoptSnapshot {
+                    adopted: false,
+                    events,
+                    state: Some(state),
+                },
+                true,
+                Some(queue),
+            )
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), admitted)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let queued_events = summaries::read_journal_events(&child.run_dir).unwrap();
+        let fork = queued_events
+            .iter()
+            .rev()
+            .find(|event| event["t"] == "run_forked")
+            .unwrap();
+        assert!(crate::fork_commit::reset_bound(fork));
+        assert_eq!(
+            fork["fork_tree_commit_version"],
+            crate::fork_commit::VERSION
+        );
+        assert_eq!(queued_events.last().unwrap()["t"], "run_queued");
+        assert!(!run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        crate::fork_commit::verify(&child.run_dir, "child", &queued_events).unwrap();
+        assert_not_executed(&queued_events);
+        // Only the tree changes after successful publication: the reset-bound
+        // dispatch must run the full verifier again before first execution.
+        std::fs::write(
+            child.run_dir.join("workspace/uncommitted"),
+            b"unexpected payload",
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        join_engine(&child).await;
+
+        assert_eq!(
+            service.inner.runs.read().await["child"].state,
+            RunStatus::Queued
+        );
+        let events = summaries::read_journal_events(&child.run_dir).unwrap();
+        assert_eq!(events, queued_events);
+        assert_not_executed(&events);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn reset_bound_fork_admits_executes_and_adopts_with_fsync_commit() {
         let (_root, service, child, events, mut queue) =
             prepared_reset_bound_fork(Some(json!(crate::fork_commit::VERSION)));
