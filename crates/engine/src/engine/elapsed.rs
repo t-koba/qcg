@@ -429,6 +429,58 @@ mod tests {
         assert_eq!(precise.to_rfc3339(), "2026-01-01T00:00:00.000000123+00:00");
     }
 
+    /// Characterizes chrono's exact `parse_from_rfc3339` acceptance grammar on
+    /// the live journal path (`active_started_at`, `queued_at`, `fetched_at`).
+    /// This is the parse-side oracle for the staged chrono->jiff migration: a
+    /// replacement must accept and reject exactly these inputs. In particular
+    /// jiff's default parser is *broader* (comma fractions, no-colon/hour-only
+    /// offsets, basic ISO) and *narrower* (>9 fractional digits), so a naive
+    /// swap creates an API-accept / engine-reject divergence on loaded journals.
+    #[test]
+    fn rfc3339_parse_contract_is_strict_chrono_grammar() {
+        // Accepted forms: Z, numeric offset, space separator, leap second,
+        // -00:00, and >9 fractional digits truncated to nanosecond precision.
+        for accepted in [
+            "2026-01-01T00:00:00+00:00",
+            "2026-01-01T00:00:00Z",
+            "2026-01-01 00:00:00Z",
+            "2026-01-01T00:00:60Z",
+            "2026-01-01T00:00:00-00:00",
+            "2026-01-01T00:00:00.123456789Z",
+            "2026-01-01T00:00:00.1234567890Z",
+        ] {
+            assert!(
+                DateTime::parse_from_rfc3339(accepted).is_ok(),
+                "chrono must accept {accepted}"
+            );
+        }
+        // >9 digits truncate to nanos on re-emit (jiff would reject outright).
+        let truncated = DateTime::parse_from_rfc3339("2026-01-01T00:00:00.1234567890Z")
+            .unwrap()
+            .to_rfc3339();
+        assert_eq!(truncated, "2026-01-01T00:00:00.123456789+00:00");
+
+        // Rejected forms: comma fraction, no-colon/hour-only/seconds-bearing
+        // offsets, out-of-range offsets, basic ISO, RFC9557 annotation, no offset.
+        for rejected in [
+            "2026-01-01T00:00:00,5Z",
+            "2026-01-01T00:00:00+0000",
+            "2026-01-01T00:00:00+00",
+            "2026-01-01T00:00:00+00:00:30",
+            "2026-01-01T00:00:00+24:00",
+            "2026-01-01T00:00:00+25:00",
+            "20260101T000000Z",
+            "2026-01-01T00:00:00+00:00[UTC]",
+            "not-a-timestamp",
+            "2026-01-01T00:00:00",
+        ] {
+            assert!(
+                DateTime::parse_from_rfc3339(rejected).is_err(),
+                "chrono must reject {rejected}"
+            );
+        }
+    }
+
     #[test]
     fn open_crash_charges_downtime_exactly_once_across_recovery() {
         let (dir, writer) = journal("recovery");
