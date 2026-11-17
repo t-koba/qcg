@@ -82,7 +82,7 @@ impl ResetPlanCandidate {
     #[doc(hidden)]
     pub fn fork_overlay_evidence(&self, binding: Value) -> Result<Value, JournalError> {
         let overlay = Overlay {
-            version: 2,
+            version: 1,
             candidate: self.clone(),
             binding: serde_json::from_value(binding)?,
         };
@@ -93,7 +93,7 @@ impl ResetPlanCandidate {
 
 impl Overlay {
     fn validate_binding(&self) -> Result<(), JournalError> {
-        if self.version != 2
+        if self.version != 1
             || self.binding.binding_version != 1
             || self.binding.plan_digest.len() != 64
             || !self

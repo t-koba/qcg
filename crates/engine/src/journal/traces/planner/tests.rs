@@ -1830,7 +1830,7 @@ async fn child_reset_overlay_refuses_missing_mismatched_duplicate_or_out_of_wind
         (fork_index, "/binding/plan_digest", json!("b".repeat(64))),
         (fork_index, "/reset_overlay_sha256", Value::Null),
         (overlay_index, "/run_id", json!("foreign")),
-        (overlay_index, "/overlay/version", json!(1)),
+        (overlay_index, "/overlay/version", json!(2)),
         (overlay_index, "/overlay/version", json!(3)),
         (
             overlay_index,

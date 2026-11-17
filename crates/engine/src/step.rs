@@ -413,7 +413,8 @@ impl StepRegistry {
     }
 
     /// Canonical private proof for the currently registered executor.
-    pub(crate) fn continuation_attestation(&self, node: &NodeDef) -> Option<[u8; 32]> {
+    #[doc(hidden)]
+    pub fn continuation_attestation(&self, node: &NodeDef) -> Option<[u8; 32]> {
         Self::attest_executor(self.executors.get(node.kind.as_str())?.as_ref(), node)
     }
 
