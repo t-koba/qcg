@@ -555,8 +555,11 @@ fn reset_schedule<'a>(
     // gate. Model their union over the reset set as a least fixpoint of nodes
     // that can reach a terminal state. A node qualifies once all its reset
     // predecessors are terminal and its needs gate can open: AllSucceeded and
-    // NoneFailed wait for every need, AnySucceeded opens on any one. Needs
-    // outside the reset set are preserved source successes (already terminal).
+    // NoneFailed wait for every need; AnySucceeded needs a preserved source
+    // success outside the reset set, or all needs terminal (the child opens the
+    // gate only on an actual Success, else skips once every need is terminal).
+    // Needs outside the reset set are preserved source successes (already
+    // terminal).
     // Multi-need AnySucceeded cannot be flattened into mandatory AND edges
     // without over-refusing plans that have a free alternative, so the gate is
     // evaluated directly. Any reset node left out has no runnable order -- the
@@ -585,7 +588,20 @@ fn reset_schedule<'a>(
                     contract::OnDeps::AllSucceeded | contract::OnDeps::NoneFailed => {
                         def.needs.iter().all(is_terminal)
                     }
-                    contract::OnDeps::AnySucceeded => def.needs.iter().any(is_terminal),
+                    contract::OnDeps::AnySucceeded => {
+                        // The child opens an AnySucceeded gate only on an actual
+                        // `Success` (needs_satisfied), or skips the node when every
+                        // need is terminal and none succeeded
+                        // (should_skip_by_dependencies). A reset need that merely
+                        // reaches a terminal state may end Failed/Skipped, which
+                        // opens neither path. So the gate is provably open only if
+                        // some need is a preserved source success outside the reset
+                        // set, or every need is terminal. Counting one reset need's
+                        // arbitrary terminal state would admit a plan where the
+                        // opener ends non-Success and the child stalls.
+                        def.needs.iter().any(|need| !reset_ids.contains(need))
+                            || def.needs.iter().all(is_terminal)
+                    }
                 },
             };
             if needs_open {

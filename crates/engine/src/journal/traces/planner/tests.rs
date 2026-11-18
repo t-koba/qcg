@@ -531,11 +531,12 @@ async fn multi_need_any_succeeded_all_alternatives_gated_refuses() {
 }
 
 #[tokio::test]
-async fn multi_need_any_succeeded_with_free_alternative_is_admitted() {
-    // Same as above, but b also needs y, a free reset node with no captured
-    // reads gating it on b. y can become terminal first and open b's
-    // AnySucceeded gate, so refusing this plan would over-refuse a genuinely
-    // schedulable reset.
+async fn multi_need_any_succeeded_free_reset_alternative_refuses() {
+    // b also needs y, a free reset node with no captured reads gating it on b.
+    // y becomes terminal first only by re-executing, and can end Failed/Skipped;
+    // the child opens an AnySucceeded gate only on an actual Success, so y is
+    // not a reliable opener. With a and c still gated on b, the child would
+    // stall. Analysis must refuse instead of admitting this plan.
     let f = Fixture::new().await;
     let mut contract = f.contract.clone();
     for id in ["c", "y"] {
@@ -561,9 +562,48 @@ async fn multi_need_any_succeeded_with_free_alternative_is_admitted() {
         ("c", BTreeSet::from([read("c", "b")])),
         ("y", BTreeSet::new()),
     ]);
+    assert_eq!(
+        reset_schedule(&contract, owners.iter(), |owner| reads.get(owner)),
+        Err(Refusal::ResetDependency),
+    );
+}
+
+#[tokio::test]
+async fn multi_need_any_succeeded_preserved_success_alternative_is_admitted() {
+    // b needs a and c (both gated on b by captured reads) plus x, a preserved
+    // source success that is NOT in the reset set. x is already Success in the
+    // child, so it reliably opens b's AnySucceeded gate; a and c can then
+    // settle. Refusing this plan would over-refuse a genuinely schedulable
+    // reset.
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    for id in ["c", "x"] {
+        let mut node = contract.graph.nodes["b"].clone();
+        node.id = id.into();
+        node.needs.clear();
+        contract.graph.nodes.insert(id.into(), node);
+    }
+    let b = contract.graph.nodes.get_mut("b").unwrap();
+    b.needs = vec!["a".into(), "c".into(), "x".into()];
+    b.on_deps = contract::OnDeps::AnySucceeded;
+
+    let read = |owner: &str, name: &str| ReadDependency {
+        owner: ReadOwner::Node(owner.into()),
+        path: vec!["steps".into(), name.into(), "output".into()],
+        kind: ReadKind::Lookup,
+        identity: ReadIdentity::Missing,
+    };
+    // x is intentionally absent from owners: it is preserved from the source,
+    // not reset, so it is a guaranteed Success in the child.
+    let owners = ["a", "b", "c"].map(String::from);
+    let reads = BTreeMap::from([
+        ("a", BTreeSet::from([read("a", "b")])),
+        ("b", BTreeSet::new()),
+        ("c", BTreeSet::from([read("c", "b")])),
+    ]);
     let schedule = reset_schedule(&contract, owners.iter(), |owner| reads.get(owner)).unwrap();
     assert_eq!(schedule["a"].predecessors, BTreeSet::from(["b".to_owned()]));
-    assert!(schedule["y"].predecessors.is_empty());
+    assert_eq!(schedule["c"].predecessors, BTreeSet::from(["b".to_owned()]));
 }
 
 #[tokio::test]
