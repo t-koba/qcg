@@ -1,9 +1,6 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import fs from "node:fs";
-import os from "node:os";
-import path from "node:path";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { pathToFileURL } from "node:url";
 
 // Exact-ID exceptions per project policy, not broad suppressions. Each entry
 // is a time-boxed, reviewable record: once its review date passes the gate
@@ -241,36 +238,27 @@ function selfTest() {
   assert.equal(evaluateAudit(report({ picomatch }), "not-a-list", 0, TEST_NOW).ok, false, "exception list must be an array");
   assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, "not-a-date").ok, false, "invalid now fails closed");
 
-  // Process-level: the gate must accept a consistent report (with npm's
-  // nonzero status explained by the excepted advisory) and reject one whose
-  // aggregate counts more findings than it emitted.
-  const fakeNpmDir = fs.mkdtempSync(path.join(os.tmpdir(), "qcg-audit-gate-"));
-  const fakeNpm = path.join(fakeNpmDir, "npm");
-  fs.writeFileSync(fakeNpm, '#!/bin/sh\nprintf "%s" "$QCG_AUDIT_FIXTURE"\nexit "${QCG_AUDIT_STATUS:-0}"\n', {
-    mode: 0o755,
-  });
-  const runGate = (fixture, status) => spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
-    encoding: "utf8",
-    env: {
-      ...process.env,
-      PATH: `${fakeNpmDir}${path.delimiter}${process.env.PATH ?? ""}`,
-      QCG_AUDIT_FIXTURE: JSON.stringify(fixture),
-      QCG_AUDIT_STATUS: String(status),
-    },
-  });
-  try {
-    const matching = runGate(report({ picomatch }), 1);
-    assert.equal(matching.status, 0, `consistent report should pass: ${matching.stderr}`);
-    assert.match(matching.stdout, /no unexcepted moderate-or-higher advisories/);
-    assert.match(matching.stdout, /excepted GHSA-fc5q-39xc-vjpf/);
-
-    const inconsistent = runGate(report({ picomatch }, { high: 2, total: 2 }), 1);
-    assert.equal(inconsistent.status, 1, "inconsistent report must not pass");
-    assert.match(inconsistent.stderr, /high count 2 disagrees with 1 reported packages/);
-  } finally {
-    fs.rmSync(fakeNpmDir, { recursive: true, force: true });
-  }
-  console.log(`audit self-test: ${cases.length} table cases + exception-entry cases + process-level cases passed`);
+  // Count reconciliation must decide the result independently of the real
+  // clock or the production exception's review date. Use a synthetic fixture
+  // exception and a fixed clock past the production reviewBy, so this case
+  // cannot drift into a time bomb or couple the parser regression to future
+  // exception maintenance. The table already covers consistent/inconsistent
+  // counts and nonzero exit through evaluateAudit; here we pin that the
+  // exception that explains nonzero status still requires reconciled counts.
+  const fixtureException = [{
+    id: fresh, reason: "self-test fixture", owner: "self-test", reviewBy: "2099-01-01",
+  }];
+  const fixedNow = new Date("2027-06-01T00:00:00Z");
+  const reportedHigh = report({ other: { via: [high] } });
+  const consistent = evaluateAudit(reportedHigh, fixtureException, 1, fixedNow);
+  assert.equal(consistent.ok, true, "consistent excepted report with nonzero status passes");
+  assert.deepEqual(consistent.ignored, [fresh]);
+  const inflated = evaluateAudit(
+    report({ other: { via: [high] } }, { high: 2, total: 2 }), fixtureException, 1, fixedNow,
+  );
+  assert.equal(inflated.ok, false, "inflated count must not pass");
+  assert.match(inflated.error, /high count 2 disagrees with 1 reported packages/);
+  console.log(`audit self-test: ${cases.length} table cases + exception-entry cases + reconciliation cases passed`);
 }
 
 function fail(message) {
