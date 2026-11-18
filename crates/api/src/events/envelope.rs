@@ -100,6 +100,7 @@ pub const FAILURE_EVENT_KINDS: &[&str] = &[
     "guardrail_tripwire",
     "llm_validation_failed",
     "llm_route_failed",
+    "llm_cost_unresolved",
     "out_of_contract",
 ];
 
