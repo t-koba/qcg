@@ -507,20 +507,6 @@ fn step_read(read: &ReadDependency) -> StepRead<'_> {
     }
 }
 
-/// A reset node advances in the child (runs or is skipped) once every
-/// dependency named here is terminal, so these are safe edges for a deadlock
-/// check. `AllSucceeded` and `NoneFailed` wait on all needs; a single-need
-/// `AnySucceeded` also waits on that one need. Multi-need `AnySucceeded` is
-/// excluded: any one successor unblocks the node, so treating every alternative
-/// as mandatory would refuse otherwise schedulable plans.
-fn mandatory_reset_needs(def: &contract::NodeDef) -> &[String] {
-    match def.on_deps {
-        contract::OnDeps::AllSucceeded | contract::OnDeps::NoneFailed => &def.needs,
-        contract::OnDeps::AnySucceeded if def.needs.len() == 1 => &def.needs,
-        contract::OnDeps::AnySucceeded => &[],
-    }
-}
-
 /// Resolve both node IDs and exact contract output aliases. Collisions are
 /// retained, not overwritten: a consumed ambiguous name must refuse even when
 /// only one of its possible owners is reset.
@@ -564,60 +550,54 @@ fn reset_schedule<'a>(
             &reset_ids,
         )?;
     }
-    // The child enforces two independent gates before it can advance a reset
-    // node: the captured-read reset gate (predecessors above) and the contract
-    // `needs` gate. Each graph is acyclic on its own, but their union over the
-    // reset set can cycle -- e.g. stale `a` read-gated on `b` while retry root
-    // `b` needs `a`. The child would then have no runnable node. Add mandatory
-    // needs as validation-only edges to this acyclicity check; the serialized
-    // reset payload keeps only captured reads.
-    let combined = reset
-        .iter()
-        .map(|(owner, node)| {
-            let mut deps = node
+    // The child enforces two gates before advancing a Pending reset node: the
+    // captured-read gate (all predecessors terminal) and the contract `needs`
+    // gate. Model their union over the reset set as a least fixpoint of nodes
+    // that can reach a terminal state. A node qualifies once all its reset
+    // predecessors are terminal and its needs gate can open: AllSucceeded and
+    // NoneFailed wait for every need, AnySucceeded opens on any one. Needs
+    // outside the reset set are preserved source successes (already terminal).
+    // Multi-need AnySucceeded cannot be flattened into mandatory AND edges
+    // without over-refusing plans that have a free alternative, so the gate is
+    // evaluated directly. Any reset node left out has no runnable order -- the
+    // child would stall with "no runnable node remains" -- so refuse. The
+    // serialized reset payload keeps only captured reads.
+    let mut terminal = BTreeSet::<&str>::new();
+    loop {
+        let mut grew = false;
+        for (owner, node) in &reset {
+            if terminal.contains(owner.as_str()) {
+                continue;
+            }
+            if !node
                 .predecessors
                 .iter()
-                .map(String::as_str)
-                .collect::<BTreeSet<_>>();
-            if let Some(def) = contract.graph.nodes.get(owner) {
-                for need in mandatory_reset_needs(def) {
-                    if reset_ids.contains(need) {
-                        deps.insert(need.as_str());
+                .all(|dep| terminal.contains(dep.as_str()))
+            {
+                continue;
+            }
+            let is_terminal =
+                |need: &String| !reset_ids.contains(need) || terminal.contains(need.as_str());
+            let needs_open = match contract.graph.nodes.get(owner) {
+                None => return Err(Refusal::Executor),
+                Some(def) if def.needs.is_empty() => true,
+                Some(def) => match def.on_deps {
+                    contract::OnDeps::AllSucceeded | contract::OnDeps::NoneFailed => {
+                        def.needs.iter().all(is_terminal)
                     }
-                }
-            }
-            (owner.as_str(), deps)
-        })
-        .collect::<BTreeMap<_, _>>();
-    // Kahn traversal is iterative and proportional to the captured reset graph.
-    // Self reads (including a consumed aggregate containing the reader) refuse:
-    // silently dropping that gate would guess a different execution dependency.
-    let mut remaining = BTreeMap::new();
-    let mut successors = BTreeMap::<&str, Vec<&str>>::new();
-    let mut ready = VecDeque::new();
-    for (owner, deps) in &combined {
-        remaining.insert(*owner, deps.len());
-        if deps.is_empty() {
-            ready.push_back(*owner);
-        }
-        for dep in deps {
-            successors.entry(*dep).or_default().push(*owner);
-        }
-    }
-    let mut visited = 0;
-    while let Some(owner) = ready.pop_front() {
-        visited += 1;
-        for successor in successors.get(owner).into_iter().flatten() {
-            let count = remaining
-                .get_mut(successor)
-                .ok_or(Refusal::ResetDependency)?;
-            *count -= 1;
-            if *count == 0 {
-                ready.push_back(successor);
+                    contract::OnDeps::AnySucceeded => def.needs.iter().any(is_terminal),
+                },
+            };
+            if needs_open {
+                terminal.insert(owner.as_str());
+                grew = true;
             }
         }
+        if !grew {
+            break;
+        }
     }
-    if visited != reset.len() {
+    if terminal.len() != reset.len() {
         return Err(Refusal::ResetDependency);
     }
     Ok(reset)

@@ -497,6 +497,76 @@ async fn cross_graph_reset_cycle_refuses_instead_of_stalling_child() {
 }
 
 #[tokio::test]
+async fn multi_need_any_succeeded_all_alternatives_gated_refuses() {
+    // b (retry root) has AnySucceeded needs=[a, c]. Both a and c read b's
+    // output, so each is gated on b by its captured-read reset gate. No
+    // alternative can reach a terminal state before b, so the child would
+    // stall with no runnable node; analysis must refuse instead of admitting it.
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    let mut c = contract.graph.nodes["b"].clone();
+    c.id = "c".into();
+    c.needs.clear();
+    contract.graph.nodes.insert("c".into(), c);
+    let b = contract.graph.nodes.get_mut("b").unwrap();
+    b.needs = vec!["a".into(), "c".into()];
+    b.on_deps = contract::OnDeps::AnySucceeded;
+
+    let read = |owner: &str, name: &str| ReadDependency {
+        owner: ReadOwner::Node(owner.into()),
+        path: vec!["steps".into(), name.into(), "output".into()],
+        kind: ReadKind::Lookup,
+        identity: ReadIdentity::Missing,
+    };
+    let owners = ["a", "b", "c"].map(String::from);
+    let reads = BTreeMap::from([
+        ("a", BTreeSet::from([read("a", "b")])),
+        ("b", BTreeSet::new()),
+        ("c", BTreeSet::from([read("c", "b")])),
+    ]);
+    assert_eq!(
+        reset_schedule(&contract, owners.iter(), |owner| reads.get(owner)),
+        Err(Refusal::ResetDependency),
+    );
+}
+
+#[tokio::test]
+async fn multi_need_any_succeeded_with_free_alternative_is_admitted() {
+    // Same as above, but b also needs y, a free reset node with no captured
+    // reads gating it on b. y can become terminal first and open b's
+    // AnySucceeded gate, so refusing this plan would over-refuse a genuinely
+    // schedulable reset.
+    let f = Fixture::new().await;
+    let mut contract = f.contract.clone();
+    for id in ["c", "y"] {
+        let mut node = contract.graph.nodes["b"].clone();
+        node.id = id.into();
+        node.needs.clear();
+        contract.graph.nodes.insert(id.into(), node);
+    }
+    let b = contract.graph.nodes.get_mut("b").unwrap();
+    b.needs = vec!["a".into(), "c".into(), "y".into()];
+    b.on_deps = contract::OnDeps::AnySucceeded;
+
+    let read = |owner: &str, name: &str| ReadDependency {
+        owner: ReadOwner::Node(owner.into()),
+        path: vec!["steps".into(), name.into(), "output".into()],
+        kind: ReadKind::Lookup,
+        identity: ReadIdentity::Missing,
+    };
+    let owners = ["a", "b", "c", "y"].map(String::from);
+    let reads = BTreeMap::from([
+        ("a", BTreeSet::from([read("a", "b")])),
+        ("b", BTreeSet::new()),
+        ("c", BTreeSet::from([read("c", "b")])),
+        ("y", BTreeSet::new()),
+    ]);
+    let schedule = reset_schedule(&contract, owners.iter(), |owner| reads.get(owner)).unwrap();
+    assert_eq!(schedule["a"].predecessors, BTreeSet::from(["b".to_owned()]));
+    assert!(schedule["y"].predecessors.is_empty());
+}
+
+#[tokio::test]
 async fn stale_output_propagates_to_transitive_alias_consumers() {
     let f = Fixture::new().await;
     let mut contract = f.contract.clone();
@@ -1495,24 +1565,6 @@ async fn package_file_currentness_uses_exact_consumed_bytes_under_source_root() 
 
     f.contract.root = f.workspace.clone();
     assert_eq!(f.analyze().unwrap_err(), Refusal::SourceBinding);
-}
-
-#[tokio::test]
-async fn mandatory_reset_needs_only_makes_unanimous_gates_cycle_edges() {
-    let f = Fixture::new().await;
-    let mut node = f.contract.graph.nodes["b"].clone();
-    // Single-need any_succeeded waits on that one need; multi-need has an
-    // alternative and must not be modeled as two mandatory edges.
-    node.needs = vec!["a".into()];
-    node.on_deps = contract::OnDeps::AnySucceeded;
-    assert_eq!(mandatory_reset_needs(&node), ["a"]);
-    node.needs = vec!["a".into(), "b".into()];
-    assert!(mandatory_reset_needs(&node).is_empty());
-    // all_succeeded and none_failed wait on every need.
-    node.on_deps = contract::OnDeps::AllSucceeded;
-    assert_eq!(mandatory_reset_needs(&node), ["a", "b"]);
-    node.on_deps = contract::OnDeps::NoneFailed;
-    assert_eq!(mandatory_reset_needs(&node), ["a", "b"]);
 }
 
 #[tokio::test]
