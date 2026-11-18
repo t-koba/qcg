@@ -1,6 +1,9 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { pathToFileURL } from "node:url";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 // Exact-ID exceptions per project policy, not broad suppressions. Each entry
 // is a time-boxed, reviewable record: once its review date passes the gate
@@ -56,6 +59,36 @@ export function evaluateAudit(report, exceptionEntries = exceptions, auditStatus
   if (Object.hasOwn(report, "error")) return invalid("npm audit reported an error");
   if (report.auditReportVersion !== 2) return invalid("expected audit report version 2");
   if (!isPlainObject(report.vulnerabilities)) return invalid("expected a vulnerabilities object");
+
+  // npm's aggregate counts are the only statement of how many packages it
+  // actually found. Reconcile them with the emitted entries before the gate
+  // can pass: otherwise an exact-ID exception for one emitted advisory can
+  // vouch for a second, unreported finding of the same severity.
+  const metadata = report.metadata;
+  if (!isPlainObject(metadata) || !isPlainObject(metadata.vulnerabilities)) {
+    return invalid("expected npm v2 vulnerability count metadata");
+  }
+  const declared = {};
+  for (const key of [...severities, "total"]) {
+    const value = metadata.vulnerabilities[key];
+    if (!Number.isSafeInteger(value) || value < 0) {
+      return invalid(`invalid npm vulnerability count for ${key}`);
+    }
+    declared[key] = value;
+  }
+  const observed = Object.fromEntries([...severities, "total"].map((key) => [key, 0]));
+  for (const [name, vulnerability] of Object.entries(report.vulnerabilities)) {
+    if (!isPlainObject(vulnerability) || !severities.includes(vulnerability.severity)) {
+      return invalid(`invalid vulnerability severity for ${name}`);
+    }
+    observed[vulnerability.severity] += 1;
+    observed.total += 1;
+  }
+  for (const key of [...severities, "total"]) {
+    if (observed[key] !== declared[key]) {
+      return invalid(`npm audit ${key} count ${declared[key]} disagrees with ${observed[key]} reported packages`);
+    }
+  }
 
   const blocking = new Map();
   const ignored = new Set();
@@ -114,7 +147,32 @@ function selfTest() {
   const advisory = (id, severity) => ({
     severity, url: `https://github.com/advisories/${id}`, title: `Fixture ${id}`,
   });
-  const report = (vulnerabilities) => ({ auditReportVersion: 2, vulnerabilities });
+  // Real npm v2 reports carry a package severity and aggregate counts. Derive
+  // both from the fixtures so every case exercises the reconciliation too;
+  // metadataOverrides makes a deliberately inconsistent report.
+  const report = (vulnerabilities, metadataOverrides = {}) => {
+    const counts = Object.fromEntries([...severities, "total"].map((key) => [key, 0]));
+    const entries = {};
+    for (const [name, vulnerability] of Object.entries(vulnerabilities)) {
+      let severity = vulnerability.severity ?? "info";
+      if (!vulnerability.severity) {
+        for (const advisory of Array.isArray(vulnerability.via) ? vulnerability.via : []) {
+          if (isPlainObject(advisory) && severities.includes(advisory.severity) &&
+              severities.indexOf(advisory.severity) > severities.indexOf(severity)) {
+            severity = advisory.severity;
+          }
+        }
+      }
+      entries[name] = { ...vulnerability, severity };
+      counts[severity] += 1;
+      counts.total += 1;
+    }
+    return {
+      auditReportVersion: 2,
+      vulnerabilities: entries,
+      metadata: { vulnerabilities: { ...counts, ...metadataOverrides } },
+    };
+  };
   const picomatch = { via: [advisory(excepted, "high")] };
   const high = { ...advisory(fresh, "high"), title: "New issue related to CVE-2026-112366" };
   const fallback = { ...picomatch.via[0], url: "https://example.test/advisory", title: "Issue CVE-2026-112366" };
@@ -130,6 +188,10 @@ function selfTest() {
     ["CVE field is not an identity", report({ picomatch: { via: [{ ...fallback, title: "Issue", cve: "CVE-2026-112366" }] } }), false, [fallback.url]],
     ["different id citing CVE is blocked", report({ picomatch: { via: [{ severity: "high", url: "https://example.test/a", title: "Issue CVE-2026-112366", cve: ["CVE-2026-112366"] }] } }), false, ["https://example.test/a"]],
     ["missing vulnerabilities", { auditReportVersion: 2 }, false, [], [], /vulnerabilities/],
+    ["missing count metadata", { ...report({}), metadata: undefined }, false, [], [], /vulnerability count metadata/],
+    ["malformed count", report({}, { high: "1" }), false, [], [], /invalid npm vulnerability count/],
+    ["inconsistent high count", report({ picomatch }, { high: 2, total: 2 }), false, [], [], /high count 2 disagrees/],
+    ["inconsistent total", report({ picomatch }, { total: 2 }), false, [], [], /total count 2 disagrees/],
     ["npm error", { ...report({}), error: null }, false, [], [], /reported an error/],
     ["wrong version", { ...report({}), auditReportVersion: 1 }, false, [], [], /version 2/],
     ["malformed via", report({ other: { via: null } }), false, [], [], /via array/],
@@ -178,7 +240,37 @@ function selfTest() {
   }
   assert.equal(evaluateAudit(report({ picomatch }), "not-a-list", 0, TEST_NOW).ok, false, "exception list must be an array");
   assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, "not-a-date").ok, false, "invalid now fails closed");
-  console.log(`audit self-test: ${cases.length} table cases + exception-entry cases passed`);
+
+  // Process-level: the gate must accept a consistent report (with npm's
+  // nonzero status explained by the excepted advisory) and reject one whose
+  // aggregate counts more findings than it emitted.
+  const fakeNpmDir = fs.mkdtempSync(path.join(os.tmpdir(), "qcg-audit-gate-"));
+  const fakeNpm = path.join(fakeNpmDir, "npm");
+  fs.writeFileSync(fakeNpm, '#!/bin/sh\nprintf "%s" "$QCG_AUDIT_FIXTURE"\nexit "${QCG_AUDIT_STATUS:-0}"\n', {
+    mode: 0o755,
+  });
+  const runGate = (fixture, status) => spawnSync(process.execPath, [fileURLToPath(import.meta.url)], {
+    encoding: "utf8",
+    env: {
+      ...process.env,
+      PATH: `${fakeNpmDir}${path.delimiter}${process.env.PATH ?? ""}`,
+      QCG_AUDIT_FIXTURE: JSON.stringify(fixture),
+      QCG_AUDIT_STATUS: String(status),
+    },
+  });
+  try {
+    const matching = runGate(report({ picomatch }), 1);
+    assert.equal(matching.status, 0, `consistent report should pass: ${matching.stderr}`);
+    assert.match(matching.stdout, /no unexcepted moderate-or-higher advisories/);
+    assert.match(matching.stdout, /excepted GHSA-fc5q-39xc-vjpf/);
+
+    const inconsistent = runGate(report({ picomatch }, { high: 2, total: 2 }), 1);
+    assert.equal(inconsistent.status, 1, "inconsistent report must not pass");
+    assert.match(inconsistent.stderr, /high count 2 disagrees with 1 reported packages/);
+  } finally {
+    fs.rmSync(fakeNpmDir, { recursive: true, force: true });
+  }
+  console.log(`audit self-test: ${cases.length} table cases + exception-entry cases + process-level cases passed`);
 }
 
 function fail(message) {
@@ -186,12 +278,7 @@ function fail(message) {
   return 1;
 }
 
-function main() {
-  if (process.argv[2] === "--self-test") {
-    selfTest();
-    return 0;
-  }
-
+function runAuditGate() {
   const { error, signal, status, stdout } = spawnSync("npm", ["audit", "--json", "--audit-level=moderate"], { encoding: "utf8" });
   if (error) return fail(`could not run npm audit: ${error.message}`);
   if (signal) return fail(`npm audit terminated by ${signal}`);
@@ -214,6 +301,14 @@ function main() {
   const ignored = result.ignored.length ? `; excepted ${result.ignored.join(", ")}` : "";
   console.log(`audit gate: no unexcepted moderate-or-higher advisories${ignored}`);
   return 0;
+}
+
+function main() {
+  if (process.argv[2] === "--self-test") {
+    selfTest();
+    return 0;
+  }
+  return runAuditGate();
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
