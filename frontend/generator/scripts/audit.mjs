@@ -27,7 +27,7 @@ function advisoryId(url, advisory) {
   return ghsa ? `GHSA-${ghsa[1].toLowerCase()}` : advisory.url;
 }
 
-export function evaluateAudit(report, exceptions = allowlist) {
+export function evaluateAudit(report, exceptions = allowlist, auditStatus = 0) {
   const invalid = (error) => ({ ok: false, blocking: [], ignored: [], error });
   if (!isPlainObject(report)) return invalid("expected a JSON object");
   if (Object.hasOwn(report, "error")) return invalid("npm audit reported an error");
@@ -36,14 +36,23 @@ export function evaluateAudit(report, exceptions = allowlist) {
 
   const blocking = new Map();
   const ignored = new Set();
+  const dependents = new Map();
+  const resolved = new Set();
+  const threshold = severities.indexOf("moderate");
+  let hasThresholdAdvisory = false;
   for (const [name, vulnerability] of Object.entries(report.vulnerabilities)) {
     if (!isPlainObject(vulnerability) || !Array.isArray(vulnerability.via) || !vulnerability.via.length) {
       return invalid(`expected a non-empty via array for ${name}`);
     }
     for (const advisory of vulnerability.via) {
-      // npm represents transitive references as names; the advisories themselves
-      // are checked in their own package entry.
-      if (typeof advisory === "string" && advisory.trim()) continue;
+      if (typeof advisory === "string" && advisory.trim()) {
+        if (!Object.hasOwn(report.vulnerabilities, advisory)) {
+          return invalid(`missing via target ${advisory} for ${name}`);
+        }
+        if (!dependents.has(advisory)) dependents.set(advisory, []);
+        dependents.get(advisory).push(name);
+        continue;
+      }
       if (!isPlainObject(advisory)) return invalid(`invalid via entry for ${name}`);
       const rank = severities.indexOf(advisory.severity);
       const url = typeof advisory.url === "string" && URL.parse(advisory.url);
@@ -51,12 +60,26 @@ export function evaluateAudit(report, exceptions = allowlist) {
           typeof advisory.title !== "string" || !advisory.title.trim()) {
         return invalid(`invalid advisory severity, URL, or title for ${name}`);
       }
+      resolved.add(name);
+      const atThreshold = rank >= threshold;
+      hasThresholdAdvisory ||= atThreshold;
       const id = advisoryId(url, advisory);
       if (exceptions.has(id)) ignored.add(id);
-      else if (rank >= severities.indexOf("moderate")) {
+      else if (atThreshold) {
         blocking.set(id, { id, package: name, title: advisory.title, severity: advisory.severity });
       }
     }
+  }
+  // Walk references backwards from concrete advisories. Set iteration also
+  // visits newly added packages, so cycles resolve only if they reach a seed.
+  for (const name of resolved) {
+    for (const dependent of dependents.get(name) ?? []) resolved.add(dependent);
+  }
+  for (const target of dependents.keys()) {
+    if (!resolved.has(target)) return invalid(`via target ${target} does not resolve to an advisory`);
+  }
+  if (auditStatus !== 0 && !hasThresholdAdvisory) {
+    return invalid(`npm audit exited with status ${auditStatus} without a moderate-or-higher advisory`);
   }
   return { ok: blocking.size === 0, blocking: [...blocking.values()], ignored: [...ignored] };
 }
@@ -87,9 +110,25 @@ function selfTest() {
     ["wrong version", { ...report({}), auditReportVersion: 1 }, false, [], [], /version 2/],
     ["malformed via", report({ other: { via: null } }), false, [], [], /via array/],
     ["malformed advisory", report({ other: { via: [advisory(fresh, "unknown")] } }), false, [], [], /invalid advisory/],
+    ["clean with zero status", report({}), true, [], [], undefined, 0],
+    ["exception explains nonzero status", report({ picomatch }), true, [], [excepted], undefined, 1],
+    ["dangling reference", report({ picomatch, vite: { via: ["picomatch", "missing"] } }),
+      false, [], [], /missing via target/],
+    ["reference cycle without an advisory", report({ vite: { via: ["tinyglobby"] }, tinyglobby: { via: ["vite"] } }),
+      false, [], [], /does not resolve/],
+    ["reference chain", report({ vite: { via: ["tinyglobby"] }, tinyglobby: { via: ["picomatch"] }, picomatch }),
+      true, [], [excepted]],
+    ["reference cycle with a path to an advisory", report({
+      vite: { via: ["tinyglobby"] }, tinyglobby: { via: ["vite", "picomatch"] }, picomatch,
+    }), true, [], [excepted]],
+    ["nonzero status with empty report", report({}), false, [], [], /npm audit exited with status 1/, 1],
+    ["nonzero status with only a low advisory", report({ other: { via: [advisory(fresh, "low")] } }),
+      false, [], [], /npm audit exited with status 1/, 1],
+    ["blocking advisory explains nonzero status", report({ other: { via: [high] } }),
+      false, [fresh], [], undefined, 1],
   ];
-  for (const [name, input, ok, blocking = [], ignored = [], error] of cases) {
-    const actual = evaluateAudit(input);
+  for (const [name, input, ok, blocking = [], ignored = [], error, status] of cases) {
+    const actual = evaluateAudit(input, undefined, status);
     assert.equal(actual.ok, ok, name);
     assert.deepEqual(actual.blocking.map(({ id }) => id), blocking, name);
     assert.deepEqual(actual.ignored, ignored, name);
@@ -110,19 +149,18 @@ function main() {
     return 0;
   }
 
-  const { error, signal, stdout } = spawnSync("npm", ["audit", "--json", "--audit-level=moderate"], { encoding: "utf8" });
+  const { error, signal, status, stdout } = spawnSync("npm", ["audit", "--json", "--audit-level=moderate"], { encoding: "utf8" });
   if (error) return fail(`could not run npm audit: ${error.message}`);
   if (signal) return fail(`npm audit terminated by ${signal}`);
   if (!stdout?.trim()) return fail("npm audit returned no JSON output");
 
-  // npm exits nonzero for vulnerabilities; decide from the JSON, not its status.
   let report;
   try {
     report = JSON.parse(stdout);
   } catch {
     return fail("npm audit returned invalid JSON");
   }
-  const result = evaluateAudit(report);
+  const result = evaluateAudit(report, undefined, status);
   if (result.error) return fail(result.error);
   if (!result.ok) {
     for (const { id, package: name, title, severity } of result.blocking) {
