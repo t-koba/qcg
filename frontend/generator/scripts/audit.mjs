@@ -139,8 +139,17 @@ export function evaluateAudit(report, exceptionEntries = exceptions, auditStatus
 
 function selfTest() {
   const TEST_NOW = new Date("2026-11-18T00:00:00Z");
-  const excepted = "GHSA-fc5q-39xc-vjpf";
+  // Exception handling is fixture-driven here: never fall back to production
+  // policy, and keep every clock-sensitive assertion on fixed dates.
+  const excepted = "GHSA-1234-5678-9abc";
   const fresh = "GHSA-aaaa-bbbb-cccc";
+  const fixtureException = {
+    id: excepted,
+    reason: "self-test fixture for exact-ID exception handling",
+    owner: "qcg self-test",
+    reviewBy: "2099-01-01",
+  };
+  const fixtureExceptions = [fixtureException];
   const advisory = (id, severity) => ({
     severity, url: `https://github.com/advisories/${id}`, title: `Fixture ${id}`,
   });
@@ -211,14 +220,14 @@ function selfTest() {
       false, [fresh], [], undefined, 1],
   ];
   for (const [name, input, ok, blocking = [], ignored = [], error, status] of cases) {
-    const actual = evaluateAudit(input, undefined, status, TEST_NOW);
+    const actual = evaluateAudit(input, fixtureExceptions, status, TEST_NOW);
     assert.equal(actual.ok, ok, name);
     assert.deepEqual(actual.blocking.map(({ id }) => id), blocking, name);
     assert.deepEqual(actual.ignored, ignored, name);
     if (error) assert.match(actual.error, error, name);
     else assert.equal(actual.error, undefined, name);
   }
-  const validEntry = exceptions[0];
+  const validEntry = fixtureException;
   const expired = { ...validEntry, reviewBy: "2026-11-17" };
   const malformed = [
     null,
@@ -231,7 +240,7 @@ function selfTest() {
   ];
   assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, TEST_NOW).ok, true, "in-date exception");
   assert.match(evaluateAudit(report({ picomatch }), [expired], 0, TEST_NOW).error, /expired/, "expired exception fails closed");
-  assert.match(evaluateAudit(report({ picomatch }), [validEntry], 0, new Date("2027-05-18T00:00:00Z")).error, /expired/, "expiry boundary fails closed");
+  assert.match(evaluateAudit(report({ picomatch }), [validEntry], 0, new Date(`${fixtureException.reviewBy}T00:00:00Z`)).error, /expired/, "expiry boundary fails closed");
   for (const [index, entry] of malformed.entries()) {
     assert.equal(evaluateAudit(report({ picomatch }), [entry], 0, TEST_NOW).ok, false, `malformed exception ${index}`);
   }
@@ -239,22 +248,18 @@ function selfTest() {
   assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, "not-a-date").ok, false, "invalid now fails closed");
 
   // Count reconciliation must decide the result independently of the real
-  // clock or the production exception's review date. Use a synthetic fixture
-  // exception and a fixed clock past the production reviewBy, so this case
-  // cannot drift into a time bomb or couple the parser regression to future
-  // exception maintenance. The table already covers consistent/inconsistent
-  // counts and nonzero exit through evaluateAudit; here we pin that the
-  // exception that explains nonzero status still requires reconciled counts.
-  const fixtureException = [{
-    id: fresh, reason: "self-test fixture", owner: "self-test", reviewBy: "2099-01-01",
-  }];
+  // clock or exception maintenance: it reuses the synthetic fixture and a
+  // fixed clock well before its review date, so it cannot drift into a time
+  // bomb. The table already covers consistent/inconsistent counts and nonzero
+  // exit through evaluateAudit; here we pin that the exception that explains
+  // nonzero status still requires reconciled counts.
   const fixedNow = new Date("2027-06-01T00:00:00Z");
-  const reportedHigh = report({ other: { via: [high] } });
-  const consistent = evaluateAudit(reportedHigh, fixtureException, 1, fixedNow);
+  const reportedHigh = report({ picomatch });
+  const consistent = evaluateAudit(reportedHigh, fixtureExceptions, 1, fixedNow);
   assert.equal(consistent.ok, true, "consistent excepted report with nonzero status passes");
-  assert.deepEqual(consistent.ignored, [fresh]);
+  assert.deepEqual(consistent.ignored, [excepted]);
   const inflated = evaluateAudit(
-    report({ other: { via: [high] } }, { high: 2, total: 2 }), fixtureException, 1, fixedNow,
+    report({ picomatch }, { high: 2, total: 2 }), fixtureExceptions, 1, fixedNow,
   );
   assert.equal(inflated.ok, false, "inflated count must not pass");
   assert.match(inflated.error, /high count 2 disagrees with 1 reported packages/);
