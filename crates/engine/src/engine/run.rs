@@ -624,7 +624,7 @@ impl Engine {
                     )?;
                     let measured_at = tokio::time::Instant::now();
                     Ok::<_, EngineError>(super::ElapsedClock {
-                        deadline: measured_at + std::time::Duration::from_secs(remaining),
+                        deadline: measured_at + remaining,
                         measured_at,
                         used,
                     })
@@ -1566,17 +1566,17 @@ pub(crate) fn remaining_elapsed_secs(
     execution_started: bool,
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<u64, EngineError> {
-    wall_elapsed(limit_secs, started_at, execution_started, now).map(|(remaining, _)| remaining)
+    wall_elapsed(limit_secs, started_at, execution_started, now)
+        .map(|(_, used)| limit_secs.saturating_sub(used.as_secs()))
 }
 // Queue/HITL time counts. Tolerated future skew clamps to zero; larger skew or
-// missing execution identity refuses resume. Preserve whole-second deadline seeding,
-// but retain the unrounded duration for facts. Live enforcement is monotonic only.
+// missing execution identity refuses resume. Live enforcement is monotonic only.
 fn wall_elapsed(
     limit_secs: u64,
     started_at: Option<&str>,
     execution_started: bool,
     now: chrono::DateTime<chrono::Utc>,
-) -> Result<(u64, std::time::Duration), EngineError> {
+) -> Result<(std::time::Duration, std::time::Duration), EngineError> {
     const FUTURE_TOLERANCE_SECS: i64 = 5;
     let elapsed = match started_at {
         Some(started) => {
@@ -1605,7 +1605,10 @@ fn wall_elapsed(
             std::time::Duration::ZERO
         }
     };
-    Ok((limit_secs.saturating_sub(elapsed.as_secs()), elapsed))
+    Ok((
+        std::time::Duration::from_secs(limit_secs).saturating_sub(elapsed),
+        elapsed,
+    ))
 }
 
 #[cfg(test)]
@@ -1617,13 +1620,13 @@ mod elapsed_tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn wall_elapsed_facts_keep_fraction_and_queue_overrun_without_changing_deadline() {
+    async fn wall_elapsed_preserves_fractional_deadline_and_queue_overrun() {
         let now = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:02:05.123456789Z")
             .unwrap()
             .to_utc();
         let (remaining, used) =
             super::wall_elapsed(60, Some("2026-01-01T00:00:00Z"), false, now).unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(remaining, std::time::Duration::ZERO);
         assert_eq!(used, std::time::Duration::new(125, 123456789));
         let measured_at = tokio::time::Instant::now();
         let clock = crate::ElapsedClock {
@@ -1644,11 +1647,30 @@ mod elapsed_tests {
             detail.exhaustion.unwrap(),
             model::BudgetExhaustion::elapsed(std::time::Duration::new(125, 123456790), 60)
         );
-        // The fraction is retained for facts but never rounded up for enforcement.
         let (remaining, used) =
             super::wall_elapsed(126, Some("2026-01-01T00:00:00Z"), false, now).unwrap();
-        assert_eq!(remaining, 1);
-        assert_eq!(used.subsec_nanos(), 123456789);
+        assert_eq!(remaining, std::time::Duration::new(0, 876_543_211));
+        let measured_at = tokio::time::Instant::now();
+        let clock = crate::ElapsedClock {
+            deadline: measured_at + remaining,
+            measured_at,
+            used,
+        };
+        let checkpoint = || {
+            crate::engine::checkpoint_scope(
+                &tokio_util::sync::CancellationToken::new(),
+                Some((clock, 126)),
+                crate::engine::CheckpointScope::Run,
+            )
+        };
+        tokio::time::advance(remaining).await;
+        assert!(checkpoint().is_ok());
+        tokio::time::advance(std::time::Duration::from_nanos(1)).await;
+        assert!(matches!(
+            checkpoint(),
+            Err(crate::StepError::ElapsedExpiredBeforeStart { limit_secs: 126, used })
+                if used == std::time::Duration::new(126, 1)
+        ));
     }
 
     #[test]
