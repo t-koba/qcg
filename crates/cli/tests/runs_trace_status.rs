@@ -103,16 +103,26 @@ fn trace(root: &Utf8PathBuf, id: &str) -> Value {
     serde_json::from_slice(&output.stdout).unwrap()
 }
 
-fn span_code(payload: &Value, name: &str) -> u64 {
-    let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+fn span<'a>(payload: &'a Value, name: &str) -> &'a Value {
+    payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
         .as_array()
-        .unwrap();
-    spans
+        .unwrap()
         .iter()
         .find(|span| span["name"] == name)
-        .unwrap_or_else(|| panic!("span `{name}` missing from trace"))["status"]["code"]
-        .as_u64()
+        .unwrap_or_else(|| panic!("span `{name}` missing from trace"))
+}
+
+fn span_code(payload: &Value, name: &str) -> u64 {
+    span(payload, name)["status"]["code"].as_u64().unwrap()
+}
+
+fn span_string_attribute<'a>(payload: &'a Value, name: &str, key: &str) -> Option<&'a str> {
+    span(payload, name)["attributes"]
+        .as_array()
         .unwrap()
+        .iter()
+        .find(|attribute| attribute["key"] == key)
+        .map(|attribute| attribute["value"]["stringValue"].as_str().unwrap())
 }
 
 #[test]
@@ -148,6 +158,14 @@ fn successful_run_exports_ok_on_root_and_terminal_span() {
         span_code(&payload, "event run_finished"),
         1,
         "terminal span"
+    );
+    assert_eq!(
+        span_string_attribute(&payload, &format!("run {id}"), "error.type"),
+        None
+    );
+    assert_eq!(
+        span_string_attribute(&payload, "event run_finished", "error.type"),
+        None
     );
 
     std::fs::remove_dir_all(root).unwrap();
@@ -186,6 +204,10 @@ fn failed_step_exports_error_on_event_and_step_spans() {
         "failed step event span"
     );
     assert_eq!(span_code(&payload, "step build"), 2, "step span");
+    assert_eq!(
+        span_string_attribute(&payload, "event step_finished", "error.type"),
+        Some("execution_failed")
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }
@@ -301,6 +323,11 @@ fn llm_validation_failure_exports_error_on_event_and_step_spans() {
         "validation event span"
     );
     assert_eq!(span_code(&payload, "step build"), 2, "validation step span");
+    assert_eq!(
+        span_string_attribute(&payload, "event llm_validation_failed", "error.type"),
+        Some("llm_validation_failed"),
+        "no structured reason code falls back to the event kind"
+    );
 
     std::fs::remove_dir_all(root).unwrap();
 }

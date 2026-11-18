@@ -224,6 +224,14 @@ pub(crate) async fn export_run_trace(
         if let Some(node) = event.path.as_ref().map(model::NodePath::as_str) {
             attributes.push(otlp_string_attribute("node.id", node));
         }
+        let status_code = event_status_code(kind, &event.data);
+        if status_code == 2 {
+            let data = serde_json::to_value(&event.data)?;
+            attributes.push(otlp_string_attribute(
+                "error.type",
+                &api::error_type_for(kind, &data),
+            ));
+        }
         spans.push(json!({
             "traceId": trace_id,
             "spanId": event.span_id,
@@ -233,7 +241,7 @@ pub(crate) async fn export_run_trace(
             "startTimeUnixNano": timestamp.to_string(),
             "endTimeUnixNano": timestamp.saturating_add(1).to_string(),
             "attributes": attributes,
-            "status": { "code": event_status_code(kind, &event.data) }
+            "status": { "code": status_code }
         }));
     }
     let payload = json!({

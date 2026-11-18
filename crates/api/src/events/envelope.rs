@@ -108,6 +108,16 @@ pub fn is_failure_event_kind(kind: &str) -> bool {
     FAILURE_EVENT_KINDS.contains(&kind)
 }
 
+/// OTLP `error.type` for a failed event: the recorded structured reason code
+/// when present, otherwise the event kind. Both trace exporters derive it here
+/// so one journal cannot report different error types.
+pub fn error_type_for(kind: &str, data: &Value) -> String {
+    data.get("reason")
+        .and_then(|reason| reason.get("code").and_then(Value::as_str))
+        .unwrap_or(kind)
+        .to_owned()
+}
+
 impl<'de> Deserialize<'de> for RunEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

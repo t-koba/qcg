@@ -125,6 +125,12 @@ pub(crate) fn trace_payload(run_id: &str, events: &[Value]) -> Result<Value, Str
             attributes.push(string_attribute("node.id", node));
         }
         let (status_code, status_message) = span_status_for_event(kind, event);
+        if status_code == 2 {
+            attributes.push(string_attribute(
+                "error.type",
+                &api::error_type_for(kind, event),
+            ));
+        }
         for (key, value) in status_detail_attributes(event) {
             attributes.push(string_attribute(&key, &value));
         }
@@ -637,6 +643,46 @@ mod tests {
             assert_eq!(span["status"]["code"], 2, "{kind} must be ERROR");
             assert_eq!(span["status"]["message"], "boom: stopped", "{kind} reason");
         }
+    }
+
+    #[test]
+    fn error_type_attribute_uses_reason_code_or_kind_on_error_spans() {
+        let events = vec![
+            json!({
+                "t": "step_finished", "seq": 1, "ts": "2026-01-01T00:00:00Z",
+                "run_id": "run-1", "trace_id": "ab".repeat(16),
+                "span_id": "cd".repeat(8), "node": "build", "status": "failed",
+                "reason": {"code": "execution_failed", "message": "boom"},
+            }),
+            json!({
+                "t": "hook_failed", "seq": 2, "ts": "2026-01-01T00:00:01Z",
+                "run_id": "run-1", "trace_id": "ab".repeat(16),
+                "span_id": "ef".repeat(8), "error": "boom",
+            }),
+            json!({
+                "t": "run_started", "seq": 3, "ts": "2026-01-01T00:00:02Z",
+                "run_id": "run-1", "trace_id": "ab".repeat(16),
+                "span_id": "ab".repeat(8),
+            }),
+        ];
+        let payload = trace_payload("run-1", &events).expect("records should map");
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans");
+        fn error_type(span: &Value) -> Option<&str> {
+            span["attributes"]
+                .as_array()
+                .expect("attributes")
+                .iter()
+                .find(|attribute| attribute["key"] == "error.type")
+                .map(|attribute| attribute["value"]["stringValue"].as_str().unwrap())
+        }
+        assert_eq!(spans[0]["status"]["code"], 2);
+        assert_eq!(error_type(&spans[0]), Some("execution_failed"));
+        assert_eq!(spans[1]["status"]["code"], 2);
+        assert_eq!(error_type(&spans[1]), Some("hook_failed"));
+        assert_eq!(spans[2]["status"]["code"], 1);
+        assert_eq!(error_type(&spans[2]), None, "OK spans carry no error.type");
     }
 
     #[test]
