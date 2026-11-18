@@ -83,10 +83,12 @@ pub fn is_terminal_event_kind(kind: &str) -> bool {
 }
 
 /// Event kinds that record an error outcome even when the run later recovers.
-/// OTLP trace exporters share this list so one journal is never reported as OK
-/// by one exporter and ERROR by another. Run/step outcome fields are mapped
-/// separately from kind.
+/// Both OTLP trace exporters share this list so one journal is never reported
+/// as OK by one exporter and ERROR by another. Run/step outcome fields are
+/// mapped separately from kind. `stream_error` is a transport-only SSE marker
+/// that is never journaled and never reaches an exporter, so it is excluded.
 pub const FAILURE_EVENT_KINDS: &[&str] = &[
+    "audit_degraded",
     "run_error",
     "run_canceled",
     "run_interrupted",

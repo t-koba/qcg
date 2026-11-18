@@ -362,3 +362,60 @@ fn recovered_step_uses_its_last_outcome_for_the_step_span() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn audit_degraded_exports_error_without_affecting_run_status() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "runs-trace-audit-degraded-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let id = "audit-degraded-run";
+    let meta = root.join("runs").join(id).join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0",
+                "generator_path": "demo",
+                "contract_sha256": "test",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock",
+                "retention_days": 10,
+            }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "audit_degraded",
+            json!({ "reason": "write_failure", "record": "llm_delta" }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "run_finished",
+            json!({ "status": "success", "metrics": {} }),
+        )
+        .unwrap();
+    drop(journal);
+
+    let payload = trace(&root, id);
+    assert_eq!(
+        span_code(&payload, "event audit_degraded"),
+        2,
+        "audit degraded event span"
+    );
+    assert_eq!(
+        span_code(&payload, &format!("run {id}")),
+        1,
+        "root span stays OK"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
