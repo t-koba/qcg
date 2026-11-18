@@ -89,6 +89,7 @@ pub fn is_terminal_event_kind(kind: &str) -> bool {
 /// that is never journaled and never reaches an exporter, so it is excluded.
 pub const FAILURE_EVENT_KINDS: &[&str] = &[
     "audit_degraded",
+    "elapsed_exceeded",
     "run_error",
     "run_canceled",
     "run_interrupted",

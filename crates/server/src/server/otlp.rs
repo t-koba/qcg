@@ -649,6 +649,31 @@ mod tests {
     }
 
     #[test]
+    fn durable_elapsed_breach_exports_as_error_with_kind_error_type() {
+        // The durable marker written when grace delivers a pending interaction:
+        // exhaustion facts, no terminal status and no structured reason code.
+        let events = vec![json!({
+            "t": "elapsed_exceeded", "seq": 1, "ts": "2026-01-01T00:00:00Z",
+            "run_id": "run-1", "trace_id": "ab".repeat(16),
+            "span_id": "cd".repeat(8),
+            "node": "build",
+            "exhaustion": {"resource": "elapsed_seconds", "used": 1, "allowed": 1},
+            "during": "interaction",
+        })];
+        let payload = trace_payload("run-1", &events).expect("record should map");
+        let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
+        assert_eq!(span["status"]["code"], 2, "budget breach must be ERROR");
+        let attributes = span["attributes"].as_array().expect("attributes");
+        assert!(
+            attributes.iter().any(|attribute| {
+                attribute["key"] == "error.type"
+                    && attribute["value"]["stringValue"] == "elapsed_exceeded"
+            }),
+            "error.type falls back to the kind without a reason code"
+        );
+    }
+
+    #[test]
     fn error_type_attribute_uses_reason_code_or_kind_on_error_spans() {
         let events = vec![
             json!({
