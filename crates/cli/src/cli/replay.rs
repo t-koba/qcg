@@ -139,13 +139,15 @@ pub(crate) async fn export_run_trace(
     let start = event_time_unix_nano(first)?;
     let end = event_time_unix_nano(last)?.max(start + 1);
     // The root span reflects the run's durable settlement, not any single
-    // recoverable step failure. The last terminal event decides it.
+    // recoverable step failure. The last terminal event decides it; a journal
+    // without one has not settled yet, so leave the status UNSET instead of
+    // claiming success.
     let run_status_code = events
         .iter()
         .rev()
         .find(|event| api::is_terminal_event_kind(&event.kind))
         .map(|event| event_status_code(&event.kind, &event.data))
-        .unwrap_or(1);
+        .unwrap_or(0);
     let run_span_id = api::span_id_for_scope(id, "run");
     let mut spans = vec![json!({
         "traceId": trace_id,

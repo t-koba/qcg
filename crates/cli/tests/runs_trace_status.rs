@@ -28,6 +28,29 @@ fn seed_run(root: &Utf8PathBuf, id: &str, status: &str) {
     drop(journal);
 }
 
+fn seed_unsettled_run(root: &Utf8PathBuf, id: &str) {
+    let meta = root.join("runs").join(id).join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0",
+                "generator_path": "demo",
+                "contract_sha256": "test",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock",
+                "retention_days": 10,
+            }),
+        )
+        .unwrap();
+    drop(journal);
+}
+
 fn trace(root: &Utf8PathBuf, id: &str) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_qcg"))
         .args(["runs", "trace", id, "--runs-dir"])
@@ -89,6 +112,24 @@ fn successful_run_exports_ok_on_root_and_terminal_span() {
         span_code(&payload, "event run_finished"),
         1,
         "terminal span"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn unsettled_run_exports_unset_on_root_span() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("runs-trace-unsettled-{}", uuid::Uuid::now_v7()));
+    let id = "unsettled-run";
+    seed_unsettled_run(&root, id);
+
+    let payload = trace(&root, id);
+    assert_eq!(
+        span_code(&payload, &format!("run {id}")),
+        0,
+        "root span must not claim OK before the journal settles"
     );
 
     std::fs::remove_dir_all(root).unwrap();
