@@ -7,9 +7,8 @@ use engine::open_artifact_file;
 use model::OutputManifest;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::fs::File;
-use std::io::{Cursor, Read as _, Seek as _, Write};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::fs::{File, Metadata};
+use std::io::{Cursor, Read as _, Write};
 use zip::write::SimpleFileOptions;
 
 pub fn read_artifacts_zip(run_dir: &Utf8Path) -> Result<Vec<u8>, ServiceError> {
@@ -25,27 +24,41 @@ pub fn read_artifacts_zip_with_limits(
     Ok(cursor.into_inner())
 }
 
-/// Manifest artifacts with pinned regular-file handles. The filesystem path
-/// is retained only for bundle output alias preflight, never for reading.
+/// Verified manifest entry without an open file. The filesystem path is
+/// retained only for bundle output alias preflight, never for reading.
 #[derive(Debug, Clone)]
 pub struct VerifiedArtifact {
     pub path: String,
     pub fs_path: Utf8PathBuf,
-    file: Arc<Mutex<File>>,
+    workspace: Utf8PathBuf,
+    identity: (u64, u64),
     pub bytes: u64,
     pub sha256: String,
 }
 
 impl VerifiedArtifact {
-    // Cloned bundle preparations share the pinned file and its cursor. Hold
-    // the lock through each read, rewinding rather than reopening by name.
-    fn reader(&self) -> Result<MutexGuard<'_, File>, ServiceError> {
-        let mut file = self
-            .file
-            .lock()
-            .map_err(|_| ServiceError::Invalid("artifact reader unavailable".into()))?;
-        file.rewind()?;
+    fn reader(&self) -> Result<File, ServiceError> {
+        let file = open_artifact_file(&self.workspace, &self.path)?;
+        if file_identity(&file.metadata()?) != self.identity {
+            return Err(ServiceError::Invalid(format!(
+                "artifact `{}` changed after verification",
+                self.path
+            )));
+        }
         Ok(file)
+    }
+}
+
+fn file_identity(metadata: &Metadata) -> (u64, u64) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        (metadata.dev(), metadata.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        (0, 0)
     }
 }
 
@@ -80,21 +93,25 @@ pub(crate) fn verify_manifest_artifacts(
     manifest: &OutputManifest,
 ) -> Result<Vec<VerifiedArtifact>, ServiceError> {
     engine::validate_output_manifest_paths(manifest)?;
+    let workspace = run_workspace_dir(run_dir);
     let mut verified = Vec::new();
     for artifact in &manifest.artifacts {
-        let workspace = run_workspace_dir(run_dir);
         let file = open_artifact_file(&workspace, &artifact.path)?;
-        let bytes = file.metadata()?.len();
+        let metadata = file.metadata()?;
+        let bytes = metadata.len();
         if bytes != artifact.bytes {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` bytes mismatch: manifest={}, actual={bytes}",
                 artifact.path, artifact.bytes
             )));
         }
+        let identity = file_identity(&metadata);
+        drop(file);
         verified.push(VerifiedArtifact {
             path: artifact.path.clone(),
             fs_path: workspace.join(&artifact.path),
-            file: Arc::new(Mutex::new(file)),
+            workspace: workspace.clone(),
+            identity,
             bytes,
             sha256: artifact.sha256.clone(),
         });
@@ -107,7 +124,7 @@ pub(crate) fn check_verified_artifact_hashes(
 ) -> Result<(), ServiceError> {
     for artifact in verified {
         let (actual_sha256, bytes) = files::hash_opened_file_sha256(
-            &mut *artifact.reader()?,
+            &mut artifact.reader()?,
             Some(artifact.bytes.saturating_add(1)),
             |_| std::io::Error::other("artifact exceeds manifest size"),
         )?;
@@ -162,15 +179,15 @@ pub fn write_artifacts_zip_stream_with_limits<W: Write>(
         for directory in directories {
             // Synthetic directory entries carry fixed metadata, matching the
             // bundle path. Reading directory metadata from a pathname here
-            // would follow a parent swapped to a symlink after pinning and
-            // leak the outside directory's mode/mtime across the boundary.
+            // could follow a symlink installed after verification and leak
+            // the outside directory's mode/mtime.
             zip.add_directory(format!("{directory}/"), bundle_entry_options(true))
                 .map_err(artifact_zip_error)?;
         }
         for artifact in verified {
-            let mut file = artifact.reader()?;
+            let file = artifact.reader()?;
             let metadata = file.metadata()?;
-            let mut file = (&mut *file).take(artifact.bytes.saturating_add(1));
+            let mut file = file.take(artifact.bytes.saturating_add(1));
             zip.start_file(&artifact.path, artifact_zip_options(&metadata)?)
                 .map_err(artifact_zip_error)?;
             copy_verified_artifact(&mut file, zip, &artifact)?;
@@ -276,8 +293,7 @@ pub fn write_run_bundle_stream_with_limits<W: Write>(
                 .map_err(artifact_zip_error)?;
         }
         for artifact in &parts.verified {
-            let mut file = artifact.reader()?;
-            let mut src = (&mut *file).take(artifact.bytes);
+            let mut src = artifact.reader()?.take(artifact.bytes);
             zip.start_file(
                 format!("artifacts/{}", artifact.path),
                 bundle_entry_options(false),

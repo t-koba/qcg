@@ -143,10 +143,12 @@ media, transform sources, artifact downloads/archives, and
 `check.format`/`check.schema`: they walk directory handles with `O_NOFOLLOW`
 at every component from the workspace root, so a parent directory swapped
 after validation cannot redirect the open or the rename outside the
-workspace. Artifact reads open nonblocking and refuse non-regular files;
-size checks, hashing, and delivery use the same pinned file, rewinding it
-for archive preflight rather than reopening its pathname. Artifact paths
-reject trailing separators and empty components before the no-follow walk,
+workspace. Artifact reads open nonblocking and refuse non-regular files.
+A direct download uses the same open file for verification and delivery.
+Archives close each file after checking its size, then use the same contained
+open for each hash check and streamed read. On Unix, each reopen must match
+the verified device and inode; the streamed bytes must match the manifest hash.
+Artifact paths reject trailing separators and empty components before the no-follow walk,
 so a final component cannot lose `O_NOFOLLOW` to a trailing slash. A hard
 link created inside the workspace to an inode outside the trust boundary is
 a regular file with a contained path and is not refused by these checks;

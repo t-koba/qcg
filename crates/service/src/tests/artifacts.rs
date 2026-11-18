@@ -61,6 +61,106 @@ async fn snapshots_read_journal_and_manifest_across_a_forced_publication() {
     }
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn many_artifacts_download_with_a_low_file_descriptor_limit() {
+    use sha2::Digest as _;
+
+    // Re-exec just this test so neither the FD count nor the lowered limit
+    // can be affected by (or interfere with) other tests.
+    const CHILD: &str = "QCG_TEST_LOW_ARTIFACT_FDS";
+    let child_args = [
+        "--exact",
+        "tests::artifacts::many_artifacts_download_with_a_low_file_descriptor_limit",
+    ];
+    if std::env::var_os(CHILD).is_none() || !std::env::args().skip(1).eq(child_args) {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args(child_args)
+            .env(CHILD, "1")
+            .output()
+            .expect("run isolated artifact test");
+        assert!(
+            output.status.success(),
+            "isolated artifact test failed: stdout={}, stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    const COUNT: usize = 320;
+    const ID: &str = "many-artifacts";
+    let root = temp_run_dir(ID);
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let service = test_service(Vec::new(), runs.clone());
+    let run_dir = write_running_run(&runs, ID);
+    let workspace = run_workspace_dir(&run_dir);
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let digest = hex::encode(sha2::Sha256::digest(b"ok"));
+    let artifacts: Vec<_> = (0..COUNT)
+        .map(|i| {
+            let path = format!("artifact-{i}.txt");
+            std::fs::write(workspace.join(&path), b"ok").expect("write artifact");
+            json!({"path": path, "sha256": digest, "bytes": 2, "label": path, "required": true})
+        })
+        .collect();
+    std::fs::write(
+        run_meta_dir(&run_dir).join("outputs.json"),
+        serde_json::to_vec(&json!({"artifacts": artifacts})).expect("serialize manifest"),
+    )
+    .expect("write manifest");
+    let limits = ArtifactZipLimits::default().effective();
+
+    #[cfg(target_os = "linux")]
+    {
+        let count_fds = || {
+            std::fs::read_dir("/proc/self/fd")
+                .expect("list FDs")
+                .count()
+        };
+        let before = count_fds();
+        let verified = crate::artifacts::collect_verified_with_limits(&run_dir, &limits)
+            .expect("verify all artifacts");
+        let after = count_fds();
+        assert_eq!(verified.len(), COUNT);
+        assert!(
+            after <= before + 8,
+            "FD count grew from {before} to {after}"
+        );
+    }
+
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: `limit` is valid for the call; only this test child lowers its soft limit.
+    assert_eq!(
+        unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+        0
+    );
+    limit.rlim_cur = limit.rlim_cur.min(64);
+    // SAFETY: we preserve the hard limit and only decrease the child's soft limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+    let zip = read_artifacts_zip_with_limits(&run_dir, &limits).expect("download artifact ZIP");
+    assert_eq!(zip::ZipArchive::new(Cursor::new(zip)).unwrap().len(), COUNT);
+
+    let parts = service
+        .run_bundle_parts(ID, &limits)
+        .await
+        .expect("prepare run bundle");
+    assert_eq!(parts.verified.len(), COUNT);
+    let output = root.join("bundle.zip");
+    let file = std::fs::File::create(&output).expect("create bundle destination");
+    parts
+        .validate_output_path(&output)
+        .expect("bundle alias preflight");
+    write_run_bundle_stream_with_limits(&parts, file, &limits).expect("download run bundle");
+    let bundle = zip::ZipArchive::new(std::fs::File::open(output).unwrap()).unwrap();
+    assert_eq!(bundle.len(), parts.entry_count);
+}
+
 #[test]
 fn artifact_zip_rejects_sources_above_limit() {
     let run_dir = temp_run_dir("zip-limit");
@@ -353,9 +453,8 @@ fn dedicated_raw_manifest_bound_rejects_before_deserialization() {
 }
 
 /// Synthetic ZIP directory entries must carry fixed metadata, never the
-/// mode/mtime of the on-disk directory: that read is by pathname after the
-/// source files were pinned and would follow a parent swapped to a symlink,
-/// leaking an outside directory's metadata across the isolation boundary.
+/// mode/mtime of the on-disk directory: a pathname lookup could follow a
+/// symlink installed after verification and leak an outside directory's metadata.
 #[cfg(unix)]
 #[test]
 fn artifact_zip_directory_metadata_is_fixed_not_from_disk() {
@@ -1398,7 +1497,7 @@ fn bundle_finalize_failure_aborts_without_retry() {
 }
 
 #[tokio::test]
-async fn bundle_same_length_mutation_after_preparation_aborts_archive() {
+async fn bundle_artifact_changes_after_preparation_abort_archive() {
     use api::StartRun;
     use camino::Utf8PathBuf;
     use std::collections::BTreeMap;
@@ -1442,11 +1541,29 @@ async fn bundle_same_length_mutation_after_preparation_aborts_archive() {
         "even ZipWriter::drop must not finalize a mismatched archive"
     );
 
-    std::fs::write(&artifact.fs_path, original).expect("restore original");
+    std::fs::write(&artifact.fs_path, &original).expect("restore original");
     let mut restored = Vec::new();
     write_run_bundle_stream_with_limits(&parts, &mut restored, &ArtifactZipLimits::default())
         .expect("restored digest must succeed");
     zip::ZipArchive::new(Cursor::new(restored)).expect("valid restored archive");
+
+    #[cfg(unix)]
+    {
+        // Replace the inode without changing the bytes or their digest.
+        let replacement = artifact.fs_path.with_file_name("replacement.txt");
+        std::fs::write(&replacement, original).expect("write identical replacement");
+        std::fs::rename(replacement, &artifact.fs_path).expect("replace verified artifact");
+        let error = write_run_bundle_stream_with_limits(
+            &parts,
+            std::io::sink(),
+            &ArtifactZipLimits::default(),
+        )
+        .expect_err("replacing the verified file must fail even with identical contents");
+        assert!(
+            matches!(error, ServiceError::Invalid(ref message) if message.contains("changed after verification")),
+            "{error}"
+        );
+    }
     let _ = std::fs::remove_dir_all(root);
 }
 
@@ -1577,20 +1694,21 @@ async fn artifact_parent_swap_never_reads_outside_sentinel() {
         output: Vec::new(),
         swapped: false,
     };
-    write_artifacts_zip_stream_with_limits(&run_dir, &mut writer, &ArtifactZipLimits::default())
-        .expect("archive copies its pinned nested artifact after the swap");
+    let error = write_artifacts_zip_stream_with_limits(
+        &run_dir,
+        &mut writer,
+        &ArtifactZipLimits::default(),
+    )
+    .expect_err("archive must refuse to reopen through the swapped parent");
+    assert!(matches!(error, ServiceError::Io(_)), "{error}");
     assert!(writer.swapped);
-    let mut archive = zip::ZipArchive::new(Cursor::new(writer.output)).unwrap();
-    content.clear();
-    archive
-        .by_name("reports/result.txt")
-        .unwrap()
-        .read_to_string(&mut content)
-        .unwrap();
-    assert_eq!(
-        content, "inside",
-        "archive must never read the outside sentinel"
+    assert!(
+        !writer
+            .output
+            .windows(b"SECRET".len())
+            .any(|b| b == b"SECRET")
     );
+    assert!(zip::ZipArchive::new(Cursor::new(writer.output)).is_err());
     content.clear();
     download.read_to_string(&mut content).unwrap();
     assert_eq!(content, "inside", "download keeps the same pinned object");
