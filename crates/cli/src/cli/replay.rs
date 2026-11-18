@@ -174,7 +174,19 @@ pub(crate) async fn export_run_trace(
     // not claim OK when the last terminal event for that node failed.
     let mut step_codes = BTreeMap::<String, u8>::new();
     for event in &events {
-        let Some(node) = event.path.as_ref().map(model::NodePath::as_str) else {
+        // Engine hook failures identify the node in `hook`, not `node`, and
+        // are not given a `path` by the journal envelope. Read both so the
+        // failed hook's own step span does not stay OK.
+        let hook_node = || match &event.data {
+            api::RunEventData::Unknown(value) => value.get("hook").and_then(Value::as_str),
+            _ => None,
+        };
+        let node = event
+            .path
+            .as_ref()
+            .map(model::NodePath::as_str)
+            .or_else(hook_node);
+        let Some(node) = node else {
             continue;
         };
         if matches!(
