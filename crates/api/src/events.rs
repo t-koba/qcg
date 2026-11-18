@@ -1152,4 +1152,66 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn failure_kind_set_pins_audited_decisions_and_exclusions() {
+        // Durable events that record a failed operation must stay classified as
+        // failures, including the kinds added from audit evidence. Downstream
+        // exporter tests iterate this list, so only an explicit assertion here
+        // catches an accidental removal.
+        for kind in [
+            "audit_degraded",
+            "llm_cost_unresolved",
+            "elapsed_exceeded",
+            "run_error",
+            "run_canceled",
+            "run_interrupted",
+            "hook_failed",
+            "step_interrupted",
+            "step_timeout",
+        ] {
+            assert!(
+                is_failure_event_kind(kind),
+                "`{kind}` must remain a failure event kind"
+            );
+        }
+        // `stream_error` is a transport-only SSE marker that is never journaled,
+        // and `foreach_budget_exhausted` is an observation followed by the
+        // foreach node's own `step_finished`; neither records an unhandled
+        // failed operation. Terminal kind markers carry outcomes in their
+        // status field, not in the kind, so they must not enter this set.
+        for kind in [
+            STREAM_ERROR_KIND,
+            "foreach_budget_exhausted",
+            "run_finished",
+            "step_finished",
+            "step_started",
+            "budget_charged",
+        ] {
+            assert!(
+                !is_failure_event_kind(kind),
+                "`{kind}` must not be a failure event kind"
+            );
+        }
+    }
+
+    #[test]
+    fn error_type_prefers_reason_code_and_falls_back_to_kind() {
+        assert_eq!(
+            error_type_for("audit_degraded", &json!({})),
+            "audit_degraded"
+        );
+        assert_eq!(
+            error_type_for(
+                "run_error",
+                &json!({ "reason": { "code": "execution_failed" } })
+            ),
+            "execution_failed"
+        );
+        // A reason without a structured code still falls back to the kind.
+        assert_eq!(
+            error_type_for("hook_failed", &json!({ "reason": { "message": "boom" } })),
+            "hook_failed"
+        );
+    }
 }
