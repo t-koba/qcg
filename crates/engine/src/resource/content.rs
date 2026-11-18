@@ -243,11 +243,15 @@ fn summarize_openapi_operations(
     Ok(operations.join("\n"))
 }
 
+pub(crate) fn snapshot_file_name(resource_name: &str) -> String {
+    format!("{}.snapshot", safe_resource_name(resource_name))
+}
+
 pub(crate) fn snapshot_resource_path(context: &RunContext, resource_name: &str) -> Utf8PathBuf {
     context
         .metadata
         .join("resources")
-        .join(format!("{}.snapshot", safe_resource_name(resource_name)))
+        .join(snapshot_file_name(resource_name))
 }
 
 pub(crate) fn read_bytes_bounded(

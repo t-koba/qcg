@@ -5,7 +5,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 
-use super::content::{read_bytes_bounded, resource_trust_label, safe_resource_name};
+use super::content::{read_bytes_bounded, resource_trust_label, snapshot_resource_path};
 use super::hash::resolve_resource_path_for_engine;
 use super::types::{ResourceCacheStatus, ResourceError, ResourceSnapshot, ResourceSnapshotSource};
 
@@ -17,7 +17,7 @@ pub(crate) async fn snapshot_remote_or_local_resource(
 ) -> Result<ResourceSnapshot, EngineError> {
     let snapshot_dir = context.metadata.join("resources");
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    let snapshot_path = snapshot_dir.join(format!("{}.snapshot", safe_resource_name(name)));
+    let snapshot_path = snapshot_resource_path(context, name);
     let limits = single_resource_limits(name, resource)
         .map_err(|error| EngineError::Failed(error.to_string()))?;
     let (bytes, source, cache) = if let Some(path) = &resource.path {

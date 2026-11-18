@@ -21,6 +21,8 @@ mod tests {
     use super::*;
     use camino::Utf8PathBuf;
     use contract::ResourceDef;
+    use serde_json::json;
+    use std::collections::BTreeMap;
 
     fn test_directory(name: &str) -> Utf8PathBuf {
         Utf8PathBuf::from_path_buf(
@@ -194,5 +196,42 @@ mod tests {
             5
         );
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn snapshot_name_aliases_are_refused_before_loading() {
+        let resources: BTreeMap<String, ResourceDef> = serde_json::from_value(json!({
+            "ref.docs": { "type": "openapi", "path": "a.json" },
+            "ref_docs": { "type": "openapi", "path": "b.json" },
+        }))
+        .expect("aliasing resources should deserialize");
+        let error = super::types::reject_snapshot_name_collisions(&resources)
+            .expect_err("aliases must fail closed before any snapshot is written");
+        let message = error.to_string();
+        assert!(
+            message.contains("ref.docs") && message.contains("ref_docs"),
+            "the error must name both colliding resources: {message}"
+        );
+    }
+
+    #[test]
+    fn snapshot_name_preflight_allows_distinct_and_non_snapshot_resources() {
+        let distinct: BTreeMap<String, ResourceDef> = serde_json::from_value(json!({
+            "docs.v1": { "type": "openapi", "path": "a.json" },
+            "docs_v2": { "type": "exec", "params": { "command": ["true"] } },
+            "a.b": { "type": "file", "path": "a.txt" },
+            "a_b": { "type": "dir", "path": "dir" },
+        }))
+        .expect("resources should deserialize");
+        super::types::reject_snapshot_name_collisions(&distinct)
+            .expect("distinct snapshot names and non-snapshot kinds must be allowed");
+
+        let case_alias: BTreeMap<String, ResourceDef> = serde_json::from_value(json!({
+            "RefDocs": { "type": "url", "url": "https://example.test/a" },
+            "refdocs": { "type": "url", "url": "https://example.test/b" },
+        }))
+        .expect("resources should deserialize");
+        super::types::reject_snapshot_name_collisions(&case_alias)
+            .expect_err("case-insensitive filename aliases must be refused");
     }
 }

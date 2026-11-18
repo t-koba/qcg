@@ -3,6 +3,7 @@ use async_trait::async_trait;
 use camino::Utf8PathBuf;
 use contract::{ResourceDef, ResourceKind};
 use serde::Serialize;
+use std::collections::BTreeMap;
 
 use super::file_loaders::{DirResourceLoader, FileResourceLoader};
 use super::hash::{resolve_resource_path, resolve_resource_path_for_engine};
@@ -171,9 +172,37 @@ pub fn select_resource(
     resource_loader(resource.kind).select(context, name, resource, selector)
 }
 
+/// Snapshot-writing resources must not share a sanitized snapshot filename:
+/// the second writer would skip the existing file yet record a digest of its
+/// own source bytes, so the reported path and digest would disagree (and a
+/// later cache hit could serve the first resource's bytes under the second's
+/// pin). Refuse the whole set before any loader runs.
+pub(super) fn reject_snapshot_name_collisions(
+    resources: &BTreeMap<String, ResourceDef>,
+) -> Result<(), EngineError> {
+    use super::content::snapshot_file_name;
+    let mut seen: BTreeMap<String, &str> = BTreeMap::new();
+    for (name, resource) in resources {
+        if !matches!(
+            resource.kind,
+            ResourceKind::Url | ResourceKind::Openapi | ResourceKind::Exec
+        ) {
+            continue;
+        }
+        let key = policy::path::path_collision_key(&snapshot_file_name(name));
+        if let Some(previous) = seen.insert(key, name.as_str()) {
+            return Err(EngineError::Failed(format!(
+                "resources `{previous}` and `{name}` map to the same snapshot file; rename one so pinned bytes stay distinct"
+            )));
+        }
+    }
+    Ok(())
+}
+
 pub async fn collect_resource_hashes(
     context: &RunContext,
 ) -> Result<Vec<ResourceSnapshot>, EngineError> {
+    reject_snapshot_name_collisions(&context.contract.manifest.resources)?;
     let mut resources = Vec::new();
     for (name, resource) in &context.contract.manifest.resources {
         if let Some(path) = resource.path.as_deref() {

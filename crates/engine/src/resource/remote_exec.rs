@@ -6,8 +6,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 
 use super::content::{
-    read_to_string_bounded, resource_trust_label, safe_resource_name, select_openapi,
-    snapshot_resource_path,
+    read_to_string_bounded, resource_trust_label, select_openapi, snapshot_resource_path,
 };
 use super::hash::resolve_resource_path;
 use super::skill::validate_resource_pin;
@@ -67,7 +66,7 @@ impl ResourceLoader for ExecResourceLoader {
         })?;
         let snapshot_dir = context.metadata.join("resources");
         tokio::fs::create_dir_all(&snapshot_dir).await?;
-        let snapshot_path = snapshot_dir.join(format!("{}.snapshot", safe_resource_name(name)));
+        let snapshot_path = snapshot_resource_path(context, name);
         tokio::fs::write(&snapshot_path, &bytes).await?;
         let sha256 = hex::encode(Sha256::digest(&bytes));
         validate_resource_pin(name, resource, &sha256)?;
