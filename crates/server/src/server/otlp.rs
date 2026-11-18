@@ -185,14 +185,11 @@ fn span_status_for_event(kind: &str, event: &Value) -> (u8, Option<String>) {
     match kind {
         "run_finished" => match status {
             "success" => (1, None),
-            "failed" | "check_failed" | "error" => (
-                2,
-                reason_message(event).or_else(|| Some(status.to_string())),
-            ),
-            // Cancel / interrupt / unknown terminal states are not success:
-            // export them as ERROR with the stored cause so monitoring
-            // reflects reality (F11-02).
-            "canceled" | "cancelled" | "interrupted" => (
+            // Every failure or non-success terminal state (including cancel,
+            // interrupt and legacy markers) is ERROR with the stored cause so
+            // monitoring reflects reality (F11-02). Missing/unknown statuses
+            // keep their distinct diagnostics below.
+            "failed" | "check_failed" | "error" | "canceled" | "cancelled" | "interrupted" => (
                 2,
                 reason_message(event).or_else(|| Some(status.to_string())),
             ),
@@ -201,16 +198,19 @@ fn span_status_for_event(kind: &str, event: &Value) -> (u8, Option<String>) {
         },
         "step_finished" => match status {
             "success" | "repaired" | "routed" | "regenerated" | "answered_on_fail" => (1, None),
+            // All failure, cancel and legacy terminal markers are ERROR with
+            // the stored cause; missing/unknown statuses keep their distinct
+            // diagnostics below.
             "failed"
             | "check_failed"
             | "repair_exhausted"
             | "regenerate_exhausted"
             | "recheck_failed"
-            | "error" => (
-                2,
-                reason_message(event).or_else(|| Some(status.to_string())),
-            ),
-            "canceled" | "cancelled" | "interrupted" | "skipped" => (
+            | "error"
+            | "canceled"
+            | "cancelled"
+            | "interrupted"
+            | "skipped" => (
                 2,
                 reason_message(event).or_else(|| Some(status.to_string())),
             ),
