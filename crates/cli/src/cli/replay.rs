@@ -170,6 +170,23 @@ pub(crate) async fn export_run_trace(
             .and_modify(|range| range.1 = timestamp.max(range.1))
             .or_insert((timestamp, timestamp));
     }
+    // A synthetic step span describes the node's durable outcome, so it must
+    // not claim OK when the last terminal event for that node failed.
+    let mut step_codes = BTreeMap::<String, u8>::new();
+    for event in &events {
+        let Some(node) = event.path.as_ref().map(model::NodePath::as_str) else {
+            continue;
+        };
+        if matches!(
+            event.kind.as_str(),
+            "step_finished" | "step_interrupted" | "step_timeout" | "hook_failed"
+        ) {
+            step_codes.insert(
+                node.to_string(),
+                event_status_code(&event.kind, &event.data),
+            );
+        }
+    }
     for (node, (node_start, node_end)) in &node_ranges {
         spans.push(json!({
             "traceId": trace_id,
@@ -180,7 +197,7 @@ pub(crate) async fn export_run_trace(
             "startTimeUnixNano": node_start.to_string(),
             "endTimeUnixNano": node_end.saturating_add(1).to_string(),
             "attributes": [otlp_string_attribute("node.id", node)],
-            "status": { "code": 1 }
+            "status": { "code": step_codes.get(node).copied().unwrap_or(1) }
         }));
     }
     for event in &events {
@@ -259,18 +276,34 @@ pub(crate) async fn export_run_trace(
 }
 
 /// OTLP span status (1 = OK, 2 = ERROR) for a run event. Terminal failure
-/// markers are ERROR; a `run_finished` uses its durable `status` so a failed
-/// run is never exported as OK, matching the resident OTLP exporter. A
-/// recoverable step failure is not terminal and does not decide the run's
-/// status.
+/// markers and failed/unsettled step outcomes are ERROR; a `run_finished`
+/// uses its durable `status` so a failed run is never exported as OK. This
+/// matches the resident OTLP exporter's mapping. A recoverable step failure
+/// is not terminal and does not decide the run's own status.
 fn event_status_code(kind: &str, data: &api::RunEventData) -> u8 {
-    if matches!(kind, "run_error" | "run_canceled" | "run_interrupted") {
+    if matches!(
+        kind,
+        "run_error"
+            | "run_canceled"
+            | "run_interrupted"
+            | "step_interrupted"
+            | "step_timeout"
+            | "hook_failed"
+    ) {
         return 2;
     }
     match data {
         api::RunEventData::RunFinished(data) => match data.status {
             api::RunCompletionStatus::Success => 1,
             api::RunCompletionStatus::Failed => 2,
+        },
+        api::RunEventData::StepFinished(data) => match data.status {
+            api::StepStatus::Success
+            | api::StepStatus::Repaired
+            | api::StepStatus::Routed
+            | api::StepStatus::Regenerated
+            | api::StepStatus::AnsweredOnFail => 1,
+            _ => 2,
         },
         _ => 1,
     }
