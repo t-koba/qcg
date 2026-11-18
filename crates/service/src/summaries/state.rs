@@ -277,9 +277,7 @@ fn rehydrate_run(
     if state.terminal.is_some() {
         return Ok(None);
     }
-    for event in &journal_values {
-        RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
-    }
+    validate_recovery_events(&journal_values)?;
     if crate::run_dirs::is_direct_run(run_dir, &state) {
         return Ok(None);
     }
@@ -343,6 +341,13 @@ fn rehydrate_run(
     )))
 }
 
+fn validate_recovery_events(events: &[Value]) -> Result<(), ServiceError> {
+    for event in events {
+        RunEvent::from_flat(event).map_err(ServiceError::Invalid)?;
+    }
+    Ok(())
+}
+
 /// Read and gate a recovery snapshot under admission ownership. In particular,
 /// an incomplete fork must never lend its copied effects to cleanup.
 pub(crate) fn read_recovery_state(
@@ -375,15 +380,38 @@ pub(crate) fn read_recovery_state(
         .file_name()
         .ok_or_else(|| ServiceError::Invalid("run directory has no file name".into()))?
         .to_string();
-    if (pending_marker
+    if pending_marker
         || journal_values
             .iter()
-            .any(|event| event.get("t").and_then(Value::as_str) == Some("run_forked")))
-        && !crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state)?
+            .any(|event| event["t"] == "run_forked")
     {
-        // The shared admission gate wiped an incomplete fork while preserving
-        // its cancel mailbox. Refused cleanup propagates an error, not a record.
-        return Ok(None);
+        match crate::run_dirs::check_run_admission(run_dir, &run_id, &journal_values, &state) {
+            Ok(true) => {}
+            // Incomplete fork wiped; its cancel mailbox is unchanged.
+            Ok(false) => return Ok(None),
+            Err(error @ ServiceError::ForkTreeCommitUnavailable(_)) if state.effects.is_empty() => {
+                validate_recovery_events(&journal_values)?;
+                if state.terminal.is_none() {
+                    if !crate::run_dirs::try_interrupt_admission(
+                        run_dir,
+                        model::FailureCode::Refused,
+                        &error.to_string(),
+                        Some(state.last_seq),
+                    )? {
+                        return Err(error);
+                    }
+                    let events = read_journal_events(run_dir)?;
+                    let settled = RunState::fold_values(&events).map_err(ServiceError::invalid)?;
+                    if settled.terminal.is_none() {
+                        return Err(error);
+                    }
+                    return Ok(Some((events, settled)));
+                }
+                // Keep the manifest and visibility marker untouched. Retried
+                // recovery sees the terminal journal; adoption still fails.
+            }
+            Err(error) => return Err(error),
+        }
     }
     Ok(Some((journal_values, state)))
 }

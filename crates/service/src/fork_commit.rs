@@ -365,14 +365,26 @@ pub(crate) fn verify(
         return Err(invalid("missing child queue identity"));
     };
     validate_reset_admission(fork, queue, events, fork_index, queue_index)?;
-    let commit: Commit =
-        serde_json::from_reader(open_plain(&run_meta_dir(run_dir).join(MANIFEST))?)?;
+    // Only the ordinary publication window is eligible for recovery settlement.
+    // An interruption immediately after the queue may already have settled it.
+    let preparation = &events[fork_index + 1..queue_index];
+    let tail = &events[queue_index + 1..];
+    let may_settle = !reset_bound
+        && (preparation.is_empty()
+            || matches!(preparation, [patch] if patch["t"] == "state_patched"))
+        && (tail.is_empty() || matches!(tail, [event] if event["t"] == "run_interrupted"));
+    let commit = read_manifest(run_dir, may_settle)?;
     if commit.commit_sha256 != commit.checksum()?
         || commit.version != VERSION
         || commit.run_id != run_id
         || Some(commit.queue_seq) != queue["seq"].as_u64()
     {
-        return Err(invalid("manifest identity mismatch"));
+        let detail = "manifest identity mismatch";
+        return Err(if may_settle {
+            ServiceError::ForkTreeCommitUnavailable(detail)
+        } else {
+            invalid(detail)
+        });
     }
     if reset_bound && commit.durability != Durability::Fsync {
         return Err(invalid("reset-bound fork requires file and directory sync"));
@@ -429,6 +441,25 @@ pub(crate) fn verify(
         }
     }
     Ok(())
+}
+
+// Classify failures at the manifest read, not while reading or validating
+// the journal, staged payload, or durability barrier. In particular a JSON
+// reader I/O failure is not evidence of a malformed manifest.
+fn read_manifest(run_dir: &Utf8Path, may_settle: bool) -> Result<Commit, ServiceError> {
+    let file = open_plain(&run_meta_dir(run_dir).join(MANIFEST)).map_err(|error| match error {
+        ServiceError::Io(io) if may_settle && io.kind() == std::io::ErrorKind::NotFound => {
+            ServiceError::ForkTreeCommitUnavailable("manifest is missing")
+        }
+        error => error,
+    })?;
+    serde_json::from_reader(file).map_err(|error| {
+        if may_settle && !error.is_io() {
+            ServiceError::ForkTreeCommitUnavailable("manifest is malformed")
+        } else {
+            error.into()
+        }
+    })
 }
 
 fn validate_reset_admission(

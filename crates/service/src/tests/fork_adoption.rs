@@ -1844,40 +1844,48 @@ fn ordinary_crash_recovery_does_not_require_a_queue_marker() {
     assert_eq!(read_journal_events(&record.run_dir).unwrap(), vec![started]);
 }
 
+fn prepare_recovery_fork(
+    root: &Utf8Path,
+) -> (RunRecord, RunRecord, crate::run_dirs::RunAdmissionLock) {
+    let source = synthetic_hitl_record(root, "source");
+    let mut child = source.clone();
+    child.run_dir = root.join("runs/child");
+    child.parent_run_id = Some("source".into());
+    let admission = stage_recovery_fork(&source, &child);
+    (source, child, admission)
+}
+
+fn stage_recovery_fork(source: &RunRecord, child: &RunRecord) -> crate::run_dirs::RunAdmissionLock {
+    let admission = crate::run_dirs::try_lock_run_admission(&child.run_dir)
+        .unwrap()
+        .unwrap();
+    crate::run_dirs::prepare_checkpoint_fork(
+        &source.run_dir,
+        "source",
+        &child.run_dir,
+        "child",
+        1,
+        &ForkStatePatch::default(),
+    )
+    .unwrap();
+    crate::run_package::copy(
+        &crate::run_package::package_dir(&source.run_dir),
+        &child.run_dir,
+        source.package_sha256.as_deref().unwrap(),
+    )
+    .unwrap();
+    admission
+}
+
 #[test]
 fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     let root = temp_run_dir("fork-recovery-admission");
     let _guard = TempGuard(root.clone());
     let runs = root.join("runs");
-    let source = synthetic_hitl_record(&root, "source");
+    let (source, child, admission) = prepare_recovery_fork(&root);
     let source_before = read_journal_events(&source.run_dir).unwrap();
-    let mut child = source.clone();
-    child.run_dir = runs.join("child");
-    child.parent_run_id = Some("source".into());
-    let prepare = || {
-        let admission = crate::run_dirs::try_lock_run_admission(&child.run_dir)
-            .unwrap()
-            .unwrap();
-        crate::run_dirs::prepare_checkpoint_fork(
-            &source.run_dir,
-            "source",
-            &child.run_dir,
-            "child",
-            1,
-            &ForkStatePatch::default(),
-        )
-        .unwrap();
-        crate::run_package::copy(
-            &crate::run_package::package_dir(&source.run_dir),
-            &child.run_dir,
-            source.package_sha256.as_deref().unwrap(),
-        )
-        .unwrap();
-        admission
-    };
     // Exact crash window: transformed source queue + run_forked, and a
     // complete, loadable package, but no queue committed by the child.
-    let admission = prepare();
     assert!(crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap());
     let prefix = read_journal_events(&child.run_dir).unwrap();
     let folded = engine::RunState::fold_values(&prefix).unwrap();
@@ -1930,11 +1938,32 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
         &cancel
     ));
 
-    // A redo with the child's own post-fork queue is recoverable, with no
-    // source edits and no engine task or scheduling race needed in this test.
-    let admission = prepare();
+    // A redo with the child's own post-fork queue and valid commit recovers.
+    let admission = stage_recovery_fork(&source, &child);
+    let committed = queue_recovery_fork(&child);
+    crate::fork_commit::publish(
+        &child.run_dir,
+        "child",
+        committed.last().unwrap()["seq"].as_u64().unwrap(),
+        false,
+    )
+    .unwrap();
+    drop(admission);
+    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
+    assert_eq!(recovered["child"].state, RunStatus::Queued);
+    assert_eq!(recovered["child"].priority, 7);
+    assert_eq!(recovered["child"].parent_run_id.as_deref(), Some("source"));
+    assert!(
+        !crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap(),
+        "validated own admission clears the preparation marker"
+    );
+    assert_eq!(read_journal_events(&child.run_dir).unwrap(), committed);
+    assert_eq!(read_journal_events(&source.run_dir).unwrap(), source_before);
+}
+
+fn queue_recovery_fork(child: &RunRecord) -> Vec<Value> {
     write_run_event(
-        &child,
+        child,
         "run_queued",
         json!({
             "run_id": "child",
@@ -1952,29 +1981,123 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
         }),
     )
     .unwrap();
+    read_journal_events(&child.run_dir).unwrap()
+}
+
+#[test]
+fn recovery_interrupts_queued_fork_without_usable_manifest() {
+    for detail in [
+        "manifest is missing",
+        "manifest is malformed",
+        "manifest identity mismatch",
+    ] {
+        let root = temp_run_dir("fork-recovery-uncommitted");
+        let _guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let (_, child, admission) = prepare_recovery_fork(&root);
+        let queued = queue_recovery_fork(&child);
+        let manifest = run_meta_dir(&child.run_dir).join("fork-tree.commit.json");
+        if detail == "manifest is malformed" {
+            std::fs::write(&manifest, b"{").unwrap();
+        } else if detail == "manifest identity mismatch" {
+            crate::fork_commit::publish(
+                &child.run_dir,
+                "child",
+                queued.last().unwrap()["seq"].as_u64().unwrap() + 1,
+                false,
+            )
+            .unwrap();
+        }
+        let manifest_before = std::fs::read(&manifest).ok();
+        assert!(
+            !crate::summaries::rehydrate_runs(&runs, 1, 8)
+                .unwrap()
+                .contains_key("child")
+        );
+        assert_eq!(read_journal_events(&child.run_dir).unwrap(), queued);
+        drop(admission);
+
+        let execution = crate::run_dirs::try_lock_run_execution(&child.run_dir)
+            .unwrap()
+            .unwrap();
+        assert!(crate::summaries::rehydrate_runs(&runs, 1, 8).is_err());
+        assert_eq!(read_journal_events(&child.run_dir).unwrap(), queued);
+        drop(execution);
+        let cancel = crate::run_dirs::request_remote_cancel(
+            &child.run_dir,
+            "child",
+            "recovery-test",
+            engine::JournalLimits::default(),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            let recovered = crate::summaries::rehydrate_runs(&runs, 1, 8).unwrap();
+            assert!(!recovered.contains_key("child"));
+            assert_eq!(recovered["source"].state, RunStatus::Queued);
+            let settled = read_journal_events(&child.run_dir).unwrap();
+            let (last, prefix) = settled.split_last().unwrap();
+            assert_eq!(prefix, queued);
+            assert_eq!(last["t"], "run_interrupted");
+            assert_eq!(last["reason"]["code"], "refused");
+            assert_eq!(
+                last["reason"]["message"],
+                format!("fork tree commit: {detail}")
+            );
+            assert_eq!(
+                engine::RunState::fold_values(&settled).unwrap().terminal,
+                Some(engine::TerminalState::Interrupted)
+            );
+        }
+        assert!(crate::run_dirs::try_adopt_run_dir_with_snapshot(&child.run_dir, "child").is_err());
+        assert!(crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap());
+        assert_eq!(std::fs::read(&manifest).ok(), manifest_before);
+        assert_eq!(
+            crate::run_dirs::list_pending_cancel_controls(&child.run_dir).unwrap()[0].0,
+            cancel
+        );
+    }
+}
+
+#[test]
+fn fork_recovery_does_not_settle_corrupt_non_manifest_evidence() {
+    let root = temp_run_dir("fork-recovery-corruption");
+    let _guard = TempGuard(root.clone());
+    let runs = root.join("runs");
+    let (_, child, admission) = prepare_recovery_fork(&root);
+    let queued = queue_recovery_fork(&child);
     drop(admission);
-    let committed = read_journal_events(&child.run_dir).unwrap();
-    assert!(
-        crate::summaries::rehydrate_runs(&runs, 8, 8).is_err(),
-        "a new-format queue without the tree commit must not recover"
-    );
+
+    // A torn, later write is not a clean queue-only crash window.
+    let journal = run_meta_dir(&child.run_dir).join("journal.jsonl");
+    let durable = std::fs::read(&journal).unwrap();
+    let mut torn = durable.clone();
+    torn.extend_from_slice(b"{\"t\":");
+    std::fs::write(&journal, &torn).unwrap();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    assert!(error.to_string().contains("unterminated tail"), "{error}");
+    assert_eq!(std::fs::read(&journal).unwrap(), torn);
+    std::fs::write(&journal, &durable).unwrap();
+
+    // A correctly identified manifest whose tree does not verify still fails closed.
     crate::fork_commit::publish(
         &child.run_dir,
         "child",
-        committed.last().unwrap()["seq"].as_u64().unwrap(),
+        queued.last().unwrap()["seq"].as_u64().unwrap(),
         false,
     )
     .unwrap();
-    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
-    assert_eq!(recovered["child"].state, RunStatus::Queued);
-    assert_eq!(recovered["child"].priority, 7);
-    assert_eq!(recovered["child"].parent_run_id.as_deref(), Some("source"));
+    std::fs::write(
+        run_workspace_dir(&child.run_dir).join("unexpected"),
+        b"changed",
+    )
+    .unwrap();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
     assert!(
-        !crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap(),
-        "validated own admission clears the preparation marker"
+        error.to_string().contains("staged tree mismatch"),
+        "{error}"
     );
-    assert_eq!(read_journal_events(&child.run_dir).unwrap(), committed);
-    assert_eq!(read_journal_events(&source.run_dir).unwrap(), source_before);
+    assert_eq!(std::fs::read(&journal).unwrap(), durable);
+    assert!(crate::run_dirs::fork_admission_pending(&child.run_dir).unwrap());
 }
 
 #[test]

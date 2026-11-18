@@ -145,6 +145,54 @@ pub(crate) fn write_run_event_if(
     Ok(())
 }
 
+/// The caller holds admission ownership. Acquire execution before writing,
+/// and use the journal's fresh fold to avoid a second terminal append.
+pub(crate) fn try_interrupt_admission(
+    run_dir: &Utf8Path,
+    code: model::FailureCode,
+    message: &str,
+    expected_seq: Option<u64>,
+) -> Result<bool, ServiceError> {
+    let Some(_execution) = try_lock_existing_run_execution(run_dir)? else {
+        return Ok(false);
+    };
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::invalid("run directory has no file name"))?;
+    let journal = run_meta_dir(run_dir).join("journal.jsonl");
+    if expected_seq.is_some() {
+        // Recovery requires a durable queue and leaves a torn tail untouched
+        // rather than letting the writer repair evidence from another failure.
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let mut file = File::open(&journal)?;
+        file.seek(SeekFrom::End(-1))?;
+        let mut last = [0];
+        file.read_exact(&mut last)?;
+        if last[0] != b'\n' {
+            return Err(ServiceError::invalid(
+                "fork journal has an unterminated tail",
+            ));
+        }
+    }
+    JournalWriter::append_events_with(&journal, run_id, JournalLimits::default(), None, |state| {
+        if expected_seq.is_some_and(|seq| state.last_seq != seq) {
+            return Err(JournalError::PreconditionFailed(
+                "fork journal changed during recovery".into(),
+            ));
+        }
+        Ok(if state.terminal.is_some() {
+            Vec::new()
+        } else {
+            vec![(
+                "run_interrupted",
+                json!({"reason": model::FailureDetail::new(code, message)}),
+            )]
+        })
+    })
+    .map_err(ServiceError::invalid)?;
+    Ok(true)
+}
+
 /// Complete only an unambiguous accepted denial. Selection and both appends
 /// share the journal lock; every surviving prefix is retryable. This is process
 /// crash reconciliation, not a power-loss transaction.

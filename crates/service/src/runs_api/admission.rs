@@ -134,7 +134,7 @@ impl LocalService {
                 {
                     // Do not let a queued but uncommitted child be resumed
                     // after this admission reported failure.
-                    Self::settle_refused_admission(&staged.run_dir).await;
+                    Self::settle_refused_admission(&staged.run_dir);
                     return Err(api_internal(error));
                 }
             }
@@ -142,7 +142,7 @@ impl LocalService {
                 // A committed queue without a cleared marker must be settled
                 // as refused before returning, preserving the prior admission
                 // contract if the marker removal itself was not durable.
-                Self::settle_refused_admission(&staged.run_dir).await;
+                Self::settle_refused_admission(&staged.run_dir);
                 return Err(api_internal(format!(
                     "fork queue was committed but its visibility marker could not be cleared: {error}"
                 )));
@@ -183,7 +183,7 @@ impl LocalService {
                 // A fresh request reported refused must not run on next boot
                 // just because its run_queued append preceded shutdown (E05).
                 if !adopted {
-                    Self::settle_refused_admission(&staged.run_dir).await;
+                    Self::settle_refused_admission(&staged.run_dir);
                 }
                 return Err(error);
             }
@@ -359,36 +359,14 @@ impl LocalService {
     /// next boot sees a terminal outcome instead of running a request we
     /// reported as refused (E05). Best-effort: a contended lease means a
     /// peer owns execution and settles it.
-    pub(super) async fn settle_refused_admission(run_dir: &Utf8Path) {
-        let lease = match crate::run_dirs::try_lock_run_execution(run_dir) {
-            Ok(lease) => lease,
-            Err(error) => {
-                tracing::warn!(run_dir = %run_dir, %error, "refused admission settlement failed to lock execution");
-                return;
-            }
-        };
-        if lease.is_none() {
-            return;
-        }
-        let Some(run_id) = run_dir.file_name() else {
-            tracing::warn!(run_dir = %run_dir, "refused admission settlement without a run id");
-            return;
-        };
-        let journal = crate::summaries::run_meta_dir(run_dir).join("journal.jsonl");
-        match engine::JournalWriter::append_single_event(
-            &journal,
-            run_id,
-            "run_interrupted",
-            serde_json::json!({
-                "reason": {"code": "interrupted", "message": "service shutdown before admission completed"},
-            }),
-            engine::JournalLimits::default(),
+    fn settle_refused_admission(run_dir: &Utf8Path) {
+        if let Err(error) = crate::run_dirs::try_interrupt_admission(
+            run_dir,
+            model::FailureCode::Interrupted,
+            "service shutdown before admission completed",
             None,
         ) {
-            Ok(_) => {}
-            Err(error) => {
-                tracing::warn!(run_dir = %run_dir, %error, "refused admission settlement failed to journal");
-            }
+            tracing::warn!(run_dir = %run_dir, %error, "refused admission settlement failed");
         }
     }
 

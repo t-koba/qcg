@@ -108,6 +108,9 @@ impl Default for ServiceDeploymentPolicy {
 pub enum ServiceError {
     #[error("{0}")]
     Invalid(String),
+    /// An ordinary, not-yet-started fork has its own queue but no usable manifest.
+    #[error("fork tree commit: {0}")]
+    ForkTreeCommitUnavailable(&'static str),
     #[error("artifact count exceeds limit")]
     ArtifactEntries,
     #[error("payload is too large: {actual} > {limit} bytes")]

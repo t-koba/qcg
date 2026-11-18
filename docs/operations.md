@@ -708,7 +708,12 @@ On supported Unix filesystems the barrier syncs every included file and then
 its directories bottom-up, publishes/syncs the manifest, and syncs metadata,
 the new run directory and its run-store parent. A pending recovery verifies
 and repeats the barrier before clearing visibility. Missing, malformed or
-mismatched new-format commit evidence refuses adoption; the stable tree is
+mismatched commit evidence refuses adoption. If an ordinary v1 checkpoint fork
+crashes after writing its own queue but before obtaining a usable manifest,
+recovery records `run_interrupted` with reason code `refused` and the manifest
+diagnostic. It does not register or execute the child, clear its visibility
+marker, or consume its cancel mailbox. Journal, payload, and durability
+verification errors still fail closed without settlement. The stable tree is
 also checked under execution ownership before the child's first execution.
 After its first start the workspace is mutable and ordinary replay applies;
 the commit identity/checksum and original journal prefix remain checked.
