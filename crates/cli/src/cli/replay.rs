@@ -224,17 +224,29 @@ pub(crate) async fn export_run_trace(
         if let Some(node) = event.path.as_ref().map(model::NodePath::as_str) {
             attributes.push(otlp_string_attribute("node.id", node));
         }
-        let data = serde_json::to_value(&event.data)?;
-        let status_code = if api::failed_operation_attempt(kind, &data) {
+        // `operation_finished` is not a registered schema, so the registry
+        // leaves its data as raw JSON. Borrow that for the shared classifier
+        // and `error.type` instead of serializing every event: OK spans emit
+        // no payload, so converting their data is pure overhead.
+        let raw_data = match &event.data {
+            api::RunEventData::Unknown(value) => Some(value),
+            _ => None,
+        };
+        let status_code = if raw_data.is_some_and(|data| api::failed_operation_attempt(kind, data))
+        {
             2
         } else {
             event_status_code(kind, &event.data)
         };
         if status_code == 2 {
-            attributes.push(otlp_string_attribute(
-                "error.type",
-                &api::error_type_for(kind, &data),
-            ));
+            let error_type = match raw_data {
+                Some(data) => api::error_type_for(kind, data),
+                None => {
+                    let data = serde_json::to_value(&event.data)?;
+                    api::error_type_for(kind, &data)
+                }
+            };
+            attributes.push(otlp_string_attribute("error.type", &error_type));
         }
         spans.push(json!({
             "traceId": trace_id,
