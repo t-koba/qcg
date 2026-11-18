@@ -509,3 +509,66 @@ fn llm_cost_unresolved_exports_error_without_affecting_run_status() {
 
     std::fs::remove_dir_all(root).unwrap();
 }
+
+#[test]
+fn elapsed_breach_exports_error_without_terminal_run_span() {
+    // The durable marker written when grace delivers a pending interaction:
+    // exhaustion facts, no terminal run_finished and no structured reason code.
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "runs-trace-elapsed-breach-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let id = "elapsed-breach-run";
+    let meta = root.join("runs").join(id).join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0",
+                "generator_path": "demo",
+                "contract_sha256": "test",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock",
+                "retention_days": 10,
+            }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "elapsed_exceeded",
+            json!({
+                "node": "build",
+                "limit_secs": 1,
+                "exhaustion": {"resource": "elapsed_seconds", "used": 1, "allowed": 1},
+                "during": "interaction",
+            }),
+        )
+        .unwrap();
+    drop(journal);
+
+    let payload = trace(&root, id);
+    assert_eq!(
+        span_code(&payload, "event elapsed_exceeded"),
+        2,
+        "budget breach event span"
+    );
+    assert_eq!(
+        span_string_attribute(&payload, "event elapsed_exceeded", "error.type"),
+        Some("elapsed_exceeded"),
+        "error.type falls back to the kind without a reason code"
+    );
+    assert_eq!(
+        span_code(&payload, &format!("run {id}")),
+        0,
+        "root span stays UNSET with no terminal outcome"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
