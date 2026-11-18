@@ -313,6 +313,15 @@ impl PreparedForkPlan {
                 hash.update(&buffer[..count]);
                 output.write_all(&buffer[..count])?;
             }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                // Copy only ordinary permission bits: a staged source must
+                // never inherit setuid/setgid/sticky bits from the source.
+                let mode = metadata.permissions().mode() & 0o777;
+                output.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
+            #[cfg(not(unix))]
             output.set_permissions(metadata.permissions())?;
             if length != observation.length || hex::encode(hash.finalize()) != observation.sha256 {
                 return Err(invalid("source changed during copy"));
@@ -404,6 +413,40 @@ mod tests {
         .unwrap();
         assert!(linked.stage(&source, &target).is_err());
         assert!(!target.join(".prepared-source").exists());
+    }
+    #[test]
+    #[cfg(unix)]
+    fn staging_strips_privilege_bits_from_source_files() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = temp_run_dir("prepared-copy-modes");
+        let _guard = TempGuard(root.clone());
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        let path = source.join("data");
+        let bytes = b"mode bytes";
+        std::fs::write(&path, bytes).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o6755)).unwrap();
+        let plan = PreparedForkPlan::new(
+            &"a".repeat(64),
+            vec![ForkFileObservation {
+                path: "data".into(),
+                length: bytes.len() as u64,
+                sha256: hex::encode(Sha256::digest(bytes)),
+            }],
+        )
+        .unwrap();
+        let target = root.join("child");
+        std::fs::create_dir(&target).unwrap();
+        let staged = plan.stage(&source, &target).unwrap();
+        let mode = std::fs::metadata(staged.0.join("data"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o7777,
+            0o755,
+            "staged copy must drop setuid/setgid/sticky bits but keep ordinary mode"
+        );
     }
     #[cfg(unix)]
     fn observe_tree(root: &Utf8Path, dir: &Utf8Path) -> Vec<ForkFileObservation> {
