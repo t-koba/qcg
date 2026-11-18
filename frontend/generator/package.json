@@ -11,7 +11,9 @@
     "generate:wasm": "node scripts/generate-wasm.mjs",
     "check:api": "node scripts/check-api-types.mjs",
     "test": "vitest run",
-    "test:api": "node scripts/test-api-types.mjs"
+    "test:api": "node scripts/test-api-types.mjs",
+    "audit:gate": "node scripts/audit.mjs",
+    "audit:self-test": "node scripts/audit.mjs --self-test"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "^5.0.3",
