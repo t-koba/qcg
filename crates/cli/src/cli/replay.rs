@@ -279,7 +279,7 @@ pub(crate) async fn export_run_trace(
         std::fs::write(path, &encoded)?;
     }
     if let Some(endpoint) = endpoint {
-        crate::http::client()?
+        let response = crate::http::client()?
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(encoded.clone())
@@ -288,6 +288,35 @@ pub(crate) async fn export_run_trace(
             .with_context(|| format!("failed to export trace to `{endpoint}`"))?
             .error_for_status()
             .with_context(|| format!("trace exporter `{endpoint}` rejected the payload"))?;
+        // A 2xx is not necessarily full success: OTLP collectors report
+        // dropped spans in the response body. Read it with the shared bounded
+        // reader and parser so both exporters observe the same contract; a
+        // rejected batch is never silently resent.
+        let body = server::read_bounded_body(response, 64 * 1024)
+            .await
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("failed to read OTLP response from `{endpoint}`"))?;
+        let outcome = server::parse_partial_success(&body)
+            .map_err(anyhow::Error::msg)
+            .with_context(|| format!("invalid OTLP response from `{endpoint}`"))?;
+        if outcome.rejected_spans > 0 {
+            let detail = if outcome.error_message.is_empty() {
+                String::new()
+            } else {
+                format!(" ({})", outcome.error_message)
+            };
+            anyhow::bail!(
+                "OTLP collector partially accepted the trace: {} spans rejected{}; no automatic resend was performed",
+                outcome.rejected_spans,
+                detail
+            );
+        }
+        if !outcome.error_message.is_empty() {
+            eprintln!(
+                "warning: OTLP collector `{endpoint}` reported: {}",
+                outcome.error_message
+            );
+        }
     }
     if output.is_none() && endpoint.is_none() {
         // serde_json emits valid UTF-8 by construction; a failure here is

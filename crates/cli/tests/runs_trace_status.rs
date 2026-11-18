@@ -1,6 +1,12 @@
 use camino::Utf8PathBuf;
 use serde_json::{Value, json};
-use std::process::Command;
+use std::{
+    io::{Read, Write},
+    net::TcpListener,
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
+};
 
 fn seed_run(root: &Utf8PathBuf, id: &str, status: &str) {
     let meta = root.join("runs").join(id).join("meta");
@@ -144,6 +150,75 @@ fn trace(root: &Utf8PathBuf, id: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+// One bounded loopback collector reply per invocation; the test thread
+// services the listener while the CLI child runs, with no external network.
+fn trace_with_collector(root: &Utf8PathBuf, id: &str, body: &str) -> Output {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    let mut command = Command::new(env!("CARGO_BIN_EXE_qcg"));
+    command
+        .args(["runs", "trace", id, "--runs-dir"])
+        .arg(root.join("runs"))
+        .args(["--otlp-endpoint", &endpoint])
+        .env_remove("PROVIDERS")
+        .env("AUTO_GC", "false");
+    for name in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(name);
+    }
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (mut socket, _) = loop {
+        match listener.accept() {
+            Ok(socket) => break socket,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let output = child.wait_with_output().unwrap();
+                    panic!(
+                        "no OTLP request received: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("{error}"),
+        }
+    };
+    socket
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    socket
+        .set_write_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        socket.read_exact(&mut byte).unwrap();
+        request.push(byte[0]);
+        assert!(request.len() < 8192);
+    }
+    assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/traces "));
+    socket.write_all(response.as_bytes()).unwrap();
+    drop(socket);
+    child.wait_with_output().unwrap()
 }
 
 fn spans_named<'a>(payload: &'a Value, name: &str) -> Vec<&'a Value> {
@@ -664,5 +739,60 @@ fn operation_attempts_map_only_their_own_spans() {
         "root span stays OK"
     );
 
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn otlp_collector_reply_controls_report_and_exit_status() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!("runs-trace-otlp-result-{}", uuid::Uuid::now_v7()));
+    let id = "otlp-collector-run";
+    seed_run(&root, id, "success");
+    for (body, success, expected, forbidden) in [
+        (
+            r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"quota"}}"#,
+            false,
+            &[
+                "2 spans rejected",
+                "partially accepted",
+                "quota",
+                "no automatic resend",
+            ][..],
+            &["exported OTLP trace"][..],
+        ),
+        (
+            "{}",
+            true,
+            &["exported OTLP trace to"][..],
+            &["warning:"][..],
+        ),
+        (
+            r#"{"partialSuccess":{"errorMessage":"queue near capacity"}}"#,
+            true,
+            &["exported OTLP trace to", "queue near capacity"][..],
+            &[][..],
+        ),
+    ] {
+        let output = trace_with_collector(&root, id, body);
+        let report = format!(
+            "stdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(output.status.success(), success, "body `{body}`: {report}");
+        for text in expected {
+            assert!(
+                report.contains(text),
+                "body `{body}` must mention `{text}`: {report}"
+            );
+        }
+        for text in forbidden {
+            assert!(
+                !report.contains(text),
+                "body `{body}` must not mention `{text}`: {report}"
+            );
+        }
+    }
     std::fs::remove_dir_all(root).unwrap();
 }

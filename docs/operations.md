@@ -1217,7 +1217,10 @@ Unattended limits:
   deletion or failure counts are not exported; alert thresholds live outside.
 - OTLP export exists in implementation (`OTLP_ENDPOINT`,
   `OTLP_INTERVAL_MS`, best-effort) and `qcg runs trace` builds
-  hierarchical spans, but no SLO is defined here. For a valid event both
+  hierarchical spans, but no SLO is defined here. With `--otlp-endpoint`,
+  `qcg runs trace` reads the collector's 2xx body with the resident exporter's
+  bounded parser: rejected spans fail the command without a resend, warnings
+  are printed, and malformed replies fail closed. For a valid event both
   exporters emit one span and agree on the status code (OK or ERROR) and, on
   ERROR, the `error.type` attribute. The streaming server additionally sets
   `status.message` and outcome/reason detail attributes; `qcg runs trace`

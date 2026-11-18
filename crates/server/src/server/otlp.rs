@@ -398,9 +398,9 @@ async fn export_cycle(
 /// resend per the OTLP spec) but reports the rejection so monitoring does
 /// not mistake it for full success.
 #[derive(Debug)]
-struct ExportOutcome {
-    rejected_spans: i64,
-    error_message: String,
+pub struct ExportOutcome {
+    pub rejected_spans: i64,
+    pub error_message: String,
 }
 
 /// Posts one batch. Non-2xx responses and transport errors are reported so
@@ -434,7 +434,10 @@ async fn export_batch(
 
 /// Reads a collector response body with an explicit bound (F11) so a
 /// misbehaving collector cannot grow memory via an unbounded read.
-async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<Vec<u8>, String> {
+pub async fn read_bounded_body(
+    response: reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, String> {
     let mut body = Vec::new();
     let mut response = response;
     while let Some(chunk) = response.chunk().await.map_err(|error| error.to_string())? {
@@ -449,7 +452,7 @@ async fn read_bounded_body(response: reqwest::Response, limit: usize) -> Result<
 /// Parses OTLP/HTTP `partial_success` from a 2xx body. Empty bodies mean
 /// full success. Malformed nonempty bodies fail as protocol errors; rejection counts
 /// must be nonnegative integers.
-fn parse_partial_success(body: &[u8]) -> Result<ExportOutcome, String> {
+pub fn parse_partial_success(body: &[u8]) -> Result<ExportOutcome, String> {
     let value: Value = if body.iter().all(u8::is_ascii_whitespace) {
         json!({})
     } else {

@@ -228,7 +228,9 @@ JSON event output go to stdout.
   artifacts).
 - `qcg runs trace <id> [--runs-dir dir] [--output trace.json]
   [--otlp-endpoint URL]` builds hierarchical run/step/event spans and writes or
-  exports an OTLP JSON trace.
+  exports an OTLP JSON trace. A collector reply reporting rejected spans fails
+  the command without resending; warning-only replies print to stderr and
+  still succeed, and malformed replies fail closed.
 - `qcg runs gc [--runs-dir dir] [--keep N] [--keep-failed N] [--delete]`
 
 GC is a dry run without `--delete` and never removes a non-terminal run.

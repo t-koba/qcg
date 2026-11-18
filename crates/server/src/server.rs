@@ -17,7 +17,7 @@ pub(crate) use idempotency::*;
 pub use middleware::MetricsPolicy;
 #[cfg(test)]
 pub(crate) use middleware::*;
-pub use otlp::OtlpConfig;
+pub use otlp::{ExportOutcome, OtlpConfig, parse_partial_success, read_bounded_body};
 pub use rate_limit::{RateLimitOverflow, RateLimitPolicy};
 #[cfg(test)]
 pub(crate) use run_detail::*;
