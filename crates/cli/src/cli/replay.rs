@@ -296,7 +296,10 @@ pub(crate) async fn export_run_trace(
 /// markers and failed/unsettled step outcomes are ERROR; a `run_finished`
 /// uses its durable `status` so a failed run is never exported as OK. This
 /// matches the resident OTLP exporter's mapping. A recoverable step failure
-/// is not terminal and does not decide the run's own status.
+/// is not terminal and does not decide the run's own status. Success is an
+/// explicit OK rather than Unset on purpose: qcg validates each outcome
+/// through the engine/contract, so a successful span carries a confirmed
+/// result (the Stable Trace API permits Ok for validated success).
 fn event_status_code(kind: &str, data: &api::RunEventData) -> u8 {
     if api::is_failure_event_kind(kind) {
         return 2;

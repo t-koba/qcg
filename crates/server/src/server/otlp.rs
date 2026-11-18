@@ -171,7 +171,10 @@ fn string_attribute(key: &str, value: &str) -> Value {
 /// kind alone is not enough: `run_finished(status="failed")` and
 /// `step_finished(status="failed"/"check_failed")` must not export as OK.
 /// Returns the numeric OTLP code (1 = OK, 2 = ERROR) plus an optional
-/// short message derived from the stored reason.
+/// short message derived from the stored reason. Success is exported as an
+/// explicit OK rather than Unset on purpose: qcg validates each outcome
+/// through the engine/contract, so a successful span carries a confirmed
+/// result (the Stable Trace API permits Ok for validated success).
 fn span_status_for_event(kind: &str, event: &Value) -> (u8, Option<String>) {
     let status = event.get("status").and_then(Value::as_str).unwrap_or("");
     // Legacy terminal markers and internal failure markers always signal an
