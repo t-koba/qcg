@@ -177,6 +177,28 @@ impl LocalService {
         id: String,
         after_seq: u64,
     ) -> Result<BoxStream<'static, RunEvent>, ApiError> {
+        self.subscribe_with_cursor_inner(
+            id,
+            after_seq,
+            #[cfg(test)]
+            None,
+        )
+        .await
+    }
+
+    /// Shared-mode history/live handoff. The test-only rendezvous pauses the
+    /// caller after its first history read and before it attaches the live
+    /// receiver, so a regression test can append and broadcast an event in
+    /// that window deterministically.
+    pub(crate) async fn subscribe_with_cursor_inner(
+        &self,
+        id: String,
+        after_seq: u64,
+        #[cfg(test)] history_attach_pause: Option<(
+            tokio::sync::oneshot::Sender<()>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    ) -> Result<BoxStream<'static, RunEvent>, ApiError> {
         let run_dir = self.run_dir_for(&id).await?;
         // Shared mode always follows the durable journal (~250ms poll) so
         // every subscriber observes identical progress even when ownership
@@ -247,15 +269,10 @@ impl LocalService {
         };
         let (history_last_seq, cursor, settled) =
             self.prepare_replay(run_dir.clone(), after_seq).await?;
-        let history_settled = Arc::new(std::sync::atomic::AtomicBool::new(settled));
-        let history_stream = self.replay_stream(
-            run_dir.clone(),
-            cursor,
-            history_last_seq,
-            history_settled.clone(),
-        );
         if settled {
-            return Ok(history_stream);
+            // Settled up front: history only, and no poller is ever created.
+            let history_settled = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            return Ok(self.replay_stream(run_dir, cursor, history_last_seq, history_settled));
         }
         let lag_id = id.clone();
         // The shared poller is created AFTER the terminal check above with
@@ -266,10 +283,32 @@ impl LocalService {
         // subscribers share one underlying poll task instead of each
         // spawning their own. Exclusive disk-only runs (no memory record,
         // hence no live channel) use the same lazily created poller here.
+        #[cfg(test)]
+        if let Some((reached, proceed)) = history_attach_pause {
+            let _ = reached.send(());
+            let _ = proceed.await;
+        }
         let receiver = match live_receiver {
             Some(receiver) => receiver,
-            None => self.shared_poll_receiver(run_dir, id.clone(), history_last_seq),
+            None => self.shared_poll_receiver(run_dir.clone(), id.clone(), history_last_seq),
         };
+        // Refresh the durable boundary AFTER the live receiver is attached.
+        // A shared poller may broadcast an event in the window between the
+        // first history read and the attach; a fresh broadcast receiver never
+        // sees that send, but the event is in the journal, so replaying it as
+        // history is the only way to avoid a silent gap (E12a).
+        let (history_last_seq, cursor, settled) =
+            self.prepare_replay(run_dir.clone(), after_seq).await?;
+        let history_settled = Arc::new(std::sync::atomic::AtomicBool::new(settled));
+        let history_stream = self.replay_stream(
+            run_dir.clone(),
+            cursor,
+            history_last_seq,
+            history_settled.clone(),
+        );
+        if settled {
+            return Ok(history_stream);
+        }
         // Owner watch for the Exclusive live tail: `Some` only when pinned
         // at attach above. Shared-poller tails carry `None` (the journal
         // reflects every generation by construction).

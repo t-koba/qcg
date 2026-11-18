@@ -1006,3 +1006,157 @@ enabled = false"#,
         .expect("probe snapshot should exist");
     let _ = std::fs::remove_dir_all(&root);
 }
+
+#[tokio::test]
+async fn shared_handoff_replays_event_broadcast_between_history_read_and_attach() {
+    // E12a: a second subscriber's history read and its broadcast attach are
+    // two separate steps. An event appended and broadcast in that window is
+    // invisible to a fresh receiver, so it must be replayed from the journal
+    // rather than silently skipped.
+    let runs = temp_run_dir("shared-handoff-gap");
+    let _guard = TempGuard(runs.clone());
+    let generators_dir = runs.join("generators");
+    let generator_dir = generators_dir.join("demo");
+    std::fs::create_dir_all(&generator_dir).expect("generator dir should be created");
+    std::fs::write(
+        generator_dir.join(contract::MANIFEST_FILE),
+        r#"[generator]
+id = "demo"
+name = "Demo"
+version = "0.1.0"
+
+[permissions]
+fs_read = []
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+fs_write = ["workspace"]
+
+[permissions.containers]
+enabled = false
+
+[[flow]]
+id = "write"
+type = "write"
+params = { content = "done", output_file = "result.txt" }
+"#,
+    )
+    .expect("generator manifest should be written");
+    let contract = contract::Contract::load(&generator_dir).expect("contract should load");
+    let run_id = format!("handoff-{}", uuid::Uuid::now_v7());
+    let run_dir = runs.join(&run_id);
+    let meta = crate::summaries::run_meta_dir(&run_dir);
+    std::fs::create_dir_all(&meta).expect("meta dir should be created");
+    let package_sha256 = pin_test_package(&generator_dir, &run_dir);
+    let writer = engine::JournalWriter::create(&meta.join("journal.jsonl"), &run_id, false, None)
+        .expect("journal writer should be created");
+    let started = json!({
+        "generator": "demo@0.1.0",
+        "generator_path": generator_dir,
+        "contract_sha256": contract.sha256,
+        "package_sha256": package_sha256,
+        "inputs": {},
+        "resource_hashes": [],
+        "schema_version": api::JOURNAL_SCHEMA_VERSION,
+        "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+    });
+    writer
+        .event("run_queued", started.clone())
+        .expect("queued event should append");
+    writer
+        .event("run_started", started)
+        .expect("started event should append");
+
+    let deployment = ServiceDeploymentPolicy {
+        journal_poll_interval_millis: 20,
+        ..Default::default()
+    };
+    let make_service = || {
+        LocalService::with_generator_roots_policy_and_store_mode(
+            vec![generators_dir.clone()],
+            runs.clone(),
+            None,
+            policy::DEFAULT_MAX_ACTIVE_RUNS,
+            DEFAULT_MAX_TRACKED_RUNS,
+            RunStoreMode::SharedFilesystem,
+            deployment,
+        )
+        .expect("shared service should initialize")
+    };
+    let service = make_service();
+
+    // Subscriber A starts the shared poller and drains the initial history.
+    let mut first = service
+        .subscribe_with_cursor(run_id.clone(), 0)
+        .await
+        .expect("first subscription");
+    for expected in 1..=2 {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), first.next())
+            .await
+            .expect("first subscriber should receive history")
+            .expect("first subscriber stream should stay open");
+        assert_eq!(event.seq, expected);
+    }
+
+    // Subscriber B reads history, then pauses before attaching its receiver.
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (proceed_tx, proceed_rx) = tokio::sync::oneshot::channel();
+    let b_service = service.clone();
+    let b_id = run_id.clone();
+    let b_task = tokio::spawn(async move {
+        b_service
+            .subscribe_with_cursor_inner(b_id, 0, Some((reached_tx, proceed_rx)))
+            .await
+            .expect("second subscription")
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), reached_rx)
+        .await
+        .expect("second subscriber should reach the attach pause")
+        .expect("pause channel should stay open");
+
+    // Append seq 3 and let the poller broadcast it to A while B is paused, so
+    // B's fresh receiver will never see that send.
+    writer
+        .event("run_resumed", json!({}))
+        .expect("resumed event should append");
+    loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(5), first.next())
+            .await
+            .expect("first subscriber should receive the new event")
+            .expect("first subscriber stream should stay open");
+        if event.seq == 3 {
+            break;
+        }
+    }
+    proceed_tx.send(()).expect("pause should be releasable");
+    let mut second = tokio::time::timeout(std::time::Duration::from_secs(5), b_task)
+        .await
+        .expect("second subscriber should attach")
+        .expect("second subscriber task should finish");
+
+    // Append seq 4 after B attached; it should arrive through the live tail.
+    writer
+        .event("run_resumed", json!({}))
+        .expect("second resumed event should append");
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut seen = Vec::new();
+    while tokio::time::Instant::now() < deadline {
+        match tokio::time::timeout_at(deadline, second.next()).await {
+            Ok(Some(event)) => {
+                seen.push(event.seq);
+                if event.seq == 4 {
+                    break;
+                }
+            }
+            Ok(None) | Err(_) => break,
+        }
+    }
+    assert!(
+        seen.contains(&3) && seen.contains(&4),
+        "second subscriber must receive both the broadcast-in-gap and post-attach events, got {seen:?}"
+    );
+    drop(writer);
+    drop(service);
+}
