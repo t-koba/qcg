@@ -109,8 +109,10 @@ Active-execution usage is the recovered durable active total plus the live
 monotonic episode interval. Wall-clock usage is the exact nonnegative duration
 from the durable queue/start anchor sampled at episode startup (including
 queue and HITL time), plus the live monotonic interval. The existing skew
-checks and whole-second flooring used to seed the wall-clock **deadline**
-are unchanged; the reported usage is not rounded to construct that deadline.
+checks are unchanged; the wall-clock **deadline** is seeded from the exact,
+unrounded fractional remaining duration, so queued and HITL time consume the
+budget at sub-second precision. The reported usage is not rounded to
+construct that deadline.
 Subsequent wall-clock changes cannot alter either live enforcement or usage.
 Amounts are sampled when the checkpoint/error or interaction marker is built,
 including any elapsed cooperative grace already spent. They are observations,
