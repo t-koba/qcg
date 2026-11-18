@@ -91,7 +91,9 @@ fn resolve_otlp_config_values(
 /// Durable outcomes map to span status via [`span_status_for_event`]: failed
 /// and check_failed outcomes are ERROR, success stays OK, and
 /// cancel/interrupt/undecided are ERROR with cause attributes (F11) so a
-/// failure is never displayed as OK.
+/// failure is never displayed as OK. `operation_finished` also carries a
+/// durable per-event outcome in its payload; it maps only that event's span,
+/// while enclosing run/step spans still rely on terminal markers.
 pub(crate) fn trace_payload(run_id: &str, events: &[Value]) -> Result<Value, String> {
     let mut spans = Vec::with_capacity(events.len());
     for event in events {
@@ -174,14 +176,22 @@ fn string_attribute(key: &str, value: &str) -> Value {
 /// short message derived from the stored reason. OK is explicit rather than
 /// Unset: for a generic event it means the event indicates no failure, not
 /// confirmed run/step completion; only terminal markers carry a durable
-/// outcome. Terminal success is a validated result, which the Stable Trace
-/// API permits as Ok.
+/// run/step outcome. `operation_finished` carries a durable per-event outcome
+/// in its payload, mapped only for its own span; the enclosing run/step spans
+/// are unaffected. Terminal success is a validated result, which the Stable
+/// Trace API permits as Ok.
 fn span_status_for_event(kind: &str, event: &Value) -> (u8, Option<String>) {
     let status = event.get("status").and_then(Value::as_str).unwrap_or("");
     // Legacy terminal markers and internal failure markers always signal an
     // error outcome, matching the CLI trace exporter's status mapping.
     if api::is_failure_event_kind(kind) {
         return (2, reason_message(event).or_else(|| Some(kind.to_string())));
+    }
+    if api::failed_operation_attempt(kind, event) {
+        return (
+            2,
+            reason_message(event).or_else(|| Some(status.to_string())),
+        );
     }
     match kind {
         "run_finished" => match status {
@@ -646,6 +656,52 @@ mod tests {
             let span = &payload["resourceSpans"][0]["scopeSpans"][0]["spans"][0];
             assert_eq!(span["status"]["code"], 2, "{kind} must be ERROR");
             assert_eq!(span["status"]["message"], "boom: stopped", "{kind} reason");
+        }
+    }
+
+    #[test]
+    fn operation_finished_maps_only_failed_attempts_to_error() {
+        let events = ["success", "clean", "indeterminate"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, status)| {
+                let mut event = json!({
+                    "t": "operation_finished", "seq": index + 1,
+                    "ts": format!("2026-01-01T00:00:0{index}Z"),
+                    "run_id": "run-1", "trace_id": "ab".repeat(16),
+                    "span_id": format!("{:016x}", index + 1),
+                    "node": "build", "operation_id": format!("op-{index}"),
+                    "status": status,
+                });
+                // The writer stores a failure reason as a plain string; it has
+                // no structured code, so error.type must fall back to the kind.
+                if status != "success" {
+                    event["reason"] = Value::String("effect failed".to_string());
+                }
+                event
+            })
+            .collect::<Vec<_>>();
+        let payload = trace_payload("run-1", &events).expect("records should map");
+        let spans = payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+            .as_array()
+            .expect("spans");
+        let error_type = |span: &Value| {
+            span["attributes"]
+                .as_array()
+                .expect("attributes")
+                .iter()
+                .find(|attribute| attribute["key"] == "error.type")
+                .and_then(|attribute| attribute["value"]["stringValue"].as_str())
+                .map(str::to_owned)
+        };
+        for (span, (expected_code, expected_error_type)) in spans.iter().zip([
+            (1_u64, None),
+            (2_u64, Some("operation_finished")),
+            (2_u64, Some("operation_finished")),
+        ]) {
+            assert_eq!(span["name"], "event operation_finished");
+            assert_eq!(span["status"]["code"], expected_code);
+            assert_eq!(error_type(span).as_deref(), expected_error_type);
         }
     }
 

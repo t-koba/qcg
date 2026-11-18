@@ -1203,6 +1203,31 @@ mod tests {
     }
 
     #[test]
+    fn failed_operation_attempt_is_payload_driven_and_fails_closed() {
+        // A mixed-outcome kind stays out of FAILURE_EVENT_KINDS: a successful
+        // attempt is not a failure, so its own payload decides the mapping.
+        assert!(!is_failure_event_kind("operation_finished"));
+        assert!(!failed_operation_attempt(
+            "operation_finished",
+            &json!({ "status": "success" })
+        ));
+        for status in ["clean", "indeterminate", "unknown"] {
+            assert!(
+                failed_operation_attempt("operation_finished", &json!({ "status": status })),
+                "`{status}` must be a failed attempt"
+            );
+        }
+        assert!(failed_operation_attempt(
+            "operation_finished",
+            &json!({ "reason": "no status" })
+        ));
+        assert!(!failed_operation_attempt(
+            "step_finished",
+            &json!({ "status": "clean" })
+        ));
+    }
+
+    #[test]
     fn error_type_prefers_reason_code_and_falls_back_to_kind() {
         assert_eq!(
             error_type_for("audit_degraded", &json!({})),

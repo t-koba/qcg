@@ -87,6 +87,49 @@ fn seed_failed_step_run(root: &Utf8PathBuf, id: &str) {
     drop(journal);
 }
 
+fn seed_operation_attempts_run(root: &Utf8PathBuf, id: &str) {
+    let meta = root.join("runs").join(id).join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0",
+                "generator_path": "demo",
+                "contract_sha256": "test",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock",
+                "retention_days": 10,
+            }),
+        )
+        .unwrap();
+    for (index, status) in ["success", "clean", "indeterminate"]
+        .into_iter()
+        .enumerate()
+    {
+        let mut payload = json!({
+            "node": "build",
+            "operation_id": format!("op-{index}"),
+            "status": status,
+        });
+        if status != "success" {
+            payload["reason"] = json!("effect failed");
+        }
+        journal.event("operation_finished", payload).unwrap();
+    }
+    journal
+        .event(
+            "run_finished",
+            json!({ "status": "success", "metrics": {} }),
+        )
+        .unwrap();
+    drop(journal);
+}
+
 fn trace(root: &Utf8PathBuf, id: &str) -> Value {
     let output = Command::new(env!("CARGO_BIN_EXE_qcg"))
         .args(["runs", "trace", id, "--runs-dir"])
@@ -101,6 +144,15 @@ fn trace(root: &Utf8PathBuf, id: &str) -> Value {
         String::from_utf8_lossy(&output.stderr)
     );
     serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn spans_named<'a>(payload: &'a Value, name: &str) -> Vec<&'a Value> {
+    payload["resourceSpans"][0]["scopeSpans"][0]["spans"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|span| span["name"] == name)
+        .collect()
 }
 
 fn span<'a>(payload: &'a Value, name: &str) -> &'a Value {
@@ -568,6 +620,48 @@ fn elapsed_breach_exports_error_without_terminal_run_span() {
         span_code(&payload, &format!("run {id}")),
         0,
         "root span stays UNSET with no terminal outcome"
+    );
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn operation_attempts_map_only_their_own_spans() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "runs-trace-operation-attempts-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let id = "operation-attempts-run";
+    seed_operation_attempts_run(&root, id);
+
+    let payload = trace(&root, id);
+    let attempts = spans_named(&payload, "event operation_finished");
+    assert_eq!(attempts.len(), 3, "one span per journaled attempt");
+    for (span, (expected_code, expected_error_type)) in attempts.into_iter().zip([
+        (1_u64, None),
+        (2_u64, Some("operation_finished")),
+        (2_u64, Some("operation_finished")),
+    ]) {
+        assert_eq!(span["status"]["code"].as_u64(), Some(expected_code));
+        let error_type = span["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|attribute| attribute["key"] == "error.type")
+            .map(|attribute| attribute["value"]["stringValue"].as_str().unwrap());
+        assert_eq!(error_type, expected_error_type);
+    }
+    assert_eq!(
+        span_code(&payload, "step build"),
+        1,
+        "enclosing step span stays OK"
+    );
+    assert_eq!(
+        span_code(&payload, &format!("run {id}")),
+        1,
+        "root span stays OK"
     );
 
     std::fs::remove_dir_all(root).unwrap();

@@ -120,6 +120,19 @@ pub fn error_type_for(kind: &str, data: &Value) -> String {
         .to_owned()
 }
 
+/// Reports whether an event records a failed external-operation attempt.
+///
+/// `operation_finished` is a mixed-outcome kind and stays OUT of
+/// `FAILURE_EVENT_KINDS`: a successful attempt is not a failure. Only the
+/// payload `status` decides, fail-closed like the engine's state fold, so a
+/// missing or unknown status counts as a failure. The enclosing step/run
+/// outcome is mapped separately from terminal markers and is not changed.
+/// Both OTLP trace exporters share this helper so one journal cannot report
+/// different attempt outcomes.
+pub fn failed_operation_attempt(kind: &str, data: &Value) -> bool {
+    kind == "operation_finished" && data.get("status").and_then(Value::as_str) != Some("success")
+}
+
 impl<'de> Deserialize<'de> for RunEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

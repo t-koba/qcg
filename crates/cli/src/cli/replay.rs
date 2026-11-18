@@ -224,9 +224,13 @@ pub(crate) async fn export_run_trace(
         if let Some(node) = event.path.as_ref().map(model::NodePath::as_str) {
             attributes.push(otlp_string_attribute("node.id", node));
         }
-        let status_code = event_status_code(kind, &event.data);
+        let data = serde_json::to_value(&event.data)?;
+        let status_code = if api::failed_operation_attempt(kind, &data) {
+            2
+        } else {
+            event_status_code(kind, &event.data)
+        };
         if status_code == 2 {
-            let data = serde_json::to_value(&event.data)?;
             attributes.push(otlp_string_attribute(
                 "error.type",
                 &api::error_type_for(kind, &data),
@@ -299,8 +303,11 @@ pub(crate) async fn export_run_trace(
 /// is not terminal and does not decide the run's own status. OK is explicit
 /// rather than Unset: for a generic event it means the event indicates no
 /// failure, not confirmed run/step completion; only `run_finished` and
-/// `step_finished` carry a durable terminal outcome. Terminal success is a
-/// validated result, which the Stable Trace API permits as Ok.
+/// `step_finished` carry a durable terminal outcome. `operation_finished`
+/// carries a durable per-event outcome in its payload, mapped only for its
+/// own span; the enclosing run/step spans still rely on terminal markers.
+/// Terminal success is a validated result, which the Stable Trace API permits
+/// as Ok.
 fn event_status_code(kind: &str, data: &api::RunEventData) -> u8 {
     if api::is_failure_event_kind(kind) {
         return 2;
