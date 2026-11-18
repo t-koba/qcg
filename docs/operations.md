@@ -1217,11 +1217,15 @@ Unattended limits:
   deletion or failure counts are not exported; alert thresholds live outside.
 - OTLP export exists in implementation (`OTLP_ENDPOINT`,
   `OTLP_INTERVAL_MS`, best-effort) and `qcg runs trace` builds
-  hierarchical spans, but no SLO is defined here. Both exporters emit one
-  span per recorded event with the same status and error semantics; `qcg runs
-  trace` additionally synthesizes a run span and per-node step spans for
-  offline inspection, which the streaming server export does not. Treat
-  traces as mechanism facts for external analysis.
+  hierarchical spans, but no SLO is defined here. For a valid event both
+  exporters emit one span and agree on the status code (OK or ERROR) and, on
+  ERROR, the `error.type` attribute. The streaming server additionally sets
+  `status.message` and outcome/reason detail attributes; `qcg runs trace`
+  does not. An OK status means that event indicates no failure, not that the
+  run or step completed successfully. `qcg runs trace` also synthesizes a run
+  span and per-node step spans for offline inspection, which the streaming
+  server export does not. Treat traces as mechanism facts for external
+  analysis.
 
 ## Priority scheduling and preemption
 
