@@ -2,13 +2,16 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { pathToFileURL } from "node:url";
 
-// Exact-ID exception per project policy, not a broad suppression: picomatch
-// <=4.0.7 is dev-only in this private demo generator with zero runtime deps.
-// As of 2026-11-17 there is no patched release; npm's only proposed fix is a
-// Vitest 4 -> 3 downgrade, which we reject. Every other moderate-or-higher
-// advisory fails the gate. Remove this exception when patched picomatch
-// (>4.0.7) is available.
-const allowlist = new Set(["GHSA-fc5q-39xc-vjpf"]);
+// Exact-ID exceptions per project policy, not broad suppressions. Each entry
+// is a time-boxed, reviewable record: once its review date passes the gate
+// fails closed and forces re-triage, so a suppression cannot quietly become
+// permanent. Every other moderate-or-higher advisory always fails the gate.
+const exceptions = [{
+  id: "GHSA-fc5q-39xc-vjpf",
+  reason: "picomatch <=4.0.7 is dev-only in this private demo generator with zero runtime deps; as of 2026-11-18 there is no patched release and npm's only proposed fix is a rejected Vitest 4 -> 3 downgrade",
+  owner: "qcg maintainers",
+  reviewBy: "2027-05-18",
+}];
 const severities = ["info", "low", "moderate", "high", "critical"];
 
 function isPlainObject(value) {
@@ -27,9 +30,29 @@ function advisoryId(url, advisory) {
   return ghsa ? `GHSA-${ghsa[1].toLowerCase()}` : advisory.url;
 }
 
-export function evaluateAudit(report, exceptions = allowlist, auditStatus = 0) {
+export function evaluateAudit(report, exceptionEntries = exceptions, auditStatus = 0, now = new Date()) {
   const invalid = (error) => ({ ok: false, blocking: [], ignored: [], error });
   if (!isPlainObject(report)) return invalid("expected a JSON object");
+  if (!Array.isArray(exceptionEntries)) return invalid("expected an exception list");
+  if (!(now instanceof Date) || Number.isNaN(now.getTime())) return invalid("invalid current date");
+  const activeExceptions = new Set();
+  for (const entry of exceptionEntries) {
+    if (!isPlainObject(entry) || typeof entry.id !== "string" ||
+        !/^GHSA-[a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4}$/i.test(entry.id) ||
+        typeof entry.reason !== "string" || !entry.reason.trim() ||
+        typeof entry.owner !== "string" || !entry.owner.trim() ||
+        typeof entry.reviewBy !== "string" || !/^\d{4}-\d{2}-\d{2}$/.test(entry.reviewBy)) {
+      return invalid("invalid audit exception entry");
+    }
+    const reviewBy = new Date(`${entry.reviewBy}T00:00:00Z`);
+    if (Number.isNaN(reviewBy.getTime()) || reviewBy.toISOString().slice(0, 10) !== entry.reviewBy) {
+      return invalid(`invalid review date for audit exception ${entry.id}`);
+    }
+    if (now >= reviewBy) {
+      return invalid(`audit exception ${entry.id} expired on ${entry.reviewBy}; re-triage required`);
+    }
+    activeExceptions.add(`GHSA-${entry.id.slice(5).toLowerCase()}`);
+  }
   if (Object.hasOwn(report, "error")) return invalid("npm audit reported an error");
   if (report.auditReportVersion !== 2) return invalid("expected audit report version 2");
   if (!isPlainObject(report.vulnerabilities)) return invalid("expected a vulnerabilities object");
@@ -64,7 +87,7 @@ export function evaluateAudit(report, exceptions = allowlist, auditStatus = 0) {
       const atThreshold = rank >= threshold;
       hasThresholdAdvisory ||= atThreshold;
       const id = advisoryId(url, advisory);
-      if (exceptions.has(id)) ignored.add(id);
+      if (activeExceptions.has(id)) ignored.add(id);
       else if (atThreshold) {
         blocking.set(id, { id, package: name, title: advisory.title, severity: advisory.severity });
       }
@@ -85,6 +108,7 @@ export function evaluateAudit(report, exceptions = allowlist, auditStatus = 0) {
 }
 
 function selfTest() {
+  const TEST_NOW = new Date("2026-11-18T00:00:00Z");
   const excepted = "GHSA-fc5q-39xc-vjpf";
   const fresh = "GHSA-aaaa-bbbb-cccc";
   const advisory = (id, severity) => ({
@@ -128,14 +152,33 @@ function selfTest() {
       false, [fresh], [], undefined, 1],
   ];
   for (const [name, input, ok, blocking = [], ignored = [], error, status] of cases) {
-    const actual = evaluateAudit(input, undefined, status);
+    const actual = evaluateAudit(input, undefined, status, TEST_NOW);
     assert.equal(actual.ok, ok, name);
     assert.deepEqual(actual.blocking.map(({ id }) => id), blocking, name);
     assert.deepEqual(actual.ignored, ignored, name);
     if (error) assert.match(actual.error, error, name);
     else assert.equal(actual.error, undefined, name);
   }
-  console.log(`audit self-test: ${cases.length} passed`);
+  const validEntry = exceptions[0];
+  const expired = { ...validEntry, reviewBy: "2026-11-17" };
+  const malformed = [
+    null,
+    {},
+    { ...validEntry, id: "not-a-ghsa" },
+    { ...validEntry, reason: "  " },
+    { ...validEntry, owner: "" },
+    { ...validEntry, reviewBy: undefined },
+    { ...validEntry, reviewBy: "2026-02-30" },
+  ];
+  assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, TEST_NOW).ok, true, "in-date exception");
+  assert.match(evaluateAudit(report({ picomatch }), [expired], 0, TEST_NOW).error, /expired/, "expired exception fails closed");
+  assert.match(evaluateAudit(report({ picomatch }), [validEntry], 0, new Date("2027-05-18T00:00:00Z")).error, /expired/, "expiry boundary fails closed");
+  for (const [index, entry] of malformed.entries()) {
+    assert.equal(evaluateAudit(report({ picomatch }), [entry], 0, TEST_NOW).ok, false, `malformed exception ${index}`);
+  }
+  assert.equal(evaluateAudit(report({ picomatch }), "not-a-list", 0, TEST_NOW).ok, false, "exception list must be an array");
+  assert.equal(evaluateAudit(report({ picomatch }), [validEntry], 0, "not-a-date").ok, false, "invalid now fails closed");
+  console.log(`audit self-test: ${cases.length} table cases + exception-entry cases passed`);
 }
 
 function fail(message) {
