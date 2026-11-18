@@ -189,10 +189,7 @@ pub(crate) async fn export_run_trace(
         let Some(node) = node else {
             continue;
         };
-        if matches!(
-            event.kind.as_str(),
-            "step_finished" | "step_interrupted" | "step_timeout" | "hook_failed"
-        ) {
+        if api::is_failure_event_kind(&event.kind) || event.kind == "step_finished" {
             step_codes.insert(
                 node.to_string(),
                 event_status_code(&event.kind, &event.data),
@@ -293,15 +290,7 @@ pub(crate) async fn export_run_trace(
 /// matches the resident OTLP exporter's mapping. A recoverable step failure
 /// is not terminal and does not decide the run's own status.
 fn event_status_code(kind: &str, data: &api::RunEventData) -> u8 {
-    if matches!(
-        kind,
-        "run_error"
-            | "run_canceled"
-            | "run_interrupted"
-            | "step_interrupted"
-            | "step_timeout"
-            | "hook_failed"
-    ) {
+    if api::is_failure_event_kind(kind) {
         return 2;
     }
     match data {

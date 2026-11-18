@@ -82,6 +82,30 @@ pub fn is_terminal_event_kind(kind: &str) -> bool {
     TERMINAL_EVENT_KINDS.contains(&kind)
 }
 
+/// Event kinds that record an error outcome even when the run later recovers.
+/// OTLP trace exporters share this list so one journal is never reported as OK
+/// by one exporter and ERROR by another. Run/step outcome fields are mapped
+/// separately from kind.
+pub const FAILURE_EVENT_KINDS: &[&str] = &[
+    "run_error",
+    "run_canceled",
+    "run_interrupted",
+    "hook_failed",
+    "step_interrupted",
+    "step_timeout",
+    "agent_failed",
+    "guardrail_error",
+    "guardrail_tripwire",
+    "llm_validation_failed",
+    "llm_route_failed",
+    "out_of_contract",
+];
+
+/// Reports whether a run-event kind records a failure outcome.
+pub fn is_failure_event_kind(kind: &str) -> bool {
+    FAILURE_EVENT_KINDS.contains(&kind)
+}
+
 impl<'de> Deserialize<'de> for RunEvent {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where

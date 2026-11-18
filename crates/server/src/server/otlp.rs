@@ -170,15 +170,7 @@ fn span_status_for_event(kind: &str, event: &Value) -> (u8, Option<String>) {
     let status = event.get("status").and_then(Value::as_str).unwrap_or("");
     // Legacy terminal markers and internal failure markers always signal an
     // error outcome, matching the CLI trace exporter's status mapping.
-    if matches!(
-        kind,
-        "run_error"
-            | "run_canceled"
-            | "run_interrupted"
-            | "hook_failed"
-            | "step_timeout"
-            | "step_interrupted"
-    ) {
+    if api::is_failure_event_kind(kind) {
         return (2, reason_message(event).or_else(|| Some(kind.to_string())));
     }
     match kind {
@@ -633,7 +625,7 @@ mod tests {
 
     #[test]
     fn internal_failure_markers_export_as_error() {
-        for kind in ["hook_failed", "step_timeout", "step_interrupted"] {
+        for kind in api::FAILURE_EVENT_KINDS {
             let events = vec![json!({
                 "t": kind, "seq": 1, "ts": "2026-01-01T00:00:00Z",
                 "run_id": "run-1", "trace_id": "ab".repeat(16),

@@ -247,6 +247,65 @@ fn failed_hook_exports_error_on_its_step_span() {
 }
 
 #[test]
+fn llm_validation_failure_exports_error_on_event_and_step_spans() {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .unwrap()
+        .join(format!(
+            "runs-trace-validation-failed-{}",
+            uuid::Uuid::now_v7()
+        ));
+    let id = "validation-failed-run";
+    let meta = root.join("runs").join(id).join("meta");
+    std::fs::create_dir_all(&meta).unwrap();
+    let journal =
+        engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+    journal
+        .event(
+            "run_started",
+            json!({
+                "generator": "demo@1.0.0",
+                "generator_path": "demo",
+                "contract_sha256": "test",
+                "inputs": {},
+                "resource_hashes": [],
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": "wall_clock",
+                "retention_days": 10,
+            }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "step_started",
+            json!({ "node": "build", "type": "llm", "attempt": 1 }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "llm_validation_failed",
+            json!({ "node": "build", "attempt": 1, "message": "bad output" }),
+        )
+        .unwrap();
+    journal
+        .event(
+            "run_finished",
+            json!({ "status": "success", "metrics": {} }),
+        )
+        .unwrap();
+    drop(journal);
+
+    let payload = trace(&root, id);
+    assert_eq!(
+        span_code(&payload, "event llm_validation_failed"),
+        2,
+        "validation event span"
+    );
+    assert_eq!(span_code(&payload, "step build"), 2, "validation step span");
+
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn recovered_step_uses_its_last_outcome_for_the_step_span() {
     let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
         .unwrap()
