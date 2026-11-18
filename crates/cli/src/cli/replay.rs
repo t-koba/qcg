@@ -138,6 +138,14 @@ pub(crate) async fn export_run_trace(
     let trace_id = first.trace_id.clone();
     let start = event_time_unix_nano(first)?;
     let end = event_time_unix_nano(last)?.max(start + 1);
+    // The root span reflects the run's durable settlement, not any single
+    // recoverable step failure. The last terminal event decides it.
+    let run_status_code = events
+        .iter()
+        .rev()
+        .find(|event| api::is_terminal_event_kind(&event.kind))
+        .map(|event| event_status_code(&event.kind, &event.data))
+        .unwrap_or(1);
     let run_span_id = api::span_id_for_scope(id, "run");
     let mut spans = vec![json!({
         "traceId": trace_id,
@@ -147,7 +155,7 @@ pub(crate) async fn export_run_trace(
         "startTimeUnixNano": start.to_string(),
         "endTimeUnixNano": end.to_string(),
         "attributes": [otlp_string_attribute("run.id", id)],
-        "status": { "code": 1 }
+        "status": { "code": run_status_code }
     })];
     let mut node_ranges = BTreeMap::<String, (u128, u128)>::new();
     for event in &events {
@@ -197,9 +205,7 @@ pub(crate) async fn export_run_trace(
             "startTimeUnixNano": timestamp.to_string(),
             "endTimeUnixNano": timestamp.saturating_add(1).to_string(),
             "attributes": attributes,
-            "status": {
-                "code": if matches!(kind, "run_error" | "run_canceled") { 2 } else { 1 }
-            }
+            "status": { "code": event_status_code(kind, &event.data) }
         }));
     }
     let payload = json!({
@@ -248,6 +254,24 @@ pub(crate) async fn export_run_trace(
         }
     }
     Ok(())
+}
+
+/// OTLP span status (1 = OK, 2 = ERROR) for a run event. Terminal failure
+/// markers are ERROR; a `run_finished` uses its durable `status` so a failed
+/// run is never exported as OK, matching the resident OTLP exporter. A
+/// recoverable step failure is not terminal and does not decide the run's
+/// status.
+fn event_status_code(kind: &str, data: &api::RunEventData) -> u8 {
+    if matches!(kind, "run_error" | "run_canceled" | "run_interrupted") {
+        return 2;
+    }
+    match data {
+        api::RunEventData::RunFinished(data) => match data.status {
+            api::RunCompletionStatus::Success => 1,
+            api::RunCompletionStatus::Failed => 2,
+        },
+        _ => 1,
+    }
 }
 
 fn event_time_unix_nano(event: &api::RunEvent) -> Result<u128> {
