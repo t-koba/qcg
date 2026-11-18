@@ -1180,9 +1180,16 @@ mod tests {
         // foreach node's own `step_finished`; neither records an unhandled
         // failed operation. Terminal kind markers carry outcomes in their
         // status field, not in the kind, so they must not enter this set.
+        // Tool-call events are observations or settled facts: `tool_call` is
+        // observation-only (its durable carrier is elsewhere), and
+        // `mcp_cleanup_settled` records a cleanup failure that is deliberately
+        // settled under policy while preserving the execution status. Neither
+        // is an unhandled failed operation, so neither exports as ERROR.
         for kind in [
             STREAM_ERROR_KIND,
             "foreach_budget_exhausted",
+            "tool_call",
+            "mcp_cleanup_settled",
             "run_finished",
             "step_finished",
             "step_started",
