@@ -51,18 +51,19 @@ pub(crate) enum Token {
 /// rather than stated approximately.
 fn parse_number_literal(literal: &str) -> Result<serde_json::Number, ExprError> {
     if !literal.contains(['.', 'e', 'E']) {
-        match serde_json::from_str::<serde_json::Number>(literal) {
-            Ok(number) if number.is_i64() || number.is_u64() => return Ok(number),
-            // The JSON number type holds an integer only up to 2^64-1; a
-            // larger literal would arrive as a rounded double, so it is
-            // refused instead of stated approximately.
-            Ok(_) => {
-                return Err(ExprError::Syntax(format!(
-                    "integer literal `{literal}` is out of range"
-                )));
-            }
-            Err(_) => {}
-        }
+        // Parse digit-only literals directly as an exact unsigned integer.
+        // Strict JSON parsing would reject a leading zero (`007`) and fall
+        // through to the lossy f64 path below, rounding an integer above 2^53
+        // into its neighbour before any comparison sees it. Rust's u64 parse
+        // keeps leading zeros while staying exact, and a sign is never part of
+        // this token (the lexer emits `-` as a separate operator). A magnitude
+        // beyond u64 is refused rather than stated approximately.
+        return literal
+            .parse::<u64>()
+            .map(serde_json::Number::from)
+            .map_err(|_| {
+                ExprError::Syntax(format!("integer literal `{literal}` is out of range"))
+            });
     }
     let value = literal
         .parse::<f64>()

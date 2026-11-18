@@ -337,6 +337,9 @@ mod tests {
             ("inputs.big < inputs.smaller", false),
             ("inputs.big == 9007199254740993", true),
             ("9007199254740993 == 9007199254740992", false),
+            // A leading zero must not degrade an exact integer to f64.
+            ("09007199254740993 == 9007199254740992", false),
+            ("09007199254740993 == 9007199254740993", true),
             ("-9007199254740993 == -9007199254740992", false),
             ("-9007199254740993 != -9007199254740992", true),
         ] {
@@ -557,12 +560,17 @@ mod tests {
         // A literal above the JSON number type's integer range would
         // arrive as a rounded double, so it is refused rather than stated
         // approximately.
-        assert!(
-            value_bag()
-                .eval_value("18446744073709551617 == 18446744073709551616")
-                .is_err(),
-            "an out-of-range integer literal should fail"
-        );
+        for expression in [
+            "18446744073709551617 == 18446744073709551616",
+            // A leading zero must not reopen the lossy f64 fallback for a
+            // magnitude the exact integer path refuses.
+            "018446744073709551617 == 18446744073709551616",
+        ] {
+            assert!(
+                value_bag().eval_value(expression).is_err(),
+                "an out-of-range integer literal should fail for `{expression}`"
+            );
+        }
     }
 
     #[test]
