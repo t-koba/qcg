@@ -9,4 +9,4 @@ export PATH="$verification_venv/bin:$PATH"
 npm --prefix frontend/generator ci
 bash scripts/check-core.sh
 bash scripts/check-demo-local.sh --dependencies-installed
-npm --prefix frontend/generator audit --audit-level=moderate
+npm --prefix frontend/generator run audit:gate && npm --prefix frontend/generator run audit:self-test

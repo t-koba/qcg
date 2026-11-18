@@ -8,7 +8,7 @@ import { pathToFileURL } from "node:url";
 // Vitest 4 -> 3 downgrade, which we reject. Every other moderate-or-higher
 // advisory fails the gate. Remove this exception when patched picomatch
 // (>4.0.7) is available.
-const allowlist = new Map([["GHSA-fc5q-39xc-vjpf", "CVE-2026-112366"]]);
+const allowlist = new Set(["GHSA-fc5q-39xc-vjpf"]);
 const severities = ["info", "low", "moderate", "high", "critical"];
 
 function isPlainObject(value) {
@@ -17,16 +17,14 @@ function isPlainObject(value) {
   return prototype === Object.prototype || prototype === null;
 }
 
-function advisoryId(url, advisory, exceptions) {
-  // A GHSA in the canonical URL takes precedence over CVEs cited in the text.
+function advisoryId(url, advisory) {
+  // Only a canonical GitHub Advisory URL can match an exception. A CVE id in
+  // free text is not an identity: a different advisory that merely cites the
+  // excepted CVE must stay blocking. Noncanonical URLs are classified by their
+  // raw URL, which cannot equal an exact GHSA id.
   const ghsa = url.origin === "https://github.com" &&
     /^\/advisories\/GHSA-([a-z0-9]{4}-[a-z0-9]{4}-[a-z0-9]{4})\/?$/i.exec(url.pathname);
-  if (ghsa) return `GHSA-${ghsa[1].toLowerCase()}`;
-  for (const [id, cve] of exceptions) {
-    if ([advisory.cve, advisory.title].some((text) =>
-      typeof text === "string" && text.toUpperCase().match(/\bCVE-\d{4}-\d+\b/g)?.includes(cve))) return id;
-  }
-  return advisory.url;
+  return ghsa ? `GHSA-${ghsa[1].toLowerCase()}` : advisory.url;
 }
 
 export function evaluateAudit(report, exceptions = allowlist) {
@@ -53,7 +51,7 @@ export function evaluateAudit(report, exceptions = allowlist) {
           typeof advisory.title !== "string" || !advisory.title.trim()) {
         return invalid(`invalid advisory severity, URL, or title for ${name}`);
       }
-      const id = advisoryId(url, advisory, exceptions);
+      const id = advisoryId(url, advisory);
       if (exceptions.has(id)) ignored.add(id);
       else if (rank >= severities.indexOf("moderate")) {
         blocking.set(id, { id, package: name, title: advisory.title, severity: advisory.severity });
@@ -81,9 +79,9 @@ function selfTest() {
     }), false, [fresh], [excepted]],
     ["new moderate", report({ other: { via: [advisory(fresh, "moderate")] } }), false, [fresh]],
     ["below threshold", report({ other: { via: [advisory(fresh, "info"), advisory(fresh, "low")] } }), true],
-    ["CVE in title", report({ picomatch: { via: [fallback] } }), true, [], [excepted]],
-    ["CVE field", report({ picomatch: { via: [{ ...fallback, title: "Issue", cve: "CVE-2026-112366" }] } }), true, [], [excepted]],
-    ["nonmatching CVE", report({ picomatch: { via: [{ ...fallback, title: "Issue CVE-2026-1123660" }] } }), false, [fallback.url]],
+    ["CVE in title is not an identity", report({ picomatch: { via: [fallback] } }), false, [fallback.url]],
+    ["CVE field is not an identity", report({ picomatch: { via: [{ ...fallback, title: "Issue", cve: "CVE-2026-112366" }] } }), false, [fallback.url]],
+    ["different id citing CVE is blocked", report({ picomatch: { via: [{ severity: "high", url: "https://example.test/a", title: "Issue CVE-2026-112366", cve: ["CVE-2026-112366"] }] } }), false, ["https://example.test/a"]],
     ["missing vulnerabilities", { auditReportVersion: 2 }, false, [], [], /vulnerabilities/],
     ["npm error", { ...report({}), error: null }, false, [], [], /reported an error/],
     ["wrong version", { ...report({}), auditReportVersion: 1 }, false, [], [], /version 2/],
