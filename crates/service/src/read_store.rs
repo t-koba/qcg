@@ -11,6 +11,7 @@ pub async fn with_acceptance_guard<T>(
     ACCEPTANCE_GUARD.scope(guard, work).await
 }
 
+use crate::file_info::{FileIdentity, file_identity};
 use crate::summaries::{run_identity_event, status_from_journal, status_name_from_state};
 use crate::{LocalService, ServiceError, run_meta_dir};
 use api::{ApiError, RunEvent};
@@ -57,21 +58,12 @@ fn value_memory(value: &Value) -> usize {
 struct Revision {
     len: u64,
     modified: SystemTime,
-    identity: Option<(u64, u64)>,
+    identity: Option<FileIdentity>,
 }
 impl Revision {
     fn of(file: &File) -> std::io::Result<Self> {
         let meta = file.metadata()?;
-        #[cfg(unix)]
-        let identity = {
-            use std::os::unix::fs::MetadataExt;
-            let inode = meta.ino();
-            (inode != 0).then_some((meta.dev(), inode))
-        };
-        #[cfg(windows)]
-        let identity = crate::invalidation::file_info(file)?.0;
-        #[cfg(not(any(unix, windows)))]
-        let identity = None;
+        let identity = file_identity(file, &meta)?;
         Ok(Self {
             len: meta.len(),
             modified: meta.modified()?,

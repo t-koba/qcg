@@ -1,3 +1,4 @@
+use crate::file_info::{FileIdentity, file_identity};
 use crate::package::ArtifactZipLimits;
 use crate::summaries::{run_meta_dir, run_workspace_dir};
 use crate::types::ServiceError;
@@ -7,7 +8,7 @@ use engine::open_artifact_file;
 use model::OutputManifest;
 use sha2::{Digest, Sha256};
 use std::cell::Cell;
-use std::fs::{File, Metadata};
+use std::fs::File;
 use std::io::{Cursor, Read as _, Write};
 use zip::write::SimpleFileOptions;
 
@@ -31,7 +32,7 @@ pub struct VerifiedArtifact {
     pub path: String,
     pub fs_path: Utf8PathBuf,
     workspace: Utf8PathBuf,
-    identity: (u64, u64),
+    identity: Option<FileIdentity>,
     pub bytes: u64,
     pub sha256: String,
 }
@@ -39,26 +40,18 @@ pub struct VerifiedArtifact {
 impl VerifiedArtifact {
     fn reader(&self) -> Result<File, ServiceError> {
         let file = open_artifact_file(&self.workspace, &self.path)?;
-        if file_identity(&file.metadata()?) != self.identity {
+        let identity = file
+            .metadata()
+            .and_then(|metadata| file_identity(&file, &metadata))
+            .ok()
+            .flatten();
+        if identity.is_none() || identity != self.identity {
             return Err(ServiceError::Invalid(format!(
                 "artifact `{}` changed after verification",
                 self.path
             )));
         }
         Ok(file)
-    }
-}
-
-fn file_identity(metadata: &Metadata) -> (u64, u64) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt as _;
-        (metadata.dev(), metadata.ino())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = metadata;
-        (0, 0)
     }
 }
 
@@ -105,7 +98,7 @@ pub(crate) fn verify_manifest_artifacts(
                 artifact.path, artifact.bytes
             )));
         }
-        let identity = file_identity(&metadata);
+        let identity = file_identity(&file, &metadata).ok().flatten();
         drop(file);
         verified.push(VerifiedArtifact {
             path: artifact.path.clone(),

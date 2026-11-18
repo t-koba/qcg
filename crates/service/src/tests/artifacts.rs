@@ -1547,11 +1547,13 @@ async fn bundle_artifact_changes_after_preparation_abort_archive() {
         .expect("restored digest must succeed");
     zip::ZipArchive::new(Cursor::new(restored)).expect("valid restored archive");
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     {
-        // Replace the inode without changing the bytes or their digest.
+        // Create the replacement before removing the original so their identities differ.
         let replacement = artifact.fs_path.with_file_name("replacement.txt");
         std::fs::write(&replacement, original).expect("write identical replacement");
+        #[cfg(windows)]
+        std::fs::remove_file(&artifact.fs_path).expect("remove verified artifact before rename");
         std::fs::rename(replacement, &artifact.fs_path).expect("replace verified artifact");
         let error = write_run_bundle_stream_with_limits(
             &parts,

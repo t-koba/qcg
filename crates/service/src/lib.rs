@@ -8,6 +8,7 @@ pub use package::{
 mod artifacts;
 mod effects;
 mod event_reader;
+mod file_info;
 pub use engine::run_counters;
 pub use event_reader::{EVENT_BATCH_BYTES, EVENT_BATCH_COUNT, EventBatch, EventCursor};
 mod catalog;
