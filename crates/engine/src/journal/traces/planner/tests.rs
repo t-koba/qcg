@@ -153,15 +153,22 @@ impl Fixture {
         Self::with_package(version, false).await
     }
     async fn with_package(version: Option<&'static str>, package: bool) -> Self {
-        Self::with_options(version, package, false).await
+        Self::with_options(version, package, false, false).await
     }
     async fn with_output_dependency() -> Self {
-        Self::with_options(Some("1"), false, true).await
+        Self::with_options(Some("1"), false, true, true).await
+    }
+    /// Same output read as `with_output_dependency`, but without `parallel`, so
+    /// the contract gives `b` an implicit `needs = ["a"]`. Together with `a`'s
+    /// reset gate on `b` that is a genuine cross-graph scheduling cycle.
+    async fn with_cyclic_output_dependency() -> Self {
+        Self::with_options(Some("1"), false, true, false).await
     }
     async fn with_options(
         version: Option<&'static str>,
         package: bool,
         output_dependency: bool,
+        parallel: bool,
     ) -> Self {
         let dir = crate::test_support::TestDir::create("source-diagnostic");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
@@ -208,7 +215,11 @@ type = "test.probe"
                 replaced, manifest,
                 "fixture alias must be included in its contract hash"
             );
-            manifest = format!("parallel = [\"a\", \"b\"]\n{replaced}");
+            manifest = if parallel {
+                format!("parallel = [\"a\", \"b\"]\n{replaced}")
+            } else {
+                replaced
+            };
         }
         std::fs::write(package_root.join(contract::MANIFEST_FILE), manifest).unwrap();
         let contract = Contract::load(&package_root).unwrap();
@@ -472,6 +483,17 @@ async fn retry_root_invalidates_success_that_read_its_missing_output() {
         }
         assert_ne!(original, payload_identity(&changed), "{field}");
     }
+}
+
+#[tokio::test]
+async fn cross_graph_reset_cycle_refuses_instead_of_stalling_child() {
+    // `a` reads b's output while absent, so its reset gate waits on `b`.
+    // With no `parallel`, the contract gives `b` an implicit needs=["a"], whose
+    // gate waits on `a`. Each graph is acyclic alone, but their union stalls the
+    // child with no runnable node. Analysis must refuse before admitting a child.
+    let f = Fixture::with_cyclic_output_dependency().await;
+    assert_eq!(f.contract.graph.nodes["b"].needs, ["a"]);
+    assert_eq!(f.analyze().unwrap_err(), Refusal::ResetDependency);
 }
 
 #[tokio::test]
@@ -1476,17 +1498,41 @@ async fn package_file_currentness_uses_exact_consumed_bytes_under_source_root() 
 }
 
 #[tokio::test]
+async fn mandatory_reset_needs_only_makes_unanimous_gates_cycle_edges() {
+    let f = Fixture::new().await;
+    let mut node = f.contract.graph.nodes["b"].clone();
+    // Single-need any_succeeded waits on that one need; multi-need has an
+    // alternative and must not be modeled as two mandatory edges.
+    node.needs = vec!["a".into()];
+    node.on_deps = contract::OnDeps::AnySucceeded;
+    assert_eq!(mandatory_reset_needs(&node), ["a"]);
+    node.needs = vec!["a".into(), "b".into()];
+    assert!(mandatory_reset_needs(&node).is_empty());
+    // all_succeeded and none_failed wait on every need.
+    node.on_deps = contract::OnDeps::AllSucceeded;
+    assert_eq!(mandatory_reset_needs(&node), ["a", "b"]);
+    node.on_deps = contract::OnDeps::NoneFailed;
+    assert_eq!(mandatory_reset_needs(&node), ["a", "b"]);
+}
+
+#[tokio::test]
 async fn reset_schedule_resolves_exact_captured_names_and_refuses_uncertain_edges() {
     let f = Fixture::new().await;
     let mut contract = f.contract.clone();
     for id in ["c", "preserved"] {
         let mut node = contract.graph.nodes["b"].clone();
         node.id = id.into();
+        // Clear the inherited implicit needs; this test is about captured read
+        // resolution, and a c->a needs edge would form a genuine cycle with a's
+        // captured read of c.
+        node.needs.clear();
         contract.graph.nodes.insert(id.into(), node);
     }
     contract.graph.nodes.get_mut("b").unwrap().output = Some("b_result".into());
-    // Scheduler needs are not evidence of value reads.
-    contract.graph.nodes.get_mut("b").unwrap().needs = vec!["a".into()];
+    // Scheduler needs are not evidence of value reads. Point at a preserved
+    // node so this fixture stays acyclic (a reads b; b needs a would be a real
+    // cross-graph deadlock, covered by its own test below).
+    contract.graph.nodes.get_mut("b").unwrap().needs = vec!["preserved".into()];
     let read = |owner: &str, path: &[&str], kind, identity| ReadDependency {
         owner: ReadOwner::Node(owner.into()),
         path: path.iter().map(|part| (*part).to_owned()).collect(),
