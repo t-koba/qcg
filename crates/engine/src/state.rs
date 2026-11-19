@@ -462,10 +462,12 @@ impl RunState {
         Self::fold_journal_through_with_limits_mode(path, through_seq, limits, true)
     }
 
-    /// Writer-only fold that can represent the single pre-queue reset
-    /// admission state. Writers must accept only its required `run_queued`
-    /// transition; ordinary recovery and replay use the strict fold above.
-    pub(crate) fn fold_journal_admission_with_limits(
+    /// Fold that can represent the single pre-queue reset admission state,
+    /// used by the journal writer and by fork preparation before the child's
+    /// `run_queued` event is appended. The caller must ensure the required
+    /// `run_queued` transition follows; ordinary recovery and replay use the
+    /// strict fold above.
+    pub fn fold_journal_admission_with_limits(
         path: &Utf8Path,
         limits: JournalLimits,
     ) -> Result<Self, crate::JournalError> {

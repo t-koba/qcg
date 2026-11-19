@@ -101,7 +101,13 @@ pub(super) fn proves_failed_history(
                     }
                     queued = true;
                 } else {
-                    if started || index != usize::from(queued) {
+                    // A service-owned ActiveExecution run opens its elapsed
+                    // ledger during admission, so `elapsed_accounted` records
+                    // may sit between run_queued and run_started. Only those
+                    // budget records are admitted in that window (see the
+                    // ElapsedAccounted arm); lifecycle/outcome order stays
+                    // strict and there is still exactly one run_started.
+                    if started || (index != 0 && !queued) {
                         return None;
                     }
                     started = true;
@@ -145,7 +151,12 @@ pub(super) fn proves_failed_history(
             }
             RunEventData::GraphResolved(_) | RunEventData::Resource(_)
                 if started && active.is_none() && settled.is_empty() => {}
-            RunEventData::ElapsedAccounted(_) if started => {}
+            // Elapsed ledger records are budget evidence, never outcomes.
+            // ActiveExecution service runs open the ledger after run_queued
+            // and before run_started; the final ledger is validated exactly
+            // by the planner's budget gate, so admitting the record here does
+            // not relax any outcome, effect or lifecycle proof.
+            RunEventData::ElapsedAccounted(_) if queued || started => {}
             RunEventData::RunFinished(api::RunFinishedEventData {
                 status: RunCompletionStatus::Failed,
                 ..

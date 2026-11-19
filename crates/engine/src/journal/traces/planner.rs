@@ -275,6 +275,15 @@ fn analyze_source(
         .iter()
         .find(|event| event["t"] == "run_started")
         .ok_or(Refusal::History)?["inputs"];
+    // The journal keeps the declared raw inputs, while steps execute with file
+    // inputs materialized to workspace-relative paths. Read evidence was
+    // captured against that view, so compare it against the same projection.
+    // Raw bytes remain bound by workspace_observation and journal identity;
+    // this is only the deterministic path projection the engine performs.
+    let raw_inputs: BTreeMap<String, Value> =
+        serde_json::from_value(original_inputs.clone()).map_err(|_| Refusal::InputIdentity)?;
+    let mut read_vars = state.vars.clone();
+    read_vars.set_inputs(materialized_input_view(contract, &raw_inputs)?);
     supported_state(state, contract)?;
     exact_budget(&state.budget)?;
     let mut folded = RunState::fold_values(events).map_err(|_| Refusal::History)?;
@@ -426,8 +435,7 @@ fn analyze_source(
                 limits.max_event_bytes,
             )?;
             unchanged &= match read.kind {
-                ReadKind::Lookup | ReadKind::Collection => state
-                    .vars
+                ReadKind::Lookup | ReadKind::Collection => read_vars
                     .matches_dependency(read)
                     .ok_or(Refusal::InputIdentity)?,
                 ReadKind::PackageFile | ReadKind::WorkspaceFile => {
@@ -924,6 +932,49 @@ fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
         return Err(Refusal::Budget);
     }
     Ok(())
+}
+
+/// Reproduce the engine's file-input path projection for read comparison.
+/// The declared bytes stay authoritative for all digest checks; this only
+/// restores the view the step actually observed when it captured reads.
+fn materialized_input_view(
+    contract: &Contract,
+    inputs: &BTreeMap<String, Value>,
+) -> Result<BTreeMap<String, Value>, Refusal> {
+    let mut view = inputs.clone();
+    for field in contract
+        .manifest
+        .inputs
+        .stages
+        .iter()
+        .flat_map(|stage| &stage.fields)
+        .filter(|field| field.kind == FieldType::File)
+    {
+        let Some(value) = inputs.get(&field.id) else {
+            continue;
+        };
+        let limit = contract
+            .manifest
+            .runtime
+            .file_input_limit_bytes
+            .ok_or(Refusal::Limit)?;
+        let file =
+            model::FileValue::from_value_with_limit(value, limit).map_err(|error| match error {
+                model::FileValueError::TooLarge { .. } => Refusal::Limit,
+                _ => Refusal::InputIdentity,
+            })?;
+        if !policy::is_safe_relative_path(&field.id)
+            || field.id.contains('/')
+            || !policy::is_safe_path_component(&file.name)
+        {
+            return Err(Refusal::InputIdentity);
+        }
+        view.insert(
+            field.id.clone(),
+            Value::String(format!("files/{}/{}", field.id, file.name)),
+        );
+    }
+    Ok(view)
 }
 
 /// Only admitted FileValues can explain workspace reads. This is a diagnostic

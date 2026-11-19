@@ -1148,7 +1148,12 @@ fn populate_checkpoint_fork(
     if let Some(projection) = trace_projection {
         projection.publish(&journal_path);
     }
-    let state = RunState::fold_journal(&journal_path).map_err(ServiceError::invalid)?;
+    // A reset-bound child journal ends at child_reset_overlay until its
+    // run_queued event is appended during admission; reset_queue_required is
+    // still set here. Fold with the pre-queue admission rule (trace restore
+    // included) so the persisted snapshot represents that pending state.
+    let state = RunState::fold_journal_admission_with_limits(&journal_path, limits)
+        .map_err(ServiceError::invalid)?;
     state
         .persist_atomic(&target_meta.join("state.json"))
         .map_err(ServiceError::invalid)?;

@@ -141,27 +141,100 @@ async fn continuation_refuses_non_failed_and_unsealed_sources_with_fixed_reasons
     );
 }
 
-/// A service-owned ActiveExecution run currently has a pre-start elapsed
-/// ledger record that the private source-history proof does not admit. The
-/// continuation path must fail closed here; widening that proof is a separate
-/// safety decision and is deliberately not done in this change.
+/// A real service-owned failed run (whose journal has a pre-start elapsed
+/// ledger record) must continue into a linked child that reuses every
+/// successful source outcome and reruns only the failed node, with the source
+/// journal left byte-identical.
 #[tokio::test]
 #[cfg(unix)]
-async fn continuation_fails_closed_on_unproven_service_history() {
+async fn continuation_creates_linked_child_preserving_successful_outcomes() {
     let root = temp_run_dir("continuation-history");
     let service = continuation_service(&root);
     let source_id = failed_source(&service, &root).await;
-    let refusal = service.continue_run(&source_id).await.unwrap_err();
+    let source_dir = service.run_dir_for(&source_id).await.expect("source dir");
+    let source_before = std::fs::read(source_dir.join("meta/journal.jsonl")).expect("journal");
+
+    let child_id = service
+        .continue_run(&source_id)
+        .await
+        .expect("service-owned failed run continues");
+    assert_ne!(child_id, source_id);
+
+    let child_dir = service.run_dir_for(&child_id).await.expect("child dir");
+    let journal = std::fs::read_to_string(child_dir.join("meta/journal.jsonl")).expect("journal");
+    let events = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .collect::<Vec<_>>();
+
+    let fork = events
+        .iter()
+        .find(|event| event["t"] == "run_forked")
+        .expect("run_forked");
+    assert_eq!(fork["source_run_id"], source_id);
+    assert_eq!(fork["source_contract_sha256"], events[0]["contract_sha256"]);
+
+    let overlay = events
+        .iter()
+        .find(|event| event["t"] == "child_reset_overlay")
+        .expect("child_reset_overlay");
+    let candidate = &overlay["overlay"]["candidate"];
+    assert_eq!(candidate["preserved_outcomes"], json!(["check_good"]));
+    assert_eq!(candidate["stale_outcomes"], json!([]));
+    assert_eq!(candidate["retry_roots"], json!(["check_bad"]));
     assert_eq!(
-        refusal,
-        ContinuationRefusal::Planning(engine::ContinuationRefusal::History)
+        candidate["reset_nodes"]
+            .as_object()
+            .expect("reset nodes")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["check_bad"]
     );
+    let budget = &candidate["inherited_budget"];
+    assert_eq!(budget["steps_executed"], 2);
+    assert_eq!(budget["steps_succeeded"], 1);
+    assert_eq!(budget["steps_failed"], 1);
+    assert_eq!(budget["budget_charged"], 2);
+
+    // The child is registered as a descendant and keeps the source private.
+    let fork_seq = fork["seq"].as_u64().expect("seq");
+    let child_queued = events
+        .iter()
+        .find(|event| event["t"] == "run_queued" && event["seq"].as_u64() > Some(fork_seq))
+        .expect("child run_queued");
+    assert_eq!(child_queued["parent_run_id"], source_id);
+    assert_eq!(
+        std::fs::read(source_dir.join("meta/journal.jsonl")).expect("journal"),
+        source_before,
+        "continuation must not modify the source run"
+    );
+
+    // The child executes only the reset node; the preserved success is reused.
+    wait_for_snapshot(&service, &child_id, RunStatus::Failed).await;
+    let child_journal =
+        std::fs::read_to_string(child_dir.join("meta/journal.jsonl")).expect("journal");
+    let child_events = child_journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .collect::<Vec<_>>();
+    let admission_seq = child_queued["seq"].as_u64().expect("seq");
+    let rerun = child_events
+        .iter()
+        .filter(|event| {
+            event["t"] == "step_started"
+                && event["seq"].as_u64().is_some_and(|seq| seq > admission_seq)
+        })
+        .map(|event| event["node"].as_str().unwrap_or(""))
+        .collect::<Vec<_>>();
+    assert_eq!(rerun, vec!["check_bad"]);
+
+    // Every refusal category stays fixed and redacted.
     for refusal in [
         ContinuationRefusal::Source,
         ContinuationRefusal::InFlight,
         ContinuationRefusal::Manifest,
         ContinuationRefusal::Admission,
-        refusal,
+        ContinuationRefusal::Planning(engine::ContinuationRefusal::History),
     ] {
         let reason = refusal.reason();
         assert!(!reason.is_empty());
