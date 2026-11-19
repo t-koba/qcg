@@ -599,9 +599,12 @@ needs = []
 retry = { max_attempts = 3, backoff_ms = 1000, timeout_secs = 60 }
 ```
 
-- `max_attempts`: total attempts including the first, 1 to 16 (default 1,
-  meaning no retry).
-- `backoff_ms`: fixed wait between attempts, up to 60000 (default 0).
+- `max_attempts`: total attempts including the first, from 1 up to the
+  deployment's `[operational_limits].retry_attempts` (default ceiling 16;
+  default contract value 1, meaning no retry).
+- `backoff_ms`: fixed wait between attempts, up to the deployment's
+  `[operational_limits].retry_backoff_ms` (default ceiling 60000; default
+  contract value 0).
 - `timeout_secs`: per-attempt execution timeout, at least 1 when set
   (omitted means no timeout).
 
@@ -4665,8 +4668,10 @@ network = ["api.search.tinyfish.ai"]
 
 The search-specific contract fields are `provider`, `max_results`, and
 `max_calls`. `provider` names a `[[search_provider]]` row; it is required when
-no explicit default is configured. `max_results` defaults to `5` and is
-limited to `20`, and `max_calls` defaults to `3` and is limited to `10`. The
+no explicit default is configured. `max_results` defaults to `5` and is limited by the deployment's
+`[operational_limits].web_search_results` (default ceiling `20`), and
+`max_calls` defaults to `3` and is limited by
+`[operational_limits].agent_tool_calls` (default ceiling `10`). The
 selected registry row owns the endpoint, query parameters, fixed headers, RFC
 6901 result mapping, and authentication. Those transport fields are not valid
 inline contract fields. The bundled API-key REST profile is named
@@ -4722,7 +4727,8 @@ side_effects = "none"
 The required fields are `name`, `kind`, `server`, and `tool`. `server` must
 match either a built-in public profile or an `[[mcp_server]]` row in the
 selected `providers.toml`; `tool` is the remote MCP name and is never chosen by
-the model. `max_calls` defaults to 3 and is limited to 10. For OAuth discovery,
+the model. `max_calls` defaults to 3 and is limited by the deployment's
+`[operational_limits].agent_tool_calls` (default ceiling 10). For OAuth discovery,
 `llm.agent` accepts `on_authorization_required = "fail" | "wait" | "degrade"`;
 the default is `fail`. The policy applies only to typed MCP authorization
 prerequisites. `wait` returns an empty authorization form; resume repeats
