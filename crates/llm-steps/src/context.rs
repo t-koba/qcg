@@ -1,4 +1,4 @@
-use contract::{ContextOverflowPolicy, DEFAULT_RETRY_PROMPT, LlmRequestPolicy, NodeDef};
+use contract::{ContextOverflowPolicy, LlmRequestPolicy, NodeDef};
 use engine::{ResultExt, StepContext, StepError};
 use llm::{ChatMessage, ChatRequest};
 use serde_json::json;
@@ -279,7 +279,7 @@ pub(crate) fn retry_prompt(
         let template = policy
             .retry_prompt
             .as_deref()
-            .unwrap_or(DEFAULT_RETRY_PROMPT);
+            .unwrap_or_else(|| contract::shipped_retry_prompt());
         let reads = ctx
             .vars
             .read_recorder()

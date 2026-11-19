@@ -1,7 +1,6 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use contract::{
-    CacheRetention, CacheWritePolicy, DEFAULT_AGENT_SYSTEM_GUARDRAIL,
-    DEFAULT_FILL_SYSTEM_GUARDRAIL, LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl,
+    CacheRetention, CacheWritePolicy, LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl,
 };
 use engine::{StepContext, StepError};
 use llm::{ChatContentPart, ChatMessage, ChatRequest, LlmRuntime, ToolSpec};
@@ -39,7 +38,7 @@ pub(crate) fn build_request(
         .llm
         .as_ref()
         .and_then(|llm| llm.fill_system_guardrail.as_deref())
-        .unwrap_or(DEFAULT_FILL_SYSTEM_GUARDRAIL);
+        .unwrap_or_else(|| contract::shipped_fill_system_guardrail());
     build_chat_request(
         ctx,
         node,
@@ -183,7 +182,7 @@ pub(crate) fn build_request_with_messages(
         .llm
         .as_ref()
         .and_then(|llm| llm.agent_system_guardrail.as_deref())
-        .unwrap_or(DEFAULT_AGENT_SYSTEM_GUARDRAIL);
+        .unwrap_or_else(|| contract::shipped_agent_system_guardrail());
     build_chat_request(ctx, node, runtime, || Ok(messages), guardrail, options)
 }
 
