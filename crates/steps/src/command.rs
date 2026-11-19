@@ -347,8 +347,8 @@ impl StepExecutor for CommandStep {
             // above) so a same-invocation resend replays the identical
             // tail. The user-visible output here carries stdout/stderr up
             // to the effective combined command output limit;
-            // journaled `tool_call` events carry a further
-            // 32 KiB truncated copy via `bounded_event_value`.
+            // journaled `tool_call` events carry a further copy bounded by
+            // the configured per-value limit (32 KiB by default).
             CommandResultMode::Process => Ok(StepOutcome::success(Some(json!({
                 "status": output.status,
                 "stdout": command_output_value(&output.stdout_bytes, &output.stdout),

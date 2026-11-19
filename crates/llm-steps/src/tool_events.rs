@@ -57,8 +57,9 @@ pub(crate) fn tool_call_event(
     // E09-3: journaled results never carry plaintext credential headers or
     // query values. Authorization-like response headers are redacted and
     // result URLs are query-redacted before the configured truncation below;
-    // its hard ceiling is 32 KiB. Truncation bounds size, redaction removes
-    // secrets. The live tool result keeps full headers for execution.
+    // that per-value limit defaults to 32 KiB and may be raised to the
+    // deployment ceiling. Truncation bounds size, redaction removes secrets.
+    // The live tool result keeps full headers for execution.
     let mut redacted_result = result.clone();
     if let Some(url) = redacted_result
         .get("url")

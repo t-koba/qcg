@@ -521,7 +521,7 @@ impl StepExecutor for HttpStep {
         // full body up to the gateway `body_limit_bytes`: the body is the
         // step's functional result, already bounded by that limit (never
         // unbounded), while journaled `tool_call` events carry a further
-        // 32 KiB truncated copy via `bounded_event_value`.
+        // copy bounded by the configured per-value limit (32 KiB by default).
         // Asymmetry by design (E09): the agent HTTP tool finishes its
         // REDACTED output instead, so its resend cache replays redacted
         // headers/URL while this plain step replays the full native
