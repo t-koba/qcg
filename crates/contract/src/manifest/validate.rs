@@ -407,29 +407,67 @@ fn validate_skill_resource(name: &str, root: &Utf8Path) -> Result<(), ContractEr
     read_and_validate_skill(name, &skill_path, root.file_name())
 }
 
+/// Counts every directory and file below `root`, matching the engine's
+/// bounded skill-library walk so validation and execution apply the same
+/// ceiling to the same tree.
+fn count_library_entries(name: &str, root: &Utf8Path, ceiling: usize) -> Result<(), ContractError> {
+    let mut pending = vec![root.to_owned()];
+    let mut inspected = 0_usize;
+    while let Some(dir) = pending.pop() {
+        let entries = std::fs::read_dir(&dir).map_err(|error| {
+            ContractError::Invalid(format!(
+                "skill_library resource `{name}` cannot read `{dir}`: {error}"
+            ))
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|error| {
+                ContractError::Invalid(format!(
+                    "skill_library resource `{name}` cannot read an entry: {error}"
+                ))
+            })?;
+            inspected = inspected.saturating_add(1);
+            if inspected > ceiling {
+                return Err(ContractError::Invalid(format!(
+                    "skill_library resource `{name}` exceeds {ceiling} entries"
+                )));
+            }
+            let file_type = entry.file_type().map_err(|error| {
+                ContractError::Invalid(format!(
+                    "skill_library resource `{name}` cannot inspect an entry: {error}"
+                ))
+            })?;
+            if file_type.is_dir() {
+                pending.push(
+                    camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
+                        ContractError::Invalid(format!(
+                            "skill_library resource `{name}` entry is not valid UTF-8: {}",
+                            path.display()
+                        ))
+                    })?,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
     // One deployment-owned ceiling, shared with the engine's bounded skill
     // library walk. A local CLI contract load and a served admission use the
     // same resolved value; a registry override applies to both.
     let ceiling = policy::operational_limits().max_skill_library_entries;
+    count_library_entries(name, root, ceiling)?;
     let entries = std::fs::read_dir(root).map_err(|error| {
         ContractError::Invalid(format!(
             "skill_library resource `{name}` cannot read `{root}`: {error}"
         ))
     })?;
-    let mut inspected = 0_usize;
     for entry in entries {
         let entry = entry.map_err(|error| {
             ContractError::Invalid(format!(
                 "skill_library resource `{name}` cannot read an entry: {error}"
             ))
         })?;
-        inspected += 1;
-        if inspected > ceiling {
-            return Err(ContractError::Invalid(format!(
-                "skill_library resource `{name}` exceeds {ceiling} entries"
-            )));
-        }
         let file_type = entry.file_type().map_err(|error| {
             ContractError::Invalid(format!(
                 "skill_library resource `{name}` cannot inspect an entry: {error}"
@@ -908,6 +946,34 @@ mod tests {
             error.to_string().contains(&ceiling.to_string()),
             "the error must name the configured ceiling: {error}"
         );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn skill_library_ceiling_counts_nested_entries_like_execution() {
+        let ceiling = policy::operational_limits().max_skill_library_entries;
+        let skill_count = ceiling / 2;
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-skill-library-nested-ceiling-{}",
+            std::process::id()
+        )))
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        for index in 0..skill_count {
+            let child = root.join(format!("skill-{index}"));
+            std::fs::create_dir(&child).expect("skill directory should be created");
+            std::fs::write(
+                child.join("SKILL.md"),
+                format!("---\nname: skill-{index}\ndescription: Demo skill\n---\n\nDo this.\n"),
+            )
+            .expect("SKILL.md should be written");
+        }
+        validate_skill_library("lib", &root)
+            .expect("skill dirs and their files exactly at the ceiling must validate");
+        std::fs::write(root.join("extra.txt"), "extra").expect("extra entry should be created");
+        validate_skill_library("lib", &root)
+            .expect_err("one recursive entry over the ceiling must be refused");
         std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
     }
 }
