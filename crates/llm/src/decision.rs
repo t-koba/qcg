@@ -167,7 +167,13 @@ fn parse_result_envelope(value: Value) -> Result<DecisionResponse, LlmError> {
             .map(|detail| {
                 const LIMIT: usize = 500;
                 if detail.len() > LIMIT {
-                    format!("{}…", &detail[..LIMIT])
+                    // Never slice through a multi-byte character: provider
+                    // error text is attacker-influenced and must not panic.
+                    let mut end = LIMIT;
+                    while !detail.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}…", &detail[..end])
                 } else {
                     detail
                 }
@@ -489,5 +495,21 @@ mod tests {
         value["answers"]["team"]["probabilities"] = json!({"billing": 0.5, "support": 0.5});
         let parsed: DecisionResponse = serde_json::from_value(value).unwrap();
         parsed.validate(&request()).unwrap();
+    }
+    #[test]
+    fn truncates_utf8_provider_error_without_panicking() {
+        let value = json!({
+            "result": {},
+            "success": false,
+            "errors": [{ "message": "あ".repeat(200) }]
+        });
+        let error = parse_result_envelope(value).expect_err("failed envelope must be refused");
+        let rendered = error.to_string();
+        assert!(
+            rendered.starts_with("decision provider reported failure"),
+            "{rendered}"
+        );
+        assert!(rendered.ends_with('…'), "{rendered}");
+        assert!(rendered.len() < 700, "detail must stay bounded: {rendered}");
     }
 }

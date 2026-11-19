@@ -103,10 +103,11 @@ impl CatalogConfig {
                 }
                 (Some(url), None) => {
                     let url = url.trim();
-                    if !(url.starts_with("https://")
-                        || url.starts_with("http://127.0.0.1")
-                        || url.starts_with("http://localhost"))
-                    {
+                    let parsed = url::Url::parse(url)
+                        .map_err(|_| "[catalog.source] url is not a valid URL".to_owned())?;
+                    let loopback_http =
+                        parsed.scheme() == "http" && crate::config::is_loopback_host(&parsed);
+                    if parsed.scheme() != "https" && !loopback_http {
                         return Err(format!(
                             "[catalog.source] url `{url}` must use HTTPS (loopback HTTP is allowed for tests)"
                         ));
@@ -2698,6 +2699,43 @@ base_url = "https://example.test/v1"
             "the cache failure must stay visible per source"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[test]
+fn catalog_source_rejects_loopback_prefix_impersonation() {
+    for url in [
+        "http://localhost.evil.com/models",
+        "http://127.0.0.1.evil.com/models",
+    ] {
+        let config = CatalogConfig {
+            source: vec![CatalogSourceSpec {
+                kind: CatalogSourceKind::ModelsDev,
+                url: Some(url.into()),
+                file: None,
+                sha256: None,
+            }],
+            ..CatalogConfig::default()
+        };
+        assert!(config.validate().is_err(), "accepted {url}");
+    }
+    for url in [
+        "https://catalog.example.test/models",
+        "http://localhost:8080/models",
+        "http://127.0.0.1/models",
+    ] {
+        let config = CatalogConfig {
+            source: vec![CatalogSourceSpec {
+                kind: CatalogSourceKind::ModelsDev,
+                url: Some(url.into()),
+                file: None,
+                sha256: None,
+            }],
+            ..CatalogConfig::default()
+        };
+        config
+            .validate()
+            .unwrap_or_else(|error| panic!("rejected {url}: {error}"));
     }
 }
 
