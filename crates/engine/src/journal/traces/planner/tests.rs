@@ -2597,3 +2597,180 @@ fn exact_elapsed_accepts_only_mode_consistent_durable_evidence() {
         "a WallClock source must not carry an active ledger"
     );
 }
+
+/// A settled, fully recorded provider charge as the engine journals it. Only
+/// `node` varies between the admitted and refused cases below.
+fn settled_llm_call(node: Option<&str>, seq: u64) -> Value {
+    let mut call = json!({
+        "t": "llm_call", "seq": seq, "ts": "2026-01-01T00:00:00Z",
+        "run_id": "source-probe", "trace_id": "trace", "span_id": "span",
+        "provider": "fake", "model": "fake", "max_tokens": 128,
+        "tokens": {
+            "input": 7, "output": 3, "cached_input": 2, "cache_creation_input": 1
+        },
+        "cost_microusd": 25, "retry_decisions": []
+    });
+    if let Some(node) = node {
+        call["node"] = json!(node);
+    }
+    call
+}
+
+/// Insert a charge inside `owner`'s step, renumber the following events and
+/// rebind the private outcome traces to their new step-finish evidence. The
+/// fixture is then re-sealed and refolded, so the planner sees a real source
+/// layout whose counters come only from the journal.
+fn inject_settled_charge(f: &mut Fixture, node: Option<&str>, owner: &str) {
+    use super::super::{FILE_NAME, Record};
+    let finish = f
+        .events
+        .iter()
+        .position(|event| event["t"] == "step_finished" && event["node"] == owner)
+        .expect("owner must finish");
+    let seq = f.events[finish]["seq"].as_u64().unwrap();
+    for event in f.events.iter_mut().skip(finish) {
+        event["seq"] = json!(event["seq"].as_u64().unwrap() + 1);
+    }
+    f.events.insert(finish, settled_llm_call(node, seq));
+
+    let trace_path = f.path.with_file_name(FILE_NAME);
+    let mut records: Vec<Record> = read_journal_values(&trace_path, JournalLimits::default())
+        .unwrap()
+        .events
+        .into_iter()
+        .map(|value| serde_json::from_value(value).unwrap())
+        .collect();
+    for record in &mut records {
+        if let Some(event) = f
+            .events
+            .iter()
+            .find(|event| event["t"] == "step_finished" && event["node"] == record.owner)
+        {
+            record.seq = event["seq"].as_u64().unwrap();
+            record.event_digest = digest(event).unwrap();
+            record.record_digest = record.calculate_digest().unwrap();
+        }
+    }
+    std::fs::write(
+        &trace_path,
+        records
+            .iter()
+            .map(|record| format!("{}\n", serde_json::to_string(record).unwrap()))
+            .collect::<String>(),
+    )
+    .unwrap();
+
+    // Keep the terminal summary consistent with the folded counters even
+    // though the planner never trusts summary counters as evidence.
+    let metrics = &mut f.events.last_mut().unwrap()["metrics"];
+    metrics["llm_calls"] = json!(1);
+    metrics["tokens_input"] = json!(7);
+    metrics["tokens_output"] = json!(3);
+    metrics["tokens_cached_input"] = json!(2);
+    metrics["tokens_cache_creation_input"] = json!(1);
+    metrics["tokens_total"] = json!(10);
+    metrics["cost_microusd"] = json!(25);
+    f.rewrite_source();
+    // `rewrite_source` keeps the original in-memory traces; reload the
+    // rebound private records so the supplied state matches the new journal.
+    super::super::TraceJournal::restore(&mut f.state, &f.events, &f.path, JournalLimits::default());
+}
+
+fn assert_inherited_model_counters(budget: &BudgetState) {
+    assert_eq!(budget.llm_calls, 1);
+    assert_eq!(budget.tokens_input, 7);
+    assert_eq!(budget.tokens_output, 3);
+    assert_eq!(budget.tokens_cached_input, 2);
+    assert_eq!(budget.tokens_cache_creation_input, 1);
+    assert_eq!(budget.cost_microusd, 25);
+    assert!(!budget.unresolved_llm_cost);
+}
+
+#[tokio::test]
+async fn settled_paid_model_work_is_preserved_and_inherited_without_a_second_charge() {
+    // The built-in offline `fake` provider cannot back a continuation-safe
+    // executor, so model accounting is injected into a real engine-produced
+    // source journal and proved through the real planner and child overlay.
+    let mut f = Fixture::new().await;
+    inject_settled_charge(&mut f, Some("a"), "a");
+    let candidate = f.analyze().unwrap();
+    assert_eq!(candidate.retry_roots, ["b"]);
+    assert_eq!(candidate.stale_outcomes, Vec::<String>::new());
+    assert_eq!(candidate.preserved_outcomes, ["a"]);
+    assert_inherited_model_counters(&candidate.inherited_budget);
+    assert_eq!(
+        serde_json::to_value(&candidate.inherited_budget).unwrap(),
+        serde_json::to_value(&f.state.budget).unwrap()
+    );
+
+    let mut events = reset_child_events(&f, &candidate);
+    let overlay = events.last().unwrap()["overlay"]["candidate"]["inherited_budget"].clone();
+    assert_eq!(
+        overlay["llm_calls"],
+        json!(1),
+        "the child inherits the paid call exactly"
+    );
+    assert_eq!(overlay["cost_microusd"], json!(25));
+    let mut state = RunState::fold_values(&events[..events.len() - 2]).unwrap();
+    state.budget = candidate.inherited_budget.clone();
+    state.apply(&events[events.len() - 2]).unwrap();
+    state.apply(events.last().unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&state.budget).unwrap(),
+        serde_json::to_value(&f.state.budget).unwrap()
+    );
+
+    append_child_queue(&f, &mut events);
+    let staged_len = events.len();
+    let (meta, workspace) = stage_child(&f, &events);
+    let path = meta.join("journal.jsonl");
+    let executed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut registry = StepRegistry::new();
+    registry.register(ResetProbe {
+        version: Some("1"),
+        safety: ContinuationSafety::ReadOnly,
+        coverage: ContinuationReadCoverage::Complete,
+        changed_owner: "b",
+        executed: executed.clone(),
+    });
+    let result = Engine::new(registry)
+        .run_with_id(
+            "child".into(),
+            meta,
+            f.contract.clone(),
+            BTreeMap::new(),
+            probe_options(workspace),
+        )
+        .await;
+    let after = read_journal_values(&path, JournalLimits::default())
+        .unwrap()
+        .events;
+    assert!(result.is_ok(), "{result:?}; {:?}", &after[staged_len..]);
+    assert_eq!(&after[..staged_len], &events);
+    assert_eq!(executed.lock().unwrap().as_slice(), ["b"]);
+    assert!(
+        after[staged_len..]
+            .iter()
+            .all(|event| event["t"] != "llm_call"),
+        "the preserved call must not be repeated"
+    );
+    let child = RunState::fold_values(&after).unwrap();
+    assert_inherited_model_counters(&child.budget);
+}
+
+#[tokio::test]
+async fn paid_charges_on_non_preserved_or_unattributable_nodes_refuse_with_budget() {
+    for node in [Some("b"), Some("ghost"), None] {
+        let mut f = Fixture::new().await;
+        inject_settled_charge(&mut f, node, "a");
+        assert_eq!(
+            f.analyze().unwrap_err(),
+            Refusal::Budget,
+            "charged owner {node:?} must refuse"
+        );
+    }
+    let mut f = Fixture::new().await;
+    inject_settled_charge(&mut f, Some("a"), "a");
+    f.state.budget.unresolved_llm_cost = true;
+    assert_eq!(f.analyze().unwrap_err(), Refusal::Budget);
+}

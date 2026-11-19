@@ -166,6 +166,11 @@ pub(super) fn proves_failed_history(
             {
                 terminal = true;
             }
+            // A settled model charge is accounting evidence, not a lifecycle
+            // transition. The typed payload already requires a provider,
+            // model, token usage and a settled cost; ownership of the charge
+            // is proved separately against preserved outcomes by the planner.
+            RunEventData::LlmCall(_) if started && active.is_some() => {}
             // Positive allowlist: retries, hooks, interactions, effects,
             // replay, lifecycle restarts and all future kinds are unproven.
             _ => return None,

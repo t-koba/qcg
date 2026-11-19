@@ -504,6 +504,7 @@ fn analyze_source(
     result.retry_roots.sort();
     result.stale_outcomes.sort();
     result.preserved_outcomes.sort();
+    preserved_model_charges(events, &result.preserved_outcomes)?;
     bind_candidate_payload(&mut identity, &result, limits.max_state_bytes)?;
     // Detect source journal changes during analysis. There is deliberately no
     // reusable authorization token: external workspace mutation remains outside
@@ -929,6 +930,37 @@ fn exact_elapsed(budget: &BudgetState) -> bool {
     }
 }
 
+/// Model counters are folded from journal charge records and inherited by the
+/// child verbatim. A charge can therefore only be paid for once if its owning
+/// node's outcome is preserved: a reset or stale owner would run again with
+/// the source charge already in the inherited budget. State equality proves
+/// the folded counters, so this only has to prove ownership of each record.
+fn preserved_model_charges(events: &[Value], preserved: &[String]) -> Result<(), Refusal> {
+    let preserved = preserved
+        .iter()
+        .map(String::as_str)
+        .collect::<BTreeSet<_>>();
+    for event in events {
+        // `llm_cost_unresolved` is refused by the budget gate above; include
+        // it here so a future accounting event cannot escape the ownership
+        // proof without an explicit change to this allowlist.
+        if !matches!(
+            event["t"].as_str(),
+            Some("llm_call" | "llm_cost_unresolved")
+        ) {
+            continue;
+        }
+        let owner = event["node"]
+            .as_str()
+            .filter(|node| !node.is_empty())
+            .ok_or(Refusal::Budget)?;
+        if !preserved.contains(owner) {
+            return Err(Refusal::Budget);
+        }
+    }
+    Ok(())
+}
+
 fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
     if budget.legacy_budget_resume_pending
         || budget.legacy_step_budget_unknown
@@ -941,12 +973,6 @@ fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
         || !exact_elapsed(budget)
         || budget.repair_attempts != 0
         || budget.regenerate_attempts != 0
-        || budget.llm_calls != 0
-        || budget.tokens_input != 0
-        || budget.tokens_output != 0
-        || budget.tokens_cached_input != 0
-        || budget.tokens_cache_creation_input != 0
-        || budget.cost_microusd != 0
     {
         return Err(Refusal::Budget);
     }

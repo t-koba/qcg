@@ -116,10 +116,14 @@ run** action in the web UI. Continuation creates a linked child rather than
 walking the DAG again: successful source outcomes are preserved, only the
 failure and nodes whose recorded reads are proven stale are reset, and the
 child inherits the source's exact budget. The source run stays byte-immutable.
-When the recorded reads, execution history, effects or budget cannot be
-proven, continuation fails closed with a fixed redacted reason. Interrupted
-and canceled runs and ambiguous external, MCP or `foreach` cases are not
-eligible yet.
+Paid model work is eligible only when it is settled and fully recorded in the
+journal and its owning node's successful outcome is preserved: the child
+inherits those call, token and cost counters exactly and never repeats the
+call. Model work that is unresolved or whose owning outcome is reset or stale
+is not eligible, even when the counters match. When the recorded reads,
+execution history, effects or budget cannot be proven, continuation fails
+closed with a fixed redacted reason. Interrupted and canceled runs and
+ambiguous external, MCP or `foreach` cases are not eligible yet.
 
 Parallel starts and finishes are marked with `"parallel": true` in the journal.
 
