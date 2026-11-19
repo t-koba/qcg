@@ -603,7 +603,7 @@ fn failed_restore_requires_history_without_changing_public_replay() {
 }
 
 #[test]
-fn failed_history_admits_only_source_local_memo_writes_and_unsettled_skips() {
+fn failed_history_admits_only_source_local_memo_writes_and_refuses_skips() {
     let limits = JournalLimits::default();
     let traces = OutcomeTraces::default();
     let mut events = failed_history();
@@ -621,8 +621,8 @@ fn failed_history_admits_only_source_local_memo_writes_and_unsettled_skips() {
     reused[5]["reused_from"] = json!({"run_id":"parent", "seq":7});
     assert!(history::proves_failed_history(&reused, &traces, limits).is_none());
 
-    // A skipped dependent has no outcome or charge and is reset by the
-    // planner; it must not masquerade as a settled owner.
+    // Skipped nodes leave no settled outcome in the state projection, so a
+    // run containing one is not continuable and its history proof stays shut.
     let skip = |node: &str| {
         json!({"t":"step_skipped", "node":node,
             "reason":{"code":"when_false", "message":"condition was false"}})
@@ -630,7 +630,7 @@ fn failed_history_admits_only_source_local_memo_writes_and_unsettled_skips() {
     let mut skipped = events.clone();
     skipped.insert(10, skip("c"));
     number_history(&mut skipped);
-    assert!(history::proves_failed_history(&skipped, &traces, limits).is_some());
+    assert!(history::proves_failed_history(&skipped, &traces, limits).is_none());
 
     let mut settled_skip = events.clone();
     settled_skip.insert(10, skip("a"));

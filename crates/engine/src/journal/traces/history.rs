@@ -180,15 +180,6 @@ pub(super) fn proves_failed_history(
                     && active
                         .as_ref()
                         .is_some_and(|(owner, _)| event["node"].as_str() == Some(*owner)) => {}
-            // A skipped dependent has no outcome or charge. It is reset by the
-            // planner and must not be mistaken for a settled owner.
-            RunEventData::StepSkipped(_)
-                if started
-                    && active.is_none()
-                    && !settled.contains_key(event["node"].as_str().unwrap_or_default())
-                    && !traces
-                        .owners
-                        .contains_key(event["node"].as_str().unwrap_or_default()) => {}
             // Positive allowlist: retries, hooks, interactions, effects,
             // replay, lifecycle restarts and all future kinds are unproven.
             _ => return None,

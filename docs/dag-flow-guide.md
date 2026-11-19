@@ -123,9 +123,9 @@ call. Model work that is unresolved or whose owning outcome is reset or stale
 is not eligible, even when the counters match. This eligibility is currently
 proven at the engine reset-plan and accounting boundary. The shipped
 `llm.generate` executor supplies the required read-only/complete attestation
-for nodes without output files; other `llm.*` executors and file-producing
-nodes remain ineligible. When the recorded reads,
-execution history, effects or budget cannot be proven, continuation fails
+for nodes without output files; other `llm.*` executors, file-producing
+nodes and runs containing skipped nodes remain ineligible. When the recorded
+reads, execution history, effects or budget cannot be proven, continuation fails
 closed with a fixed redacted reason. Interrupted and canceled runs and
 ambiguous external, MCP or `foreach` cases are not eligible yet.
 
