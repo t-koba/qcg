@@ -480,11 +480,20 @@ impl Engine {
         let journal = &scoped_journal;
         let retry: RetryPolicy = node.retry.clone().unwrap_or_default();
         // Reject invalid programmatic bounds; never rewrite zero to one (E10).
-        if retry.max_attempts == 0 || retry.max_attempts > policy::MAX_RETRY_ATTEMPTS {
+        if retry.max_attempts == 0
+            || retry.max_attempts > policy::operational_limits().retry_attempts
+        {
             return Err(EngineError::Failed(format!(
                 "node `{}` retry.max_attempts must be between 1 and {}",
                 node.id,
-                policy::MAX_RETRY_ATTEMPTS
+                policy::operational_limits().retry_attempts
+            )));
+        }
+        if retry.backoff_ms > policy::operational_limits().retry_backoff_ms {
+            return Err(EngineError::Failed(format!(
+                "node `{}` retry.backoff_ms must not exceed {}",
+                node.id,
+                policy::operational_limits().retry_backoff_ms
             )));
         }
         let max_attempts = retry.max_attempts as usize;

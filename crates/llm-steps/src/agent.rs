@@ -405,8 +405,8 @@ impl StepExecutor for LlmAgentStep {
                                 &[],
                                 json!({
                                     "provider": string_schema(),
-                                    "max_results": { "type": "integer", "minimum": 1, "maximum": policy::MAX_WEB_SEARCH_RESULTS },
-                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_TOOL_CALLS }
+                                    "max_results": { "type": "integer", "minimum": 1, "maximum": policy::operational_limits().web_search_results },
+                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::operational_limits().agent_tool_calls }
                                 })
                             ),
                             agent_tool_params_schema(
@@ -415,7 +415,7 @@ impl StepExecutor for LlmAgentStep {
                                 json!({
                                     "server": string_schema(),
                                     "tool": string_schema(),
-                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_TOOL_CALLS },
+                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::operational_limits().agent_tool_calls },
                                     "side_effects": { "type": "boolean" },
                                     "destinations": string_array_schema()
                                 })
@@ -428,12 +428,12 @@ impl StepExecutor for LlmAgentStep {
                                     "tools": string_array_schema(),
                                     "input_schema": { "type": "object" },
                                     "output_schema": string_schema(),
-                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_TOOL_CALLS },
-                                    "max_iterations": { "type": "integer", "minimum": 1, "maximum": policy::MAX_AGENT_ITERATIONS },
+                                    "max_calls": { "type": "integer", "minimum": 1, "maximum": policy::operational_limits().agent_tool_calls },
+                                    "max_iterations": { "type": "integer", "minimum": 1, "maximum": policy::operational_limits().agent_iterations },
                                     "max_tokens_total": { "type": "integer", "minimum": 1 },
                                     "max_tool_calls_total": { "type": "integer", "minimum": 1 },
                                     "model": model_ref_schema(),
-                                    "fallback_models": { "type": "array", "items": model_ref_schema(), "maxItems": policy::MAX_FALLBACK_MODELS },
+                                    "fallback_models": { "type": "array", "items": model_ref_schema(), "maxItems": policy::operational_limits().fallback_models },
                                     "request": request_policy_schema(),
                                     "on_failure": agent_failure_policy_schema(),
                                     "handoff": { "type": "boolean" }

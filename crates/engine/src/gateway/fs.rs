@@ -48,12 +48,13 @@ pub fn open_artifact_file(
 /// Q01: effective patch target ceiling for the commit-time base re-check.
 /// A patch target larger than this is refused instead of replaced, because a
 /// node must never overwrite a file it could not re-read within the same
-/// bound it used to read it. This is the supported upper bound for patch and
-/// repair targets regardless of higher caller `PatchLimits`: callers asking
-/// for more fail fast at admission (see `apply_anchored_patch`) with this
-/// ceiling displayed instead of failing later at the re-check.
-/// Must equal `policy::MAX_PATCH_TARGET_BYTES`.
-const PATCH_COMMIT_RECHECK_BYTES: usize = policy::MAX_PATCH_TARGET_BYTES;
+/// bound it used to read it. The configured deployment ceiling is the
+/// effective ceiling (defaults preserve today's 8 MiB); callers asking for
+/// more fail fast at admission (see `apply_anchored_patch`) with the same
+/// ceiling.
+fn patch_commit_recheck_bytes() -> usize {
+    policy::operational_limits().patch_target_bytes
+}
 
 // Workspace filesystem isolation boundary (E13).
 //
@@ -1491,10 +1492,10 @@ impl FsGateway {
         use std::io::Read as _;
         // Q01: fail fast when the caller asks for more than the effective
         // patch ceiling instead of failing later at the commit re-check.
-        if limits.max_result_bytes > PATCH_COMMIT_RECHECK_BYTES {
+        if limits.max_result_bytes > patch_commit_recheck_bytes() {
             return Err(files::AnchoredPatchError::ResultTooLarge {
                 bytes: limits.max_result_bytes,
-                limit: PATCH_COMMIT_RECHECK_BYTES,
+                limit: patch_commit_recheck_bytes(),
             }
             .into());
         }
@@ -1598,15 +1599,15 @@ impl FsGateway {
             Err(error) => return Err(error),
         };
         let mut bytes = Vec::new();
-        file.take((PATCH_COMMIT_RECHECK_BYTES + 1) as u64)
+        file.take(patch_commit_recheck_bytes().saturating_add(1) as u64)
             .read_to_end(&mut bytes)
             .map_err(GatewayError::from)?;
-        if bytes.len() > PATCH_COMMIT_RECHECK_BYTES {
+        if bytes.len() > patch_commit_recheck_bytes() {
             // Too large to hash within the commit bound: refuse rather than
             // claim a base this node never read.
             return Err(files::AnchoredPatchError::ResultTooLarge {
                 bytes: bytes.len(),
-                limit: PATCH_COMMIT_RECHECK_BYTES,
+                limit: patch_commit_recheck_bytes(),
             }
             .into());
         }
@@ -2638,7 +2639,7 @@ mod unix_staging_tests {
         let over = files::PatchLimits {
             max_edits: 8,
             max_patch_bytes: 1024,
-            max_result_bytes: policy::MAX_PATCH_TARGET_BYTES + 1,
+            max_result_bytes: policy::operational_limits().patch_target_bytes + 1,
         };
         let error = gateway
             .apply_anchored_patch(
@@ -2657,7 +2658,7 @@ mod unix_staging_tests {
         assert!(
             error
                 .to_string()
-                .contains(&policy::MAX_PATCH_TARGET_BYTES.to_string()),
+                .contains(&policy::operational_limits().patch_target_bytes.to_string()),
             "the ceiling must be displayed: {error}"
         );
     }

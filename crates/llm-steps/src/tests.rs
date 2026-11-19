@@ -3213,3 +3213,125 @@ mod choose_exhaustion;
 mod fill_exhaustion;
 
 mod continuation_reuse;
+
+#[test]
+fn raised_deployment_ceiling_accepts_eleventh_tool_call() {
+    // The configured values are the effective ceilings: raising above the
+    // defaults must let a contract declare an eleventh tool call and use it.
+    // Single installation for this test binary; all raised values share one
+    // combined ceiling so repeated parsing stays idempotent.
+    let raised = policy::OperationalLimits {
+        agent_tool_calls: 20,
+        agent_iterations: 64,
+        fallback_models: 16,
+        web_search_results: 40,
+        retry_attempts: 32,
+        retry_backoff_ms: 120_000,
+        patch_target_bytes: 16 * 1024 * 1024,
+    };
+    // Idempotent: the same value may be installed by preload + router.
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    assert_eq!(policy::operational_limits().agent_tool_calls, 20);
+
+    let root = std::env::temp_dir().join(format!(
+        "llm-steps-raised-ceiling-{}-{}",
+        std::process::id(),
+        uuid_suffix()
+    ));
+    let contract = contract_with_llm_generate(&root, "fake");
+    let node = agent_node();
+    let runtime = LlmRuntime::builtins();
+
+    let agent_eleven = ToolDecl::Agent {
+        name: "researcher".into(),
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        instructions: "Research only the delegated artifact.".into(),
+        tools: vec![],
+        max_calls: 11,
+        max_iterations: 6,
+        max_tokens_total: 1024,
+        max_tool_calls_total: 11,
+        model: None,
+        fallback_models: vec![],
+        request: Box::new(LlmRequestPolicy::default()),
+        on_failure: Default::default(),
+        handoff: false,
+    };
+    crate::agent_tools::validate_agent_tool(&node, &contract, &runtime, &agent_eleven)
+        .expect("eleventh tool call must validate with a raised ceiling");
+
+    // Execution accepts the eleventh call: charging eleven calls against an
+    // eleven-call budget succeeds.
+    let tools = vec![agent_eleven.clone()];
+    let mut total = 0_usize;
+    let mut counts = BTreeMap::new();
+    for expected in 1..=11_usize {
+        let count = charge_agent_tool_call(
+            "agent",
+            "llm.agent",
+            &tools,
+            "researcher",
+            &mut total,
+            11,
+            &mut counts,
+        )
+        .expect("each of the eleven calls must fit the declared budget");
+        assert_eq!(count, expected);
+    }
+
+    // Values above the configured ceiling stay refused, never clamped.
+    let agent_over = ToolDecl::Agent {
+        name: "researcher".into(),
+        description: None,
+        input_schema: None,
+        output_schema: None,
+        instructions: "Research only the delegated artifact.".into(),
+        tools: vec![],
+        max_calls: 21,
+        max_iterations: 6,
+        max_tokens_total: 1024,
+        max_tool_calls_total: 21,
+        model: None,
+        fallback_models: vec![],
+        request: Box::new(LlmRequestPolicy::default()),
+        on_failure: Default::default(),
+        handoff: false,
+    };
+    let error = crate::agent_tools::validate_agent_tool(&node, &contract, &runtime, &agent_over)
+        .expect_err("twenty-first call must be refused above the raised ceiling");
+    assert!(error.to_string().contains("between 1 and 20"), "{error}");
+
+    // Analogous second cap: retry bounds validate against the same raised
+    // ceiling. A manifest with twenty attempts validates; thirty-three is
+    // refused above the thirty-two ceiling.
+    let mut manifest_twenty = contract.manifest.clone();
+    manifest_twenty.flow[0].retry = Some(contract::RetryPolicy {
+        max_attempts: 20,
+        backoff_ms: 0,
+        timeout_secs: Some(30),
+        on_indeterminate: contract::RetryOnIndeterminate::Fail,
+    });
+    manifest_twenty
+        .validate()
+        .expect("twenty retry attempts must validate with a raised ceiling");
+
+    let mut manifest_over = contract.manifest.clone();
+    manifest_over.flow[0].retry = Some(contract::RetryPolicy {
+        max_attempts: 33,
+        backoff_ms: 0,
+        timeout_secs: Some(30),
+        on_indeterminate: contract::RetryOnIndeterminate::Fail,
+    });
+    let error = manifest_over
+        .validate()
+        .expect_err("thirty-three attempts must be refused above the raised ceiling");
+    assert!(error.to_string().contains("between 1 and 32"), "{error}");
+
+    let _ = std::fs::remove_dir_all(&root);
+}

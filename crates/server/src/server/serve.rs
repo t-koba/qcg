@@ -154,6 +154,11 @@ pub fn resolve_server_policy_with_container_timeouts(
     config: &ServerConfig,
     container_timeouts: policy::ContainerTimeouts,
 ) -> Result<ResolvedServerPolicy, String> {
+    // Install the deployment ceiling before any contract is validated so a
+    // tightened or raised ceiling is already effective for per-request
+    // validation. Missing registry with no explicit path means built-ins.
+    service::preload_operational_limits(config.providers_path.as_deref())
+        .map_err(|error| format!("invalid providers registry: {error}"))?;
     let idempotency_timing = super::idempotency::config::IdempotencyTiming::resolve()?;
     let idempotency_ttl = super::idempotency::effective_idempotency_ttl()
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;

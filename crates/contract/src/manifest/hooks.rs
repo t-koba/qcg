@@ -153,18 +153,20 @@ impl HooksRule {
                 )));
             }
             if let Some(retry) = &hook.retry {
-                if retry.max_attempts == 0 || retry.max_attempts > policy::MAX_RETRY_ATTEMPTS {
+                if retry.max_attempts == 0
+                    || retry.max_attempts > policy::operational_limits().retry_attempts
+                {
                     return Err(ContractError::Invalid(format!(
                         "hook `{}` retry.max_attempts must be between 1 and {}",
                         hook.id,
-                        policy::MAX_RETRY_ATTEMPTS
+                        policy::operational_limits().retry_attempts
                     )));
                 }
-                if retry.backoff_ms > policy::MAX_RETRY_BACKOFF_MS {
+                if retry.backoff_ms > policy::operational_limits().retry_backoff_ms {
                     return Err(ContractError::Invalid(format!(
                         "hook `{}` retry.backoff_ms must not exceed {}",
                         hook.id,
-                        policy::MAX_RETRY_BACKOFF_MS
+                        policy::operational_limits().retry_backoff_ms
                     )));
                 }
                 if retry.timeout_secs.is_some_and(|timeout| timeout == 0) {

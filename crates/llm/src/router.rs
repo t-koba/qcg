@@ -113,6 +113,74 @@ impl LlmRouter {
         Ok(None)
     }
 
+    /// Installs `[operational_limits]` from the providers registry before any
+    /// contract is validated. This is the boot choke point for CLI local runs
+    /// and `serve`: it resolves the same registry file as [`Self::load_optional`]
+    /// and installs its deployment ceiling so a tightened or raised ceiling is
+    /// already effective when `Contract::load` runs. A missing file is a no-op
+    /// (the later registry load reports a missing explicit or `PROVIDERS`
+    /// path, and policy resolution reports an empty path); a file that exists
+    /// but is unreadable or unparsable refuses boot fail-closed. Repeated
+    /// installation of the same value is a no-op; a conflicting value is
+    /// refused instead of changing policy mid-process.
+    pub fn preload_operational_limits(explicit: Option<&Utf8Path>) -> Result<(), RegistryError> {
+        if let Some(path) = explicit {
+            return Self::install_limits_from_file(path);
+        }
+        if let Some(env_path) = std::env::var_os("PROVIDERS") {
+            let path =
+                Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&env_path)).map_err(|_| {
+                    RegistryError::Invalid {
+                        message: format!("`PROVIDERS` is not valid UTF-8: {env_path:?}"),
+                    }
+                })?;
+            return Self::install_limits_from_file(path.as_path());
+        }
+        for candidate in candidate_paths(false) {
+            if candidate.is_file() {
+                return Self::install_limits_from_file(&candidate);
+            }
+        }
+        Ok(())
+    }
+
+    fn install_limits_from_file(path: &Utf8Path) -> Result<(), RegistryError> {
+        // Missing files are a no-op here: the later `load_optional` /
+        // `load_llm_runtime` reports a missing explicit or `PROVIDERS` path,
+        // and `resolve_server_policy` reports an empty path. Preload only
+        // refuses a file that exists but is unreadable or unparsable, so a
+        // tightened or raised ceiling is installed before validation without
+        // moving the existing missing-file failure later in boot.
+        if path.as_str().is_empty() || !path.is_file() {
+            return Ok(());
+        }
+        let read_error = |source| RegistryError::Read {
+            path: path.to_path_buf(),
+            source,
+        };
+        let mut file = File::open(path).map_err(read_error)?;
+        let metadata = file.metadata().map_err(read_error)?;
+        if !metadata.is_file() {
+            return Err(RegistryError::Invalid {
+                message: format!("providers registry `{path}` is not a regular file"),
+            });
+        }
+        let mut bytes = Vec::new();
+        file.by_ref().read_to_end(&mut bytes).map_err(read_error)?;
+        let text = String::from_utf8(bytes).map_err(|error| RegistryError::Invalid {
+            message: format!("providers registry `{path}` is not valid UTF-8: {error}"),
+        })?;
+        let parse_error = |message| RegistryError::Parse {
+            path: path.to_path_buf(),
+            message,
+        };
+        let file = ProvidersFile::parse(&text).map_err(parse_error)?;
+        if let Some(limits) = file.operational_limits {
+            policy::set_deployment_operational_limits(limits).map_err(parse_error)?;
+        }
+        Ok(())
+    }
+
     pub fn from_file(path: &Utf8Path) -> Result<Self, RegistryError> {
         let read_error = |source| RegistryError::Read {
             path: path.to_path_buf(),
@@ -143,6 +211,9 @@ impl LlmRouter {
             message,
         };
         let file = ProvidersFile::parse(text).map_err(parse_error)?;
+        if let Some(limits) = file.operational_limits {
+            policy::set_deployment_operational_limits(limits).map_err(parse_error)?;
+        }
         let default_model = file
             .default
             .as_ref()

@@ -87,6 +87,16 @@ pub(crate) fn local_cli_service(
     )?)
 }
 
+/// Installs `[operational_limits]` before any contract is validated so a
+/// tightened or raised ceiling is already effective for `Contract::load`.
+/// Missing registry with no explicit path means built-ins (defaults).
+fn preload_operational_limits_for_contracts(
+    providers_path: Option<&camino::Utf8Path>,
+) -> Result<()> {
+    service::preload_operational_limits(providers_path)
+        .map_err(|error| anyhow::anyhow!("invalid providers registry: {error}"))
+}
+
 /// Shared serve boot for `serve` and `dev`. Resolve once before
 /// binding (E04 single freeze): validation and serving observe identical
 /// values; a refused boot never occupies the port.
@@ -136,6 +146,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
         }
         Command::Validate { path, json } => {
             if !json {
+                preload_operational_limits_for_contracts(providers_path.as_deref())?;
                 let contract = Contract::load(&path)?;
                 app_registry(providers_path.as_deref())?.validate_contract(&contract)?;
                 println!(
@@ -147,6 +158,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 return Ok(std::process::ExitCode::SUCCESS);
             }
             let result = (|| {
+                preload_operational_limits_for_contracts(providers_path.as_deref())?;
                 let contract = Contract::load(&path)?;
                 app_registry(providers_path.as_deref())?.validate_contract(&contract)?;
                 Ok::<_, anyhow::Error>(contract)
@@ -197,6 +209,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             if diff && !plan {
                 anyhow::bail!("--diff requires --plan");
             }
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let contract = Contract::load(&generator)?;
             let input_runtime = contract.manifest.runtime.clone();
             let inputs = load_inputs(
@@ -251,6 +264,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             baseline,
             json,
         } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let deployment = CliDeployment::from_env(providers_path.clone())?;
             run_eval(
                 generator,
@@ -264,6 +278,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             .await?;
         }
         Command::List { generators_dir } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let scan_limit = directory_scan_limit()?;
             let mut roots = vec![generators_dir.clone()];
             if let Some(bundled) = bundled_generators_root()
@@ -542,6 +557,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             max_bytes,
             max_metadata_bytes,
         } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let output = output.unwrap_or_else(|| {
                 Utf8PathBuf::from(format!("{}.pkg", dir.file_name().unwrap_or("generator")))
             });
@@ -585,6 +601,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             max_archive_bytes,
             max_metadata_bytes,
         } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let installed = install(
                 providers_path.as_deref(),
                 &source,
@@ -698,6 +715,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             max_artifact_entries,
             max_asset_bytes,
         } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let container_timeouts =
                 policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
             let api_token = resolve_api_token(api_token)?;
@@ -732,6 +750,7 @@ async fn run_async() -> Result<std::process::ExitCode> {
             watch_interval_ms,
             eval,
         } => {
+            preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let container_timeouts =
                 policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
             let retention = policy::RetentionPolicy::from_env()

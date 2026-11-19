@@ -974,6 +974,9 @@ pub struct ProvidersFile {
     #[serde(default)]
     pub mcp_server: Vec<mcp::McpServerSpec>,
     pub catalog: Option<crate::catalog::CatalogConfig>,
+    /// Optional deployment ceilings for the shared operational limits.
+    #[serde(default)]
+    pub operational_limits: Option<policy::OperationalLimits>,
 }
 
 impl ProvidersFile {
@@ -987,6 +990,9 @@ impl ProvidersFile {
     pub(crate) fn validate(&self) -> Result<(), String> {
         if let Some(catalog) = &self.catalog {
             catalog.validate()?;
+        }
+        if let Some(limits) = &self.operational_limits {
+            limits.validate()?;
         }
         let mut seen = BTreeMap::new();
         for spec in &self.provider {

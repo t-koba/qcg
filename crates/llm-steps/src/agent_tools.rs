@@ -223,21 +223,23 @@ pub(crate) fn validate_agent_tool(
                     format!("agent tool `{name}` requires non-empty instructions"),
                 ));
             }
-            if *max_calls == 0 || *max_calls > policy::MAX_AGENT_TOOL_CALLS {
+            if *max_calls == 0 || *max_calls > policy::operational_limits().agent_tool_calls {
                 return Err(StepError::failed(
                     &node.id,
                     format!(
                         "agent tool `{name}` max_calls must be between 1 and {}",
-                        policy::MAX_AGENT_TOOL_CALLS
+                        policy::operational_limits().agent_tool_calls
                     ),
                 ));
             }
-            if *max_iterations == 0 || *max_iterations > policy::MAX_AGENT_ITERATIONS {
+            if *max_iterations == 0
+                || *max_iterations > policy::operational_limits().agent_iterations
+            {
                 return Err(StepError::failed(
                     &node.id,
                     format!(
                         "agent tool `{name}` max_iterations must be between 1 and {}",
-                        policy::MAX_AGENT_ITERATIONS
+                        policy::operational_limits().agent_iterations
                     ),
                 ));
             }
@@ -270,12 +272,12 @@ pub(crate) fn validate_agent_tool(
                     ));
                 }
             }
-            if fallback_models.len() > policy::MAX_FALLBACK_MODELS {
+            if fallback_models.len() > policy::operational_limits().fallback_models {
                 return Err(StepError::failed(
                     &node.id,
                     format!(
                         "agent tool `{name}` declares more than {} fallback models",
-                        policy::MAX_FALLBACK_MODELS
+                        policy::operational_limits().fallback_models
                     ),
                 ));
             }

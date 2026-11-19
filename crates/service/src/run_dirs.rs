@@ -2750,6 +2750,16 @@ pub(crate) fn app_registry(runtime: Arc<llm::LlmRuntime>) -> engine::StepRegistr
 /// built-in capabilities when no providers registry is found. This is the
 /// single choke point for registry assembly; binaries resolve the registry
 /// through here instead of composing runtimes directly.
+/// Installs `[operational_limits]` before any contract is loaded. CLI local
+/// runs call this before `Contract::load` so a tightened or raised ceiling is
+/// already effective at validation; `serve` installs through the same path
+/// before the service (and its later per-request validations) is built. A
+/// missing registry with no explicit path means built-ins (defaults).
+pub fn preload_operational_limits(providers_path: Option<&Utf8Path>) -> Result<(), ServiceError> {
+    llm::LlmRouter::preload_operational_limits(providers_path)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
 pub fn load_llm_runtime(
     providers_path: Option<&Utf8Path>,
 ) -> Result<Arc<llm::LlmRuntime>, ServiceError> {

@@ -584,12 +584,12 @@ pub(crate) fn resolve_patch_limits(
     );
     // Q01: the effective patch target ceiling applies regardless of higher
     // caller output limits; fail fast with the ceiling displayed.
-    if max_result_bytes > policy::MAX_PATCH_TARGET_BYTES {
+    if max_result_bytes > policy::operational_limits().patch_target_bytes {
         return Err(StepError::failed(
             &node.id,
             format!(
                 "resolved output limit {max_result_bytes} exceeds the effective patch target ceiling {}",
-                policy::MAX_PATCH_TARGET_BYTES
+                policy::operational_limits().patch_target_bytes
             ),
         ));
     }

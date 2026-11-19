@@ -75,8 +75,8 @@ pub use limits::{
     MAX_WEB_SEARCH_RESULTS, MIN_DIRECTORY_SCAN_ENTRIES, MIN_JOURNAL_POLL_INTERVAL_MILLIS,
     MIN_JOURNAL_SCAN_WINDOW_BYTES, MIN_LIVE_EVENT_CHANNEL_CAPACITY, MIN_METRICS_GENERATOR_LIMIT,
     MIN_PATCH_BYTES, MIN_PATCH_EDITS, MIN_RATE_LIMIT_MAX_IDENTITIES, MIN_SHUTDOWN_PHASE_SECS,
-    MIN_STORE_RESCAN_SECS, TOOL_EVENT_VALUE_LIMIT_BYTES, parse_bool_env, parse_bounded_env,
-    parse_positive_env,
+    MIN_STORE_RESCAN_SECS, OperationalLimits, TOOL_EVENT_VALUE_LIMIT_BYTES, operational_limits,
+    parse_bool_env, parse_bounded_env, parse_positive_env, set_deployment_operational_limits,
 };
 pub use params::{params_schema, string_array_schema, string_schema};
 pub use path::{

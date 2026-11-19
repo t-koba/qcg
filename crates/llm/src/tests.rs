@@ -1616,6 +1616,7 @@ fn query_rejects_credential_environment_placeholders() {
             search_provider: vec![],
             mcp_server: vec![],
             catalog: None,
+            operational_limits: None,
         }
         .validate()
         .expect_err("credential query interpolation must be rejected");
@@ -3719,6 +3720,44 @@ fn default_cache_controls_are_omitted_from_serialized_requests() {
     let explicit = serde_json::to_value(&explicit).expect("explicit controls should serialize");
     assert_eq!(explicit["cache_write"], "forbid");
     assert_eq!(explicit["cache_retention"], "extended");
+}
+
+#[test]
+fn operational_limits_section_is_strict_with_defaults_as_floor() {
+    let file = ProvidersFile::parse(
+        "[operational_limits]\nagent_tool_calls = 4\nretry_backoff_ms = 100\n",
+    )
+    .expect("a narrowed deployment ceiling must parse");
+    let limits = file
+        .operational_limits
+        .expect("the section must be retained for installation");
+    assert_eq!(limits.agent_tool_calls, 4);
+    assert_eq!(limits.retry_backoff_ms, 100);
+    assert_eq!(limits.agent_iterations, policy::MAX_AGENT_ITERATIONS);
+
+    let unknown = ProvidersFile::parse("[operational_limits]\nmax_calls = 4\n")
+        .expect_err("unknown operational key must refuse the registry");
+    assert!(unknown.contains("unknown field"), "{unknown}");
+
+    // The configured values are the effective ceilings: raising above the
+    // defaults parses and validates so a deployment can declare an eleventh
+    // tool call.
+    let raised = ProvidersFile::parse(
+        "[operational_limits]\nagent_tool_calls = 11\npatch_target_bytes = 16777216\n",
+    )
+    .expect("a raised deployment ceiling must parse");
+    let limits = raised
+        .operational_limits
+        .expect("the raised section must be retained");
+    assert_eq!(limits.agent_tool_calls, 11);
+    assert_eq!(limits.patch_target_bytes, 16 * 1024 * 1024);
+    limits
+        .validate()
+        .expect("raising above the defaults must validate");
+
+    let zero = ProvidersFile::parse("[operational_limits]\nagent_tool_calls = 0\n")
+        .expect_err("a zero count must refuse the registry");
+    assert!(zero.contains("agent_tool_calls"), "{zero}");
 }
 
 #[path = "tests/retry_policy.rs"]

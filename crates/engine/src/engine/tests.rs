@@ -8228,6 +8228,78 @@ async fn foreach_parallel_all_success_retains_behavior_with_provenance() {
     let _ = std::fs::remove_dir_all(&run_dir);
 }
 
+#[tokio::test]
+async fn raised_retry_ceiling_accepts_twenty_attempts_at_validation_and_execution() {
+    // The configured values are the effective ceilings: raising retry_attempts
+    // above the default must let a contract declare twenty attempts and run.
+    // Single installation for this test binary; the combined ceiling matches
+    // the llm-steps regression so every binary observes one frozen value.
+    let raised = policy::OperationalLimits {
+        agent_tool_calls: 20,
+        agent_iterations: 64,
+        fallback_models: 16,
+        web_search_results: 40,
+        retry_attempts: 32,
+        retry_backoff_ms: 120_000,
+        patch_target_bytes: 16 * 1024 * 1024,
+    };
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    assert_eq!(policy::operational_limits().retry_attempts, 32);
+
+    // Validation accepts twenty attempts with the raised ceiling.
+    let ok_manifest = manifest(vec![retry_node("flaky", "test.pass", 20, 0, None)]);
+    ok_manifest
+        .validate()
+        .expect("twenty retry attempts must validate with a raised ceiling");
+
+    // Execution accepts twenty attempts: a passing step with a twenty-attempt
+    // budget succeeds instead of failing closed on the legacy sixteen cap.
+    let run_dir = temp_run_dir("raised-retry-twenty");
+    let contract = test_contract(&run_dir, ok_manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(TestPassStep);
+    Engine::new(registry)
+        .run_with_id(
+            "raised-retry-twenty".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect("twenty-attempt budget must execute with a raised ceiling");
+    let _ = std::fs::remove_dir_all(&run_dir);
+
+    // Values above the configured ceiling stay refused at validation and at
+    // execution, never silently clamped.
+    let over_manifest = manifest(vec![retry_node("flaky", "test.pass", 33, 0, None)]);
+    let error = over_manifest
+        .validate()
+        .expect_err("thirty-three attempts must be refused above the raised ceiling");
+    assert!(error.to_string().contains("between 1 and 32"), "{error}");
+
+    let run_dir = temp_run_dir("raised-retry-over");
+    let contract = test_contract(&run_dir, over_manifest);
+    let mut registry = StepRegistry::new();
+    registry.register(TestPassStep);
+    let error = Engine::new(registry)
+        .run_with_id(
+            "raised-retry-over".into(),
+            run_dir.join("meta"),
+            contract,
+            BTreeMap::new(),
+            run_options(run_dir.join("workspace")),
+        )
+        .await
+        .expect_err("thirty-three attempts must fail execution above the ceiling");
+    assert!(error.to_string().contains("between 1 and 32"), "{error}");
+    let _ = std::fs::remove_dir_all(&run_dir);
+}
+
 #[path = "tests/parallel_facts.rs"]
 mod parallel_facts;
 mod replay_safety;

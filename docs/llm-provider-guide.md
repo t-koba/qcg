@@ -260,6 +260,37 @@ Fields:
   describe transport mechanisms; generator and node policy never belongs in
   this registry.
 
+## Operational limits
+
+The same registry carries the deployment ceilings for the seven operational
+limits shared by contract validation and execution:
+
+```toml
+[operational_limits]
+agent_tool_calls = 10       # includes web.search max_calls
+agent_iterations = 32
+fallback_models = 8
+web_search_results = 20
+retry_attempts = 16
+retry_backoff_ms = 60000
+patch_target_bytes = 8388608  # 8 MiB
+```
+
+Every key is optional and the values above are the defaults when the section
+or a key is omitted. Unknown keys refuse registry parsing; a zero count (or a
+zero patch target) also refuses parsing. The configured values are the
+effective ceilings themselves: a deployment may tighten or raise them, and a
+contract declaring more than today's defaults validates when the deployment
+raises the ceiling. Contracts declare their own values (`max_calls`,
+`max_iterations`, `fallback_models`, `max_results`, `retry.max_attempts`,
+`retry.backoff_ms`, and runtime output limits); a declared value above the
+effective ceiling is refused at validation and at execution, never silently
+clamped. The ceiling is installed before contracts are validated (CLI local
+runs preload it before `Contract::load`; `serve` installs it while resolving
+server policy) and frozen when the registry is parsed, so validation and
+execution observe the same values for the process. `retry_backoff_ms = 0`
+means no delay and is valid.
+
 ### ChatGPT subscription authentication
 
 The standalone `qcg auth login`, `qcg auth status`, and `qcg auth logout`

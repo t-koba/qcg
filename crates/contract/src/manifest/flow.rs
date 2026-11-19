@@ -270,11 +270,11 @@ fn validate_foreach_params(
             .map(|retry| retry.max_attempts)
             .unwrap_or(1);
         let product = (outer_max as usize).saturating_mul(child_max as usize);
-        if product > policy::MAX_RETRY_ATTEMPTS as usize {
+        if product > policy::operational_limits().retry_attempts as usize {
             return Err(ContractError::Invalid(format!(
                 "foreach node `{node_id}` retry product {product} (outer {outer_max} * child `{}` {child_max}) exceeds {}",
                 child.id,
-                policy::MAX_RETRY_ATTEMPTS
+                policy::operational_limits().retry_attempts
             )));
         }
         // Recursive total-product across nesting depth (E10): a block child
@@ -288,16 +288,16 @@ fn validate_foreach_params(
                 foreach_total_product(child, manifest, &mut visited).map_err(|message| {
                     ContractError::Invalid(format!(
                         "foreach node `{node_id}` nested retry product exceeds {} via child `{}`: {message}",
-                        policy::MAX_RETRY_ATTEMPTS,
+                        policy::operational_limits().retry_attempts,
                         child.id
                     ))
                 })?;
             let total = (outer_max as usize).saturating_mul(nested_total);
-            if total > policy::MAX_RETRY_ATTEMPTS as usize {
+            if total > policy::operational_limits().retry_attempts as usize {
                 return Err(ContractError::Invalid(format!(
                     "foreach node `{node_id}` total retry product {total} (outer {outer_max} * nested {nested_total} via child `{}`) exceeds {}",
                     child.id,
-                    policy::MAX_RETRY_ATTEMPTS
+                    policy::operational_limits().retry_attempts
                 )));
             }
         }
@@ -366,16 +366,18 @@ fn validate_retry_bounds(scope: &str, node: &NodeDef) -> Result<(), ContractErro
         format!("block `{scope}` node `{}`", node.id)
     };
     if let Some(retry) = &node.retry {
-        if retry.max_attempts == 0 || retry.max_attempts > policy::MAX_RETRY_ATTEMPTS {
+        if retry.max_attempts == 0
+            || retry.max_attempts > policy::operational_limits().retry_attempts
+        {
             return Err(ContractError::Invalid(format!(
                 "{location} retry.max_attempts must be between 1 and {}",
-                policy::MAX_RETRY_ATTEMPTS,
+                policy::operational_limits().retry_attempts,
             )));
         }
-        if retry.backoff_ms > policy::MAX_RETRY_BACKOFF_MS {
+        if retry.backoff_ms > policy::operational_limits().retry_backoff_ms {
             return Err(ContractError::Invalid(format!(
                 "{location} retry.backoff_ms must not exceed {}",
-                policy::MAX_RETRY_BACKOFF_MS,
+                policy::operational_limits().retry_backoff_ms,
             )));
         }
         if retry.timeout_secs.is_some_and(|timeout| timeout == 0) {

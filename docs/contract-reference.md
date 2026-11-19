@@ -4880,11 +4880,12 @@ fields are rejected when their structs define a closed schema.
    body; omitted means the 16 MiB default, never an unbounded body.
    Template output is streamed through a bounded writer and each render gets a
    fresh fuel budget; exceeding either limit fails the render explicitly.
-   Hash-anchored patch and repair targets larger than 8 MiB
-   (`policy::MAX_PATCH_TARGET_BYTES`) are refused even when
-   `output_file_limit_bytes` / `output_total_limit_bytes` allow more: 8 MiB is
-   the effective patch target ceiling, and callers asking for more fail fast
-   with the ceiling displayed (Q01).
+   Hash-anchored patch and repair targets larger than the effective patch
+   target ceiling are refused even when `output_file_limit_bytes` /
+   `output_total_limit_bytes` allow more: the ceiling defaults to 8 MiB and
+   is the configured `[operational_limits].patch_target_bytes` in
+   `providers.toml` (tightened or raised by the deployment); callers asking
+   for more fail fast with the ceiling displayed (Q01).
    Template source and serialized context are bounded before compilation and
    evaluation. `file_input_limit_bytes` bounds every individual input value
    (including `file`, `json`, and schema-backed custom fields), while

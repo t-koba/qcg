@@ -5,6 +5,8 @@
 //! and reviewable in one place. `None`-style opt-outs stay with the caller:
 //! these constants only fix the numeric policy, never its interpretation.
 
+use serde::Deserialize;
+use std::sync::OnceLock;
 use std::time::Duration;
 
 /// Default maximum directory entries scanned when listing run or
@@ -95,22 +97,28 @@ pub const MAX_RUN_LABELS: usize = 32;
 /// Maximum bytes for one run label key or value.
 pub const MAX_RUN_LABEL_BYTES: usize = 256;
 
-/// Inclusive upper bound for LLM agent tool iterations per call.
+/// Default ceiling for LLM agent tool iterations per call.
+/// The effective ceiling is `OperationalLimits::agent_iterations`.
 pub const MAX_AGENT_ITERATIONS: usize = 32;
 
-/// Inclusive upper bound for declared max tool calls on one tool.
+/// Default ceiling for declared max tool calls on one tool.
+/// The effective ceiling is `OperationalLimits::agent_tool_calls`.
 pub const MAX_AGENT_TOOL_CALLS: usize = 10;
 
-/// Inclusive upper bound for `web.search` results per call.
+/// Default ceiling for `web.search` results per call.
+/// The effective ceiling is `OperationalLimits::web_search_results`.
 pub const MAX_WEB_SEARCH_RESULTS: usize = 20;
 
-/// Inclusive upper bound for declared fallback models on one tool.
+/// Default ceiling for declared fallback models on one tool.
+/// The effective ceiling is `OperationalLimits::fallback_models`.
 pub const MAX_FALLBACK_MODELS: usize = 8;
 
-/// Inclusive upper bound for retry attempts on one node or hook.
+/// Default ceiling for retry attempts on one node or hook.
+/// The effective ceiling is `OperationalLimits::retry_attempts`.
 pub const MAX_RETRY_ATTEMPTS: u32 = 16;
 
-/// Inclusive upper bound for fixed retry backoff, in milliseconds.
+/// Default ceiling for fixed retry backoff, in milliseconds.
+/// The effective ceiling is `OperationalLimits::retry_backoff_ms`.
 pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 
 /// Inclusive upper bound for `foreach` parallel fan-out.
@@ -175,12 +183,12 @@ pub const MAX_ANCHORED_READ_LINES: usize = 2_000;
 pub const DEFAULT_PATCH_EDITS: usize = 32;
 pub const DEFAULT_PATCH_BYTES: usize = 64 * 1024;
 
-/// Q01: effective patch target ceiling, in bytes. Hash-anchored patch and
-/// repair refuse targets larger than this at the commit-time re-check, no
-/// matter how high the caller sets `output_file_limit_bytes` /
-/// `output_total_limit_bytes`. Adopted as the supported upper bound (not a
-/// request for larger capacity): callers asking for more fail fast with the
-/// ceiling displayed instead of failing later at the re-check.
+/// Q01: default patch target ceiling, in bytes. Hash-anchored patch and
+/// repair refuse targets larger than the effective ceiling at the commit-time
+/// re-check, no matter how high the caller sets `output_file_limit_bytes` /
+/// `output_total_limit_bytes`. The effective ceiling is
+/// `OperationalLimits::patch_target_bytes`; callers asking for more fail fast
+/// with the ceiling displayed instead of failing later at the re-check.
 pub const MAX_PATCH_TARGET_BYTES: usize = 8 * 1024 * 1024;
 
 /// Default timeout, in seconds, for MCP server operations.
@@ -188,6 +196,138 @@ pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 
 /// Default cap, in bytes, for MCP responses.
 pub const DEFAULT_MCP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+
+/// Deployment ceilings for the seven operational limits shared by contract
+/// validation and execution. This is policy, not mechanism: the configured
+/// values are the effective ceilings themselves. Defaults preserve today's
+/// values; a deployment may tighten or raise a ceiling in `providers.toml`.
+/// Contracts may declare values up to the effective ceiling; values above it
+/// are refused at validation and at runtime, never silently clamped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OperationalLimits {
+    /// Maximum tool calls on one agent tool, including `web.search`.
+    #[serde(default = "default_agent_tool_calls")]
+    pub agent_tool_calls: usize,
+    /// Maximum agent iterations per call.
+    #[serde(default = "default_agent_iterations")]
+    pub agent_iterations: usize,
+    /// Maximum fallback models declared on one tool.
+    #[serde(default = "default_fallback_models")]
+    pub fallback_models: usize,
+    /// Maximum `web.search` results per call.
+    #[serde(default = "default_web_search_results")]
+    pub web_search_results: usize,
+    /// Maximum retry attempts on one node or hook.
+    #[serde(default = "default_retry_attempts")]
+    pub retry_attempts: u32,
+    /// Maximum fixed retry backoff, in milliseconds. Zero is allowed: it
+    /// means no delay, and matches today's contract validation.
+    #[serde(default = "default_retry_backoff_ms")]
+    pub retry_backoff_ms: u64,
+    /// Effective hash-anchored patch target ceiling, in bytes (Q01).
+    #[serde(default = "default_patch_target_bytes")]
+    pub patch_target_bytes: usize,
+}
+
+const fn default_agent_tool_calls() -> usize {
+    MAX_AGENT_TOOL_CALLS
+}
+const fn default_agent_iterations() -> usize {
+    MAX_AGENT_ITERATIONS
+}
+const fn default_fallback_models() -> usize {
+    MAX_FALLBACK_MODELS
+}
+const fn default_web_search_results() -> usize {
+    MAX_WEB_SEARCH_RESULTS
+}
+const fn default_retry_attempts() -> u32 {
+    MAX_RETRY_ATTEMPTS
+}
+const fn default_retry_backoff_ms() -> u64 {
+    MAX_RETRY_BACKOFF_MS
+}
+const fn default_patch_target_bytes() -> usize {
+    MAX_PATCH_TARGET_BYTES
+}
+
+impl Default for OperationalLimits {
+    fn default() -> Self {
+        Self {
+            agent_tool_calls: default_agent_tool_calls(),
+            agent_iterations: default_agent_iterations(),
+            fallback_models: default_fallback_models(),
+            web_search_results: default_web_search_results(),
+            retry_attempts: default_retry_attempts(),
+            retry_backoff_ms: default_retry_backoff_ms(),
+            patch_target_bytes: default_patch_target_bytes(),
+        }
+    }
+}
+
+impl OperationalLimits {
+    /// Refuse only intrinsic ill-formedness: every count and the patch target
+    /// must be nonzero; any `retry_backoff_ms` is valid (zero means no delay).
+    /// There is no legacy upper bound: the configured values are the
+    /// effective ceilings, so a deployment may raise them above the defaults.
+    pub fn validate(&self) -> Result<(), String> {
+        for (name, value) in [
+            ("agent_tool_calls", self.agent_tool_calls),
+            ("agent_iterations", self.agent_iterations),
+            ("fallback_models", self.fallback_models),
+            ("web_search_results", self.web_search_results),
+            ("retry_attempts", self.retry_attempts as usize),
+            ("patch_target_bytes", self.patch_target_bytes),
+        ] {
+            if value == 0 {
+                return Err(format!("{name} must be at least 1"));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Default deployment ceiling, used until a registry installs its own.
+/// Preserves today's values; kept as a `const` so reads never freeze the
+/// process-wide installation (see `operational_limits`).
+const DEFAULT_DEPLOYMENT_LIMITS: OperationalLimits = OperationalLimits {
+    agent_tool_calls: MAX_AGENT_TOOL_CALLS,
+    agent_iterations: MAX_AGENT_ITERATIONS,
+    fallback_models: MAX_FALLBACK_MODELS,
+    web_search_results: MAX_WEB_SEARCH_RESULTS,
+    retry_attempts: MAX_RETRY_ATTEMPTS,
+    retry_backoff_ms: MAX_RETRY_BACKOFF_MS,
+    patch_target_bytes: MAX_PATCH_TARGET_BYTES,
+};
+
+static DEPLOYMENT_LIMITS: OnceLock<OperationalLimits> = OnceLock::new();
+
+/// Installs the deployment ceiling once, before contracts are validated.
+/// Repeated installation of the same value is a no-op (a registry may be
+/// parsed more than once, and CLI preload plus router install observe the
+/// same file); a conflicting value is refused instead of changing policy
+/// mid-process. Reads via `operational_limits` never install, so validation
+/// before installation observes defaults without freezing a later install.
+pub fn set_deployment_operational_limits(limits: OperationalLimits) -> Result<(), String> {
+    limits.validate()?;
+    match DEPLOYMENT_LIMITS.set(limits) {
+        Ok(()) => Ok(()),
+        Err(_) if DEPLOYMENT_LIMITS.get() == Some(&limits) => Ok(()),
+        Err(_) => Err("operational limits are already frozen for this process".into()),
+    }
+}
+
+/// Effective deployment ceiling. Unset means today's defaults; never an
+/// unrestricted value. Every operational check reads through this accessor.
+/// A read alone never installs: only `set_deployment_operational_limits`
+/// freezes the process value, so tests and boot paths that validate before
+/// installing still observe defaults without blocking a later install.
+pub fn operational_limits() -> &'static OperationalLimits {
+    DEPLOYMENT_LIMITS
+        .get()
+        .unwrap_or(&DEFAULT_DEPLOYMENT_LIMITS)
+}
 
 /// Request header carrying the idempotency key.
 pub const IDEMPOTENCY_HEADER: &str = "idempotency-key";
@@ -280,6 +420,105 @@ pub fn parse_positive_env(name: &str, default: usize) -> Result<usize, String> {
                 "invalid {name} `{value}`: must be an integer of at least 1"
             )),
         },
+    }
+}
+
+#[cfg(test)]
+mod operational_limits_tests {
+    use super::*;
+
+    #[test]
+    fn defaults_match_today_values() {
+        assert_eq!(
+            OperationalLimits::default(),
+            OperationalLimits {
+                agent_tool_calls: 10,
+                agent_iterations: 32,
+                fallback_models: 8,
+                web_search_results: 20,
+                retry_attempts: 16,
+                retry_backoff_ms: 60_000,
+                patch_target_bytes: 8 * 1024 * 1024,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<OperationalLimits>("{}").unwrap(),
+            OperationalLimits::default()
+        );
+    }
+
+    #[test]
+    fn unknown_keys_are_refused() {
+        let error = serde_json::from_str::<OperationalLimits>(r#"{"max_calls": 4}"#)
+            .expect_err("strict config must reject unknown keys");
+        assert!(error.to_string().contains("max_calls"), "{error}");
+    }
+
+    #[test]
+    fn deployment_ceiling_is_frozen_for_the_process() {
+        let narrowed = OperationalLimits {
+            agent_tool_calls: 3,
+            retry_attempts: 4,
+            ..OperationalLimits::default()
+        };
+        set_deployment_operational_limits(narrowed).expect("first installation wins");
+        set_deployment_operational_limits(narrowed)
+            .expect("repeated registry parsing must not change policy");
+        assert_eq!(operational_limits().agent_tool_calls, 3);
+        assert_eq!(operational_limits().retry_attempts, 4);
+        let conflicting = OperationalLimits {
+            agent_tool_calls: 4,
+            ..narrowed
+        };
+        assert!(set_deployment_operational_limits(conflicting).is_err());
+    }
+
+    #[test]
+    fn values_may_narrow_or_raise_but_not_disable() {
+        let narrowed = OperationalLimits {
+            agent_tool_calls: 2,
+            patch_target_bytes: 1024,
+            ..OperationalLimits::default()
+        };
+        narrowed.validate().expect("narrowing is allowed");
+
+        // The configured values are the effective ceilings: raising above the
+        // defaults is valid and lets contracts declare more than today.
+        for json in [
+            r#"{"agent_tool_calls": 11}"#,
+            r#"{"agent_tool_calls": 20}"#,
+            r#"{"agent_iterations": 64}"#,
+            r#"{"fallback_models": 16}"#,
+            r#"{"web_search_results": 40}"#,
+            r#"{"retry_attempts": 32}"#,
+            r#"{"retry_backoff_ms": 120000}"#,
+            r#"{"patch_target_bytes": 16777216}"#,
+        ] {
+            let limits: OperationalLimits = serde_json::from_str(json).unwrap();
+            limits
+                .validate()
+                .expect("raising above the defaults must be allowed");
+        }
+
+        // Zero counts (and a zero patch target) stay refused; zero backoff
+        // remains valid because it means no delay.
+        for (json, expected) in [
+            (r#"{"agent_tool_calls": 0}"#, "agent_tool_calls"),
+            (r#"{"agent_iterations": 0}"#, "agent_iterations"),
+            (r#"{"fallback_models": 0}"#, "fallback_models"),
+            (r#"{"web_search_results": 0}"#, "web_search_results"),
+            (r#"{"retry_attempts": 0}"#, "retry_attempts"),
+            (r#"{"patch_target_bytes": 0}"#, "patch_target_bytes"),
+        ] {
+            let limits: OperationalLimits = serde_json::from_str(json).unwrap();
+            let error = limits.validate().expect_err("zero value must be refused");
+            assert!(error.contains(expected), "{error}");
+        }
+        let zero_backoff: OperationalLimits =
+            serde_json::from_str(r#"{"retry_backoff_ms": 0}"#).unwrap();
+        zero_backoff
+            .validate()
+            .expect("zero backoff means no delay and stays valid");
     }
 }
 
