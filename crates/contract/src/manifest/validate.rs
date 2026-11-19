@@ -548,7 +548,9 @@ fn validate_skill_library(
 /// Reads SKILL.md without accepting a substitute: every read/encoding fault
 /// stays a hard contract error for both `skill` and `skill_library`. With a
 /// configured selected-bytes budget, at most one byte past the budget is read
-/// so an oversized file is refused before it is fully allocated.
+/// so an oversized file is refused before it is fully allocated. The size check
+/// runs before decoding, so a boundary that splits a multi-byte character is
+/// reported as oversize rather than as a broken encoding in a valid file.
 fn read_skill_source(
     resource: &str,
     skill_path: &Utf8Path,
@@ -564,16 +566,17 @@ fn read_skill_source(
     };
     let file = std::fs::File::open(skill_path).map_err(read_error)?;
     let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
-    let mut source = String::new();
+    let mut bytes = Vec::new();
     file.take(read_limit)
-        .read_to_string(&mut source)
+        .read_to_end(&mut bytes)
         .map_err(read_error)?;
-    if source.len() > limit {
+    if bytes.len() > limit {
         return Err(ContractError::Invalid(format!(
             "skill resource `{resource}` SKILL.md `{skill_path}` exceeds max_selected_bytes {limit}"
         )));
     }
-    Ok(source)
+    String::from_utf8(bytes)
+        .map_err(|error| read_error(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))
 }
 
 /// Content-only check, kept separate from the read so a library can skip one
@@ -1245,7 +1248,7 @@ mod tests {
         let root = admission_temp_root("standalone-bytes");
         let skill = root.join("skill");
         std::fs::create_dir(&skill).expect("skill directory should be created");
-        let source = "---\nname: demo\ndescription: Demo.\n---\nBody.\n";
+        let source = "---\nname: demo\ndescription: Demo.\n---\nBody é.\n";
         let skill_file = skill.join("SKILL.md");
         std::fs::write(&skill_file, source).expect("SKILL.md should be written");
         let len = source.len();
@@ -1258,6 +1261,21 @@ mod tests {
         assert!(
             error.to_string().contains("max_selected_bytes"),
             "the error must name the configured budget: {error}"
+        );
+
+        // A budget whose one-byte over-read ends inside a multi-byte character
+        // must report the size fault, not an encoding fault on a valid file.
+        let split = source.find('é').expect("source has a multi-byte character");
+        let split_budget = budgeted_resources("demo", "skill", "skill", split);
+        let split_error = validate_resource_files(&root, &split_budget)
+            .expect_err("a budget that splits a character must still be refused");
+        assert!(
+            split_error.to_string().contains("max_selected_bytes"),
+            "oversize must be reported before decoding: {split_error}"
+        );
+        assert!(
+            !split_error.to_string().contains("UTF-8"),
+            "a valid file must not be reported as an encoding fault: {split_error}"
         );
         std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
     }
