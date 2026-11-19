@@ -4,8 +4,8 @@ const MAX_REDIRECTS: usize = 3;
 
 /// This client carries no credentials or cookies, so a release URL may hand a
 /// download off to a CDN: a credential-free HTTPS target on another host is
-/// safe to follow. Same-host targets keep the initial userinfo, and no hop may
-/// downgrade from HTTPS or revisit a URL.
+/// safe to follow. Only the same origin keeps the initial userinfo, and no hop
+/// may downgrade from HTTPS or revisit a URL.
 fn redirect_allowed(next: &Url, previous: &[Url]) -> bool {
     let Some(initial) = previous.first() else {
         return false;
@@ -17,7 +17,7 @@ fn redirect_allowed(next: &Url, previous: &[Url]) -> bool {
     {
         return false;
     }
-    if next.host_str() == initial.host_str() {
+    if next.origin() == initial.origin() {
         (next.username(), next.password()) == (initial.username(), initial.password())
     } else {
         next.scheme() == "https" && next.username().is_empty() && next.password().is_none()
@@ -96,8 +96,9 @@ mod tests {
             assert!(!redirect_allowed(target, std::slice::from_ref(&https)));
             assert!(!redirect_allowed(target, &[http.clone(), https.clone()]));
         }
-        // With no HTTPS anywhere in the chain, same-host plain HTTP still works.
-        assert!(redirect_allowed(
+        // A port change is also a new origin and cannot carry userinfo;
+        // a credential-free HTTPS upgrade remains allowed.
+        assert!(!redirect_allowed(
             &Url::parse("http://releases.example:8080/archive").unwrap(),
             std::slice::from_ref(&http)
         ));
@@ -128,11 +129,23 @@ mod tests {
     fn redirect_policy_keeps_same_host_userinfo_and_refuses_foreign_userinfo() {
         let initial = Url::parse("http://user:password@releases.example/archive").unwrap();
         assert!(redirect_allowed(
-            &Url::parse("https://user:password@releases.example:8443/archive").unwrap(),
+            &Url::parse("http://user:password@releases.example/next").unwrap(),
             std::slice::from_ref(&initial)
         ));
+        for cross_origin in [
+            "https://user:password@releases.example/archive",
+            "http://user:password@releases.example/archive",
+            "http://user:password@releases.example:8443/archive",
+        ] {
+            assert!(
+                !redirect_allowed(
+                    &Url::parse(cross_origin).unwrap(),
+                    std::slice::from_ref(&initial)
+                ),
+                "a scheme or port change is a new origin: {cross_origin}"
+            );
+        }
         for target in [
-            "https://releases.example/archive",
             "https://other:password@releases.example/archive",
             "https://user:changed@releases.example/archive",
             "https://user@releases.example/archive",
@@ -143,10 +156,14 @@ mod tests {
                 "{target}"
             );
         }
-        // Dropping userinfo across hosts forwards nothing to the CDN.
+        // Dropping userinfo across origins forwards nothing to the target.
         assert!(redirect_allowed(
             &Url::parse("https://cdn.example/archive").unwrap(),
-            &[initial]
+            std::slice::from_ref(&initial)
+        ));
+        assert!(redirect_allowed(
+            &Url::parse("https://releases.example/archive").unwrap(),
+            std::slice::from_ref(&initial)
         ));
     }
 
@@ -244,16 +261,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_follows_same_host_redirect_across_ports() {
-        let (target, target_server) =
-            serve("HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".into())
-                .await;
-        let (url, redirect_server) = serve(format!(
-            "HTTP/1.1 302 Found\r\nLocation: {target}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )).await;
+    async fn client_follows_a_same_origin_redirect() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            for response in [
+                "HTTP/1.1 302 Found\r\nLocation: /final\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
         assert_eq!(get(&url, Some(2)).await.unwrap(), b"ok");
-        redirect_server.await.unwrap();
-        target_server.await.unwrap();
+        task.await.unwrap();
     }
 
     #[tokio::test]
