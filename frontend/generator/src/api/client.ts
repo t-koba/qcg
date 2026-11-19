@@ -183,6 +183,15 @@ export class ApiClient {
     );
   }
 
+  continueRun(runId: string, idempotencyKey?: string, signal?: AbortSignal): Promise<RunSnapshot> {
+    return this.post<RunSnapshot>(
+      `/api/runs/${encodeURIComponent(runId)}/continue`,
+      undefined,
+      idempotencyKey,
+      signal,
+    );
+  }
+
   artifactUrl(runId: string, path: string): string {
     return `${this.base}/api/runs/${encodeURIComponent(runId)}/artifacts/${encodePath(path)}`;
   }

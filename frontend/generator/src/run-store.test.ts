@@ -1,4 +1,4 @@
-import { afterEach, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { RunStore } from "./run-store.svelte";
 import type { FormSpec, RunSnapshot } from "./api/client";
 const snapshot = (seq: number, state: RunSnapshot["state"]): RunSnapshot => ({
@@ -224,4 +224,68 @@ it("preserves explicit null answers and defaults only missing values", async () 
     { values: { nullable: "fallback" } },
     expect.any(String),
   );
+});
+
+
+describe("continuing a failed run", () => {
+  function failedStore(state: RunSnapshot["state"] = "failed") {
+    const store = new RunStore();
+    store.applySnapshot(snapshot(1, state));
+    store.currentRun = "test";
+    store.runState = state;
+    store.ensureSubscribed = vi.fn();
+    store.refreshRun = vi.fn().mockResolvedValue(undefined);
+    store.api.listRuns = vi.fn().mockResolvedValue({ items: [], next_cursor: null }) as typeof store.api.listRuns;
+    return store;
+  }
+
+  it("applies the child snapshot, selects its tab and refreshes history", async () => {
+    const store = failedStore();
+    const child = { ...snapshot(1, "queued"), run_id: "child", parent_run_id: "test" };
+    const continueRun = vi.fn().mockResolvedValue(child);
+    store.api.continueRun = continueRun as typeof store.api.continueRun;
+
+    await store.continueCurrentRun();
+
+    expect(continueRun).toHaveBeenCalledWith("test", expect.any(String));
+    expect(store.currentRun).toBe("child");
+    expect(store.tabs.child.runState).toBe("queued");
+    expect(store.runState).toBe("queued");
+    expect(store.tabs.test).toMatchObject({ pendingAction: null, pendingOp: null });
+    await vi.waitFor(() => expect(store.api.listRuns).toHaveBeenCalledOnce());
+  });
+
+  it.each(["succeeded", "canceled", "interrupted", "running"] as const)("refuses to continue a %s run", async (state) => {
+    const store = failedStore(state);
+    const continueRun = vi.fn().mockResolvedValue(snapshot(2, "queued"));
+    store.api.continueRun = continueRun as typeof store.api.continueRun;
+
+    await store.continueCurrentRun();
+
+    expect(continueRun).not.toHaveBeenCalled();
+  });
+
+  it("keeps the failed run state when the continuation fails and clears its pending operation", async () => {
+    const store = failedStore();
+    store.api.continueRun = vi.fn().mockRejectedValue(new Error("request lost")) as typeof store.api.continueRun;
+
+    await expect(store.continueCurrentRun()).rejects.toThrow("request lost");
+    expect(store.currentRun).toBe("test");
+    expect(store.tabs.test).toMatchObject({ runState: "failed", pendingAction: null, pendingOp: null });
+  });
+
+  it("does not continue while another action is pending or the tab is a placeholder", async () => {
+    const store = failedStore();
+    const continueRun = vi.fn();
+    store.api.continueRun = continueRun as typeof store.api.continueRun;
+    store.tabs.test.pendingAction = "starting";
+
+    await store.continueCurrentRun();
+    expect(continueRun).not.toHaveBeenCalled();
+
+    store.tabs.test.pendingAction = null;
+    store.tabs.test.runId = "pending-local";
+    await store.continueCurrentRun();
+    expect(continueRun).not.toHaveBeenCalled();
+  });
 });

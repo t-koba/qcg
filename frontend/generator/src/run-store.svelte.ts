@@ -379,6 +379,31 @@ export class RunStore {
     }
   }
 
+  /** Continue the selected terminally failed run into a verified child run. */
+  async continueCurrentRun(): Promise<void> {
+    const tab = this.currentTab();
+    if (!tab || tab.pendingAction || tab.runId.startsWith("pending-") || tab.lastSnapshotSeq === 0) return;
+    // Defense in depth: only a failed run may be continued, even if a button
+    // or a script tries to invoke this outside the terminal failed view.
+    if (tab.runState !== "failed" || this.runState !== "failed") return;
+    tab.pendingAction = "starting";
+    const op = randomId();
+    tab.pendingOp = op;
+    this.saveCurrentView();
+    try {
+      const snapshot = await this.api.continueRun(tab.runId, randomId());
+      this.applySnapshot(snapshot);
+      this.selectTab(snapshot.run_id);
+      void this.withError(() => this.refreshRuns());
+    } finally {
+      if (tab.pendingOp === op) {
+        tab.pendingAction = null;
+        tab.pendingOp = null;
+        if (this.currentRun === tab.runId) this.pendingAction = null;
+      }
+    }
+  }
+
   async openRun(runId: string): Promise<void> {
     const snapshot = await this.api.get<RunSnapshot>(`/api/runs/${encodeURIComponent(runId)}`, AbortSignal.timeout(15000));
     this.applySnapshot(snapshot);

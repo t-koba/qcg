@@ -50,3 +50,39 @@ describe("package-reviewed run start", () => {
     expect(otherHeaders.has("x-qcg-package-sha256")).toBe(false);
   });
 });
+
+describe("continuing a failed run", () => {
+  it("posts to the continue endpoint without a request body and with an idempotency key", async () => {
+    const child = { run_id: "child", state: "queued" };
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, _init?: RequestInit) =>
+      new Response(JSON.stringify(child), { status: 201 }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const controller = new AbortController();
+    const client = new ApiClient();
+
+    await expect(client.continueRun("run/1", "key-1", controller.signal)).resolves.toEqual(child);
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/runs/run%2F1/continue");
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
+    expect(init?.signal).toBe(controller.signal);
+    const headers = new Headers(init?.headers);
+    expect(headers.get("idempotency-key")).toBe("key-1");
+  });
+
+  it("reports a rejected continuation as a typed API error", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(
+      JSON.stringify({ detail: "only failed runs can be continued" }),
+      { status: 409, headers: { "content-type": "application/problem+json" } },
+    )));
+    const client = new ApiClient();
+    await expect(client.continueRun("test", "key-1")).rejects.toMatchObject({
+      name: "ApiProblemError",
+      status: 409,
+      message: "only failed runs can be continued",
+    });
+  });
+});

@@ -201,6 +201,14 @@
           {#if terminal}
             <div class="completion-actions">
               <button class="secondary-btn" type="button" disabled={!store.currentRun || store.pendingAction !== null} onclick={() => void store.withError(() => store.forkCurrentRun())}>{messages.forkRun}</button>
+              <button
+                class="secondary-btn"
+                type="button"
+                disabled={!store.currentRun || store.pendingAction !== null || store.runState !== "failed"}
+                title={store.runState === "failed" ? messages.continueRun : messages.continueRunUnavailable}
+                aria-label={store.runState === "failed" ? messages.continueRun : `${messages.continueRun} — ${messages.continueRunUnavailable}`}
+                onclick={() => void store.withError(() => store.continueCurrentRun())}
+              >{messages.continueRun}</button>
               <button class="primary-btn" type="button" onclick={() => store.resetRun()}>{messages.startAgain}</button>
             </div>
           {/if}
