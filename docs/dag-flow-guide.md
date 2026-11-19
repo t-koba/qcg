@@ -120,7 +120,11 @@ Paid model work is eligible only when it is settled and fully recorded in the
 journal and its owning node's successful outcome is preserved: the child
 inherits those call, token and cost counters exactly and never repeats the
 call. Model work that is unresolved or whose owning outcome is reset or stale
-is not eligible, even when the counters match. When the recorded reads,
+is not eligible, even when the counters match. This eligibility is currently
+proven at the engine reset-plan and accounting boundary; no shipped `llm.*`
+executor yet supplies the read-only/complete attestation it requires, so paid
+model preservation is not available end to end through the CLI, API or UI
+today. When the recorded reads,
 execution history, effects or budget cannot be proven, continuation fails
 closed with a fixed redacted reason. Interrupted and canceled runs and
 ambiguous external, MCP or `foreach` cases are not eligible yet.
