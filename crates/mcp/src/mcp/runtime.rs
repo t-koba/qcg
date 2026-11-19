@@ -30,7 +30,9 @@ use super::profile::{CredentialGuard, McpProfile};
 use super::public::{is_reserved_public_id, shipped_public_profiles, validate_public_spec};
 use super::session::{McpSession, mcp_http_client};
 use super::spec::McpServerSpec;
-use super::transport::{McpAuth, McpTransport, OAuthCredentialStore};
+#[cfg(feature = "mcp-oauth")]
+use super::transport::OAuthCredentialStore;
+use super::transport::{McpAuth, McpTransport};
 use super::validate::required_env;
 #[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};

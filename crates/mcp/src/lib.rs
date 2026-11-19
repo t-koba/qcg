@@ -279,7 +279,12 @@ mod tests {
         tuned.url = Some("https://mcp.example.test/mcp".into());
         tuned.allowed_hosts = vec!["mcp.example.test".into()];
         tuned.timeout_seconds = 45;
-        let runtime = McpRuntime::from_config(Some(vec![tuned]), vec![remote_spec()])
+        // The regular row only proves coexistence with a public profile; use an
+        // auth-free HTTPS spec so this table-tuning test runs with or without
+        // the mcp-oauth feature. OAuth's own gating has a dedicated test.
+        let mut regular = remote_spec();
+        regular.auth = McpAuth::None;
+        let runtime = McpRuntime::from_config(Some(vec![tuned]), vec![regular])
             .expect("configured public profiles must load");
         assert_eq!(runtime.server_ids(), ["exa-public", "tinyfish"]);
         let profile = runtime
