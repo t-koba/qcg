@@ -1,9 +1,8 @@
-use contract::{ContextOverflowPolicy, LlmRequestPolicy, NodeDef};
+use contract::{ContextOverflowPolicy, DEFAULT_RETRY_PROMPT, LlmRequestPolicy, NodeDef};
 use engine::{ResultExt, StepContext, StepError};
 use llm::{ChatMessage, ChatRequest};
 use serde_json::json;
 
-use super::DEFAULT_RETRY_PROMPT;
 use crate::completion::local_exhaustion;
 use crate::prompting::{utf8_head, utf8_tail};
 use crate::request_policy::{EffectiveRequestPolicy, effective_request_policy};

@@ -170,20 +170,23 @@ Fields:
 - `fill_system_guardrail`: optional replacement for the system instruction
   prepended to `llm.generate`, `llm.fill`, `llm.choose`, and `llm.repair`
   requests. `agent_system_guardrail` does the same for `llm.agent` requests,
-  including specialists. Omitting either field keeps qcg's shipped wording
-  byte-for-byte. Like `retry_prompt`, each is bounded to 64 KiB in the
-  manifest (`MAX_MODEL_INSTRUCTION_BYTES`); this is a format/resource bound on
-  a manifest string, not a policy limit on model behavior, and the shipped
-  defaults are far inside it. Empty or whitespace-only replacements are
-  refused so a contract cannot silently delete the shipped instructions.
-  Unknown `[llm]` keys are rejected. These fields
-  choose instruction text only: tool results and MCP output are still parsed
-  as untrusted data by the same mechanism, and no instruction text is ever
-  taken from model output.
-- `system`: generator-specific system text appended after qcg's
-  mechanism-owned guardrail (or its contract replacement above). Node and
-  specialist `request.system` values are appended in layer order; all are
-  rendered against the node context.
+  including specialists. Omitting either field keeps the shipped `[llm]`
+  default byte-for-byte. Like `retry_prompt`, each is
+  bounded to 64 KiB in the manifest (`MAX_MODEL_INSTRUCTION_BYTES`); this is a
+  format/resource bound on a manifest string, not a policy limit on model
+  behavior, and the shipped defaults are far inside it. Empty or
+  whitespace-only replacements are refused so a contract cannot silently
+  delete the shipped instructions. Unknown `[llm]` keys are rejected. These
+  fields choose instruction text only: the wording is shipped configuration
+  text, not enforcement. Tool results and MCP output remain untrusted data in
+  tool-role messages, and no instruction text is ever taken from model output.
+- `system`: generator-specific system text appended after the `[llm]`
+  fill/agent system instruction above (the contract replacement, or its
+  shipped default). Node and specialist `request.system` values are appended
+  in layer order; all are rendered against the node context. The mechanism
+  guarantee does not depend on that wording: tool results and MCP output stay
+  untrusted data in tool-role messages, and qcg never takes instruction text
+  from model output.
 - `retry_prompt`: minijinja text used after schema validation failures, in
   place of qcg's shipped default. Available variables are `error` and
   `attempt`. Node and specialist `request.retry_prompt` values override it for

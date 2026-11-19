@@ -1,13 +1,13 @@
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use contract::{
-    CacheRetention, CacheWritePolicy, LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl,
+    CacheRetention, CacheWritePolicy, DEFAULT_AGENT_SYSTEM_GUARDRAIL,
+    DEFAULT_FILL_SYSTEM_GUARDRAIL, LlmRequestPolicy, NodeDef, PromptCachePolicy, ToolDecl,
 };
 use engine::{StepContext, StepError};
 use llm::{ChatContentPart, ChatMessage, ChatRequest, LlmRuntime, ToolSpec};
 use model::StructuredOutputMode;
 use serde_json::Value;
 
-use super::{AGENT_SYSTEM_GUARDRAIL, FILL_SYSTEM_GUARDRAIL};
 use crate::agent_tools::agent_tool_schema;
 use crate::mcp_tools::McpAgentTools;
 use crate::prompting::{read_bytes_bounded, resolve_workspace_read};
@@ -39,7 +39,7 @@ pub(crate) fn build_request(
         .llm
         .as_ref()
         .and_then(|llm| llm.fill_system_guardrail.as_deref())
-        .unwrap_or(FILL_SYSTEM_GUARDRAIL);
+        .unwrap_or(DEFAULT_FILL_SYSTEM_GUARDRAIL);
     build_chat_request(
         ctx,
         node,
@@ -183,7 +183,7 @@ pub(crate) fn build_request_with_messages(
         .llm
         .as_ref()
         .and_then(|llm| llm.agent_system_guardrail.as_deref())
-        .unwrap_or(AGENT_SYSTEM_GUARDRAIL);
+        .unwrap_or(DEFAULT_AGENT_SYSTEM_GUARDRAIL);
     build_chat_request(ctx, node, runtime, || Ok(messages), guardrail, options)
 }
 

@@ -420,9 +420,11 @@ validates each model argument against the original schema. When a server
 advertises `outputSchema`, its `structuredContent` is validated before the
 result enters the next LLM turn. External schema references are rejected, so
 schema validation cannot initiate undeclared network or filesystem access.
-Tool results remain untrusted data (the agent
-guardrail tells the model not to treat them as instructions) and are scanned
-for declared secret values before they enter the next LLM turn. The primary boundary is native tool-role isolation: results enter as `tool` messages, never as instructions. Flows that expose high-volume untrusted tools (`mcp`, web search) can opt in to a `tool_output` `regex_deny` scoped to that tool; there is deliberately no delimiter/datamark encoding on tool results: the available synthetic regex probe tripped on both a raw tool result and a resource-wrapped payload, but did not test instruction-following; no demonstrated benefit justifies adding the extra encoding.
+Tool results remain untrusted data and are scanned
+for declared secret values before they enter the next LLM turn. The boundary
+is native tool-role isolation: results enter as `tool` messages, never as
+instructions, and no instruction text is taken from model output. The shipped
+system wording is configuration text, not enforcement. Flows that expose high-volume untrusted tools (`mcp`, web search) can opt in to a `tool_output` `regex_deny` scoped to that tool; there is deliberately no delimiter/datamark encoding on tool results: the available synthetic regex probe tripped on both a raw tool result and a resource-wrapped payload, but did not test instruction-following; no demonstrated benefit justifies adding the extra encoding.
 
 ```toml
 [[flow.params.guardrails]]
