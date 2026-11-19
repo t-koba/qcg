@@ -15,6 +15,7 @@ mod tests {
             transport: McpTransport::StreamableHttp,
             lifecycle: McpLifecycle::Initialize,
             url: Some("https://agent.tinyfish.ai/mcp".into()),
+            allow_plaintext_private_http: false,
             command: vec![],
             env: BTreeMap::new(),
             env_from: BTreeMap::new(),
@@ -312,17 +313,30 @@ mod tests {
             .expect_err("static headers must be refused on public profiles");
         assert!(error.contains("static headers"), "{error}");
 
-        let mut http = shipped_public_profiles()[1].clone();
-        http.url = Some("http://search.parallel.ai/mcp".into());
-        http.allowed_hosts = vec!["search.parallel.ai".into()];
-        let error = McpRuntime::from_config(Some(vec![http]), Vec::new())
-            .expect_err("non-HTTPS public endpoints must be refused");
-        assert!(error.contains("HTTPS"), "{error}");
-
         let duplicate = shipped_public_profiles()[0].clone();
         let error = McpRuntime::from_config(Some(vec![duplicate.clone(), duplicate]), Vec::new())
             .expect_err("duplicate public ids must be refused");
         assert!(error.contains("duplicate"), "{error}");
+    }
+
+    #[test]
+    fn public_profiles_require_https_and_cannot_opt_in() {
+        for host in ["search.parallel.ai", "127.0.0.1", "10.0.0.1"] {
+            let mut spec = shipped_public_profiles()[1].clone();
+            spec.url = Some(format!("http://{host}/mcp"));
+            spec.allowed_hosts = vec![host.into()];
+            let error = McpRuntime::from_config(Some(vec![spec]), Vec::new())
+                .expect_err("non-HTTPS public endpoints must be refused");
+            assert!(error.contains("HTTPS"), "{error}");
+        }
+        let mut spec = shipped_public_profiles()[1].clone();
+        spec.allow_plaintext_private_http = true;
+        let error = McpRuntime::from_config(Some(vec![spec]), Vec::new())
+            .expect_err("even HTTPS public endpoints cannot opt in");
+        assert_eq!(
+            error,
+            "public MCP profiles must not enable allow_plaintext_private_http"
+        );
     }
 
     #[test]
@@ -505,6 +519,131 @@ mod tests {
             .validate()
             .expect_err("embedded URL credentials must be rejected");
         assert!(error.to_string().contains("credentials"), "{error}");
+    }
+
+    fn http_row(host: &str) -> String {
+        format!("id = 'private-mcp'\nurl = 'http://{host}:8080/mcp'\nallowed_hosts = ['{host}']\n")
+    }
+
+    #[test]
+    fn plaintext_http_requires_opt_in_and_a_literal_private_ip() {
+        for host in ["10.0.0.1", "172.16.0.1", "192.168.0.1", "[fd00::1]"] {
+            let row = http_row(host);
+            let spec: McpServerSpec = toml::from_str(&row).unwrap();
+            assert!(!spec.allow_plaintext_private_http);
+            assert!(spec.validate().unwrap_err().contains("must use HTTPS"));
+
+            let mut spec: McpServerSpec =
+                toml::from_str(&format!("{row}allow_plaintext_private_http = true")).unwrap();
+            let runtime = McpRuntime::from_config(Some(vec![]), vec![spec.clone()])
+                .expect("literal private HTTP endpoint must load with opt-in");
+            let url = runtime
+                .resolve("private-mcp")
+                .unwrap()
+                .url
+                .as_ref()
+                .unwrap();
+            assert_eq!(url.scheme(), "http");
+            assert_eq!(url.host_str(), Some(host));
+
+            spec.allowed_hosts.clear();
+            assert!(spec.validate().unwrap_err().contains("allowed_hosts"));
+        }
+        for host in [
+            "mcp.internal.test",
+            "93.184.215.14",
+            "[2001:db8::1]",
+            "169.254.1.1",
+            "[fe80::1]",
+            "100.64.0.1",
+            "224.0.0.1",
+            "[ff02::1]",
+            "0.0.0.0",
+            "[::]",
+            "[::ffff:a00:1]",
+        ] {
+            let row = http_row(host);
+            let spec: McpServerSpec =
+                toml::from_str(&format!("{row}allow_plaintext_private_http = true")).unwrap();
+            assert!(
+                spec.validate().unwrap_err().contains("must use HTTPS"),
+                "{host}"
+            );
+        }
+    }
+
+    #[test]
+    fn opted_in_plaintext_http_rejects_authentication_headers_and_oauth_settings() {
+        let row = format!(
+            "{}allow_plaintext_private_http = true\n",
+            http_row("10.0.0.1")
+        );
+        for config in [
+            "auth = 'bearer'\ncredential_env = 'MCP_TEST_TOKEN'",
+            "auth = 'header'\ncredential_env = 'MCP_TEST_TOKEN'\nauth_header = 'x-test'",
+            "auth = 'oauth'",
+            "credential_env = 'MCP_TEST_TOKEN'",
+            "auth_header = 'x-test'",
+            "auth_prefix = 'Bearer '",
+            "headers = { 'x-test' = 'untrusted' }",
+            "headers = { 'invalid header' = 'untrusted' }",
+            "oauth_client_id_env = 'MCP_TEST_CLIENT_ID'",
+            "oauth_client_secret_env = 'MCP_TEST_CLIENT_SECRET'",
+            "oauth_scopes = ['read']",
+            "oauth_store = 'memory'",
+            "oauth_state_ttl_seconds = 0",
+        ] {
+            let spec: McpServerSpec = toml::from_str(&format!("{row}{config}")).unwrap();
+            assert_eq!(
+                spec.validate().unwrap_err(),
+                "allow_plaintext_private_http requires HTTP endpoints without authentication, static headers, or OAuth settings"
+            );
+        }
+        let spec: McpServerSpec = toml::from_str(&format!(
+            "{}auth = 'bearer'\ncredential_env = 'MCP_TEST_TOKEN'",
+            row.replace("http://", "https://")
+        ))
+        .unwrap();
+        spec.validate()
+            .expect("the opt-in does not restrict HTTPS authentication");
+    }
+
+    #[test]
+    fn plaintext_http_opt_in_preserves_existing_url_and_schema_checks() {
+        let row = http_row("10.0.0.1");
+        let mut spec: McpServerSpec =
+            toml::from_str(&format!("{row}allow_plaintext_private_http = true")).unwrap();
+        for url in [
+            "ftp://10.0.0.1/mcp",
+            "http://redact-me@10.0.0.1/mcp",
+            "http://10.0.0.1/mcp?redact-me",
+            "http://10.0.0.1/mcp#redact-me",
+        ] {
+            spec.url = Some(url.into());
+            let error = spec.validate().unwrap_err();
+            assert!(error.contains("must be HTTP(S) without credentials, query, or fragment"));
+            assert!(!error.contains("redact-me"));
+        }
+        let mut stdio = stdio_spec();
+        stdio.allow_plaintext_private_http = true;
+        assert_eq!(
+            stdio.validate().unwrap_err(),
+            "allow_plaintext_private_http requires streamable_http transport"
+        );
+
+        let error = toml::from_str::<McpServerSpec>(&format!("{row}allow_private_http = true"))
+            .expect_err("unknown keys must still be refused");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+
+        for host in ["localhost", "127.0.0.1", "[::1]"] {
+            let spec: McpServerSpec = toml::from_str(&format!(
+                "{}auth = 'bearer'\ncredential_env = 'MCP_TEST_TOKEN'",
+                http_row(host)
+            ))
+            .unwrap();
+            spec.validate()
+                .expect("the existing loopback exception stays unchanged");
+        }
     }
 
     #[test]
@@ -769,6 +908,7 @@ mod tests {
             transport: McpTransport::Stdio,
             lifecycle: McpLifecycle::Initialize,
             url: None,
+            allow_plaintext_private_http: false,
             command: vec!["demo-server".into(), "--stdio".into()],
             env: BTreeMap::new(),
             env_from: BTreeMap::new(),

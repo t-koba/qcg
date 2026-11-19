@@ -598,12 +598,20 @@ task_poll_interval_ms = 250
 ```
 
 `transport` defaults to `streamable_http`. The URL must be an HTTP(S) URL
-without userinfo, query, or fragment; a non-loopback remote URL must use
-HTTPS. `allowed_hosts` must include the endpoint host and every host needed by
-OAuth discovery, authorization, token, or registration requests (hosts only; IPv6 literals use the bracketed form `"[2001:db8::1]"`). It is also
-the redirect allowlist for the OAuth HTTP client. The contract must list every
-one of these hosts in `[permissions].network`; the registry never grants that
-permission by itself.
+without userinfo, query, or fragment. Non-loopback endpoints require HTTPS by
+default. An operator can set `allow_plaintext_private_http = true` on a regular
+`[[mcp_server]]` row to allow an HTTP URL with a literal RFC1918 IPv4 address
+(e.g. `http://192.168.1.10/mcp`) or bracketed IPv6 unique-local address
+(e.g. `http://[fd00::10]/mcp`). Private DNS names and link-local addresses do
+not qualify. For HTTP with the opt-in, use `auth = "none"`, omit credential
+fields and static headers, and leave all OAuth settings at their defaults.
+The opt-in does not apply to stdio, public profiles, or OAuth.
+
+`allowed_hosts` must include the endpoint host and every host needed by OAuth
+discovery, authorization, token, or registration requests (hosts only; use
+brackets for IPv6 literals). It is also the redirect allowlist for the OAuth
+HTTP client. The contract must list every one of these hosts in
+`[permissions].network`; the registry never grants that permission by itself.
 
 `allowed_destinations` is the separate operator ceiling for server-side fetch:
 whole-value absolute HTTP(S), protocol-relative `//host/path`, and schemeless

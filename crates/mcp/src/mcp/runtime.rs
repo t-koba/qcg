@@ -31,9 +31,9 @@ use super::public::{is_reserved_public_id, shipped_public_profiles, validate_pub
 use super::session::{McpSession, mcp_http_client};
 use super::spec::McpServerSpec;
 use super::transport::{McpAuth, McpTransport, OAuthCredentialStore};
+use super::validate::required_env;
 #[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};
-use super::validate::{required_env, validate_remote_url};
 
 pub(crate) struct McpClient;
 
@@ -164,7 +164,7 @@ impl McpRuntime {
         let mut active_sessions = BTreeMap::new();
         let mut lifecycle_gates = BTreeMap::new();
         for spec in specs {
-            spec.validate()?;
+            let url = spec.validate_with_url()?;
             let id = spec.id.clone();
             if profiles.contains_key(&id) {
                 return Err(format!("duplicate MCP server id `{id}`"));
@@ -175,11 +175,6 @@ impl McpRuntime {
                     "MCP server `{id}` uses OAuth, which requires the `mcp-oauth` cargo feature"
                 ));
             }
-            let url = spec
-                .url
-                .as_deref()
-                .map(|raw| validate_remote_url(&id, raw))
-                .transpose()?;
             #[cfg(feature = "mcp-oauth")]
             let keyring_account = match spec.url.as_deref() {
                 Some(url) => format!("{}@{url}", spec.id),

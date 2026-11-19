@@ -185,6 +185,9 @@ pub fn is_reserved_public_id(id: &str) -> bool {
 /// credential material. Contract-level tool bindings and host permissions
 /// still gate every call.
 pub fn validate_public_spec(spec: &McpServerSpec) -> Result<(), String> {
+    if spec.allow_plaintext_private_http {
+        return Err("public MCP profiles must not enable allow_plaintext_private_http".into());
+    }
     spec.validate()?;
     if !is_reserved_public_id(&spec.id) {
         return Err(format!(

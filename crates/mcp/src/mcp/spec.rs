@@ -1,6 +1,7 @@
 use policy::{MAX_DECIDER_TIMEOUT_SECONDS, MIN_DECIDER_TIMEOUT_SECONDS, credential_like_name};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use url::Url;
 
 pub(crate) const TOOLS_LIST_PAGE_LIMIT_MIN: usize = 1;
 
@@ -24,7 +25,7 @@ use super::transport::{
 };
 use super::validate::{
     dangerous_process_env_name, reserved_transport_header, valid_env_name, valid_id,
-    validate_destination, validate_host, validate_remote_url,
+    validate_destination, validate_host, validate_remote_url_with_policy,
 };
 
 #[derive(Clone, Deserialize)]
@@ -37,6 +38,9 @@ pub struct McpServerSpec {
     pub lifecycle: McpLifecycle,
     #[serde(default)]
     pub url: Option<String>,
+    /// Allows credential-free HTTP to a literal private IP for a regular remote row.
+    #[serde(default)]
+    pub allow_plaintext_private_http: bool,
     #[serde(default)]
     pub command: Vec<String>,
     #[serde(default)]
@@ -109,6 +113,10 @@ impl std::fmt::Debug for McpServerSpec {
             .field("transport", &self.transport)
             .field("lifecycle", &self.lifecycle)
             .field("url", &self.url.as_ref().map(|_| "<configured>"))
+            .field(
+                "allow_plaintext_private_http",
+                &self.allow_plaintext_private_http,
+            )
             .field("command_bin", &self.command.first())
             .field("command_arg_count", &self.command.len().saturating_sub(1))
             .field("env", &self.env.keys().collect::<Vec<_>>())
@@ -148,12 +156,38 @@ impl std::fmt::Debug for McpServerSpec {
 
 impl McpServerSpec {
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_with_url().map(|_| ())
+    }
+
+    pub(crate) fn validate_with_url(&self) -> Result<Option<Url>, String> {
         if !valid_id(&self.id) {
             return Err(format!(
                 "MCP server id `{}` must contain only lowercase ASCII letters, digits, `.`, `_`, or `-`",
                 self.id
             ));
         }
+        // Reject credential configuration before general field checks can report its values.
+        let opted_in_url = if self.allow_plaintext_private_http {
+            if self.transport != McpTransport::StreamableHttp {
+                return Err(
+                    "allow_plaintext_private_http requires streamable_http transport".into(),
+                );
+            }
+            let url = self.validate_endpoint_url()?;
+            if url.scheme() == "http"
+                && (self.auth != McpAuth::None
+                    || self.has_static_auth_fields()
+                    || !self.headers.is_empty()
+                    || self.has_oauth_fields()
+                    || self.oauth_store != default_oauth_store()
+                    || self.oauth_state_ttl_seconds != default_oauth_state_ttl_seconds())
+            {
+                return Err("allow_plaintext_private_http requires HTTP endpoints without authentication, static headers, or OAuth settings".into());
+            }
+            Some(url)
+        } else {
+            None
+        };
         if self.timeout_seconds == 0 {
             return Err(format!(
                 "MCP server `{}` timeout_seconds must be greater than zero",
@@ -244,7 +278,7 @@ impl McpServerSpec {
                 self.id
             ));
         }
-        match self.transport {
+        let url = match self.transport {
             McpTransport::StreamableHttp => {
                 if !self.command.is_empty() || !self.env.is_empty() || !self.env_from.is_empty() {
                     return Err(format!(
@@ -252,13 +286,10 @@ impl McpServerSpec {
                         self.id
                     ));
                 }
-                let raw = self.url.as_deref().ok_or_else(|| {
-                    format!(
-                        "MCP server `{}` streamable_http transport requires url",
-                        self.id
-                    )
-                })?;
-                let url = validate_remote_url(&self.id, raw)?;
+                let url = match opted_in_url {
+                    Some(url) => url,
+                    None => self.validate_endpoint_url()?,
+                };
                 let endpoint_host = url.host_str().expect("validated URL has host");
                 if !self.allowed_hosts.iter().any(|host| host == endpoint_host) {
                     return Err(format!(
@@ -281,6 +312,7 @@ impl McpServerSpec {
                 }
                 self.validate_non_network_tools()?;
                 self.validate_destination_decider()?;
+                Some(url)
             }
             McpTransport::Stdio => {
                 if self.url.is_some() || !self.headers.is_empty() || !self.allowed_hosts.is_empty()
@@ -316,17 +348,12 @@ impl McpServerSpec {
                         self.id
                     ));
                 }
+                None
             }
-        }
+        };
         match self.auth {
             McpAuth::None => {
-                if self.credential_env.is_some()
-                    || self.auth_header.is_some()
-                    || !self.auth_prefix.is_empty()
-                    || self.oauth_client_id_env.is_some()
-                    || self.oauth_client_secret_env.is_some()
-                    || !self.oauth_scopes.is_empty()
-                {
+                if self.has_static_auth_fields() || self.has_oauth_fields() {
                     return Err(format!(
                         "MCP server `{}` auth = \"none\" must not declare authentication fields",
                         self.id
@@ -365,10 +392,7 @@ impl McpServerSpec {
                 self.reject_oauth_fields()?;
             }
             McpAuth::Oauth => {
-                if self.credential_env.is_some()
-                    || self.auth_header.is_some()
-                    || !self.auth_prefix.is_empty()
-                {
+                if self.has_static_auth_fields() {
                     return Err(format!(
                         "MCP server `{}` OAuth must not declare static credential fields",
                         self.id
@@ -408,7 +432,17 @@ impl McpServerSpec {
                 }
             }
         }
-        Ok(())
+        Ok(url)
+    }
+
+    fn validate_endpoint_url(&self) -> Result<Url, String> {
+        let raw = self.url.as_deref().ok_or_else(|| {
+            format!(
+                "MCP server `{}` streamable_http transport requires url",
+                self.id
+            )
+        })?;
+        validate_remote_url_with_policy(&self.id, raw, self.allow_plaintext_private_http)
     }
 
     fn validate_non_network_tools(&self) -> Result<(), String> {
@@ -496,11 +530,18 @@ impl McpServerSpec {
         Ok(())
     }
 
-    fn reject_oauth_fields(&self) -> Result<(), String> {
-        if self.oauth_client_id_env.is_some()
+    fn has_static_auth_fields(&self) -> bool {
+        self.credential_env.is_some() || self.auth_header.is_some() || !self.auth_prefix.is_empty()
+    }
+
+    fn has_oauth_fields(&self) -> bool {
+        self.oauth_client_id_env.is_some()
             || self.oauth_client_secret_env.is_some()
             || !self.oauth_scopes.is_empty()
-        {
+    }
+
+    fn reject_oauth_fields(&self) -> Result<(), String> {
+        if self.has_oauth_fields() {
             return Err(format!(
                 "MCP server `{}` non-OAuth auth must not declare OAuth fields",
                 self.id

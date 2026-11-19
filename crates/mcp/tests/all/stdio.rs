@@ -27,6 +27,7 @@ fn spec(id: &str, command: Vec<String>) -> McpServerSpec {
         transport: McpTransport::Stdio,
         lifecycle: mcp::McpLifecycle::Initialize,
         url: None,
+        allow_plaintext_private_http: false,
         command,
         env: BTreeMap::new(),
         env_from: BTreeMap::new(),

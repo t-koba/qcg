@@ -1,6 +1,7 @@
 #[cfg(feature = "mcp-oauth")]
 use rmcp::transport::auth::AuthError;
 use serde::Serialize;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 use super::error::McpError;
@@ -116,6 +117,14 @@ pub(crate) fn reserved_transport_header(value: &str) -> bool {
 }
 
 pub(crate) fn validate_remote_url(id: &str, raw: &str) -> Result<Url, String> {
+    validate_remote_url_with_policy(id, raw, false)
+}
+
+pub(crate) fn validate_remote_url_with_policy(
+    id: &str,
+    raw: &str,
+    allow_plaintext_private_http: bool,
+) -> Result<Url, String> {
     let url =
         Url::parse(raw).map_err(|error| format!("MCP server `{id}` has invalid url: {error}"))?;
     if !matches!(url.scheme(), "http" | "https")
@@ -129,10 +138,23 @@ pub(crate) fn validate_remote_url(id: &str, raw: &str) -> Result<Url, String> {
             "MCP server `{id}` url must be HTTP(S) without credentials, query, or fragment"
         ));
     }
-    if url.scheme() != "https" && !is_loopback(url.host_str().expect("validated host")) {
+    let host = url.host_str().expect("validated host");
+    if !(url.scheme() == "https"
+        || is_loopback(host)
+        || (allow_plaintext_private_http && is_private_ip_literal(host)))
+    {
         return Err(format!("MCP server `{id}` remote url must use HTTPS"));
     }
     Ok(url)
+}
+
+fn is_private_ip_literal(host: &str) -> bool {
+    host.parse::<Ipv4Addr>().is_ok_and(|ip| ip.is_private())
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .and_then(|host| host.parse::<Ipv6Addr>().ok())
+            .is_some_and(|ip| ip.is_unique_local())
 }
 
 #[cfg(feature = "mcp-oauth")]

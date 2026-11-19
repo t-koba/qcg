@@ -229,6 +229,7 @@ fn spec_with_lifecycle(id: &str, url: &str, lifecycle: mcp::McpLifecycle) -> Mcp
         transport: McpTransport::StreamableHttp,
         lifecycle,
         url: Some(url.to_string()),
+        allow_plaintext_private_http: false,
         command: vec![],
         env: BTreeMap::new(),
         env_from: BTreeMap::new(),

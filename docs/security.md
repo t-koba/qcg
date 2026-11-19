@@ -386,8 +386,15 @@ The generic `mcp` agent tool is also explicit opt-in. Its contract fixes the
 profile `server`, remote `tool`, per-tool call budget, whether the operation
 is expected to have side effects, and optional per-tool `destinations` narrowing. Streamable HTTP profiles allow only their
 declared `allowed_hosts`, require every one of those hosts in
-`permissions.network`, and use HTTPS for non-loopback endpoints. Stdio profiles
-allow only their exact command vector through `permissions.commands`; the child
+`permissions.network`, and require HTTPS for non-loopback endpoints unless an
+operator sets `allow_plaintext_private_http = true` on a regular `[[mcp_server]]`
+row. The exception covers only literal RFC1918 IPv4 or bracketed IPv6 unique-local
+addresses, not private DNS names. Opted-in HTTP permits no authentication,
+credential fields, static headers, or non-default OAuth settings. It does not
+apply to public profiles or OAuth. Plain HTTP does not encrypt traffic or
+authenticate the server; use it only on a network you trust.
+
+Stdio profiles allow only their exact command vector through `permissions.commands`; the child
 does not receive the qcg process environment. The argument schema gate and the
 qcg-to-server reach check above do not govern server-to-destination reach, so
 model-chosen URL arguments pass a second operator-owned ceiling first:
