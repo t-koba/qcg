@@ -4798,6 +4798,16 @@ hosts journaled in plaintext alongside the existing argument summary; resume
 recomputes the extraction and refuses on mismatch, and tightening the policy
 applies retroactively to resumed calls.
 
+The server row may also declare `non_network_tools` (default empty): exact
+remote tool names the operator has verified never fetch URLs or hosts. Only
+those tools skip destination extraction at validation and execution, bypassing
+the ceiling, narrowing, decider, and ambiguity checks. This applies to both
+agent `mcp` tools and direct `mcp.call` steps using the exact remote name;
+all other tools keep the fail-closed path above. This is an operator
+trust assertion about the remote tool implementation — qcg cannot re-check a
+server-side fetch — so declare only verified tools; a dotted non-URL argument
+such as `report.md` stays a classified host for undeclared tools.
+
 An `mcp` tool may also declare `destinations = ["example.com"]` to narrow the
 operator ceiling per tool. Absent (default) inherits the ceiling; an explicit
 list allows only those hosts with an empty list meaning query-only (any

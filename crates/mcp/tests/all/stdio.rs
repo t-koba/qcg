@@ -41,6 +41,7 @@ fn spec(id: &str, command: Vec<String>) -> McpServerSpec {
         oauth_store: OAuthCredentialStore::Memory,
         allowed_hosts: Vec::new(),
         allowed_destinations: Vec::new(),
+        non_network_tools: Vec::new(),
         destination_decider: Vec::new(),
         destination_decider_timeout_seconds: None,
         timeout_seconds: 5,

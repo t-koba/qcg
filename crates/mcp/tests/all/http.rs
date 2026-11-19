@@ -243,6 +243,7 @@ fn spec_with_lifecycle(id: &str, url: &str, lifecycle: mcp::McpLifecycle) -> Mcp
         oauth_store: OAuthCredentialStore::Memory,
         allowed_hosts: vec!["127.0.0.1".into()],
         allowed_destinations: Vec::new(),
+        non_network_tools: Vec::new(),
         destination_decider: Vec::new(),
         destination_decider_timeout_seconds: None,
         timeout_seconds: 5,

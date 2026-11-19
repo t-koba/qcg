@@ -29,6 +29,7 @@ mod tests {
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec!["agent.tinyfish.ai".into()],
             allowed_destinations: vec![],
+            non_network_tools: Vec::new(),
             destination_decider: vec![],
             destination_decider_timeout_seconds: None,
             timeout_seconds: 30,
@@ -349,6 +350,66 @@ mod tests {
                 .validate()
                 .expect_err("non-host destinations must be rejected");
             assert!(error.contains("allowed destination"), "{error}");
+        }
+    }
+
+    #[test]
+    fn non_network_tools_defaults_to_empty_when_omitted() {
+        let config = serde_json::json!({
+            "id": "no-fetch", "transport": "streamable_http", "lifecycle": "initialize",
+            "url": "https://agent.tinyfish.ai/mcp", "auth": "none",
+            "allowed_hosts": ["agent.tinyfish.ai"],
+        });
+        let spec: McpServerSpec =
+            serde_json::from_value(config).expect("omitted field must deserialize to empty");
+        assert!(spec.non_network_tools.is_empty());
+        spec.validate().expect("empty default must validate");
+        let runtime = McpRuntime::from_specs(vec![spec]).expect("empty default must load");
+        assert!(
+            runtime
+                .resolve("no-fetch")
+                .expect("profile resolves")
+                .non_network_tools()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn non_network_tools_are_bounded_and_well_formed_on_both_transports() {
+        let mut remote = remote_spec();
+        let mut stdio = stdio_spec();
+        remote.non_network_tools = vec!["local_only".into(), "echo".into()];
+        stdio.non_network_tools = remote.non_network_tools.clone();
+        remote
+            .validate()
+            .expect("declared names must validate on http");
+        stdio
+            .validate()
+            .expect("declared names must validate on stdio");
+
+        for (names, reason) in [
+            (vec![" ".to_string()], "empty or whitespace-only"),
+            (vec!["tool\nname".to_string()], "control characters"),
+            (vec!["a".repeat(129)], "128 bytes"),
+            (vec!["same".to_string(), "same".to_string()], "duplicate"),
+            (
+                (0..1_001).map(|n| format!("tool-{n}")).collect::<Vec<_>>(),
+                "at most",
+            ),
+        ] {
+            let mut remote = remote_spec();
+            remote.non_network_tools = names.clone();
+            let error = remote
+                .validate()
+                .expect_err("malformed tool declarations must be rejected");
+            assert!(error.contains("non_network_tools"), "{error}");
+            assert!(error.contains(reason), "expected {reason}: {error}");
+            let mut stdio = stdio_spec();
+            stdio.non_network_tools = names;
+            let error = stdio
+                .validate()
+                .expect_err("stdio must reject the same malformed declarations");
+            assert!(error.contains("non_network_tools"), "{error}");
         }
     }
 
@@ -708,6 +769,7 @@ mod tests {
             oauth_store: OAuthCredentialStore::Memory,
             allowed_hosts: vec![],
             allowed_destinations: vec![],
+            non_network_tools: Vec::new(),
             destination_decider: vec![],
             destination_decider_timeout_seconds: None,
             timeout_seconds: 30,

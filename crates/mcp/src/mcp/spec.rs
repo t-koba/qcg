@@ -6,6 +6,8 @@ pub(crate) const TOOLS_LIST_PAGE_LIMIT_MIN: usize = 1;
 
 pub(crate) const TOOLS_LIST_PAGE_LIMIT_MAX: usize = 1_000;
 
+const NON_NETWORK_TOOL_NAME_MAX_BYTES: usize = 128;
+
 const OAUTH_STATE_TTL_SECONDS_MIN: u64 = 60;
 
 const OAUTH_STATE_TTL_SECONDS_MAX: u64 = 3_600;
@@ -67,6 +69,14 @@ pub struct McpServerSpec {
     /// server fetches remotely too.
     #[serde(default)]
     pub allowed_destinations: Vec<String>,
+    /// Remote tool names the operator has verified cannot perform server-side
+    /// fetches: these tools never fetch URLs or hosts from their arguments.
+    /// Empty (default) keeps every tool under the fail-closed extraction,
+    /// ceiling, narrowing, decider and ambiguity rules. Only declare a tool
+    /// after verifying its remote implementation never fetches; qcg cannot
+    /// re-check what the server does with an argument.
+    #[serde(default)]
+    pub non_network_tools: Vec<String>,
     /// Optional fail-closed destination decider: an operator-configured
     /// command consulted only when the static `allowed_destinations` ceiling
     /// misses. Empty (default) keeps current behavior exactly. The command
@@ -117,6 +127,7 @@ impl std::fmt::Debug for McpServerSpec {
             .field("oauth_store", &self.oauth_store)
             .field("allowed_hosts", &self.allowed_hosts)
             .field("allowed_destinations", &self.allowed_destinations)
+            .field("non_network_tools", &self.non_network_tools)
             .field("destination_decider_bin", &self.destination_decider.first())
             .field(
                 "destination_decider_arg_count",
@@ -268,6 +279,7 @@ impl McpServerSpec {
                         )
                     })?;
                 }
+                self.validate_non_network_tools()?;
                 self.validate_destination_decider()?;
             }
             McpTransport::Stdio => {
@@ -286,6 +298,7 @@ impl McpServerSpec {
                         )
                     })?;
                 }
+                self.validate_non_network_tools()?;
                 self.validate_destination_decider()?;
                 if self
                     .command
@@ -393,6 +406,44 @@ impl McpServerSpec {
                         self.id
                     ));
                 }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_non_network_tools(&self) -> Result<(), String> {
+        if self.non_network_tools.len() > TOOLS_LIST_PAGE_LIMIT_MAX {
+            return Err(format!(
+                "MCP server `{}` non_network_tools must have at most {TOOLS_LIST_PAGE_LIMIT_MAX} entries (got {})",
+                self.id,
+                self.non_network_tools.len()
+            ));
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for tool in &self.non_network_tools {
+            if tool.trim().is_empty() {
+                return Err(format!(
+                    "MCP server `{}` non_network_tools must not contain empty or whitespace-only tool names",
+                    self.id
+                ));
+            }
+            if tool.chars().any(char::is_control) {
+                return Err(format!(
+                    "MCP server `{}` non_network_tools must not contain control characters",
+                    self.id
+                ));
+            }
+            if tool.len() > NON_NETWORK_TOOL_NAME_MAX_BYTES {
+                return Err(format!(
+                    "MCP server `{}` non_network_tools tool name exceeds {NON_NETWORK_TOOL_NAME_MAX_BYTES} bytes",
+                    self.id
+                ));
+            }
+            if !seen.insert(tool) {
+                return Err(format!(
+                    "MCP server `{}` non_network_tools contains duplicate tool `{tool}`",
+                    self.id
+                ));
             }
         }
         Ok(())

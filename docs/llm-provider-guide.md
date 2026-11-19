@@ -635,6 +635,17 @@ the contract's `[permissions].commands`; verdicts are journaled as
 `mcp_destination_decision` (hosts only) and resumes re-invoke fresh. Unset
 keeps the static ceiling exactly.
 
+`non_network_tools` (default empty) lists remote tool names the operator has
+verified never fetch URLs or hosts. Only an exact name in this list skips
+destination extraction — and therefore the ceiling, tool narrowing, decider,
+and ambiguity checks — at validation and execution; every undeclared tool keeps
+the fail-closed behavior above. This is a trust assertion about the remote
+implementation: qcg cannot verify what a server does with an argument, so
+declare only tools you have checked (for example, a tool whose argument is a
+filename such as `report.md`, not a fetch target). Names must be non-empty,
+unique, free of control characters, and at most 128 bytes; the list holds at
+most 1,000 entries (the `tools_list_page_limit` maximum).
+
 `lifecycle` selects MCP session negotiation explicitly: `initialize` uses the
 widely deployed initialize handshake, while `discover` requires the modern
 `server/discover` lifecycle and is the default for custom profiles. Use
@@ -663,7 +674,8 @@ auth = "none"
 `allowed_hosts`. It can declare `allowed_destinations`, with the same
 whole-value extraction and empty-default-deny semantics as above, plus the
 same optional fallback-only `destination_decider` and bounded
-`destination_decider_timeout_seconds`. The child process receives a cleared environment containing
+`destination_decider_timeout_seconds`, and accepts `non_network_tools` with the
+same verified-tool semantics. The child process receives a cleared environment containing
 only `PATH`, the non-sensitive `env` entries, and `env_from` values copied from
 the qcg process. Sensitive environment names must use `env_from`; provider
 credentials are never inherited implicitly. The complete command vector must

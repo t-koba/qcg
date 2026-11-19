@@ -65,6 +65,12 @@ impl McpProfile {
         &self.spec.allowed_destinations
     }
 
+    /// Remote tool names the operator has verified cannot fetch URLs or hosts.
+    /// Empty by default, so every undeclared tool stays fail-closed.
+    pub fn non_network_tools(&self) -> &[String] {
+        &self.spec.non_network_tools
+    }
+
     /// Operator destination decider argv for this server, if configured.
     /// `None` (default) keeps the static ceiling exactly.
     pub fn destination_decider(&self) -> Option<&[String]> {

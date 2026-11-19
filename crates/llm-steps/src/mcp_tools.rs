@@ -7,7 +7,7 @@ use mcp::{
     McpError, McpSession,
 };
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::agent::agent_command_permission;
 
@@ -43,6 +43,9 @@ pub(crate) struct McpAgentTools {
     /// Operator `allowed_destinations` ceiling per resolved server id.
     /// Missing entries fail closed (deny everything extracted).
     destinations: BTreeMap<String, Vec<String>>,
+    /// Operator-verified non-fetching remote tool names per resolved server.
+    /// Only these skip extraction; all others keep the fail-closed rules.
+    non_network_tools: BTreeMap<String, BTreeSet<String>>,
     /// Contract-delegated per-tool narrowing. `None` inherits the ceiling;
     /// `Some(list)` allows only those hosts with an empty list meaning
     /// query-only. Missing entries inherit the ceiling.
@@ -75,7 +78,9 @@ impl McpAgentTools {
     /// narrowing would still admit, sync validation defers: it passes so the
     /// non-suspending execution gate ([`Self::authorize_destinations`]) can
     /// consult operator policy. A denied execution surfaces there as
-    /// `Refused`; narrowing denials never defer.
+    /// `Refused`; narrowing denials never defer. A tool the operator declares
+    /// in `non_network_tools` is the sole exception: it returns no hosts
+    /// before extraction, since its arguments cannot name a fetch target.
     pub(crate) fn check_destinations(
         &self,
         node: &NodeDef,
@@ -88,6 +93,13 @@ impl McpAgentTools {
                 format!("MCP tool alias `{alias}` was not resolved"),
             )
         })?;
+        if self
+            .non_network_tools
+            .get(&tool.server)
+            .is_some_and(|names| names.contains(&tool.remote_name))
+        {
+            return Ok(Vec::new());
+        }
         let allowed = self
             .destinations
             .get(&tool.server)
@@ -183,6 +195,7 @@ impl McpAgentTools {
 
         let mut permitted_commands = Vec::new();
         let mut destinations = BTreeMap::new();
+        let mut non_network_tools = BTreeMap::new();
         let mut deciders = BTreeMap::new();
         for server in requested.keys() {
             let profile = runtime
@@ -190,6 +203,10 @@ impl McpAgentTools {
                 .resolve(server)
                 .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
             destinations.insert(server.clone(), profile.allowed_destinations().to_vec());
+            non_network_tools.insert(
+                server.clone(),
+                profile.non_network_tools().iter().cloned().collect(),
+            );
             if let Some(argv) = profile.destination_decider() {
                 deciders.insert(
                     server.clone(),
@@ -346,6 +363,7 @@ impl McpAgentTools {
             sessions,
             tools: resolved,
             destinations,
+            non_network_tools,
             declared,
             deciders,
             authorization_required,
@@ -676,6 +694,7 @@ mod tests {
                 },
             )]),
             destinations: BTreeMap::from([("exa-public".to_string(), allowed)]),
+            non_network_tools: BTreeMap::new(),
             declared: BTreeMap::from([("fetch".to_string(), declared)]),
             deciders: BTreeMap::new(),
             authorization_required: Vec::new(),
@@ -713,6 +732,59 @@ mod tests {
         tools
             .validate_args(&node, "fetch", &json!({"url": "https://other.test/x"}))
             .expect("wildcard must allow any destination");
+    }
+
+    #[test]
+    fn declared_non_network_tool_skips_extraction_but_undeclared_tools_do_not() {
+        let node = node();
+        let dotted = json!({"file": "report.md"});
+        // Omitted/empty declaration preserves the current fail-closed path:
+        // the dotted filename is classified as a host and denied.
+        let tools = harness(Vec::new());
+        let error = tools
+            .validate_args(&node, "fetch", &dotted)
+            .expect_err("undeclared tools must still extract destinations");
+        assert!(matches!(error, StepError::Refused { .. }), "{error}");
+        assert!(error.to_string().contains("report.md"), "{error}");
+
+        let mut declared = harness(Vec::new());
+        declared.non_network_tools.insert(
+            "exa-public".to_string(),
+            BTreeSet::from(["web_fetch_exa".to_string()]),
+        );
+        assert_eq!(
+            declared
+                .check_destinations(&node, "fetch", &dotted)
+                .expect("declared tool must skip extraction"),
+            Vec::<String>::new()
+        );
+        declared
+            .validate_args(&node, "fetch", &dotted)
+            .expect("dotted non-URL argument must pass for a declared tool");
+        declared
+            .validate_args(&node, "fetch", &json!({"url": "https://example.test/x"}))
+            .expect("a verified non-fetching tool has no destination to classify");
+
+        // A declaration for another server tool does not widen this tool.
+        let mut other_tool = harness(Vec::new());
+        other_tool.non_network_tools.insert(
+            "exa-public".to_string(),
+            BTreeSet::from(["web_search_exa".to_string()]),
+        );
+        assert!(
+            other_tool.validate_args(&node, "fetch", &dotted).is_err(),
+            "only the exact remote tool name may skip extraction"
+        );
+        // A declaration for another server does not widen this tool either.
+        let mut other_server = harness(Vec::new());
+        other_server.non_network_tools.insert(
+            "other-server".to_string(),
+            BTreeSet::from(["web_fetch_exa".to_string()]),
+        );
+        assert!(
+            other_server.validate_args(&node, "fetch", &dotted).is_err(),
+            "declarations are per server"
+        );
     }
 
     #[test]

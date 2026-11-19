@@ -197,7 +197,11 @@ narrowing admits; the decider takes hosts-only input, must answer strict
 `mcp_destination_decision` with fresh re-invocation on resume. Denials are
 `Refused` `tool_call` failures naming the offending host, and the extracted
 hosts ride the `operation_started` details alongside the argument summary for
-audit.
+audit. A row may also list `non_network_tools` (default empty): exact remote
+tool names the operator has verified never fetch URLs or hosts. Only those
+tools skip destination extraction at validation and execution; all others stay
+fail-closed. This is an operator trust assertion about the remote tool, not a
+parser change — declare a tool only after verifying its implementation.
 OAuth credentials use the OS keyring by default. Keyring entries live in the session's unlocked login collection (the Linux Secret Service default collection), not in a backable file, and do not survive container restart by themselves; WSL has no default collection. The SPA Connections panel
 starts authorization on a loopback server, while the process-level token
 manager is shared by profile across runs. A headless host without an unlocked provider fails closed with an actionable OS-keyring-unavailable error; either run an unlocked provider or accept `oauth_store = "memory"` plus loopback re-authorization after every restart. Each run has its own bounded MCP

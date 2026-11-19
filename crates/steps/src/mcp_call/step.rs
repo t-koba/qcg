@@ -206,6 +206,11 @@ async fn authorize_direct_destinations(
     tool: &str,
     args: &Value,
 ) -> Result<(), engine::StepError> {
+    // The operator asserts this remote tool never fetches URLs or hosts, so
+    // its arguments cannot contain a destination to classify or authorize.
+    if profile.non_network_tools().iter().any(|name| name == tool) {
+        return Ok(());
+    }
     let extracted = check_direct_destinations(
         node,
         server,
@@ -320,6 +325,96 @@ mod tests {
             reuse: None,
             params: Default::default(),
         }
+    }
+
+    fn direct_profile(non_network_tools: Option<&[&str]>) -> mcp::McpProfile {
+        let mut config = json!({
+            "id": "exa", "transport": "streamable_http", "lifecycle": "initialize",
+            "url": "https://mcp.example.test/mcp", "auth": "none",
+            "allowed_hosts": ["mcp.example.test"], "allowed_destinations": [],
+        });
+        if let Some(names) = non_network_tools {
+            config["non_network_tools"] = json!(names);
+        }
+        let spec: mcp::McpServerSpec =
+            serde_json::from_value(config).expect("test profile must deserialize");
+        let runtime = mcp::McpRuntime::from_specs(vec![spec]).expect("test profile must load");
+        runtime.resolve("exa").expect("profile resolves").clone()
+    }
+
+    fn direct_context(root: &camino::Utf8PathBuf) -> (engine::RunContext, engine::JournalWriter) {
+        std::fs::write(
+            root.join(contract::MANIFEST_FILE),
+            r#"[generator]
+id = "direct-destination-test"
+name = "Direct destination test"
+version = "0.1.0"
+[[flow]]
+id = "call"
+type = "mcp.call"
+[flow.params]
+server = "exa"
+tool = "local_only"
+"#,
+        )
+        .unwrap();
+        let contract = contract::Contract::load(root).expect("test contract must load");
+        let run = engine::RunContext::for_tests(
+            "direct-destination-test".into(),
+            root.join("workspace"),
+            root.join("meta"),
+            contract,
+            std::collections::BTreeMap::new(),
+            std::collections::BTreeMap::new(),
+        )
+        .expect("test run context");
+        let journal =
+            engine::JournalWriter::create(&root.join("journal.jsonl"), &run.run_id, false, None)
+                .expect("test journal");
+        (run, journal)
+    }
+
+    #[tokio::test]
+    async fn direct_declared_non_network_tool_skips_extraction_but_undeclared_tools_do_not() {
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("direct-destination-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let node = node();
+        let args = json!({"file": "report.md"});
+        let (run, journal) = direct_context(&root);
+        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
+        let ctx = StepContext {
+            run: &run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+
+        let omitted = direct_profile(None);
+        let error =
+            authorize_direct_destinations(&ctx, &node, &omitted, "exa", "local_only", &args)
+                .await
+                .expect_err("omitted field must keep the fail-closed extraction");
+        assert!(matches!(error, StepError::Refused { .. }), "{error}");
+        assert!(error.to_string().contains("report.md"), "{error}");
+
+        let declared = direct_profile(Some(&["local_only"]));
+        authorize_direct_destinations(&ctx, &node, &declared, "exa", "local_only", &args)
+            .await
+            .expect("declared tool must pass under an empty ceiling");
+
+        let other_tool = direct_profile(Some(&["other_tool"]));
+        assert!(
+            authorize_direct_destinations(&ctx, &node, &other_tool, "exa", "local_only", &args)
+                .await
+                .is_err(),
+            "only the exact tool name may skip extraction"
+        );
+        drop(ctx);
+        drop(journal);
+        drop(run);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
