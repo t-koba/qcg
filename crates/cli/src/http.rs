@@ -213,6 +213,31 @@ mod tests {
         );
     }
 
+    // Drain the full request before answering. If a loopback server drops a
+    // socket while request bytes are still unread (a POST body, or the whole
+    // request for a server that never reads), Windows TCP answers with RST
+    // (os error 10053), which races the response and turns a redirect
+    // assertion into a connection abort. Linux/macOS discard the unread bytes
+    // and send FIN, so the flake only showed up on windows-latest.
+    async fn read_request(socket: &mut tokio::net::TcpStream) {
+        let mut head = Vec::new();
+        while !head.ends_with(b"\r\n\r\n") {
+            head.push(socket.read_u8().await.unwrap());
+            assert!(head.len() < 8192, "request head must be bounded");
+        }
+        let content_length = String::from_utf8_lossy(&head)
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().unwrap())
+            })
+            .unwrap_or(0);
+        assert!(content_length <= 8192, "request body must be bounded");
+        let mut body = vec![0_u8; content_length];
+        socket.read_exact(&mut body).await.unwrap();
+    }
+
     // A single bounded loopback response; no external server, TLS or DNS needed.
     async fn serve(response: String) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -220,11 +245,7 @@ mod tests {
         let task = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), async {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                    assert!(request.len() < 8192);
-                }
+                read_request(&mut socket).await;
                 socket.write_all(response.as_bytes()).await.unwrap();
             })
             .await
@@ -305,6 +326,7 @@ mod tests {
                 "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                read_request(&mut socket).await;
                 socket.write_all(response.as_bytes()).await.unwrap();
             }
         });
@@ -337,11 +359,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(5), async {
                 for hop in 0..=MAX_REDIRECTS {
                     let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut request = Vec::new();
-                    while !request.ends_with(b"\r\n\r\n") {
-                        request.push(socket.read_u8().await.unwrap());
-                        assert!(request.len() < 8192);
-                    }
+                    read_request(&mut socket).await;
                     let next = hop + 1;
                     socket
                         .write_all(
