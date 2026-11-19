@@ -436,6 +436,16 @@ fn count_library_entries(name: &str, root: &Utf8Path, ceiling: usize) -> Result<
                     "skill_library resource `{name}` cannot inspect an entry: {error}"
                 ))
             })?;
+            if file_type.is_symlink() {
+                return Err(ContractError::Invalid(format!(
+                    "skill_library resource `{name}` contains a symbolic link"
+                )));
+            }
+            if !file_type.is_dir() && !file_type.is_file() {
+                return Err(ContractError::Invalid(format!(
+                    "skill_library resource `{name}` contains an unsupported entry"
+                )));
+            }
             if file_type.is_dir() {
                 pending.push(
                     camino::Utf8PathBuf::from_path_buf(entry.path()).map_err(|path| {
@@ -974,6 +984,26 @@ mod tests {
         std::fs::write(root.join("extra.txt"), "extra").expect("extra entry should be created");
         validate_skill_library("lib", &root)
             .expect_err("one recursive entry over the ceiling must be refused");
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn skill_library_validation_refuses_symlinks_like_execution() {
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-skill-library-symlink-{}", std::process::id())),
+        )
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        std::os::unix::fs::symlink("nowhere", root.join("link"))
+            .expect("symlink should be created");
+        let error = validate_skill_library("lib", &root)
+            .expect_err("a symlink must be refused before execution sees it");
+        assert!(
+            error.to_string().contains("symbolic link"),
+            "unexpected refusal: {error}"
+        );
         std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
     }
 }
