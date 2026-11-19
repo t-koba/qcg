@@ -7,7 +7,7 @@ use api::{
 };
 use camino::Utf8PathBuf;
 use contract::{Contract, PackagePathError};
-use policy::{DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES, is_safe_relative_path};
+use policy::is_safe_relative_path;
 use tokio::io::AsyncReadExt as _;
 
 impl LocalService {
@@ -18,13 +18,14 @@ impl LocalService {
             if !root.exists() {
                 continue;
             }
+            let limit = self.inner.deployment_policy.max_directory_scan_entries;
             let entries = std::fs::read_dir(root).map_err(api_internal)?;
             let mut entry_count = 0_usize;
             for entry in entries {
                 entry_count = entry_count.saturating_add(1);
-                if entry_count > DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES {
+                if entry_count > limit {
                     return Err(api_internal(format!(
-                        "generator directory `{root}` contains more than {DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES} entries"
+                        "generator directory `{root}` contains more than {limit} entries"
                     )));
                 }
                 let entry = entry.map_err(api_internal)?;
@@ -236,6 +237,37 @@ fn map_llm_catalog(view: llm::CatalogView) -> LlmCatalogResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{RunStoreMode, ServiceDeploymentPolicy};
+
+    #[tokio::test]
+    async fn generator_listing_honors_the_deployment_scan_limit() {
+        let dir = std::env::temp_dir().join(format!("qcg-catalog-scan-{}", uuid::Uuid::now_v7()));
+        let root = dir.join("generators");
+        let runs = dir.join("runs");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&runs).unwrap();
+        std::fs::write(root.join("one.txt"), "one").unwrap();
+        std::fs::write(root.join("two.txt"), "two").unwrap();
+        let make = |limit: usize| {
+            let policy = ServiceDeploymentPolicy {
+                max_directory_scan_entries: limit,
+                ..Default::default()
+            };
+            LocalService::with_generator_roots_policy_and_store_mode(
+                vec![camino::Utf8PathBuf::from_path_buf(root.clone()).unwrap()],
+                camino::Utf8PathBuf::from_path_buf(runs.clone()).unwrap(),
+                None,
+                policy::DEFAULT_MAX_ACTIVE_RUNS,
+                policy::DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::Exclusive,
+                policy,
+            )
+            .unwrap()
+        };
+        assert!(make(1).list_generators().await.is_err());
+        assert!(make(2).list_generators().await.unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn model_warning_and_effective_tiers_are_preserved_in_catalog_response() {
