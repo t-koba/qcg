@@ -285,9 +285,17 @@ pub(crate) async fn export_run_trace(
             .body(encoded.clone())
             .send()
             .await
-            .with_context(|| format!("failed to export trace to `{endpoint}`"))?
-            .error_for_status()
-            .with_context(|| format!("trace exporter `{endpoint}` rejected the payload"))?;
+            .with_context(|| format!("failed to export trace to `{endpoint}`"))?;
+        // `error_for_status` treats 3xx as success, but a final redirect or
+        // 300 reply is not an accepted export. Only a 2xx may be parsed for
+        // partial success. Report the numeric status alone: neither a
+        // collector body nor a transport detail belongs in this diagnostic.
+        if !response.status().is_success() {
+            anyhow::bail!(
+                "trace exporter returned a non-success HTTP status ({})",
+                response.status().as_u16()
+            );
+        }
         // A 2xx is not necessarily full success: OTLP collectors report
         // dropped spans in the response body. Read it with the shared bounded
         // reader and parser so both exporters observe the same contract; a

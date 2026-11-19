@@ -154,12 +154,12 @@ fn trace(root: &Utf8PathBuf, id: &str) -> Value {
 
 // One bounded loopback collector reply per invocation; the test thread
 // services the listener while the CLI child runs, with no external network.
-fn trace_with_collector(root: &Utf8PathBuf, id: &str, body: &str) -> Output {
+fn trace_with_collector(root: &Utf8PathBuf, id: &str, status: &str, body: &str) -> Output {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let endpoint = format!("http://{}/v1/traces", listener.local_addr().unwrap());
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "{status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     let mut command = Command::new(env!("CARGO_BIN_EXE_qcg"));
@@ -764,8 +764,9 @@ fn otlp_collector_reply_controls_report_and_exit_status() {
         .join(format!("runs-trace-otlp-result-{}", uuid::Uuid::now_v7()));
     let id = "otlp-collector-run";
     seed_run(&root, id, "success");
-    for (body, success, expected, forbidden) in [
+    for (status, body, success, expected, forbidden) in [
         (
+            "HTTP/1.1 200 OK",
             r#"{"partialSuccess":{"rejectedSpans":"2","errorMessage":"quota"}}"#,
             false,
             &[
@@ -777,35 +778,49 @@ fn otlp_collector_reply_controls_report_and_exit_status() {
             &["exported OTLP trace"][..],
         ),
         (
+            "HTTP/1.1 200 OK",
             "{}",
             true,
             &["exported OTLP trace to"][..],
             &["warning:"][..],
         ),
         (
+            "HTTP/1.1 200 OK",
             r#"{"partialSuccess":{"errorMessage":"queue near capacity"}}"#,
             true,
             &["exported OTLP trace to", "queue near capacity"][..],
             &[][..],
         ),
+        (
+            // No Location header: the final response itself is 3xx.
+            "HTTP/1.1 300 Multiple Choices",
+            "",
+            false,
+            &["non-success HTTP status (300)"][..],
+            &["exported OTLP trace"][..],
+        ),
     ] {
-        let output = trace_with_collector(&root, id, body);
+        let output = trace_with_collector(&root, id, status, body);
         let report = format!(
             "stdout: {}\nstderr: {}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(output.status.success(), success, "body `{body}`: {report}");
+        assert_eq!(
+            output.status.success(),
+            success,
+            "status `{status}` body `{body}`: {report}"
+        );
         for text in expected {
             assert!(
                 report.contains(text),
-                "body `{body}` must mention `{text}`: {report}"
+                "status `{status}` body `{body}` must mention `{text}`: {report}"
             );
         }
         for text in forbidden {
             assert!(
                 !report.contains(text),
-                "body `{body}` must not mention `{text}`: {report}"
+                "status `{status}` body `{body}` must not mention `{text}`: {report}"
             );
         }
     }
