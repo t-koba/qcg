@@ -74,10 +74,11 @@ pub trait LlmProvider: Send + Sync {
         Vec::new()
     }
     /// Upper bound for a single completion call, including model thinking
-    /// time. Defaults to 120 seconds; providers backed by reasoning models
-    /// override this through their registry row (`timeout_seconds`).
+    /// time. Defaults to `[operational_limits].provider_request_timeout_seconds`
+    /// (120 seconds shipped); providers backed by reasoning models override
+    /// this through their registry row (`timeout_seconds`).
     fn timeout_seconds(&self) -> u64 {
-        120
+        policy::operational_limits().provider_request_timeout_seconds
     }
     /// Provider-owned failure decisions. The router enforces attempt and
     /// stream-emission guards; policy never grants route authorization.

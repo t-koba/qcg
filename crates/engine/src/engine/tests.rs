@@ -8244,6 +8244,7 @@ async fn raised_retry_ceiling_accepts_twenty_attempts_at_validation_and_executio
         patch_target_bytes: 16 * 1024 * 1024,
         audit_tool_value_bytes: 128 * 1024,
         direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
     };
     match policy::set_deployment_operational_limits(raised) {
         Ok(()) => {}

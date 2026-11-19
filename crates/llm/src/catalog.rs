@@ -23,7 +23,6 @@ use std::time::Duration;
 
 const DISCOVERY_BODY_LIMIT_BYTES: usize = 2 * 1024 * 1024;
 const MODELS_DEV_BODY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
-const DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS: u64 = 30;
 
 /// `[catalog]` section of the provider registry.
 #[derive(Debug, Clone, Deserialize)]
@@ -512,7 +511,7 @@ impl CatalogService {
         let response = self
             .client
             .get(url)
-            .timeout(Duration::from_secs(DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS))
+            .timeout(policy::catalog_fetch_timeout(policy::operational_limits()))
             .send()
             .await
             .map_err(|error| format!("catalog fetch `{url}` failed: {error}"))?;
@@ -675,7 +674,7 @@ impl CatalogService {
         let mut request = self
             .client
             .get(url)
-            .timeout(Duration::from_secs(DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS));
+            .timeout(policy::catalog_fetch_timeout(policy::operational_limits()));
         // Active credentials for reflection screening (F03). Loaded here so
         // rotation takes effect on the next call; never logged or returned
         // in errors.

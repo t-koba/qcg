@@ -4006,6 +4006,14 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
         limits.direct_mcp_tool_value_bytes,
         policy::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES
     );
+    assert_eq!(
+        limits.provider_request_timeout_seconds,
+        policy::DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        limits.catalog_fetch_timeout_seconds,
+        policy::DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS
+    );
 
     let unknown = ProvidersFile::parse("[operational_limits]\nmax_calls = 4\n")
         .expect_err("unknown operational key must refuse the registry");
@@ -4015,7 +4023,7 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
     // defaults parses and validates so a deployment can declare an eleventh
     // tool call.
     let raised = ProvidersFile::parse(
-        "[operational_limits]\nagent_tool_calls = 11\npatch_target_bytes = 16777216\naudit_tool_value_bytes = 65536\ndirect_mcp_tool_value_bytes = 131072\n",
+        "[operational_limits]\nagent_tool_calls = 11\npatch_target_bytes = 16777216\naudit_tool_value_bytes = 65536\ndirect_mcp_tool_value_bytes = 131072\nprovider_request_timeout_seconds = 600\ncatalog_fetch_timeout_seconds = 120\n",
     )
     .expect("a raised deployment ceiling must parse");
     let limits = raised
@@ -4025,9 +4033,59 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
     assert_eq!(limits.patch_target_bytes, 16 * 1024 * 1024);
     assert_eq!(limits.audit_tool_value_bytes, 64 * 1024);
     assert_eq!(limits.direct_mcp_tool_value_bytes, 128 * 1024);
+    assert_eq!(limits.provider_request_timeout_seconds, 600);
+    assert_eq!(limits.catalog_fetch_timeout_seconds, 120);
+    assert_eq!(
+        policy::effective_provider_timeout_seconds(None, &limits),
+        600
+    );
+    assert_eq!(
+        policy::catalog_fetch_timeout(&limits),
+        Duration::from_secs(120)
+    );
     limits
         .validate()
         .expect("raising above the defaults must validate");
+
+    let tightened = ProvidersFile::parse(
+        "[operational_limits]\nprovider_request_timeout_seconds = 45\ncatalog_fetch_timeout_seconds = 5\n",
+    )
+    .expect("a tightened timeout must parse");
+    let limits = tightened
+        .operational_limits
+        .expect("the tightened section must be retained");
+    assert_eq!(
+        policy::effective_provider_timeout_seconds(None, &limits),
+        45
+    );
+    assert_eq!(
+        policy::catalog_fetch_timeout(&limits),
+        Duration::from_secs(5)
+    );
+    // Row-level values still win over the deployment default.
+    assert_eq!(
+        policy::effective_provider_timeout_seconds(Some(3), &limits),
+        3
+    );
+
+    for (key, value) in [
+        ("provider_request_timeout_seconds", "0"),
+        ("catalog_fetch_timeout_seconds", "0"),
+    ] {
+        let text = format!("[operational_limits]\n{key} = {value}\n");
+        let error = ProvidersFile::parse(&text)
+            .expect_err("a zero timeout would mean no bound and must refuse the registry");
+        assert!(error.contains(key), "{error}");
+    }
+    for key in [
+        "provider_request_timeout_seconds",
+        "catalog_fetch_timeout_seconds",
+    ] {
+        let text = format!("[operational_limits]\n{key}_typo = 30\n");
+        let error = ProvidersFile::parse(&text)
+            .expect_err("an unknown timeout key must refuse the registry");
+        assert!(error.contains("unknown field"), "{error}");
+    }
 
     let zero_audit = ProvidersFile::parse("[operational_limits]\naudit_tool_value_bytes = 0\n")
         .expect_err("a zero audit ceiling must refuse the registry");

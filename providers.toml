@@ -75,6 +75,29 @@
 #   lifecycle     MCP only: initialize | discover; defaults to discover and
 #                 must match the server's documented lifecycle
 #
+# `[operational_limits]` overrides the deployment ceilings and timeout
+# defaults installed before any contract is validated. Every key is optional;
+# the values below are the shipped defaults and stay in force when a key or the
+# whole section is absent. Unknown keys and zero counts, byte targets or
+# timeouts refuse registry parsing. Contract values above a ceiling are
+# refused, never clamped. `provider_request_timeout_seconds` is the timeout for
+# provider rows that omit their own `timeout_seconds` (an explicit row value
+# wins); `catalog_fetch_timeout_seconds` bounds both external catalog fetches
+# and per-provider model discovery.
+#
+# [operational_limits]
+# agent_tool_calls = 10
+# agent_iterations = 32
+# fallback_models = 8
+# web_search_results = 20
+# retry_attempts = 16
+# retry_backoff_ms = 60000
+# provider_request_timeout_seconds = 120
+# catalog_fetch_timeout_seconds = 30
+# patch_target_bytes = 8388608
+# audit_tool_value_bytes = 32768
+# direct_mcp_tool_value_bytes = 65536
+#
 # `[subscription_auth]` overrides the OIDC inputs used by `qcg auth` (standalone
 # subscription credentials). Every key is optional; the values shown below are
 # the shipped defaults and stay in force when a key or the whole section is

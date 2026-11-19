@@ -866,7 +866,10 @@ impl LlmProvider for HttpProvider {
     }
 
     fn timeout_seconds(&self) -> u64 {
-        self.spec.timeout_seconds.unwrap_or(120)
+        policy::effective_provider_timeout_seconds(
+            self.spec.timeout_seconds,
+            policy::operational_limits(),
+        )
     }
 
     fn retry_policy(&self) -> crate::RetryPolicy {

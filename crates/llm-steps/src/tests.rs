@@ -2184,6 +2184,7 @@ fn raised_audit_value_limit_retains_larger_tool_result() {
         patch_target_bytes: 16 * 1024 * 1024,
         audit_tool_value_bytes: 128 * 1024,
         direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
     };
     match policy::set_deployment_operational_limits(raised) {
         Ok(()) => {}
@@ -2242,6 +2243,7 @@ fn audit_value_above_deployment_ceiling_is_refused() {
         patch_target_bytes: 16 * 1024 * 1024,
         audit_tool_value_bytes: 128 * 1024,
         direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
     };
     match policy::set_deployment_operational_limits(raised) {
         Ok(()) => {}
@@ -3489,6 +3491,7 @@ fn raised_deployment_ceiling_accepts_eleventh_tool_call() {
         patch_target_bytes: 16 * 1024 * 1024,
         audit_tool_value_bytes: 128 * 1024,
         direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
     };
     // Idempotent: the same value may be installed by preload + router.
     match policy::set_deployment_operational_limits(raised) {

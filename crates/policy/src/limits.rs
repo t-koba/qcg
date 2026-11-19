@@ -121,6 +121,12 @@ pub const MAX_RETRY_ATTEMPTS: u32 = 16;
 /// The effective ceiling is `OperationalLimits::retry_backoff_ms`.
 pub const MAX_RETRY_BACKOFF_MS: u64 = 60_000;
 
+/// Default completion timeout for provider rows without `timeout_seconds`.
+pub const DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS: u64 = 120;
+
+/// Default timeout for external catalog fetches and model discovery.
+pub const DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS: u64 = 30;
+
 /// Inclusive upper bound for `foreach` parallel fan-out.
 pub const MAX_FOREACH_PARALLELISM: usize = 256;
 
@@ -197,12 +203,14 @@ pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 /// Default cap, in bytes, for MCP responses.
 pub const DEFAULT_MCP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Deployment ceilings for the nine operational limits shared by contract
+/// Deployment ceilings for the eleven operational limits shared by contract
 /// validation and execution. This is policy, not mechanism: the configured
 /// values are the effective ceilings themselves. Defaults preserve today's
 /// values; a deployment may tighten or raise a ceiling in `providers.toml`.
 /// Contracts may declare values up to the effective ceiling; values above it
-/// are refused at validation and at runtime, never silently clamped.
+/// are refused at validation and at runtime, never silently clamped. The
+/// provider timeout is the fallback for rows omitting `timeout_seconds` (an
+/// explicit row value wins); the catalog timeout applies to both network paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperationalLimits {
@@ -225,6 +233,14 @@ pub struct OperationalLimits {
     /// means no delay, and matches today's contract validation.
     #[serde(default = "default_retry_backoff_ms")]
     pub retry_backoff_ms: u64,
+    /// Default completion timeout, in seconds, for provider rows that omit
+    /// `timeout_seconds`. A row's explicit value takes precedence.
+    #[serde(default = "default_provider_request_timeout_seconds")]
+    pub provider_request_timeout_seconds: u64,
+    /// Timeout, in seconds, for external catalog fetches and per-provider
+    /// model discovery. Both paths use the same resolved value.
+    #[serde(default = "default_catalog_fetch_timeout_seconds")]
+    pub catalog_fetch_timeout_seconds: u64,
     /// Effective hash-anchored patch target ceiling, in bytes (Q01).
     #[serde(default = "default_patch_target_bytes")]
     pub patch_target_bytes: usize,
@@ -256,6 +272,12 @@ const fn default_retry_attempts() -> u32 {
 const fn default_retry_backoff_ms() -> u64 {
     MAX_RETRY_BACKOFF_MS
 }
+const fn default_provider_request_timeout_seconds() -> u64 {
+    DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS
+}
+const fn default_catalog_fetch_timeout_seconds() -> u64 {
+    DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS
+}
 const fn default_patch_target_bytes() -> usize {
     MAX_PATCH_TARGET_BYTES
 }
@@ -275,6 +297,8 @@ impl Default for OperationalLimits {
             web_search_results: default_web_search_results(),
             retry_attempts: default_retry_attempts(),
             retry_backoff_ms: default_retry_backoff_ms(),
+            provider_request_timeout_seconds: default_provider_request_timeout_seconds(),
+            catalog_fetch_timeout_seconds: default_catalog_fetch_timeout_seconds(),
             patch_target_bytes: default_patch_target_bytes(),
             audit_tool_value_bytes: default_audit_tool_value_bytes(),
             direct_mcp_tool_value_bytes: default_direct_mcp_tool_value_bytes(),
@@ -283,10 +307,11 @@ impl Default for OperationalLimits {
 }
 
 impl OperationalLimits {
-    /// Refuse only intrinsic ill-formedness: every count and the patch target
-    /// must be nonzero; any `retry_backoff_ms` is valid (zero means no delay).
-    /// There is no legacy upper bound: the configured values are the
-    /// effective ceilings, so a deployment may raise them above the defaults.
+    /// Refuse only intrinsic ill-formedness: every count, byte target and
+    /// timeout must be nonzero (a zero timeout would mean no bound); any
+    /// `retry_backoff_ms` is valid (zero means no delay). There is no legacy
+    /// upper bound: the configured values are the effective ceilings, so a
+    /// deployment may raise them above the defaults.
     pub fn validate(&self) -> Result<(), String> {
         for (name, value) in [
             ("agent_tool_calls", self.agent_tool_calls),
@@ -294,6 +319,14 @@ impl OperationalLimits {
             ("fallback_models", self.fallback_models),
             ("web_search_results", self.web_search_results),
             ("retry_attempts", self.retry_attempts as usize),
+            (
+                "provider_request_timeout_seconds",
+                self.provider_request_timeout_seconds as usize,
+            ),
+            (
+                "catalog_fetch_timeout_seconds",
+                self.catalog_fetch_timeout_seconds as usize,
+            ),
             ("patch_target_bytes", self.patch_target_bytes),
             ("audit_tool_value_bytes", self.audit_tool_value_bytes),
             (
@@ -319,6 +352,8 @@ const DEFAULT_DEPLOYMENT_LIMITS: OperationalLimits = OperationalLimits {
     web_search_results: MAX_WEB_SEARCH_RESULTS,
     retry_attempts: MAX_RETRY_ATTEMPTS,
     retry_backoff_ms: MAX_RETRY_BACKOFF_MS,
+    provider_request_timeout_seconds: DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS,
+    catalog_fetch_timeout_seconds: DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS,
     patch_target_bytes: MAX_PATCH_TARGET_BYTES,
     audit_tool_value_bytes: TOOL_EVENT_VALUE_LIMIT_BYTES,
     direct_mcp_tool_value_bytes: DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES,
@@ -350,6 +385,22 @@ pub fn operational_limits() -> &'static OperationalLimits {
     DEPLOYMENT_LIMITS
         .get()
         .unwrap_or(&DEFAULT_DEPLOYMENT_LIMITS)
+}
+
+/// Effective completion timeout for one provider row: its explicit
+/// `timeout_seconds`, else the deployment default. Callers pass the resolved
+/// limits so the precedence is testable without freezing policy.
+pub fn effective_provider_timeout_seconds(
+    configured: Option<u64>,
+    limits: &OperationalLimits,
+) -> u64 {
+    configured.unwrap_or(limits.provider_request_timeout_seconds)
+}
+
+/// Effective per-request timeout for external catalog fetches and provider
+/// model discovery. Both network paths share this one resolved value.
+pub fn catalog_fetch_timeout(limits: &OperationalLimits) -> Duration {
+    Duration::from_secs(limits.catalog_fetch_timeout_seconds)
 }
 
 /// Request header carrying the idempotency key.
@@ -467,6 +518,8 @@ mod operational_limits_tests {
                 web_search_results: 20,
                 retry_attempts: 16,
                 retry_backoff_ms: 60_000,
+                provider_request_timeout_seconds: 120,
+                catalog_fetch_timeout_seconds: 30,
                 patch_target_bytes: 8 * 1024 * 1024,
                 audit_tool_value_bytes: 32 * 1024,
                 direct_mcp_tool_value_bytes: 64 * 1024,
@@ -483,6 +536,38 @@ mod operational_limits_tests {
         let error = serde_json::from_str::<OperationalLimits>(r#"{"max_calls": 4}"#)
             .expect_err("strict config must reject unknown keys");
         assert!(error.to_string().contains("max_calls"), "{error}");
+    }
+
+    #[test]
+    fn timeout_resolution_preserves_defaults_and_honours_overrides() {
+        let defaults = OperationalLimits::default();
+        assert_eq!(
+            effective_provider_timeout_seconds(None, &defaults),
+            DEFAULT_PROVIDER_REQUEST_TIMEOUT_SECONDS
+        );
+        assert_eq!(catalog_fetch_timeout(&defaults), Duration::from_secs(30));
+
+        // Same shipped values whether the section is absent or empty.
+        let empty = OperationalLimits {
+            ..OperationalLimits::default()
+        };
+        assert_eq!(effective_provider_timeout_seconds(None, &empty), 120);
+        assert_eq!(catalog_fetch_timeout(&empty), Duration::from_secs(30));
+
+        for (seconds, catalog) in [(1, 1), (600, 120)] {
+            let limits = OperationalLimits {
+                provider_request_timeout_seconds: seconds,
+                catalog_fetch_timeout_seconds: catalog,
+                ..OperationalLimits::default()
+            };
+            limits
+                .validate()
+                .expect("both timeout values must be valid");
+            assert_eq!(effective_provider_timeout_seconds(None, &limits), seconds);
+            assert_eq!(catalog_fetch_timeout(&limits), Duration::from_secs(catalog));
+            // An explicit row value always wins over the deployment default.
+            assert_eq!(effective_provider_timeout_seconds(Some(7), &limits), 7);
+        }
     }
 
     #[test]
@@ -525,6 +610,8 @@ mod operational_limits_tests {
             r#"{"web_search_results": 40}"#,
             r#"{"retry_attempts": 32}"#,
             r#"{"retry_backoff_ms": 120000}"#,
+            r#"{"provider_request_timeout_seconds": 600}"#,
+            r#"{"catalog_fetch_timeout_seconds": 120}"#,
             r#"{"patch_target_bytes": 16777216}"#,
             r#"{"audit_tool_value_bytes": 65536}"#,
             r#"{"direct_mcp_tool_value_bytes": 131072}"#,
@@ -543,6 +630,14 @@ mod operational_limits_tests {
             (r#"{"fallback_models": 0}"#, "fallback_models"),
             (r#"{"web_search_results": 0}"#, "web_search_results"),
             (r#"{"retry_attempts": 0}"#, "retry_attempts"),
+            (
+                r#"{"provider_request_timeout_seconds": 0}"#,
+                "provider_request_timeout_seconds",
+            ),
+            (
+                r#"{"catalog_fetch_timeout_seconds": 0}"#,
+                "catalog_fetch_timeout_seconds",
+            ),
             (r#"{"patch_target_bytes": 0}"#, "patch_target_bytes"),
             (r#"{"audit_tool_value_bytes": 0}"#, "audit_tool_value_bytes"),
             (

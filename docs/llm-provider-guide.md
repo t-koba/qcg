@@ -135,8 +135,9 @@ Fields:
   APIs. Together the three `decision_*` fields are the transport mechanism;
   the contract's `llm.decide` params stay pure policy
   (`provider`, `model`, `state`, `questions`, budgets).
-- `timeout_seconds`: timeout for each completion attempt. The default is 120
-  seconds; retryable failures may start another independently timed attempt.
+- `timeout_seconds`: timeout for each completion attempt. Rows omitting it use
+  `[operational_limits].provider_request_timeout_seconds` (120 seconds
+  shipped); retryable failures may start another independently timed attempt.
 - `retry_attempts`: attempts per completion call including the first, 1 to 10.
   The default is 3. The provider `retry_policy` selects which failures retry
   (by default timeouts, 5xx, 429, and empty responses); it cannot raise this bound.
@@ -289,8 +290,8 @@ URL is a registry field.
 
 ## Operational limits
 
-The same registry carries the deployment ceilings for the nine operational
-limits shared by contract validation and execution:
+The same registry carries the deployment ceilings and timeout defaults for
+the eleven operational limits shared by contract validation and execution:
 
 ```toml
 [operational_limits]
@@ -300,17 +301,22 @@ fallback_models = 8
 web_search_results = 20
 retry_attempts = 16
 retry_backoff_ms = 60000
+provider_request_timeout_seconds = 120  # rows omitting timeout_seconds
+catalog_fetch_timeout_seconds = 30      # catalog fetch and model discovery
 patch_target_bytes = 8388608  # 8 MiB
 audit_tool_value_bytes = 32768  # 32 KiB general tool-call detail ceiling
 direct_mcp_tool_value_bytes = 65536  # 64 KiB direct mcp.call detail ceiling
 ```
 
 Every key is optional and the values above are the defaults when the section
-or a key is omitted. Unknown keys refuse registry parsing; a zero count (or a
-zero patch target) also refuses parsing. The configured values are the
-effective ceilings themselves: a deployment may tighten or raise them, and a
-contract declaring more than today's defaults validates when the deployment
-raises the ceiling. Contracts declare their own values (`max_calls`,
+or a key is omitted. Unknown keys refuse registry parsing; a zero count, byte
+target or timeout also refuses parsing (a zero timeout would mean no bound).
+The configured values are the effective ceilings themselves: a deployment may
+tighten or raise them, and a contract declaring more than today's defaults
+validates when the deployment raises the ceiling. The two timeout values are
+defaults rather than ceilings: an explicit provider row `timeout_seconds`
+always wins, and both catalog network paths use the one configured value.
+Contracts declare their own values (`max_calls`,
 `max_iterations`, `fallback_models`, `max_results`, `retry.max_attempts`,
 `retry.backoff_ms`, runtime output limits, and `[audit].max_tool_value_bytes`);
 a declared value above the
@@ -521,9 +527,12 @@ url = "https://models.dev/api.json"
 sha256 = "..."                            # optional pin
 ```
 
-The cache is loaded at process start so validation stays deterministic
-offline. `qcg serve` refreshes stale sources in the background (failures are
-logged and retried, never fatal), and `qcg models --refresh` or
+Each remote source fetch and each provider model-discovery request uses
+`[operational_limits].catalog_fetch_timeout_seconds` (30 seconds shipped);
+both paths share the same resolved value. The cache is loaded at process start
+so validation stays deterministic offline. `qcg serve` refreshes stale sources
+in the background (failures are logged and retried, never fatal), and
+`qcg models --refresh` or
 Local catalog source files and the catalog cache have the same 64 MiB byte
 limit as remote catalog sources. Oversized or non-regular files report an
 error; an unreadable cache is ignored with a visible error. Cache writes that
