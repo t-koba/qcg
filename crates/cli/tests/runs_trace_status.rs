@@ -202,6 +202,10 @@ fn trace_with_collector(root: &Utf8PathBuf, id: &str, status: &str, body: &str) 
             Err(error) => panic!("{error}"),
         }
     };
+    // On Windows the accepted socket can inherit the listener's nonblocking
+    // mode, which would turn the first header read into WouldBlock before the
+    // collector request arrives. Make it blocking before applying timeouts.
+    socket.set_nonblocking(false).unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(10)))
         .unwrap();
