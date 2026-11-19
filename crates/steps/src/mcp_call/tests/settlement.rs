@@ -76,6 +76,11 @@ impl ServerHandler for CountingTool {
                 json!({"action": "accept", "content": {"name": "Ada"}})
             );
         }
+        if let Some(size) = args["size"].as_u64() {
+            return Ok(
+                CallToolResult::structured(json!({"text": "x".repeat(size as usize)})).into(),
+            );
+        }
         if args["large"] == true {
             return Ok(CallToolResult::structured(json!({"text": "x".repeat(70 * 1024)})).into());
         }
@@ -343,6 +348,15 @@ async fn execute_large(
     ctx: &StepContext<'_>,
     node: &NodeDef,
 ) -> Result<DirectMcpCallOutcome, StepError> {
+    execute_with_arguments(mock, ctx, node, json!({"ask": false, "large": true})).await
+}
+
+async fn execute_with_arguments(
+    mock: &MockMcp,
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    arguments: Value,
+) -> Result<DirectMcpCallOutcome, StepError> {
     let session = mock
         .runtime
         .connect(
@@ -358,16 +372,8 @@ async fn execute_large(
         )
         .await
         .unwrap();
-    let result = execute_direct_mcp_call(
-        &session,
-        "echo",
-        json!({"ask": false, "large": true}),
-        ctx,
-        node,
-        3,
-        1024 * 1024,
-    )
-    .await;
+    let result =
+        execute_direct_mcp_call(&session, "echo", arguments, ctx, node, 3, 1024 * 1024).await;
     session.close().await.unwrap();
     result
 }
@@ -793,6 +799,165 @@ async fn oversized_results_stay_bounded_in_events_but_replay_exact() {
     let replay = execute_large(&mock, &ctx, &harness.node).await.unwrap();
     assert!(matches!(replay, DirectMcpCallOutcome::Complete(value) if value == raw));
     assert_eq!(mock.hits.lock().unwrap().len(), before);
+}
+
+#[tokio::test]
+async fn direct_mcp_event_value_limit_uses_the_contract_audit_config() {
+    for (configured_limit, expect_truncated) in [(None, false), (Some(1024), true)] {
+        let audit = configured_limit
+            .map(|limit| format!("\n[audit]\nmax_tool_value_bytes = {limit}\n"))
+            .unwrap_or_default();
+        let harness = Harness::with_manifest(&format!(
+            r#"
+[generator]
+id = "cleanup-test"
+name = "Direct audit test"
+version = "0.1.0"
+[[flow]]
+id = "call"
+type = "mcp.call"
+[flow.params]
+server = "mock"
+tool = "echo"
+{audit}"#
+        ));
+        let journal = harness.journal();
+        let mut vars = ValueBag::with_inputs(BTreeMap::new());
+        let ctx = StepContext {
+            run: &harness.run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        let mock = MockMcp::start().await;
+        // Between the shared 32 KiB ceiling and the direct path's 64 KiB
+        // shipped default: only a configured override may truncate it.
+        let execution =
+            execute_with_arguments(&mock, &ctx, &harness.node, json!({"size": 20 * 1024}))
+                .await
+                .expect("direct call should succeed");
+        let DirectMcpCallOutcome::Complete(raw) = &execution else {
+            panic!("{execution:?}");
+        };
+        let expected = raw.clone();
+        let raw_bytes = serde_json::to_vec(&expected).unwrap().len();
+        assert!(
+            raw_bytes > 32 * 1024 && raw_bytes < 64 * 1024,
+            "fixture must separate the two limits: {raw_bytes}"
+        );
+        settle(&ctx, &harness.node, None, false, Ok(execution)).expect("settlement should succeed");
+        let fact = &harness.records("mcp_cleanup_settled")[0];
+        assert_eq!(
+            fact["truncated"], expect_truncated,
+            "limit: {configured_limit:?}"
+        );
+        if expect_truncated {
+            assert_eq!(fact["result"]["value"]["bytes"], raw_bytes);
+            assert!(fact["result"]["value"]["summary"].is_string());
+        } else {
+            assert_eq!(fact["result"]["value"], expected);
+        }
+    }
+}
+
+#[tokio::test]
+async fn raised_direct_audit_value_limit_retains_larger_tool_result() {
+    // A deployment/contract must be able to raise the direct audit cap:
+    // with a raised ceiling, an 80 KiB tool result (above the shipped 64
+    // KiB direct default) is retained instead of truncated.
+    let raised = policy::OperationalLimits {
+        audit_tool_value_bytes: 128 * 1024,
+        direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
+    };
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    let harness = Harness::with_manifest(
+        r#"
+[generator]
+id = "cleanup-test"
+name = "Direct raised audit test"
+version = "0.1.0"
+[[flow]]
+id = "call"
+type = "mcp.call"
+[flow.params]
+server = "mock"
+tool = "echo"
+
+[audit]
+max_tool_value_bytes = 98304
+"#,
+    );
+    policy::AuditPolicy::from_config(&harness.run.contract.manifest.audit)
+        .expect("a 96 KiB contract value must validate under a raised ceiling");
+    assert_eq!(
+        harness
+            .run
+            .contract
+            .manifest
+            .audit
+            .direct_tool_event_value_limit_bytes(),
+        96 * 1024
+    );
+    let journal = harness.journal();
+    let mut vars = ValueBag::with_inputs(BTreeMap::new());
+    let ctx = StepContext {
+        run: &harness.run,
+        journal: &journal,
+        vars: &mut vars,
+        llm: None,
+    };
+    let mock = MockMcp::start().await;
+    // `size` is doubled in the journaled result (`content` plus
+    // `structuredContent`), so 35 KiB of text separates the 64 KiB shipped
+    // default from the raised 96 KiB limit.
+    let execution = execute_with_arguments(&mock, &ctx, &harness.node, json!({"size": 35 * 1024}))
+        .await
+        .expect("direct call should succeed");
+    let DirectMcpCallOutcome::Complete(raw) = &execution else {
+        panic!("{execution:?}");
+    };
+    let expected = raw.clone();
+    let raw_bytes = serde_json::to_vec(&expected).unwrap().len();
+    assert!(
+        raw_bytes > 64 * 1024 && raw_bytes < 96 * 1024,
+        "fixture must exceed the shipped 64 KiB direct default yet fit the raised 96 KiB limit: {raw_bytes}"
+    );
+    settle(&ctx, &harness.node, None, false, Ok(execution)).expect("settlement should succeed");
+    let fact = &harness.records("mcp_cleanup_settled")[0];
+    assert_eq!(
+        fact["truncated"], false,
+        "raised limit must retain the result"
+    );
+    assert_eq!(fact["result"]["value"], expected);
+}
+
+#[test]
+fn direct_audit_value_above_deployment_ceiling_is_refused() {
+    let raised = policy::OperationalLimits {
+        audit_tool_value_bytes: 128 * 1024,
+        direct_mcp_tool_value_bytes: 128 * 1024,
+        ..policy::OperationalLimits::default()
+    };
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    let ceiling = policy::operational_limits()
+        .audit_tool_value_bytes
+        .min(policy::operational_limits().direct_mcp_tool_value_bytes);
+    let over = policy::AuditConfig {
+        max_tool_value_bytes: Some(ceiling + 1),
+        ..policy::AuditConfig::default()
+    };
+    let error = policy::AuditPolicy::from_config(&over)
+        .expect_err("a direct value above the configured ceiling must be refused");
+    assert!(error.contains("max_tool_value_bytes"), "{error}");
 }
 
 #[test]

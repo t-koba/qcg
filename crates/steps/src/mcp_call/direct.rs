@@ -707,8 +707,14 @@ pub(crate) fn record_direct_mcp_tool_event(
         .into_iter()
         .map(serde_json::from_value::<ToolCallSource>)
         .collect::<Result<Vec<_>, _>>()?;
+    let value_limit_bytes = ctx
+        .run
+        .contract
+        .manifest
+        .audit
+        .direct_tool_event_value_limit_bytes();
     let (result, result_truncated) = result
-        .map(bounded_direct_mcp_event_value)
+        .map(|value| bounded_direct_mcp_event_value(value, value_limit_bytes))
         .unwrap_or((Value::Null, false));
     let result_summary = match result {
         Value::Null => Value::Null,
@@ -749,12 +755,11 @@ pub(crate) fn record_direct_mcp_tool_event(
         .event("tool_call", event)
         .map_err(|journal_error| StepError::failed(&node.id, journal_error.to_string()))
 }
-fn bounded_direct_mcp_event_value(value: &Value) -> (Value, bool) {
-    const MAX_BYTES: usize = 64 * 1024;
+fn bounded_direct_mcp_event_value(value: &Value, limit_bytes: usize) -> (Value, bool) {
     let Ok(bytes) = serde_json::to_vec(value) else {
         return (json!({ "summary": "result serialization failed" }), true);
     };
-    if bytes.len() <= MAX_BYTES {
+    if bytes.len() <= limit_bytes {
         return (value.clone(), false);
     }
     (
@@ -857,6 +862,47 @@ mod tests {
             error.to_string(),
             "step `server/tool` failed: MCP input request `request-1` uses unsupported method `sampling/createMessage`"
         );
+    }
+
+    #[test]
+    fn direct_event_value_keeps_shipped_default_and_honors_configured_limit() {
+        let value = json!({ "payload": "x".repeat(40 * 1024) });
+        let default_limit = policy::AuditConfig::default().direct_tool_event_value_limit_bytes();
+        assert_eq!(default_limit, 64 * 1024, "shipped default must not change");
+        let (kept, truncated) = bounded_direct_mcp_event_value(&value, default_limit);
+        assert!(!truncated, "a 40 KiB result fits the shipped 64 KiB limit");
+        assert_eq!(kept, value);
+
+        let configured = policy::AuditConfig {
+            max_tool_value_bytes: Some(1024),
+            ..policy::AuditConfig::default()
+        };
+        let (kept, truncated) = bounded_direct_mcp_event_value(
+            &value,
+            configured.direct_tool_event_value_limit_bytes(),
+        );
+        assert!(truncated, "configured max_tool_value_bytes must be honored");
+        assert_eq!(kept["bytes"], serde_json::to_vec(&value).unwrap().len());
+
+        // A configured value above the shipped default is honored, not
+        // clamped: an 80 KiB result fits a 96 KiB configured limit.
+        let raised = policy::AuditConfig {
+            max_tool_value_bytes: Some(96 * 1024),
+            ..policy::AuditConfig::default()
+        };
+        assert_eq!(
+            raised.direct_tool_event_value_limit_bytes(),
+            96 * 1024,
+            "a configured direct value must not be clamped to 64 KiB"
+        );
+        let large = json!({ "payload": "x".repeat(80 * 1024) });
+        let (kept, truncated) =
+            bounded_direct_mcp_event_value(&large, raised.direct_tool_event_value_limit_bytes());
+        assert!(
+            !truncated,
+            "an 80 KiB result fits a raised 96 KiB configured limit"
+        );
+        assert_eq!(kept, large);
     }
 
     #[test]

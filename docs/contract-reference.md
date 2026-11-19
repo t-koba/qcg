@@ -886,8 +886,9 @@ floats, including whole-valued floats (`-3.0`) and negative zero (`-0.0`).
   settlement facts remain null: the new default does not reinterpret an earlier
   refusal as authorization. Every disposition retains the exact
   completed result in the operation replay state and a bounded event result
-  (64 KiB, `truncated` flag), and retains the exact `mcp_input_pending`
-  continuation when the tool asked for input. Fail-fast does not turn a
+  (`[audit].max_tool_value_bytes`, 64 KiB default for direct calls,
+  `truncated` flag), and retains the exact `mcp_input_pending` continuation
+  when the tool asked for input. Fail-fast does not turn a
   completed tool call into an execution failure or erase its pending question.
   The external-operation guard reuses completed results rather than
   redispatching the remote effect.
@@ -4980,10 +4981,14 @@ fields are rejected when their structs define a closed schema.
    kinds are rejected as class keys. `max_bytes` and `max_events` bound the
    observation stream; a breach or write failure degrades audit persistence
    for the run and records a durable `audit_degraded` event instead of
-   failing the run. `max_tool_value_bytes` optionally lowers the serialized
+   failing the run. `max_tool_value_bytes` optionally sets the serialized
    per-value size threshold for `tool_call` arguments and results; it must be
-   between 1 and 32768 bytes. Unset retains the 32 KiB default and values
-   beyond the 32 KiB hard ceiling are rejected. Values exceeding the effective
+   between 1 and the deployment ceiling
+   (`[operational_limits].audit_tool_value_bytes` and
+   `direct_mcp_tool_value_bytes`, 32 KiB and 64 KiB by default). Unset retains
+   the 32 KiB default (64 KiB for direct `mcp.call` events); an explicit value
+   narrows or, when the deployment raises the ceiling, raises either path.
+   Values above the configured ceiling are rejected. Values exceeding the effective
    threshold are replaced by the existing `{type, bytes, truncated}` marker;
    secret redaction and source extraction still happen before that replacement.
    A deployment `audit_floor` only raises per-kind observation modes; it

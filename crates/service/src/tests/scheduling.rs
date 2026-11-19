@@ -705,6 +705,7 @@ options = ["yes"]
             &root.join("runs"),
             policy::DEFAULT_MAX_TRACKED_RUNS,
             policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+            policy::LIVE_EVENT_CHANNEL_CAPACITY,
         )
         .unwrap();
         assert_eq!(recovered[&victim].queued_at, Some(key));

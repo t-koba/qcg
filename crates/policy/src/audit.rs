@@ -145,12 +145,24 @@ pub struct AuditConfig {
 }
 
 impl AuditConfig {
-    /// Resolves the per-value tool-call event threshold. Contract validation
-    /// rejects explicit values outside `1..=TOOL_EVENT_VALUE_LIMIT_BYTES`.
+    /// Resolves the per-value tool-call event threshold. Unset keeps the
+    /// shipped 32 KiB default; an explicit value is honored as configured.
+    /// Contract validation refuses values above the deployment ceiling
+    /// (`[operational_limits].audit_tool_value_bytes` and
+    /// `direct_mcp_tool_value_bytes`), never clamping silently.
     pub fn tool_event_value_limit_bytes(&self) -> usize {
         self.max_tool_value_bytes
             .unwrap_or(TOOL_EVENT_VALUE_LIMIT_BYTES)
-            .min(TOOL_EVENT_VALUE_LIMIT_BYTES)
+    }
+
+    /// Resolves the direct `mcp.call` event detail limit. Unset keeps the
+    /// shipped 64 KiB limit; an explicit `max_tool_value_bytes` is honored
+    /// as configured, even above the shipped default, when the deployment
+    /// ceiling allows it. Contract validation refuses values above the
+    /// ceiling instead of clamping.
+    pub fn direct_tool_event_value_limit_bytes(&self) -> usize {
+        self.max_tool_value_bytes
+            .unwrap_or(crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES)
     }
 
     /// Raises this configuration to the deployment floor. A `Standard` floor
@@ -223,12 +235,16 @@ impl AuditPolicy {
                 crate::DEFAULT_MAX_JOURNAL_EVENT_COUNT
             ));
         }
-        if config
-            .max_tool_value_bytes
-            .is_some_and(|value| value == 0 || value > TOOL_EVENT_VALUE_LIMIT_BYTES)
-        {
+        if config.max_tool_value_bytes.is_some_and(|value| {
+            value == 0
+                || value > crate::operational_limits().audit_tool_value_bytes
+                || value > crate::operational_limits().direct_mcp_tool_value_bytes
+        }) {
+            let effective = crate::operational_limits()
+                .audit_tool_value_bytes
+                .min(crate::operational_limits().direct_mcp_tool_value_bytes);
             return Err(format!(
-                "audit max_tool_value_bytes must be between 1 and {TOOL_EVENT_VALUE_LIMIT_BYTES}"
+                "audit max_tool_value_bytes must be between 1 and {effective}"
             ));
         }
         for kind in config.classes.keys() {
@@ -438,6 +454,40 @@ mod tests {
             TOOL_EVENT_VALUE_LIMIT_BYTES
         );
         assert!(AuditPolicy::from_config(&config).is_ok());
+    }
+
+    #[test]
+    fn direct_tool_value_limit_keeps_shipped_default_and_honors_override() {
+        assert_eq!(
+            AuditConfig::default().direct_tool_event_value_limit_bytes(),
+            crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES
+        );
+        let configured = AuditConfig {
+            max_tool_value_bytes: Some(1024),
+            ..AuditConfig::default()
+        };
+        assert_eq!(configured.direct_tool_event_value_limit_bytes(), 1024);
+        // A configured value above the shipped default is honored as
+        // resolved: validity is enforced at contract validation against the
+        // deployment ceiling, never by silently clamping here.
+        let raised = AuditConfig {
+            max_tool_value_bytes: Some(crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES + 1),
+            ..AuditConfig::default()
+        };
+        assert_eq!(
+            raised.direct_tool_event_value_limit_bytes(),
+            crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES + 1,
+            "a configured value must not be clamped to the shipped default"
+        );
+        let general_raised = AuditConfig {
+            max_tool_value_bytes: Some(TOOL_EVENT_VALUE_LIMIT_BYTES + 1),
+            ..AuditConfig::default()
+        };
+        assert_eq!(
+            general_raised.tool_event_value_limit_bytes(),
+            TOOL_EVENT_VALUE_LIMIT_BYTES + 1,
+            "a configured general value must not be clamped to 32 KiB"
+        );
     }
 
     #[test]

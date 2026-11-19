@@ -1839,7 +1839,13 @@ fn ordinary_crash_recovery_does_not_require_a_queue_marker() {
         format!("{started}\n"),
     )
     .unwrap();
-    let recovered = crate::summaries::rehydrate_runs(&root.join("runs"), 8, 8).unwrap();
+    let recovered = crate::summaries::rehydrate_runs(
+        &root.join("runs"),
+        8,
+        8,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
+    )
+    .unwrap();
     assert_eq!(recovered["ordinary"].state, RunStatus::Queued);
     assert_eq!(read_journal_events(&record.run_dir).unwrap(), vec![started]);
 }
@@ -1892,7 +1898,7 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     crate::run_package::load(&child.run_dir, &folded).unwrap();
     assert_eq!(prefix.last().unwrap()["t"], "run_forked");
     assert!(
-        !crate::summaries::rehydrate_runs(&runs, 8, 8)
+        !crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
             .unwrap()
             .contains_key("child"),
         "recovery must skip a busy admission, even with a complete package"
@@ -1904,12 +1910,14 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     // never schedules it, and leaves all evidence for exclusive reconciliation.
     let binding = engine::host_cgroup::binding_path(&run_meta_dir(&child.run_dir));
     std::fs::write(&binding, b"unreconciled host evidence").unwrap();
-    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+        .unwrap_err();
     assert!(
         error.to_string().contains("host-cgroup evidence"),
         "{error}"
     );
-    let (recovered, failures) = crate::summaries::refresh_runs(&runs, 8, 8).unwrap();
+    let (recovered, failures) =
+        crate::summaries::refresh_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
     assert_eq!(failures, 1);
     assert!(!recovered.contains_key("child"));
     assert_eq!(read_journal_events(&child.run_dir).unwrap(), prefix);
@@ -1922,7 +1930,8 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
         engine::JournalLimits::default(),
     )
     .unwrap();
-    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
+    let recovered =
+        crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
     assert!(!recovered.contains_key("child"));
     assert_eq!(recovered["source"].state, RunStatus::Queued);
     assert!(!run_meta_dir(&child.run_dir).join("journal.jsonl").exists());
@@ -1949,7 +1958,8 @@ fn fork_recovery_requires_own_queue_after_complete_package_copy() {
     )
     .unwrap();
     drop(admission);
-    let recovered = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap();
+    let recovered =
+        crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
     assert_eq!(recovered["child"].state, RunStatus::Queued);
     assert_eq!(recovered["child"].priority, 7);
     assert_eq!(recovered["child"].parent_run_id.as_deref(), Some("source"));
@@ -2010,7 +2020,7 @@ fn recovery_interrupts_queued_fork_without_usable_manifest() {
         }
         let manifest_before = std::fs::read(&manifest).ok();
         assert!(
-            !crate::summaries::rehydrate_runs(&runs, 1, 8)
+            !crate::summaries::rehydrate_runs(&runs, 1, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
                 .unwrap()
                 .contains_key("child")
         );
@@ -2020,7 +2030,10 @@ fn recovery_interrupts_queued_fork_without_usable_manifest() {
         let execution = crate::run_dirs::try_lock_run_execution(&child.run_dir)
             .unwrap()
             .unwrap();
-        assert!(crate::summaries::rehydrate_runs(&runs, 1, 8).is_err());
+        assert!(
+            crate::summaries::rehydrate_runs(&runs, 1, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+                .is_err()
+        );
         assert_eq!(read_journal_events(&child.run_dir).unwrap(), queued);
         drop(execution);
         let cancel = crate::run_dirs::request_remote_cancel(
@@ -2031,7 +2044,9 @@ fn recovery_interrupts_queued_fork_without_usable_manifest() {
         )
         .unwrap();
         for _ in 0..2 {
-            let recovered = crate::summaries::rehydrate_runs(&runs, 1, 8).unwrap();
+            let recovered =
+                crate::summaries::rehydrate_runs(&runs, 1, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+                    .unwrap();
             assert!(!recovered.contains_key("child"));
             assert_eq!(recovered["source"].state, RunStatus::Queued);
             let settled = read_journal_events(&child.run_dir).unwrap();
@@ -2073,7 +2088,8 @@ fn fork_recovery_does_not_settle_corrupt_non_manifest_evidence() {
     let mut torn = durable.clone();
     torn.extend_from_slice(b"{\"t\":");
     std::fs::write(&journal, &torn).unwrap();
-    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+        .unwrap_err();
     assert!(error.to_string().contains("unterminated tail"), "{error}");
     assert_eq!(std::fs::read(&journal).unwrap(), torn);
     std::fs::write(&journal, &durable).unwrap();
@@ -2091,7 +2107,8 @@ fn fork_recovery_does_not_settle_corrupt_non_manifest_evidence() {
         b"changed",
     )
     .unwrap();
-    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+        .unwrap_err();
     assert!(
         error.to_string().contains("staged tree mismatch"),
         "{error}"
@@ -2152,7 +2169,8 @@ fn incomplete_fork_with_post_marker_effect_evidence_is_preserved() {
     )
     .unwrap();
 
-    let error = crate::summaries::rehydrate_runs(&runs, 8, 8).unwrap_err();
+    let error = crate::summaries::rehydrate_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+        .unwrap_err();
     assert!(error.to_string().contains("post-marker history"), "{error}");
     assert_eq!(read_journal_events(&child_dir).unwrap(), before);
     assert!(crate::run_package::package_dir(&child_dir).exists());
@@ -2168,7 +2186,8 @@ fn incomplete_fork_with_post_marker_effect_evidence_is_preserved() {
         cancel,
         "refusing cleanup must preserve the cancel mailbox"
     );
-    let (recovered, failures) = crate::summaries::refresh_runs(&runs, 8, 8).unwrap();
+    let (recovered, failures) =
+        crate::summaries::refresh_runs(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
     assert_eq!(failures, 1);
     assert!(!recovered.contains_key("child"));
     assert_eq!(read_journal_events(&child_dir).unwrap(), before);

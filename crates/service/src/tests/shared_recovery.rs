@@ -52,7 +52,8 @@ async fn corrupt_entry_does_not_block_shared_adoption_or_hide_limits() {
     std::fs::create_dir_all(&corrupt_meta).unwrap();
     std::fs::write(corrupt_meta.join("journal.jsonl"), b"not json\n").unwrap();
     assert!(
-        crate::summaries::rehydrate_runs(&runs, 10, 100).is_err(),
+        crate::summaries::rehydrate_runs(&runs, 10, 100, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+            .is_err(),
         "startup must still refuse a corrupt journal"
     );
     peer.refresh_shared_runs()
@@ -67,11 +68,11 @@ async fn corrupt_entry_does_not_block_shared_adoption_or_hide_limits() {
     assert!(!records.contains_key("corrupt"));
     drop(records);
     assert!(
-        crate::summaries::refresh_runs(&runs, 10, 1).is_err(),
+        crate::summaries::refresh_runs(&runs, 10, 1, policy::LIVE_EVENT_CHANNEL_CAPACITY).is_err(),
         "corrupt entries must consume the scan budget"
     );
     assert!(
-        crate::summaries::refresh_runs(&runs, 0, 100).is_err(),
+        crate::summaries::refresh_runs(&runs, 0, 100, policy::LIVE_EVENT_CHANNEL_CAPACITY).is_err(),
         "the non-terminal run cap must remain a global error"
     );
     // A valid journal with a broken package still consumes the run cap.
@@ -82,7 +83,9 @@ async fn corrupt_entry_does_not_block_shared_adoption_or_hide_limits() {
         package_meta.join("journal.jsonl"),
     )
     .unwrap();
-    assert!(crate::summaries::refresh_runs(&runs, 1, 100).is_err());
+    assert!(
+        crate::summaries::refresh_runs(&runs, 1, 100, policy::LIVE_EVENT_CHANNEL_CAPACITY).is_err()
+    );
     std::fs::remove_dir_all(runs.join("corrupt")).unwrap();
     std::fs::remove_dir_all(runs.join("missing-package")).unwrap();
     peer.refresh_shared_runs().await.unwrap();

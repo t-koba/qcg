@@ -2170,6 +2170,97 @@ fn configured_tool_event_value_limit_applies_to_success_and_failure_paths() {
 }
 
 #[test]
+fn raised_audit_value_limit_retains_larger_tool_result() {
+    // A deployment/contract must be able to raise the operational audit cap:
+    // with a raised deployment ceiling, a 40 KiB tool result (above the
+    // shipped 32 KiB default) is retained instead of truncated.
+    let raised = policy::OperationalLimits {
+        agent_tool_calls: 20,
+        agent_iterations: 64,
+        fallback_models: 16,
+        web_search_results: 40,
+        retry_attempts: 32,
+        retry_backoff_ms: 120_000,
+        patch_target_bytes: 16 * 1024 * 1024,
+        audit_tool_value_bytes: 128 * 1024,
+        direct_mcp_tool_value_bytes: 128 * 1024,
+    };
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    let audit = policy::AuditConfig {
+        max_tool_value_bytes: Some(96 * 1024),
+        ..policy::AuditConfig::default()
+    };
+    policy::AuditPolicy::from_config(&audit)
+        .expect("a 96 KiB contract value must validate under a raised ceiling");
+    assert_eq!(audit.tool_event_value_limit_bytes(), 96 * 1024);
+    let large = json!({ "payload": "x".repeat(40 * 1024) });
+    assert!(
+        serde_json::to_vec(&large).unwrap().len() > policy::TOOL_EVENT_VALUE_LIMIT_BYTES,
+        "fixture must exceed the shipped 32 KiB default"
+    );
+    let call = ChatToolCall {
+        id: "call-raised".into(),
+        name: "fetch".into(),
+        args: large.clone(),
+    };
+    let event = tool_call_event(
+        "research",
+        None,
+        None,
+        &call,
+        &large,
+        ToolCallEventOutcome {
+            status: ToolCallStatus::Succeeded,
+            phase: ToolCallPhase::Completed,
+            error: None,
+            duration: std::time::Duration::ZERO,
+        },
+        &audit,
+    )
+    .expect("raised event should serialize");
+    assert_eq!(
+        event["arguments"], large,
+        "raised limit must retain arguments"
+    );
+    assert_eq!(event["result"], large, "raised limit must retain results");
+    assert_eq!(event["truncated"], false);
+}
+
+#[test]
+fn audit_value_above_deployment_ceiling_is_refused() {
+    let raised = policy::OperationalLimits {
+        agent_tool_calls: 20,
+        agent_iterations: 64,
+        fallback_models: 16,
+        web_search_results: 40,
+        retry_attempts: 32,
+        retry_backoff_ms: 120_000,
+        patch_target_bytes: 16 * 1024 * 1024,
+        audit_tool_value_bytes: 128 * 1024,
+        direct_mcp_tool_value_bytes: 128 * 1024,
+    };
+    match policy::set_deployment_operational_limits(raised) {
+        Ok(()) => {}
+        Err(_) if policy::operational_limits() == &raised => {}
+        Err(error) => panic!("raised ceiling must install: {error}"),
+    }
+    let ceiling = policy::operational_limits()
+        .audit_tool_value_bytes
+        .min(policy::operational_limits().direct_mcp_tool_value_bytes);
+    let over = policy::AuditConfig {
+        max_tool_value_bytes: Some(ceiling + 1),
+        ..policy::AuditConfig::default()
+    };
+    let error = policy::AuditPolicy::from_config(&over)
+        .expect_err("a value above the configured ceiling must be refused");
+    assert!(error.contains("max_tool_value_bytes"), "{error}");
+}
+
+#[test]
 fn tool_source_scan_is_depth_node_and_result_bounded() {
     let many = Value::Array(
         (0..(TOOL_EVENT_SOURCE_SCAN_NODES * 2))
@@ -3228,6 +3319,8 @@ fn raised_deployment_ceiling_accepts_eleventh_tool_call() {
         retry_attempts: 32,
         retry_backoff_ms: 120_000,
         patch_target_bytes: 16 * 1024 * 1024,
+        audit_tool_value_bytes: 128 * 1024,
+        direct_mcp_tool_value_bytes: 128 * 1024,
     };
     // Idempotent: the same value may be installed by preload + router.
     match policy::set_deployment_operational_limits(raised) {

@@ -262,7 +262,7 @@ Fields:
 
 ## Operational limits
 
-The same registry carries the deployment ceilings for the seven operational
+The same registry carries the deployment ceilings for the nine operational
 limits shared by contract validation and execution:
 
 ```toml
@@ -274,6 +274,8 @@ web_search_results = 20
 retry_attempts = 16
 retry_backoff_ms = 60000
 patch_target_bytes = 8388608  # 8 MiB
+audit_tool_value_bytes = 32768  # 32 KiB general tool-call detail ceiling
+direct_mcp_tool_value_bytes = 65536  # 64 KiB direct mcp.call detail ceiling
 ```
 
 Every key is optional and the values above are the defaults when the section
@@ -283,7 +285,8 @@ effective ceilings themselves: a deployment may tighten or raise them, and a
 contract declaring more than today's defaults validates when the deployment
 raises the ceiling. Contracts declare their own values (`max_calls`,
 `max_iterations`, `fallback_models`, `max_results`, `retry.max_attempts`,
-`retry.backoff_ms`, and runtime output limits); a declared value above the
+`retry.backoff_ms`, runtime output limits, and `[audit].max_tool_value_bytes`);
+a declared value above the
 effective ceiling is refused at validation and at execution, never silently
 clamped. The ceiling is installed before contracts are validated (CLI local
 runs preload it before `Contract::load`; `serve` installs it while resolving

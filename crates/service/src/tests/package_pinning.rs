@@ -329,7 +329,8 @@ async fn recovery_and_fork_refuse_missing_mismatched_and_legacy_snapshots() {
             }
         }
         assert!(
-            crate::summaries::rehydrate_runs(&runs, 32, 64).is_err(),
+            crate::summaries::rehydrate_runs(&runs, 32, 64, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+                .is_err(),
             "{fault}"
         );
         assert!(

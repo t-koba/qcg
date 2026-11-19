@@ -121,8 +121,15 @@ pub(crate) fn rehydrate_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
+    live_event_channel_capacity: usize,
 ) -> Result<BTreeMap<String, RunRecord>, ServiceError> {
-    rehydrate_runs_with_effects(runs_dir, max_tracked_runs, max_scan_entries).map(|(runs, _)| runs)
+    rehydrate_runs_with_effects(
+        runs_dir,
+        max_tracked_runs,
+        max_scan_entries,
+        live_event_channel_capacity,
+    )
+    .map(|(runs, _)| runs)
 }
 
 /// Startup recovery: also reports every run directory (terminal or direct
@@ -132,12 +139,14 @@ pub(crate) fn rehydrate_runs_with_effects(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
+    live_event_channel_capacity: usize,
 ) -> Result<(BTreeMap<String, RunRecord>, EffectCandidates), ServiceError> {
     let mut effects = EffectCandidates::new();
     scan_runs(
         runs_dir,
         max_tracked_runs,
         max_scan_entries,
+        live_event_channel_capacity,
         false,
         &mut effects,
     )
@@ -154,9 +163,15 @@ pub(crate) fn refresh_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
+    live_event_channel_capacity: usize,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
-    refresh_runs_with_effects(runs_dir, max_tracked_runs, max_scan_entries)
-        .map(|scan| (scan.runs, scan.failures))
+    refresh_runs_with_effects(
+        runs_dir,
+        max_tracked_runs,
+        max_scan_entries,
+        live_event_channel_capacity,
+    )
+    .map(|scan| (scan.runs, scan.failures))
 }
 
 pub(crate) struct RefreshedRuns {
@@ -171,12 +186,14 @@ pub(crate) fn refresh_runs_with_effects(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
+    live_event_channel_capacity: usize,
 ) -> Result<RefreshedRuns, ServiceError> {
     let mut effects = EffectCandidates::new();
     scan_runs(
         runs_dir,
         max_tracked_runs,
         max_scan_entries,
+        live_event_channel_capacity,
         true,
         &mut effects,
     )
@@ -191,6 +208,7 @@ fn scan_runs(
     runs_dir: &Utf8Path,
     max_tracked_runs: usize,
     max_scan_entries: usize,
+    live_event_channel_capacity: usize,
     tolerate_entry_errors: bool,
     effects: &mut EffectCandidates,
 ) -> Result<(BTreeMap<String, RunRecord>, usize), ServiceError> {
@@ -222,7 +240,12 @@ fn scan_runs(
                 ServiceError::Invalid(format!("run path is not valid UTF-8: {}", path.display()))
             })
             .and_then(|run_dir| {
-                let recovered = rehydrate_run(&run_dir, &mut nonterminal_runs, effects);
+                let recovered = rehydrate_run(
+                    &run_dir,
+                    &mut nonterminal_runs,
+                    live_event_channel_capacity,
+                    effects,
+                );
                 if recovered.is_err() {
                     effects
                         .entry(run_dir)
@@ -256,6 +279,7 @@ fn scan_runs(
 fn rehydrate_run(
     run_dir: &Utf8Path,
     nonterminal_runs: &mut usize,
+    live_event_channel_capacity: usize,
     effects: &mut EffectCandidates,
 ) -> Result<Option<(String, RunRecord)>, ServiceError> {
     // Serialize with preparation before even probing the journal. Contention
@@ -312,7 +336,7 @@ fn rehydrate_run(
     // Restore the durable FIFO key, including a scheduler-preserved
     // queued_at override, instead of re-stamping on recovery.
     let queued_at = read_last_queued_at_from_values(&journal_values);
-    let (events, _) = broadcast::channel(policy::LIVE_EVENT_CHANNEL_CAPACITY);
+    let (events, _) = broadcast::channel(live_event_channel_capacity);
     Ok(Some((
         run_id,
         RunRecord {

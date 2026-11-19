@@ -197,7 +197,7 @@ pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 /// Default cap, in bytes, for MCP responses.
 pub const DEFAULT_MCP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Deployment ceilings for the seven operational limits shared by contract
+/// Deployment ceilings for the nine operational limits shared by contract
 /// validation and execution. This is policy, not mechanism: the configured
 /// values are the effective ceilings themselves. Defaults preserve today's
 /// values; a deployment may tighten or raise a ceiling in `providers.toml`.
@@ -228,6 +228,14 @@ pub struct OperationalLimits {
     /// Effective hash-anchored patch target ceiling, in bytes (Q01).
     #[serde(default = "default_patch_target_bytes")]
     pub patch_target_bytes: usize,
+    /// Deployment ceiling for `[audit].max_tool_value_bytes` on the general
+    /// tool-call path. Defaults to today's 32 KiB value.
+    #[serde(default = "default_audit_tool_value_bytes")]
+    pub audit_tool_value_bytes: usize,
+    /// Deployment ceiling for `[audit].max_tool_value_bytes` on direct
+    /// `mcp.call` events. Defaults to today's 64 KiB shipped detail limit.
+    #[serde(default = "default_direct_mcp_tool_value_bytes")]
+    pub direct_mcp_tool_value_bytes: usize,
 }
 
 const fn default_agent_tool_calls() -> usize {
@@ -251,6 +259,12 @@ const fn default_retry_backoff_ms() -> u64 {
 const fn default_patch_target_bytes() -> usize {
     MAX_PATCH_TARGET_BYTES
 }
+const fn default_audit_tool_value_bytes() -> usize {
+    TOOL_EVENT_VALUE_LIMIT_BYTES
+}
+const fn default_direct_mcp_tool_value_bytes() -> usize {
+    DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES
+}
 
 impl Default for OperationalLimits {
     fn default() -> Self {
@@ -262,6 +276,8 @@ impl Default for OperationalLimits {
             retry_attempts: default_retry_attempts(),
             retry_backoff_ms: default_retry_backoff_ms(),
             patch_target_bytes: default_patch_target_bytes(),
+            audit_tool_value_bytes: default_audit_tool_value_bytes(),
+            direct_mcp_tool_value_bytes: default_direct_mcp_tool_value_bytes(),
         }
     }
 }
@@ -279,6 +295,11 @@ impl OperationalLimits {
             ("web_search_results", self.web_search_results),
             ("retry_attempts", self.retry_attempts as usize),
             ("patch_target_bytes", self.patch_target_bytes),
+            ("audit_tool_value_bytes", self.audit_tool_value_bytes),
+            (
+                "direct_mcp_tool_value_bytes",
+                self.direct_mcp_tool_value_bytes,
+            ),
         ] {
             if value == 0 {
                 return Err(format!("{name} must be at least 1"));
@@ -299,6 +320,8 @@ const DEFAULT_DEPLOYMENT_LIMITS: OperationalLimits = OperationalLimits {
     retry_attempts: MAX_RETRY_ATTEMPTS,
     retry_backoff_ms: MAX_RETRY_BACKOFF_MS,
     patch_target_bytes: MAX_PATCH_TARGET_BYTES,
+    audit_tool_value_bytes: TOOL_EVENT_VALUE_LIMIT_BYTES,
+    direct_mcp_tool_value_bytes: DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES,
 };
 
 static DEPLOYMENT_LIMITS: OnceLock<OperationalLimits> = OnceLock::new();
@@ -375,6 +398,12 @@ pub const MAX_RATE_LIMIT_MAX_IDENTITIES: usize = 65_536;
 /// Maximum bytes kept per tool-call event value before truncation.
 pub const TOOL_EVENT_VALUE_LIMIT_BYTES: usize = 32 * 1024;
 
+/// Shipped per-value detail limit for direct `mcp.call` events. This path
+/// historically retained 64 KiB while the shared tool-call ceiling is
+/// `TOOL_EVENT_VALUE_LIMIT_BYTES`; a configured `max_tool_value_bytes`
+/// lowers either path.
+pub const DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES: usize = 64 * 1024;
+
 /// Default cap, in bytes, for LLM request context.
 pub const DEFAULT_LLM_CONTEXT_LIMIT_BYTES: usize = 1024 * 1024;
 
@@ -439,6 +468,8 @@ mod operational_limits_tests {
                 retry_attempts: 16,
                 retry_backoff_ms: 60_000,
                 patch_target_bytes: 8 * 1024 * 1024,
+                audit_tool_value_bytes: 32 * 1024,
+                direct_mcp_tool_value_bytes: 64 * 1024,
             }
         );
         assert_eq!(
@@ -478,6 +509,8 @@ mod operational_limits_tests {
         let narrowed = OperationalLimits {
             agent_tool_calls: 2,
             patch_target_bytes: 1024,
+            audit_tool_value_bytes: 1024,
+            direct_mcp_tool_value_bytes: 1024,
             ..OperationalLimits::default()
         };
         narrowed.validate().expect("narrowing is allowed");
@@ -493,6 +526,8 @@ mod operational_limits_tests {
             r#"{"retry_attempts": 32}"#,
             r#"{"retry_backoff_ms": 120000}"#,
             r#"{"patch_target_bytes": 16777216}"#,
+            r#"{"audit_tool_value_bytes": 65536}"#,
+            r#"{"direct_mcp_tool_value_bytes": 131072}"#,
         ] {
             let limits: OperationalLimits = serde_json::from_str(json).unwrap();
             limits
@@ -509,6 +544,11 @@ mod operational_limits_tests {
             (r#"{"web_search_results": 0}"#, "web_search_results"),
             (r#"{"retry_attempts": 0}"#, "retry_attempts"),
             (r#"{"patch_target_bytes": 0}"#, "patch_target_bytes"),
+            (r#"{"audit_tool_value_bytes": 0}"#, "audit_tool_value_bytes"),
+            (
+                r#"{"direct_mcp_tool_value_bytes": 0}"#,
+                "direct_mcp_tool_value_bytes",
+            ),
         ] {
             let limits: OperationalLimits = serde_json::from_str(json).unwrap();
             let error = limits.validate().expect_err("zero value must be refused");

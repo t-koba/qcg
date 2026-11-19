@@ -468,7 +468,8 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(try_lock_run_admission(&dir).unwrap().is_none());
-        let (records, candidates) = rehydrate_runs_with_effects(&runs, 8, 8).unwrap();
+        let (records, candidates) =
+            rehydrate_runs_with_effects(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
         assert!(records.is_empty());
         assert_eq!(
             candidates,
@@ -561,7 +562,8 @@ mod tests {
             .await
             .is_err()
         );
-        let scan = refresh_runs_with_effects(&runs, 8, 8).unwrap();
+        let scan =
+            refresh_runs_with_effects(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
         assert_eq!(scan.failures, 1);
         assert_eq!(
             scan.effects,

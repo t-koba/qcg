@@ -2656,6 +2656,7 @@ async fn rehydrate_restores_accepted_answers_from_journal() {
         &runs_dir,
         DEFAULT_MAX_TRACKED_RUNS,
         policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
     )
     .expect("rehydrate should succeed");
     let waiting = pending.get(&run_id).expect("run should rehydrate");
@@ -2671,6 +2672,7 @@ async fn rehydrate_restores_accepted_answers_from_journal() {
         &runs_dir,
         DEFAULT_MAX_TRACKED_RUNS,
         policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
     )
     .expect("rehydrate should succeed");
     let queued = pending.get(&run_id).expect("run should rehydrate");
@@ -2681,6 +2683,61 @@ async fn rehydrate_restores_accepted_answers_from_journal() {
         "accepted answer must survive a restart before the engine consumes it"
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+#[test]
+fn rehydrated_live_events_use_the_configured_channel_capacity() {
+    let root = temp_run_dir("rehydrate-event-capacity");
+    let _guard = TempGuard(root.clone());
+    let run_id = format!("synth-{}", uuid::Uuid::now_v7());
+    drop(synthetic_hitl_record(&root, &run_id));
+    let runs_dir = root.join("runs");
+    // Both capacities are powers of two, so tokio's internal rounding cannot
+    // hide an off-by-one in the lag probe below.
+    let configured = policy::MIN_LIVE_EVENT_CHANNEL_CAPACITY * 2;
+    let events = crate::summaries::read_journal_events(&runs_dir.join(&run_id))
+        .expect("synthetic journal should be readable");
+    let event = api::RunEvent::from_flat(&events[0]).expect("journal event should parse");
+    let assert_capacity = |record: &crate::types::RunRecord, capacity: usize| {
+        let mut receiver = record.events.subscribe();
+        for _ in 0..=capacity {
+            record.events.send(event.clone()).expect("receiver is live");
+        }
+        assert!(
+            matches!(
+                receiver.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(1))
+            ),
+            "capacity {capacity} must overflow by exactly one message"
+        );
+        for _ in 0..capacity {
+            assert!(
+                receiver.try_recv().is_ok(),
+                "capacity {capacity} messages must be retained"
+            );
+        }
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+    };
+    let recovered = rehydrate_runs(
+        &runs_dir,
+        DEFAULT_MAX_TRACKED_RUNS,
+        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        configured,
+    )
+    .expect("rehydrate should succeed");
+    assert_capacity(&recovered[&run_id], configured);
+
+    let default = rehydrate_runs(
+        &runs_dir,
+        DEFAULT_MAX_TRACKED_RUNS,
+        policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
+    )
+    .expect("rehydrate should succeed");
+    assert_capacity(&default[&run_id], policy::LIVE_EVENT_CHANNEL_CAPACITY);
 }
 
 #[tokio::test]

@@ -160,6 +160,7 @@ impl LocalService {
             &runs_dir,
             max_tracked_runs,
             policy.max_directory_scan_entries,
+            policy.live_event_channel_capacity,
         )?;
         let llm_runtime = crate::run_dirs::load_llm_runtime_with_container_timeouts(
             providers_path.as_deref(),
@@ -475,6 +476,7 @@ impl LocalService {
             &self.inner.runs_dir,
             self.inner.max_tracked_runs,
             self.inner.deployment_policy.max_directory_scan_entries,
+            self.inner.deployment_policy.live_event_channel_capacity,
         ) {
             Ok(recovered) => recovered,
             Err(error) => {
@@ -893,6 +895,7 @@ impl LocalService {
                 &self.inner.runs_dir,
                 self.inner.max_tracked_runs,
                 self.inner.deployment_policy.max_directory_scan_entries,
+                self.inner.deployment_policy.live_event_channel_capacity,
             ) {
                 Ok((disk, effects)) => {
                     self.merge_effect_candidates(effects);

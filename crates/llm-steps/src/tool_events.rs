@@ -11,7 +11,6 @@ use std::time::Instant;
 use crate::mcp_forms::{mcp_form_spec, mcp_input_responses, mcp_question_id};
 use crate::mcp_tools::{AgentToolOutcome, McpAgentTools};
 use crate::prompting::utf8_head;
-use policy::TOOL_EVENT_VALUE_LIMIT_BYTES;
 
 pub(crate) struct ToolCallEventOutcome {
     pub(crate) status: ToolCallStatus,
@@ -211,9 +210,12 @@ pub(crate) fn bounded_event_value(
     value_limit_bytes: usize,
 ) -> Result<(Value, bool), serde_json::Error> {
     let bytes = serde_json::to_vec(value)?;
-    // Contract validation rejects an explicitly larger value. Keep the
-    // mechanism ceiling here as a final guard for every event construction.
-    if bytes.len() <= value_limit_bytes.min(TOOL_EVENT_VALUE_LIMIT_BYTES) {
+    // The limit is the resolved configured value: contract validation refuses
+    // values above the deployment ceiling, so a valid configured value is
+    // honored here even above the shipped default, never clamped silently.
+    // Credential redaction and the fail-closed `{type, bytes, truncated}`
+    // marker below are unchanged.
+    if bytes.len() <= value_limit_bytes {
         Ok((value.clone(), false))
     } else {
         Ok((

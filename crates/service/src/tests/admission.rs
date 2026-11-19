@@ -1570,8 +1570,9 @@ fn g03_accumulated_admissions_do_not_exhaust_scan_budget() {
     std::fs::write(runs.join(".maintenance.lock"), b"lock").expect("maintenance lock");
     // Zero live runs must rehydrate under a budget smaller than the
     // coordination count (8 would fail if locks were counted).
-    let recovered = crate::summaries::rehydrate_runs(&runs, 16, 8)
-        .expect("coordination-only store must rehydrate");
+    let recovered =
+        crate::summaries::rehydrate_runs(&runs, 16, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+            .expect("coordination-only store must rehydrate");
     assert!(
         recovered.is_empty(),
         "no live runs should be tracked, got: {}",
@@ -1583,8 +1584,9 @@ fn g03_accumulated_admissions_do_not_exhaust_scan_budget() {
     let live_id = "live-run-1";
     let live_record = synthetic_hitl_record(&root, live_id);
     drop(live_record);
-    let recovered = crate::summaries::rehydrate_runs(&runs, 16, 8)
-        .expect("one live run plus coordination must rehydrate");
+    let recovered =
+        crate::summaries::rehydrate_runs(&runs, 16, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY)
+            .expect("one live run plus coordination must rehydrate");
     assert_eq!(
         recovered.len(),
         1,
@@ -1762,6 +1764,7 @@ async fn h02_raise_survives_rehydrate_and_spawn_resolution() {
         &root.join("runs"),
         policy::DEFAULT_MAX_TRACKED_RUNS,
         policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
     )
     .expect("rehydrate should succeed");
     let record = recovered.get(&id).expect("run should rehydrate");
@@ -1865,6 +1868,7 @@ enabled = false"#,
         &root.join("runs"),
         policy::DEFAULT_MAX_TRACKED_RUNS,
         policy::DEFAULT_MAX_DIRECTORY_SCAN_ENTRIES,
+        policy::LIVE_EVENT_CHANNEL_CAPACITY,
     )
     .expect("peer rehydrate");
     let peer_record = recovered.get(&id).expect("peer should see the run");
