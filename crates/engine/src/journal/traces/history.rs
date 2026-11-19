@@ -171,6 +171,24 @@ pub(super) fn proves_failed_history(
             // model, token usage and a settled cost; ownership of the charge
             // is proved separately against preserved outcomes by the planner.
             RunEventData::LlmCall(_) if started && active.is_some() => {}
+            // A fresh memo write records the response of the active call; it
+            // is not a cross-run reuse. Reused responses remain unproven here
+            // because their parent journal is outside this source.
+            RunEventData::LlmMemo(memo)
+                if started
+                    && memo.reused_from.is_none()
+                    && active
+                        .as_ref()
+                        .is_some_and(|(owner, _)| event["node"].as_str() == Some(*owner)) => {}
+            // A skipped dependent has no outcome or charge. It is reset by the
+            // planner and must not be mistaken for a settled owner.
+            RunEventData::StepSkipped(_)
+                if started
+                    && active.is_none()
+                    && !settled.contains_key(event["node"].as_str().unwrap_or_default())
+                    && !traces
+                        .owners
+                        .contains_key(event["node"].as_str().unwrap_or_default()) => {}
             // Positive allowlist: retries, hooks, interactions, effects,
             // replay, lifecycle restarts and all future kinds are unproven.
             _ => return None,

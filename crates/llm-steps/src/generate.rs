@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use contract::{Contract, NodeDef};
-use engine::{StepContext, StepError, StepExecutor, StepOutcome, validate_json_schema_step};
+use engine::{
+    ContinuationReadCoverage, ContinuationSafety, StepContext, StepError, StepExecutor,
+    StepOutcome, validate_json_schema_step,
+};
 use llm::LlmRuntime;
 use policy::{params_schema, string_schema};
 use serde_json::{Value, json};
@@ -29,6 +32,22 @@ impl StepExecutor for LlmGenerateStep {
     engine::step_type_id!("llm.generate");
 
     engine::parallel_step_traits!(Default);
+
+    /// The provider call is a settled, journaled charge: continuation preserves
+    /// the successful outcome and its counters instead of repeating the call.
+    /// Every runtime input comes from the bound contract/package or captured
+    /// StepContext reads, so an unchanged node can be preserved as read-only.
+    fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
+        ContinuationSafety::ReadOnly
+    }
+
+    fn continuation_read_coverage(&self, _node: &NodeDef) -> ContinuationReadCoverage {
+        ContinuationReadCoverage::Complete
+    }
+
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        Some("llm.generate-v1")
+    }
 
     fn params_schema(&self) -> Option<Value> {
         Some(params_schema(&["prompt"], llm_common_properties(json!({}))))

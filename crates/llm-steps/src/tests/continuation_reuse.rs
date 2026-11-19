@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use engine::{Engine, Progress, ReuseSource, RunOptions, RunState};
+use engine::{Engine, JournalLimits, Progress, ReuseSource, RunOptions, RunState};
 use llm::{
     Capabilities, ChatContent, ChatRequest, ChatResponse, LlmError, LlmProvider, TokenUsage,
 };
@@ -127,6 +127,46 @@ fn chain() -> Dir {
             ("e", "", "STEP-E {{ steps.d.output.text }}"),
         ],
     )
+}
+
+/// Stage the generator package where the continuation planner expects it.
+/// The source journal's contract digest is bound to these exact package bytes.
+fn stage_package(dir: &Dir, tag: &str) {
+    let package = dir.0.join(tag).join("generator-package");
+    std::fs::create_dir_all(&package).unwrap();
+    for entry in std::fs::read_dir(&dir.0).unwrap() {
+        let path = entry.unwrap().path();
+        if path.is_file() {
+            let name = Utf8PathBuf::from_path_buf(path.file_name().unwrap().into()).unwrap();
+            std::fs::copy(&path, package.join(name)).unwrap();
+        }
+    }
+}
+
+/// Two independent `llm.generate` nodes, neither producing output files:
+/// `a` settles successfully, `c` fails. This is the shape the service
+/// continuation planner accepts for preserving the successful paid call.
+fn paid_chain() -> Dir {
+    let root = Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+        "qcg-paid-reuse-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    )))
+    .unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    let mut manifest = HEADER.to_string();
+    for id in ["a", "c"] {
+        manifest.push_str(&format!(
+            "[[flow]]\nid = \"{id}\"\ntype = \"llm.generate\"\nneeds = []\non_deps = \"none_failed\"\n[flow.params]\nprompt = \"{id}.txt\"\n"
+        ));
+    }
+    std::fs::write(root.join("a.txt"), "STEP-A x").unwrap();
+    std::fs::write(root.join("c.txt"), "STEP-C x").unwrap();
+    std::fs::write(root.join(contract::MANIFEST_FILE), manifest).unwrap();
+    Dir(root)
 }
 
 fn inputs(pairs: &[(&str, Value)]) -> BTreeMap<String, Value> {
@@ -486,4 +526,46 @@ async fn responses_of_steps_that_did_not_succeed_are_not_served() {
     )
     .await;
     assert_eq!(provider.calls.load(Ordering::SeqCst), 1, "only b is repaid");
+}
+
+#[tokio::test]
+async fn shipped_llm_generate_continuation_preserves_settled_paid_work() {
+    let dir = paid_chain();
+    let provider = echo(true);
+    let failed = run(&dir, "src", inputs(&[]), &provider, None).await;
+    assert!(matches!(failed, Progress::Failed(_)), "{failed:?}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+
+    // The shipped executor satisfies the service continuation planner's
+    // private proof, and the failed source inherits exactly the one settled
+    // call instead of dropping or doubling its counters.
+    stage_package(&dir, "src");
+    let mut registry = StepRegistry::new();
+    crate::register_llm_steps(&mut registry, Arc::new(LlmRuntime::builtins()));
+    let contract = Contract::load(&dir.0).unwrap();
+    let plan = engine::plan_continuation(
+        &dir.0.join("src"),
+        &registry,
+        JournalLimits::from(&contract.manifest.runtime),
+    )
+    .expect("shipped llm.generate executor must support continuation");
+    assert_eq!(plan.inherited_budget().llm_calls, 1);
+
+    provider.down.store(false, Ordering::SeqCst);
+    provider.calls.store(0, Ordering::SeqCst);
+    let done = run(
+        &dir,
+        "child",
+        inputs(&[]),
+        &provider,
+        Some(source(&dir, "src")),
+    )
+    .await;
+    assert!(matches!(done, Progress::Done(_)), "{done:?}");
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "only the failed step reaches the provider again"
+    );
+    assert_eq!(reused(&dir, "child"), ["a"]);
 }
