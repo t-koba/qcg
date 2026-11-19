@@ -4690,10 +4690,12 @@ selected registry row owns the endpoint, query parameters, fixed headers, RFC
 6901 result mapping, and authentication. Those transport fields are not valid
 inline contract fields. The bundled API-key REST profile is named
 `tinyfish-api`; it is separate from the OAuth MCP profile named `tinyfish`.
-The built-in `exa-public` and `parallel-public` MCP profiles are anonymous
-public research endpoints and remain registered even when no `providers.toml`
-exists. A contract still binds exact MCP tools and grants the corresponding
-hosts explicitly. Their ids are reserved and cannot be overridden by registry
+The `exa-public` and `parallel-public` MCP profiles are anonymous public
+research endpoints shipped in `providers.toml`; their embedded defaults remain
+registered even when no `providers.toml` exists. A deployment can tune or
+disable them under `[public_mcp_server.<id>]` without code changes. A contract
+still binds exact MCP tools and grants the corresponding hosts explicitly.
+Their ids are reserved and cannot be declared as ordinary `[[mcp_server]]`
 rows.
 
 The API key is read from the selected profile's `api_key_env` and injected into

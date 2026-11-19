@@ -1616,6 +1616,7 @@ fn query_rejects_credential_environment_placeholders() {
             provider: vec![spec],
             search_provider: vec![],
             mcp_server: vec![],
+            public_mcp_server: None,
             catalog: None,
             operational_limits: None,
         }
@@ -2604,6 +2605,137 @@ fn router_reports_configuration_errors_from_specs() {
     assert!(router.configuration_error_for("fake").is_none());
     assert!(router.capabilities_for("keyed").is_some());
     assert!(router.capabilities_for("nope").is_none());
+}
+
+#[test]
+fn shipped_public_profiles_come_from_registry_configuration() {
+    let text = include_str!("../../../providers.toml");
+    let file = ProvidersFile::parse(text).expect("shipped registry must parse");
+    let value = file
+        .public_mcp_server
+        .as_ref()
+        .expect("shipped registry must declare public profiles");
+    let specs = mcp::PublicProfiles::from_value(value)
+        .expect("shipped public profiles must validate")
+        .into_specs();
+    assert_eq!(specs.len(), 2);
+    for (spec, url, host) in [
+        ("exa-public", "https://mcp.exa.ai/mcp", "mcp.exa.ai"),
+        (
+            "parallel-public",
+            "https://search.parallel.ai/mcp",
+            "search.parallel.ai",
+        ),
+    ] {
+        let configured = specs
+            .iter()
+            .find(|configured| configured.id == spec)
+            .unwrap_or_else(|| panic!("missing shipped profile {spec}"));
+        assert_eq!(configured.url.as_deref(), Some(url));
+        assert_eq!(configured.allowed_hosts, [host]);
+        assert_eq!(configured.timeout_seconds, 120);
+        assert_eq!(configured.max_response_bytes, 4_194_304);
+        assert_eq!(configured.tools_list_page_limit, 100);
+        assert_eq!(configured.oauth_state_ttl_seconds, 600);
+        assert_eq!(configured.task_poll_interval_ms, 250);
+        let shipped = mcp::shipped_public_profiles()
+            .iter()
+            .find(|item| item.id == spec)
+            .expect("embedded default must match the shipped row");
+        assert_eq!(shipped.url, configured.url);
+        assert_eq!(shipped.allowed_hosts, configured.allowed_hosts);
+        assert_eq!(shipped.timeout_seconds, configured.timeout_seconds);
+        assert_eq!(shipped.max_response_bytes, configured.max_response_bytes);
+        assert_eq!(
+            shipped.tools_list_page_limit,
+            configured.tools_list_page_limit
+        );
+        assert_eq!(
+            shipped.oauth_state_ttl_seconds,
+            configured.oauth_state_ttl_seconds
+        );
+        assert_eq!(
+            shipped.task_poll_interval_ms,
+            configured.task_poll_interval_ms
+        );
+    }
+
+    // No registry at all still registers the same shipped profiles.
+    let router = LlmRouter::parse_text("").expect("an empty registry must be valid");
+    assert_eq!(router.mcp.server_ids(), ["exa-public", "parallel-public"]);
+    assert_eq!(
+        LlmRuntime::builtins().mcp.server_ids(),
+        ["exa-public", "parallel-public"]
+    );
+}
+
+#[test]
+fn public_profiles_can_be_disabled_and_tuned_without_code_changes() {
+    let disabled = LlmRouter::parse_text("[public_mcp_server]\nenabled = false\n")
+        .expect("disabling the whole public table must be valid");
+    assert!(disabled.mcp.server_ids().is_empty());
+
+    let one = LlmRouter::parse_text("[public_mcp_server.exa-public]\nenabled = false\n")
+        .expect("one profile may be disabled independently");
+    assert_eq!(one.mcp.server_ids(), ["parallel-public"]);
+
+    let tuned = LlmRouter::parse_text("[public_mcp_server.exa-public]\ntimeout_seconds = 45\n")
+        .expect("a shipped profile may be tuned by one field");
+    assert_eq!(tuned.mcp.server_ids(), ["exa-public", "parallel-public"]);
+    let profile = tuned
+        .mcp
+        .resolve("exa-public")
+        .expect("tuned profile exists");
+    assert_eq!(profile.timeout_seconds(), 45);
+    assert_eq!(profile.allowed_hosts(), ["mcp.exa.ai"]);
+    assert_eq!(profile.auth_name(), "none");
+}
+
+#[test]
+fn public_profile_table_refuses_unknown_duplicate_and_reserved_ids() {
+    for (text, expected) in [
+        (
+            "[public_mcp_server.exa-public]\nunknown_field = 1\n",
+            "unknown field",
+        ),
+        (
+            "[public_mcp_server]\nenabled = false\n[public_mcp_server.exa-public]\nunknown_field = 1\n",
+            "unknown field",
+        ),
+        ("[public_mcp_server]\nnot_a_profile = 1\n", "not reserved"),
+        (
+            "[public_mcp_server.exa-public]\nenabled = \"no\"\n",
+            "must be a boolean",
+        ),
+        (
+            "[public_mcp_server.evil]\nurl = \"https://example.invalid/mcp\"\n",
+            "not reserved",
+        ),
+        (
+            "[public_mcp_server.exa-public]\nurl = \"https://example.invalid/mcp\"\nallowed_hosts = [\"example.invalid\"]\n[public_mcp_server.exa-public]\n",
+            "duplicate",
+        ),
+        (
+            "[public_mcp_server.exa-public]\nauth = \"bearer\"\ncredential_env = \"SECRET\"\n",
+            "anonymous",
+        ),
+        (
+            "[public_mcp_server.exa-public]\nurl = \"http://mcp.exa.ai/mcp\"\nallowed_hosts = [\"mcp.exa.ai\"]\n",
+            "HTTPS",
+        ),
+        (
+            "[[mcp_server]]\nid = \"exa-public\"\ntransport = \"streamable_http\"\nurl = \"https://example.invalid/mcp\"\nallowed_hosts = [\"example.invalid\"]\n",
+            "reserved",
+        ),
+    ] {
+        let error = LlmRouter::parse_text(text)
+            .expect_err("invalid public profile configuration must be refused")
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "expected `{expected}` in error for {text:?}: {error}"
+        );
+    }
 }
 
 #[test]

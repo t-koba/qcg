@@ -28,10 +28,12 @@ model fallbacks, isolation, validation gates, and artifact declarations.
 
 Before LLM design, the demo offers `Exa + Parallel public MCP` as its first and
 recommended research choice, followed by either provider alone or no external
-research. The built-in `exa-public` and `parallel-public` profiles require no
-registry file or API key and expose only exact read-only search/fetch bindings
-with per-tool and agent-wide call limits. Their network permissions are fixed
-to `mcp.exa.ai` and `search.parallel.ai`. Search results remain untrusted model context. The
+research. The `exa-public` and `parallel-public` profiles are shipped registry
+configuration; their embedded defaults need no registry file or API key and
+expose only exact read-only search/fetch bindings with per-tool and agent-wide
+call limits. A registry can tune or disable them under `[public_mcp_server.<id>]`.
+Their network permissions are pinned to `mcp.exa.ai` and `search.parallel.ai`.
+Search results remain untrusted model context. The
 `tinyfish` OAuth profile and credentialed REST `[[search_provider]]` profiles
 remain explicit alternatives rather than the no-setup default.
 

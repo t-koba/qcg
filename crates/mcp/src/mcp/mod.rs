@@ -1,6 +1,7 @@
 pub mod access;
 pub mod error;
 pub mod profile;
+pub mod public;
 pub mod runtime;
 pub mod session;
 pub mod spec;
@@ -10,6 +11,7 @@ pub mod validate;
 pub use access::*;
 pub use error::*;
 pub use profile::*;
+pub use public::*;
 pub use runtime::*;
 pub use session::*;
 pub use spec::*;

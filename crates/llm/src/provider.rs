@@ -1001,6 +1001,11 @@ pub struct ProvidersFile {
     pub search_provider: Vec<SearchProviderSpec>,
     #[serde(default)]
     pub mcp_server: Vec<mcp::McpServerSpec>,
+    /// Trusted anonymous public MCP profile overrides. Absent uses the
+    /// shipped rows; `enabled = false` here disables every profile. Their ids
+    /// are reserved and may only be declared here, not in `mcp_server`.
+    #[serde(default)]
+    pub public_mcp_server: Option<toml::Value>,
     pub catalog: Option<crate::catalog::CatalogConfig>,
     /// Optional deployment ceilings for the shared operational limits.
     #[serde(default)]
@@ -1039,8 +1044,24 @@ impl ProvidersFile {
         let mut mcp_seen = BTreeMap::new();
         for spec in &self.mcp_server {
             spec.validate()?;
+            if mcp::is_reserved_public_id(&spec.id) {
+                return Err(format!(
+                    "MCP server id `{}` is reserved for a public profile; configure it in `public_mcp_server`",
+                    spec.id
+                ));
+            }
             if mcp_seen.insert(spec.id.as_str(), ()).is_some() {
                 return Err(format!("duplicate MCP server id `{}`", spec.id));
+            }
+        }
+        if let Some(value) = &self.public_mcp_server {
+            let public = mcp::PublicProfiles::from_value(value)?;
+            let mut public_seen = BTreeMap::new();
+            for spec in public.specs() {
+                mcp::validate_public_spec(spec)?;
+                if public_seen.insert(spec.id.as_str(), ()).is_some() {
+                    return Err(format!("duplicate public MCP profile id `{}`", spec.id));
+                }
             }
         }
         if let Some(default) = &self.default

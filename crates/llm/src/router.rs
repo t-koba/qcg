@@ -222,8 +222,14 @@ impl LlmRouter {
             .default
             .as_ref()
             .and_then(|default| default.search.clone());
-        let mcp = mcp::McpRuntime::from_specs_with_public_defaults(file.mcp_server)
-            .map_err(parse_error)?;
+        let public = file
+            .public_mcp_server
+            .as_ref()
+            .map(mcp::PublicProfiles::from_value)
+            .transpose()
+            .map_err(parse_error)?
+            .map(mcp::PublicProfiles::into_specs);
+        let mcp = mcp::McpRuntime::from_config(public, file.mcp_server).map_err(parse_error)?;
         let catalog =
             CatalogService::new(file.provider.clone(), file.catalog).map_err(parse_error)?;
         let mut router = Self {

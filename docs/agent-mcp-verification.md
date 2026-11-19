@@ -53,8 +53,9 @@ layer below must pass independently before the feature is considered working.
 
 ## Public Exa and Parallel profiles
 
-The `exa-public` and `parallel-public` profiles are anonymous defaults, but a
-generator must still declare exact tools and network hosts. What is verified
+The `exa-public` and `parallel-public` profiles are anonymous shipped
+configuration defaults, but a generator must still declare exact tools and
+network hosts. What is verified
 offline is everything that does not depend on the remote service being up: the
 pinned profile identity, transport and host allowlist, discovery bounds, schema
 sanitization, argument validation against the discovered input schema, result

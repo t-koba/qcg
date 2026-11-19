@@ -27,16 +27,13 @@ use super::profile::{
     AllowedOAuthHttpClient, KeyringCredentialStore, PendingAuthorization, ProfileCredentialStore,
 };
 use super::profile::{CredentialGuard, McpProfile};
+use super::public::{is_reserved_public_id, shipped_public_profiles, validate_public_spec};
 use super::session::{McpSession, mcp_http_client};
 use super::spec::McpServerSpec;
-use super::transport::{
-    McpAuth, McpLifecycle, McpTransport, OAuthCredentialStore, default_oauth_state_ttl_seconds,
-    default_task_poll_interval_ms, default_tools_list_page_limit,
-};
+use super::transport::{McpAuth, McpTransport, OAuthCredentialStore};
 #[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};
 use super::validate::{required_env, validate_remote_url};
-use policy::{DEFAULT_MCP_MAX_RESPONSE_BYTES, DEFAULT_MCP_TIMEOUT_SECONDS};
 
 pub(crate) struct McpClient;
 
@@ -125,27 +122,39 @@ impl McpRuntime {
         Self::from_specs(Vec::new()).expect("empty MCP registry is valid")
     }
 
-    /// Creates a registry containing built-in anonymous, read-only public MCP
-    /// endpoints. These profiles require no providers file or credential.
+    /// Registry containing the shipped anonymous public MCP profiles. Used
+    /// when no providers registry was resolved; their rows come from the
+    /// shipped configuration embedded at build time.
     pub fn public_defaults() -> Self {
-        Self::from_specs(public_default_specs()).expect("built-in public MCP profiles are valid")
+        Self::from_specs(shipped_public_profiles().to_vec())
+            .expect("shipped public MCP profiles are valid")
     }
 
-    /// Adds the built-in public profiles and rejects attempts to override their
-    /// reserved ids.
-    pub fn from_specs_with_public_defaults(mut specs: Vec<McpServerSpec>) -> Result<Self, String> {
-        let defaults = public_default_specs();
-        if let Some(spec) = specs
-            .iter()
-            .find(|spec| defaults.iter().any(|default| default.id == spec.id))
-        {
-            return Err(format!(
-                "MCP server id `{}` is reserved for a built-in public profile",
-                spec.id
-            ));
+    /// Builds a runtime from a providers registry. `public` is the trusted
+    /// resolved public-profile table; absent means use the shipped defaults.
+    /// Reserved ids may only be configured there, never as regular
+    /// `mcp_server` rows.
+    pub fn from_config(
+        public: Option<Vec<McpServerSpec>>,
+        mut regular: Vec<McpServerSpec>,
+    ) -> Result<Self, String> {
+        let public = match public {
+            Some(specs) => specs,
+            None => shipped_public_profiles().to_vec(),
+        };
+        for spec in &public {
+            validate_public_spec(spec)?;
         }
-        specs.extend(defaults);
-        Self::from_specs(specs)
+        for spec in &regular {
+            if is_reserved_public_id(&spec.id) {
+                return Err(format!(
+                    "MCP server id `{}` is reserved for a public profile; configure it in `public_mcp_server`",
+                    spec.id
+                ));
+            }
+        }
+        regular.extend(public);
+        Self::from_specs(regular)
     }
 
     pub fn from_specs(specs: Vec<McpServerSpec>) -> Result<Self, String> {
@@ -920,46 +929,6 @@ fn host_stdio_scope(
     container_client: bool,
 ) -> Option<&policy::HostCgroupScope> {
     if container_client { None } else { scope }
-}
-
-fn public_default_specs() -> Vec<McpServerSpec> {
-    [
-        ("exa-public", "https://mcp.exa.ai/mcp", "mcp.exa.ai"),
-        (
-            "parallel-public",
-            "https://search.parallel.ai/mcp",
-            "search.parallel.ai",
-        ),
-    ]
-    .into_iter()
-    .map(|(id, url, host)| McpServerSpec {
-        id: id.to_string(),
-        transport: McpTransport::StreamableHttp,
-        lifecycle: McpLifecycle::Initialize,
-        url: Some(url.to_string()),
-        command: Vec::new(),
-        env: BTreeMap::new(),
-        env_from: BTreeMap::new(),
-        headers: BTreeMap::new(),
-        auth: McpAuth::None,
-        credential_env: None,
-        auth_header: None,
-        auth_prefix: String::new(),
-        oauth_scopes: Vec::new(),
-        oauth_client_id_env: None,
-        oauth_client_secret_env: None,
-        oauth_store: OAuthCredentialStore::Memory,
-        allowed_hosts: vec![host.to_string()],
-        allowed_destinations: Vec::new(),
-        destination_decider: Vec::new(),
-        destination_decider_timeout_seconds: None,
-        timeout_seconds: DEFAULT_MCP_TIMEOUT_SECONDS,
-        max_response_bytes: DEFAULT_MCP_MAX_RESPONSE_BYTES,
-        tools_list_page_limit: default_tools_list_page_limit(),
-        oauth_state_ttl_seconds: default_oauth_state_ttl_seconds(),
-        task_poll_interval_ms: default_task_poll_interval_ms(),
-    })
-    .collect()
 }
 
 #[cfg(test)]

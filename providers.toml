@@ -27,9 +27,10 @@
 # Search and MCP tools are opt-in at the contract level. Generator execution
 # calls no such endpoint unless a contract declares the corresponding tool and
 # grants its hosts or command. Anonymous Exa and Parallel MCP profiles ship as
-# the default public research choices; they need no credential or connection
-# setup. Explicit Connections-panel OAuth operations are independent of
-# generator execution.
+# the default public research choices in the `[public_mcp_server.<id>]` rows
+# below; they need no credential or connection setup. Deployments may tune or
+# disable those rows without code changes. Explicit Connections-panel OAuth
+# operations are independent of generator execution.
 #
 #   [default]
 #   model = { provider = "openai", model = "gpt-4.1-mini" }
@@ -73,6 +74,63 @@
 #                 max_tokens (default) or max_completion_tokens for Chat
 #   lifecycle     MCP only: initialize | discover; defaults to discover and
 #                 must match the server's documented lifecycle
+#
+# `[public_mcp_server.<id>]` rows use the same fields as `[[mcp_server]]`
+# plus `enabled = false` to disable one profile. Only the reserved ids
+# `exa-public` and `parallel-public` are accepted. Unnamed ids and unspecified
+# fields keep the shipped row embedded in the binary (also used when no
+# registry exists); `enabled = false` on the table disables all profiles.
+# Unknown keys, duplicate ids, reserved ids in `[[mcp_server]]`, and non-public
+# transports or credentials are refused. A public row must use HTTPS, no
+# credential and exactly one `allowed_hosts` entry: the endpoint host.
+
+# Anonymous public MCP research profiles. These rows are the shipped
+# defaults: changing a field here changes the registered profile. Deployments
+# may override single fields per id or set `enabled = false` on one id or on
+# the table. Contracts still bind exact tools and grant the endpoint host.
+[public_mcp_server.exa-public]
+id = "exa-public"
+transport = "streamable_http"
+lifecycle = "initialize"
+url = "https://mcp.exa.ai/mcp"
+command = []
+env = {}
+env_from = {}
+headers = {}
+auth = "none"
+auth_prefix = ""
+oauth_scopes = []
+oauth_store = "memory"
+allowed_hosts = ["mcp.exa.ai"]
+allowed_destinations = []
+destination_decider = []
+timeout_seconds = 120
+max_response_bytes = 4194304
+tools_list_page_limit = 100
+oauth_state_ttl_seconds = 600
+task_poll_interval_ms = 250
+
+[public_mcp_server.parallel-public]
+id = "parallel-public"
+transport = "streamable_http"
+lifecycle = "initialize"
+url = "https://search.parallel.ai/mcp"
+command = []
+env = {}
+env_from = {}
+headers = {}
+auth = "none"
+auth_prefix = ""
+oauth_scopes = []
+oauth_store = "memory"
+allowed_hosts = ["search.parallel.ai"]
+allowed_destinations = []
+destination_decider = []
+timeout_seconds = 120
+max_response_bytes = 4194304
+tools_list_page_limit = 100
+oauth_state_ttl_seconds = 600
+task_poll_interval_ms = 250
 
 # Search providers are active configuration profiles. They do not enable web
 # access by themselves: each contract must declare `web.search` and allow the

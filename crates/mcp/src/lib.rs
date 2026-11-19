@@ -220,7 +220,7 @@ mod tests {
     }
 
     #[test]
-    fn public_defaults_are_anonymous_and_pinned_to_exact_hosts() {
+    fn shipped_public_profiles_are_anonymous_and_pinned_to_exact_hosts() {
         let runtime = McpRuntime::public_defaults();
         assert_eq!(runtime.server_ids(), ["exa-public", "parallel-public"]);
         for (id, url, host) in [
@@ -233,20 +233,81 @@ mod tests {
         ] {
             let profile = runtime.resolve(id).expect("public profile should resolve");
             assert_eq!(profile.spec.auth, McpAuth::None);
+            assert_eq!(profile.spec.transport, McpTransport::StreamableHttp);
             assert_eq!(profile.spec.lifecycle, McpLifecycle::Initialize);
             assert_eq!(profile.spec.url.as_deref(), Some(url));
             assert_eq!(profile.spec.allowed_hosts, [host]);
+            assert!(profile.spec.allowed_destinations.is_empty());
             assert!(profile.spec.credential_env.is_none());
+            assert_eq!(profile.spec.oauth_store, OAuthCredentialStore::Memory);
+            assert_eq!(profile.spec.timeout_seconds, 120);
+            assert_eq!(profile.spec.max_response_bytes, 4_194_304);
+            assert_eq!(profile.spec.tools_list_page_limit, 100);
+            assert_eq!(profile.spec.oauth_state_ttl_seconds, 600);
+            assert_eq!(profile.spec.task_poll_interval_ms, 250);
         }
     }
 
     #[test]
-    fn public_default_ids_cannot_be_overridden() {
+    fn public_default_ids_cannot_be_overridden_by_regular_rows() {
         let mut spec = remote_spec();
         spec.id = "exa-public".into();
-        let error = McpRuntime::from_specs_with_public_defaults(vec![spec])
-            .expect_err("built-in public profile ids must be reserved");
+        let error = McpRuntime::from_config(None, vec![spec])
+            .expect_err("public profile ids must be reserved");
         assert!(error.contains("reserved"), "{error}");
+    }
+
+    #[test]
+    fn public_table_can_tune_disable_and_coexist_with_regular_rows() {
+        let mut tuned = shipped_public_profiles()[0].clone();
+        tuned.url = Some("https://mcp.example.test/mcp".into());
+        tuned.allowed_hosts = vec!["mcp.example.test".into()];
+        tuned.timeout_seconds = 45;
+        let runtime = McpRuntime::from_config(Some(vec![tuned]), vec![remote_spec()])
+            .expect("configured public profiles must load");
+        assert_eq!(runtime.server_ids(), ["exa-public", "tinyfish"]);
+        let profile = runtime
+            .resolve("exa-public")
+            .expect("tuned profile resolves");
+        assert_eq!(
+            profile.spec.url.as_deref(),
+            Some("https://mcp.example.test/mcp")
+        );
+        assert_eq!(profile.spec.allowed_hosts, ["mcp.example.test"]);
+        assert_eq!(profile.spec.timeout_seconds, 45);
+
+        let disabled = McpRuntime::from_config(Some(Vec::new()), Vec::new())
+            .expect("an empty public table must be valid");
+        assert!(disabled.server_ids().is_empty());
+    }
+
+    #[test]
+    fn public_table_refuses_non_public_or_duplicate_rows() {
+        let mut unknown = shipped_public_profiles()[0].clone();
+        unknown.id = "not-public".into();
+        let error = McpRuntime::from_config(Some(vec![unknown]), Vec::new())
+            .expect_err("unknown public ids must be refused");
+        assert!(error.contains("not reserved"), "{error}");
+
+        let mut credentialed = shipped_public_profiles()[0].clone();
+        credentialed
+            .headers
+            .insert("x-api-key".into(), "secret".into());
+        let error = McpRuntime::from_config(Some(vec![credentialed]), Vec::new())
+            .expect_err("static headers must be refused on public profiles");
+        assert!(error.contains("static headers"), "{error}");
+
+        let mut http = shipped_public_profiles()[1].clone();
+        http.url = Some("http://search.parallel.ai/mcp".into());
+        http.allowed_hosts = vec!["search.parallel.ai".into()];
+        let error = McpRuntime::from_config(Some(vec![http]), Vec::new())
+            .expect_err("non-HTTPS public endpoints must be refused");
+        assert!(error.contains("HTTPS"), "{error}");
+
+        let duplicate = shipped_public_profiles()[0].clone();
+        let error = McpRuntime::from_config(Some(vec![duplicate.clone(), duplicate]), Vec::new())
+            .expect_err("duplicate public ids must be refused");
+        assert!(error.contains("duplicate"), "{error}");
     }
 
     #[test]

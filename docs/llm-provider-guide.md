@@ -1,10 +1,11 @@
 # Provider Guide
 
 qcg resolves LLM, web-search, and MCP connection profiles from one external
-registry file, `providers.toml`. The built-in profiles are the `fake` LLM
-provider and anonymous public `exa-public` / `parallel-public` MCP servers.
-Other provider names and transport profiles live in the registry and
-documentation rather than qcg's code. Contracts reference LLM rows by `id`,
+registry file, `providers.toml`. The built-in `fake` LLM provider and the
+anonymous public `exa-public` / `parallel-public` MCP profiles are shipped as
+configuration in that registry and embedded for runs without one. Other
+provider names and transport profiles live in the registry and documentation
+rather than qcg's code. Contracts reference LLM rows by `id`,
 REST search rows by `provider`, and MCP servers by `server`.
 
 Web search is a harness capability and is opt-in per contract. Declaring a
@@ -22,8 +23,9 @@ The registry file is resolved once per process, in this order:
 3. `./providers.toml` relative to the working directory
 4. `<install prefix>/share/qcg/providers.toml` next to the binary
 
-If no file is found, the built-in `fake` LLM provider and anonymous public
-`exa-public` / `parallel-public` MCP servers remain available; referencing any
+If no file is found, the built-in `fake` LLM provider and the anonymous public
+`exa-public` / `parallel-public` MCP profiles from the shipped registry remain
+available; referencing any
 other provider fails with registry setup guidance. Release
 archives bundle the default registry at
 `share/qcg/providers.toml`; the source tree keeps it at the workspace root.
@@ -584,8 +586,8 @@ host-free calls such as `{"query":"rust"}` pass, while any fetch target is
 refused until its host is listed. The endpoint host above never implies
 destination rights. To migrate a fetch tool (for example an
 Exa/Parallel fetch behind a custom `[[mcp_server]]` row), add each host the
-model may ask the server to fetch; the built-in `exa-public` and
-`parallel-public` profiles ship with the empty default, so their fetch tools
+model may ask the server to fetch; the shipped `exa-public` and
+`parallel-public` profiles keep the empty default, so their fetch tools
 stay refused until the operator fronts the endpoint with an explicit row.
 The ceiling covers only the initial whole-value host: qcg cannot re-check
 server-side redirect targets or pin server-side DNS. The `HttpGateway`
@@ -607,7 +609,7 @@ keeps the static ceiling exactly.
 widely deployed initialize handshake, while `discover` requires the modern
 `server/discover` lifecycle and is the default for custom profiles. Use
 `initialize` for a server that documents only the initialize handshake. qcg
-never silently retries a different lifecycle. The built-in Exa and
+never silently retries a different lifecycle. The shipped Exa and
 Parallel profiles are pinned to `initialize` and are exercised by live
 contract tests.
 
@@ -1198,9 +1200,10 @@ Notes:
 
 - The built-in `fake` provider and the anonymous `exa-public` and
   `parallel-public` MCP profiles work even when no providers registry file
-  exists. The public MCP profiles still require exact contract tool bindings
-  and network permissions. Their ids are reserved and registry rows cannot
-  override their pinned endpoints or security policy.
+  exists: their rows ship in `providers.toml` and are embedded in the binary.
+  The public MCP profiles still require exact contract tool bindings and
+  network permissions. Their ids are reserved and cannot be declared as
+  ordinary `[[mcp_server]]` rows.
 - Referencing an unregistered LLM provider, REST search profile, or MCP server
   fails contract validation with "is not registered" plus registry setup
   guidance. qcg never silently selects another provider, search profile, or
@@ -1222,10 +1225,32 @@ Notes:
   MCP profile uses OAuth and does not require that API key; its OAuth
   credentials are obtained from the loopback Connections panel and managed
   through the OS keyring.
-- `exa-public` and `parallel-public` are built-in anonymous Streamable HTTP MCP
-  profiles. They require neither a registry file, an API key, nor an OAuth
-  connection. Parallel's separate Task MCP endpoint requires authentication
-  and is not bundled as an anonymous profile.
+- `exa-public` and `parallel-public` are anonymous Streamable HTTP MCP profiles
+  shipped as configuration. They require neither a registry file, an API key,
+  nor an OAuth connection. Parallel's separate Task MCP endpoint requires
+  authentication and is not bundled as an anonymous profile.
+
+### Public MCP profiles
+
+The two shipped public rows live in `providers.toml` under
+`[public_mcp_server.<id>]`. They are registered by default, also when no
+registry file exists. A deployment can tune any field or disable one profile
+without changing code:
+
+```toml
+[public_mcp_server.exa-public]
+enabled = false          # omit the Exa profile
+
+[public_mcp_server.parallel-public]
+timeout_seconds = 60     # keep its shipped endpoint and host, change one bound
+```
+
+Setting `enabled = false` on `[public_mcp_server]` itself disables both.
+Unnamed ids and unspecified fields keep the shipped row. Only the two reserved
+ids are accepted; unknown keys, duplicate rows, reserved ids in
+`[[mcp_server]]`, credentials, static headers, non-HTTPS URLs and mismatched
+`allowed_hosts` fail closed. A public row's `allowed_hosts` must be exactly its
+endpoint host, and contracts must still bind each tool and grant that host.
 
 ## Adding a provider
 

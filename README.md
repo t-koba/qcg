@@ -11,10 +11,12 @@ and human-approval boundaries.
 
 LLM, web-search, and generic MCP connection profiles are configured in the
 unified `providers.toml` registry. MCP tools are declared by a generator and
-resolved at run time from the selected profile. The built-in `exa-public` and
-`parallel-public` Streamable HTTP profiles are available even without a
-registry file and provide anonymous public search and fetch without setup; the
-demo offers both together as its recommended research choice. The `tinyfish`
+resolved at run time from the selected profile. The `exa-public` and
+`parallel-public` Streamable HTTP profiles ship as configuration in
+`providers.toml` and provide anonymous public search and fetch without setup;
+their embedded defaults remain available even without a registry file. They
+can be tuned or disabled through `[public_mcp_server.<id>]`; the demo offers
+both together as its recommended research choice. The `tinyfish`
 profile remains an OAuth alternative, and
 `tinyfish-api` is a separate API-key-based REST profile. See the
 [provider guide](docs/llm-provider-guide.md) and
