@@ -1374,6 +1374,39 @@ id = "declared"
     }
 
     #[test]
+    fn configured_sampling_removal_version_clamps_catalog_metadata() {
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "anthropic-cutoff"
+api = "anthropic_messages"
+base_url = "https://example.test/v1"
+api_version = "2025-06-01"
+sampling_removed_api_version = "2025-01-01"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        let external = map_models_dev(
+            r#"{"anthropic-cutoff":{"models":{"external":{"temperature":true,"top_p":true}}}}"#,
+        )
+        .expect("external catalog");
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            snapshot.external = external;
+        }
+        service.rebuild_models();
+        let capabilities = service
+            .model_capabilities("anthropic-cutoff", "external")
+            .expect("effective capabilities");
+        assert!(!capabilities.temperature);
+        assert!(!capabilities.top_p);
+    }
+
+    #[test]
     fn models_dev_maps_reasoning_effort_capabilities_and_pricing() {
         let catalog = map_models_dev(MODELS_DEV_FIXTURE).expect("fixture must map");
         let models = catalog.providers.get("openai").expect("provider entry");

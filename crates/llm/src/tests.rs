@@ -1496,6 +1496,7 @@ fn spec_with_base_url(id: &str, base_url: &str) -> ProviderSpec {
         id: id.into(),
         api: ApiFlavor::ChatCompletions,
         api_version: None,
+        sampling_removed_api_version: None,
         base_url: Some(base_url.into()),
         base_url_env: None,
         api_key_env: None,
@@ -2243,6 +2244,108 @@ fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
             error.contains(&format!("declares an invalid `api_version` `{version}`")),
             "{error}"
         );
+    }
+}
+
+#[test]
+fn anthropic_sampling_removal_version_is_read_from_the_provider_row() {
+    // Omitting the rule keeps today's changeover.
+    let file = ProvidersFile::parse(&test_provider_row(
+        "anthropic-shipped",
+        "anthropic_messages",
+        "https://example.invalid",
+        "",
+    ))
+    .expect("default row must validate");
+    assert_eq!(
+        file.provider[0].anthropic_sampling_removed_version(),
+        "2026-10-21"
+    );
+    assert!(!file.provider[0].sampling_removed());
+
+    // A row may move the cutoff earlier: its own version and rule apply.
+    let error = ProvidersFile::parse(&test_provider_row(
+        "anthropic-earlier",
+        "anthropic_messages",
+        "https://example.invalid",
+        "sampling_removed_api_version = \"2025-01-01\"\napi_version = \"2025-06-01\"\ncapabilities = { temperature = true }\n",
+    ))
+    .expect_err("earlier row rule must refuse sampling");
+    assert!(
+        error.contains("version `2025-01-01` or later removes sampling parameters"),
+        "{error}"
+    );
+
+    // A row may move it later: the shipped changeover now keeps sampling.
+    let file = ProvidersFile::parse(&test_provider_row(
+        "anthropic-later",
+        "anthropic_messages",
+        "https://example.invalid",
+        "sampling_removed_api_version = \"2030-01-01\"\napi_version = \"2026-10-21\"\ncapabilities = { temperature = true, top_p = true }\n",
+    ))
+    .expect("later row rule must keep sampling");
+    let spec = &file.provider[0];
+    assert_eq!(spec.anthropic_sampling_removed_version(), "2030-01-01");
+    assert!(!spec.sampling_removed());
+    assert_eq!(spec.anthropic_api_version(), "2026-10-21");
+
+    // Model overrides follow the row's rule rather than a built-in date.
+    let error = ProvidersFile::parse(&test_provider_row(
+        "anthropic-earlier-model",
+        "anthropic_messages",
+        "https://example.invalid",
+        "sampling_removed_api_version = \"2025-01-01\"\napi_version = \"2025-06-01\"\n\n[[provider.models]]\nid = \"model\"\ncapabilities = { top_p = true }\n",
+    ))
+    .expect_err("model override must follow the row rule");
+    assert!(
+        error.contains("version `2025-01-01` or later removes sampling parameters"),
+        "{error}"
+    );
+}
+
+#[test]
+fn anthropic_sampling_removal_version_rejects_invalid_rows() {
+    let error = ProvidersFile::parse(&test_provider_row(
+        "chat-rule",
+        "chat_completions",
+        "https://example.invalid",
+        "sampling_removed_api_version = \"2026-10-21\"\n",
+    ))
+    .expect_err("date-keyed rule is anthropic-only");
+    assert!(
+        error.contains("may only set `sampling_removed_api_version` for anthropic_messages"),
+        "{error}"
+    );
+
+    for version in ["", "2026-1-1", "not-a-date", "2026-02-30", "2026-10-211"] {
+        let extra = format!("sampling_removed_api_version = \"{version}\"\n");
+        let error = ProvidersFile::parse(&test_provider_row(
+            "anthropic-bad-rule",
+            "anthropic_messages",
+            "https://example.invalid",
+            &extra,
+        ))
+        .expect_err("malformed row rule must fail");
+        assert!(
+            error.contains(&format!(
+                "declares an invalid `sampling_removed_api_version` `{version}`"
+            )),
+            "{error}"
+        );
+    }
+
+    for extra in [
+        "sampling_removed_api_versions = \"2026-10-21\"\n",
+        "anthropic_sampling_cutover = \"2026-10-21\"\n",
+    ] {
+        let error = ProvidersFile::parse(&test_provider_row(
+            "anthropic-unknown-rule",
+            "anthropic_messages",
+            "https://example.invalid",
+            extra,
+        ))
+        .expect_err("unknown row keys must fail");
+        assert!(error.contains("unknown field"), "{error}");
     }
 }
 

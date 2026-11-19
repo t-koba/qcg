@@ -28,7 +28,10 @@ pub const DEFAULT_RETRY_RATE_LIMIT_FLOOR_MS: u64 = 5000;
 /// set any cap within the mechanistic range 1..=16.
 pub const DEFAULT_RETRY_BACKOFF_EXPONENT_CAP: u32 = 8;
 const DEFAULT_ANTHROPIC_API_VERSION: &str = "2023-06-01";
-const ANTHROPIC_SAMPLING_REMOVED_VERSION: &str = "2026-10-21";
+/// Shipped default for the first `anthropic_messages` API version that
+/// removes `temperature` and `top_p`. Rows may declare their own cutoff;
+/// mechanism code never selects a vendor rule on its own.
+const DEFAULT_ANTHROPIC_SAMPLING_REMOVED_VERSION: &str = "2026-10-21";
 fn is_anthropic_version(version: &str) -> bool {
     version.len() == 10 && chrono::NaiveDate::parse_from_str(version, "%Y-%m-%d").is_ok()
 }
@@ -536,6 +539,9 @@ pub struct ProviderSpec {
     pub chat_token_limit_field: Option<ChatTokenLimitField>,
     /// Anthropic API version (`YYYY-MM-DD`, default `2023-06-01`); only for `anthropic_messages`.
     pub api_version: Option<String>,
+    /// First `YYYY-MM-DD` API version whose rows remove `temperature` and
+    /// `top_p` (default `2026-10-21`); only for `anthropic_messages`.
+    pub sampling_removed_api_version: Option<String>,
     /// How `[llm].cache = "auto"` is expressed for this row. Required when
     /// the `prompt_cache` capability is enabled and invalid otherwise.
     pub prompt_cache_field: Option<PromptCacheField>,
@@ -582,9 +588,18 @@ impl ProviderSpec {
             .unwrap_or(DEFAULT_ANTHROPIC_API_VERSION)
     }
 
+    /// Resolved date-keyed sampling rule for this row: the row's own
+    /// `sampling_removed_api_version` or the shipped default. Validation,
+    /// catalog clamping and dispatch all read the owning row's rule.
+    pub fn anthropic_sampling_removed_version(&self) -> &str {
+        self.sampling_removed_api_version
+            .as_deref()
+            .unwrap_or(DEFAULT_ANTHROPIC_SAMPLING_REMOVED_VERSION)
+    }
+
     pub(crate) fn sampling_removed(&self) -> bool {
         self.api == ApiFlavor::AnthropicMessages
-            && self.anthropic_api_version() >= ANTHROPIC_SAMPLING_REMOVED_VERSION
+            && self.anthropic_api_version() >= self.anthropic_sampling_removed_version()
     }
 
     pub(crate) fn validate(&self) -> Result<(), String> {
@@ -737,9 +752,22 @@ impl ProviderSpec {
                 )));
             }
         }
+        if let Some(configured) = self.sampling_removed_api_version.as_deref() {
+            if self.api != ApiFlavor::AnthropicMessages {
+                return Err(invalid(
+                    "may only set `sampling_removed_api_version` for anthropic_messages",
+                ));
+            }
+            if !is_anthropic_version(configured) {
+                return Err(invalid(&format!(
+                    "declares an invalid `sampling_removed_api_version` `{configured}`: must be `YYYY-MM-DD`"
+                )));
+            }
+        }
+        let removed_at = self.anthropic_sampling_removed_version();
         if self.sampling_removed() && (self.capabilities.temperature || self.capabilities.top_p) {
             return Err(invalid(&format!(
-                "with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{ANTHROPIC_SAMPLING_REMOVED_VERSION}` or later removes sampling parameters, so set both capabilities false"
+                "with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{removed_at}` or later removes sampling parameters, so set both capabilities false"
             )));
         }
         let decision_transport_is_default = self.decision_input_wrapper
@@ -811,7 +839,7 @@ impl ProviderSpec {
             {
                 let model_id = &model.id;
                 return Err(invalid(&format!(
-                    "model `{model_id}` with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{ANTHROPIC_SAMPLING_REMOVED_VERSION}` or later removes sampling parameters, so set both capabilities false"
+                    "model `{model_id}` with `api_version` `{version}` may not advertise `temperature` or `top_p`: version `{removed_at}` or later removes sampling parameters, so set both capabilities false"
                 )));
             }
             if model.prompt_cache_retention.is_some()
