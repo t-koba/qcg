@@ -24,7 +24,7 @@ fn redirect_allowed(next: &Url, previous: &[Url]) -> bool {
     }
 }
 
-pub(crate) fn client() -> reqwest::Result<Client> {
+pub(crate) fn download_client() -> reqwest::Result<Client> {
     Client::builder()
         .timeout(std::time::Duration::from_secs(120))
         .redirect(Policy::custom(|attempt| {
@@ -37,8 +37,24 @@ pub(crate) fn client() -> reqwest::Result<Client> {
         .build()
 }
 
+/// Trace export posts a whole trace body; a collector must not be able to
+/// replay it to a different origin. Refuse every redirect with the same fixed
+/// redacted error used by the download policy.
+pub(crate) fn export_client() -> reqwest::Result<Client> {
+    Client::builder()
+        .timeout(std::time::Duration::from_secs(120))
+        .redirect(Policy::custom(|attempt| {
+            attempt.error("CLI redirect refused")
+        }))
+        .build()
+}
+
 pub(crate) async fn get(url: &str, limit: Option<u64>) -> anyhow::Result<Vec<u8>> {
-    let mut response = client()?.get(url).send().await?.error_for_status()?;
+    let mut response = download_client()?
+        .get(url)
+        .send()
+        .await?
+        .error_for_status()?;
     let mut left = limit.unwrap_or(u64::MAX);
     if response.content_length().unwrap_or(0) > left {
         anyhow::bail!("remote body exceeds byte limit");
@@ -255,7 +271,26 @@ mod tests {
     #[tokio::test]
     async fn client_refuses_cross_host_redirect_instead_of_returning_success() {
         let (url, server) = serve("HTTP/1.1 302 Found\r\nLocation: http://localhost:1/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()).await;
-        let error = client().unwrap().get(&url).send().await.unwrap_err();
+        let error = download_client()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
+        assert_fixed_redirect_error(&error);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn export_client_refuses_all_redirects() {
+        let (url, server) = serve("HTTP/1.1 302 Found\r\nLocation: https://other.example/trace\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()).await;
+        let error = export_client()
+            .unwrap()
+            .post(&url)
+            .body("trace")
+            .send()
+            .await
+            .unwrap_err();
         assert_fixed_redirect_error(&error);
         server.await.unwrap();
     }
@@ -284,7 +319,12 @@ mod tests {
                 .into(),
         )
         .await;
-        let error = client().unwrap().get(&url).send().await.unwrap_err();
+        let error = download_client()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
         assert_fixed_redirect_error(&error);
         server.await.unwrap();
     }
@@ -315,7 +355,12 @@ mod tests {
             .await
             .unwrap();
         });
-        let error = client().unwrap().get(&url).send().await.unwrap_err();
+        let error = download_client()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
         assert_fixed_redirect_error(&error);
         server.await.unwrap();
     }

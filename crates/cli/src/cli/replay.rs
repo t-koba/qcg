@@ -279,7 +279,7 @@ pub(crate) async fn export_run_trace(
         std::fs::write(path, &encoded)?;
     }
     if let Some(endpoint) = endpoint {
-        let response = crate::http::client()?
+        let response = crate::http::export_client()?
             .post(endpoint)
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(encoded.clone())
