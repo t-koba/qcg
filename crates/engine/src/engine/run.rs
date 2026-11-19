@@ -498,7 +498,10 @@ impl Engine {
             let proven = contract.graph.nodes.get(owner).is_some_and(|node| {
                 self.registry.get(&node.kind).is_some_and(|executor| {
                     StepRegistry::attest_executor(executor.as_ref(), node) == Some(*expected)
-                        && executor.continuation_safety(node) == ContinuationSafety::ReadOnly
+                        && matches!(
+                            executor.continuation_safety(node),
+                            ContinuationSafety::ReadOnly | ContinuationSafety::SettledMetered
+                        )
                         && executor.continuation_read_coverage(node)
                             == ContinuationReadCoverage::Complete
                 })

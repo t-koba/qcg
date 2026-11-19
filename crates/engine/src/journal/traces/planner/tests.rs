@@ -89,6 +89,38 @@ impl StepExecutor for Probe {
         }
     }
 }
+/// Same execution and coverage as `Probe`, but declares the settled-metered
+/// effect safety of a paid executor. Nothing else changes in the proof.
+struct MeteredProbe(Probe);
+#[async_trait]
+impl StepExecutor for MeteredProbe {
+    fn type_id(&self) -> &'static str {
+        "test.probe"
+    }
+    fn continuation_semantics_version(&self) -> Option<&'static str> {
+        self.0.continuation_semantics_version()
+    }
+    fn continuation_safety(&self, _: &NodeDef) -> ContinuationSafety {
+        ContinuationSafety::SettledMetered
+    }
+    fn continuation_read_coverage(&self, _: &NodeDef) -> ContinuationReadCoverage {
+        ContinuationReadCoverage::Complete
+    }
+    async fn execute(
+        &self,
+        ctx: &mut StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<StepOutcome, StepError> {
+        self.0.execute(ctx, node).await
+    }
+}
+
+fn metered_registry() -> StepRegistry {
+    let mut registry = StepRegistry::new();
+    registry.register(MeteredProbe(Probe(Some("1"))));
+    registry
+}
+
 struct ReadOnlyWithoutCoverage;
 #[async_trait]
 impl StepExecutor for ReadOnlyWithoutCoverage {
@@ -144,6 +176,7 @@ struct Fixture {
     contract: Contract,
     events: Vec<Value>,
     state: RunState,
+    metered: bool,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -169,6 +202,20 @@ impl Fixture {
         package: bool,
         output_dependency: bool,
         parallel: bool,
+    ) -> Self {
+        Self::with_options_and_safety(version, package, output_dependency, parallel, false).await
+    }
+
+    async fn with_metered_executor() -> Self {
+        Self::with_options_and_safety(Some("1"), false, false, false, true).await
+    }
+
+    async fn with_options_and_safety(
+        version: Option<&'static str>,
+        package: bool,
+        output_dependency: bool,
+        parallel: bool,
+        metered: bool,
     ) -> Self {
         let dir = crate::test_support::TestDir::create("source-diagnostic");
         let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
@@ -228,7 +275,11 @@ type = "test.probe"
         std::fs::create_dir_all(&workspace).unwrap();
         let options = probe_options(workspace.clone());
         let mut executing_registry = StepRegistry::new();
-        executing_registry.register(Probe(version));
+        if metered {
+            executing_registry.register(MeteredProbe(Probe(version)));
+        } else {
+            executing_registry.register(Probe(version));
+        }
         let failure = Engine::new(executing_registry)
             .run_with_id(
                 "source-probe".into(),
@@ -261,6 +312,7 @@ type = "test.probe"
             contract,
             events,
             state,
+            metered,
         }
     }
     fn original_inputs(&self) -> &Value {
@@ -274,12 +326,17 @@ type = "test.probe"
         FsGateway::new(self.workspace.clone(), &self.contract.manifest.permissions)
     }
     fn analyze(&self) -> Result<ResetPlanCandidate, Refusal> {
+        let registry = if self.metered {
+            metered_registry()
+        } else {
+            registry()
+        };
         analyze_source(
             &self.path,
             &self.state,
             &self.events,
             &self.contract,
-            &registry(),
+            &registry,
             &self.fs(),
             JournalLimits::default(),
         )
@@ -2773,4 +2830,47 @@ async fn paid_charges_on_non_preserved_or_unattributable_nodes_refuse_with_budge
     inject_settled_charge(&mut f, Some("a"), "a");
     f.state.budget.unresolved_llm_cost = true;
     assert_eq!(f.analyze().unwrap_err(), Refusal::Budget);
+}
+
+/// `SettledMetered` is not a blanket allowance: the accounting gates stay
+/// authoritative for a paid executor just as they are for a read-only one.
+#[tokio::test]
+async fn settled_metered_declaration_still_refuses_unproven_charges() {
+    for (node, unresolved) in [
+        (Some("b"), false),     // reset charged owner
+        (Some("ghost"), false), // unattributable charge
+        (None, false),          // charge without an owner
+        (Some("a"), true),      // unsettled cost
+    ] {
+        let mut f = Fixture::with_metered_executor().await;
+        inject_settled_charge(&mut f, node, "a");
+        if unresolved {
+            f.state.budget.unresolved_llm_cost = true;
+        }
+        assert_eq!(
+            f.analyze().unwrap_err(),
+            Refusal::Budget,
+            "metered executor with charge owner {node:?}, unresolved={unresolved}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn settled_metered_declaration_still_requires_a_matching_executor_proof() {
+    let f = Fixture::with_metered_executor().await;
+    // A read-only attestation for the same type/semantics is a changed
+    // declaration, not an equivalent spelling of settled metered work.
+    assert_eq!(
+        analyze_source(
+            &f.path,
+            &f.state,
+            &f.events,
+            &f.contract,
+            &registry(),
+            &f.fs(),
+            JournalLimits::default(),
+        )
+        .unwrap_err(),
+        Refusal::Executor
+    );
 }

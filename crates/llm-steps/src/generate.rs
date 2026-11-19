@@ -33,12 +33,13 @@ impl StepExecutor for LlmGenerateStep {
 
     engine::parallel_step_traits!(Default);
 
-    /// The provider call is a settled, journaled charge: continuation preserves
-    /// the successful outcome and its counters instead of repeating the call.
-    /// Every runtime input comes from the bound contract/package or captured
-    /// StepContext reads, so an unchanged node can be preserved as read-only.
+    /// The provider call is a settled, journaled charge, not a read-only
+    /// effect: continuation preserves the successful outcome and its counters
+    /// only through the engine's complete accounting and charged-owner proof,
+    /// never by repeating the call. Every runtime input comes from the bound
+    /// contract/package or captured StepContext reads.
     fn continuation_safety(&self, _node: &NodeDef) -> ContinuationSafety {
-        ContinuationSafety::ReadOnly
+        ContinuationSafety::SettledMetered
     }
 
     fn continuation_read_coverage(&self, _node: &NodeDef) -> ContinuationReadCoverage {

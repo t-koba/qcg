@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use engine::{Engine, JournalLimits, Progress, ReuseSource, RunOptions, RunState};
+use engine::{Engine, JournalLimits, Progress, ReuseSource, RunOptions, RunState, test_support};
 use llm::{
     Capabilities, ChatContent, ChatRequest, ChatResponse, LlmError, LlmProvider, TokenUsage,
 };
@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct Echo {
     calls: AtomicUsize,
     down: AtomicBool,
+    usage: TokenUsage,
 }
 
 #[async_trait]
@@ -33,7 +34,7 @@ impl LlmProvider for Echo {
         }
         Ok(ChatResponse {
             content: vec![ChatContent::Text(format!("R[{prompt}]"))],
-            usage: TokenUsage::default(),
+            usage: self.usage.clone(),
             stop: StopReason::EndTurn,
             provider_state: None,
             web_search: None,
@@ -45,6 +46,23 @@ fn echo(down: bool) -> Arc<Echo> {
     Arc::new(Echo {
         calls: AtomicUsize::new(0),
         down: AtomicBool::new(down),
+        usage: TokenUsage::default(),
+    })
+}
+
+/// Distinct metered usage makes inherited and newly charged counters
+/// distinguishable in the reset-child journal.
+fn metered_echo(down: bool) -> Arc<Echo> {
+    Arc::new(Echo {
+        calls: AtomicUsize::new(0),
+        down: AtomicBool::new(down),
+        usage: TokenUsage {
+            input: 7,
+            output: 3,
+            reasoning: 0,
+            cached_input: 2,
+            cache_creation_input: 1,
+        },
     })
 }
 
@@ -568,4 +586,95 @@ async fn shipped_llm_generate_continuation_preserves_settled_paid_work() {
         "only the failed step reaches the provider again"
     );
     assert_eq!(reused(&dir, "child"), ["a"]);
+}
+
+/// Consumes the actual reset plan through the child overlay, not a separately
+/// started ReuseSource child. The inherited charge belongs to the preserved
+/// source node, so only the failed node may reach the provider again.
+#[tokio::test]
+async fn shipped_llm_generate_reset_child_inherits_metered_counters_without_repeating_the_call() {
+    let dir = paid_chain();
+    let provider = metered_echo(true);
+    let failed = run(&dir, "src", inputs(&[]), &provider, None).await;
+    assert!(matches!(failed, Progress::Failed(_)), "{failed:?}");
+    assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+    let source_state = RunState::fold_journal(&dir.0.join("src/meta/journal.jsonl")).unwrap();
+    assert_eq!(source_state.budget.llm_calls, 1);
+    assert_eq!(source_state.budget.tokens_input, 7);
+    assert_eq!(source_state.budget.tokens_output, 3);
+
+    stage_package(&dir, "src");
+    let mut registry = StepRegistry::new();
+    crate::register_llm_steps(&mut registry, Arc::new(LlmRuntime::builtins()));
+    let contract = Contract::load(&dir.0).unwrap();
+    let plan = test_support::stage_reset_child(
+        &dir.0.join("src"),
+        "src",
+        &dir.0.join("child"),
+        "child",
+        &registry,
+        JournalLimits::from(&contract.manifest.runtime),
+    )
+    .expect("shipped llm.generate must satisfy the settled-metered reset proof");
+    assert_eq!(plan.inherited_budget().llm_calls, 1);
+    assert_eq!(plan.inherited_budget().tokens_input, 7);
+    assert_eq!(plan.inherited_budget().tokens_output, 3);
+    assert_eq!(
+        plan.inherited_budget().cost_microusd,
+        source_state.budget.cost_microusd
+    );
+    let staged = events(&dir, "child");
+    let overlay = staged
+        .iter()
+        .find(|event| event["t"] == "child_reset_overlay")
+        .expect("the planned reset overlay is consumed by the child");
+    let candidate = &overlay["overlay"]["candidate"];
+    assert_eq!(candidate["preserved_outcomes"], json!(["a"]));
+    assert_eq!(candidate["retry_roots"], json!(["c"]));
+    let staged_len = staged.len();
+
+    provider.down.store(false, Ordering::SeqCst);
+    provider.calls.store(0, Ordering::SeqCst);
+    let done = run(
+        &dir,
+        "child",
+        inputs(&[]),
+        &provider,
+        Some(source(&dir, "src")),
+    )
+    .await;
+    assert!(matches!(done, Progress::Done(_)), "{done:?}");
+    assert_eq!(
+        provider.calls.load(Ordering::SeqCst),
+        1,
+        "the preserved provider request is not repeated"
+    );
+
+    let after = events(&dir, "child");
+    let new_charges = after[staged_len..]
+        .iter()
+        .filter(|event| event["t"] == "llm_call")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        new_charges.len(),
+        1,
+        "only the failed node is charged again"
+    );
+    assert_eq!(new_charges[0]["node"], "c");
+    let new_cost = new_charges[0]["cost_microusd"].as_u64().unwrap();
+    let child_state = RunState::fold_journal(&dir.0.join("child/meta/journal.jsonl")).unwrap();
+    assert_eq!(child_state.budget.llm_calls, 2);
+    assert_eq!(child_state.budget.tokens_input, 14);
+    assert_eq!(child_state.budget.tokens_output, 6);
+    assert_eq!(child_state.budget.tokens_cached_input, 4);
+    assert_eq!(child_state.budget.tokens_cache_creation_input, 2);
+    assert_eq!(
+        child_state.budget.cost_microusd,
+        source_state.budget.cost_microusd + new_cost
+    );
+    assert_eq!(
+        reused(&dir, "child"),
+        Vec::<String>::new(),
+        "the reset child replays a instead of issuing a second memo lookup"
+    );
 }

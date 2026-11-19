@@ -237,6 +237,12 @@ pub enum ContinuationSafety {
     /// No side effects beyond captured reads and the outcome. Reuse may only be
     /// considered once an eligibility evaluator proves all dependencies unchanged.
     ReadOnly,
+    /// A separately proven metered effect (for example a settled provider
+    /// request): its exact usage and cost are fully settled in the source
+    /// journal. Reuse is allowed only through the complete accounting proof
+    /// that also proves the charged owner's outcome is preserved. This is not
+    /// a read-only declaration.
+    SettledMetered,
 }
 
 /// Independent attestation that every runtime input read is captured in the
@@ -431,6 +437,7 @@ impl StepRegistry {
         let safety = match executor.continuation_safety(node) {
             ContinuationSafety::Unsupported => "unsupported",
             ContinuationSafety::ReadOnly => "read_only",
+            ContinuationSafety::SettledMetered => "settled_metered",
         };
         let coverage = match executor.continuation_read_coverage(node) {
             ContinuationReadCoverage::Unsupported => "unsupported",

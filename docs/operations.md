@@ -774,16 +774,21 @@ recorder's existing byte bound; conflicting declarations invalidate the owner.
 `check.format` declares read-only safety and complete coverage with semantics
 version `1`. `check.schema` declares read-only safety and semantics version `1`,
 but complete coverage only on Unix; it is unsupported for this diagnostic on
-non-Unix targets. No other built-in executor currently records this file
-evidence.
+non-Unix targets. `llm.generate` declares settled-metered safety and complete
+coverage: its fully journaled provider charge is not read-only and may be
+preserved only with the complete accounting proof. No other built-in executor
+currently records this file evidence.
 A private, unwired engine diagnostic can compare a cleanly sealed failed
 source run's captured reads with that same source's folded values and workspace
 bytes. It accepts only the persisted service-run layout (`<run-id>/meta/journal.jsonl`
 paired with `<run-id>/workspace`); direct and mismatched layouts fail closed. It
 requires complete event-bound traces for every outcome and separate
-executor declarations for read-only effects and complete runtime-read coverage,
-plus a nonmissing exact match between the captured and current registry
-attestations. `check.format` and Unix `check.schema` supply these with semantics token `1`.
+executor declarations for read-only or settled-metered effects and complete
+runtime-read coverage. A settled-metered declaration grants no preservation by
+itself: the plan must also prove settled accounting and that every charged
+owner's outcome is preserved. A nonmissing exact match between the captured and
+current registry attestations is required. `check.format` and Unix
+`check.schema` supply these with semantics token `1`.
 Executor authors must change their token when execution or read-capture semantics
 change. Missing/empty tokens, unknown executors and mismatched attestations fail
 closed, even with complete coverage; custom executors default to unsupported.
@@ -871,8 +876,9 @@ trace evidence, elapsed accounting and all budget/cost liabilities remain intact
 Replay therefore omits cleared successes without rewriting copied history.
 The candidate binds executor attestations for exactly all reset and preserved
 outcome owners. Child run entry rechecks these against the execution registry,
-requiring matching nonempty semantics tokens, read-only safety and complete read
-coverage before hooks, resource acquisition, output reuse or execution. Missing
+requiring matching nonempty semantics tokens, read-only or settled-metered
+safety and complete read coverage before hooks, resource acquisition, output
+reuse or execution. Missing
 owners/executors and changed declarations refuse the child. Recovery and
 peer-writer resync derive these projections, gates and attestations from journal
 events, never from `state.json` authority. This point-in-time revalidation is not

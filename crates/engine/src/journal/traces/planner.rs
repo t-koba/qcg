@@ -349,8 +349,12 @@ fn analyze_source(
         let attestation = registry
             .continuation_attestation(node)
             .ok_or(Refusal::Executor)?;
-        if registry.continuation_safety(node) != ContinuationSafety::ReadOnly
-            || registry.continuation_read_coverage(node) != ContinuationReadCoverage::Complete
+        // Both declarations are accepted only inside this analysis, which also
+        // proves complete accounting and charged-owner preservation below.
+        if !matches!(
+            registry.continuation_safety(node),
+            ContinuationSafety::ReadOnly | ContinuationSafety::SettledMetered
+        ) || registry.continuation_read_coverage(node) != ContinuationReadCoverage::Complete
             || (event["t"] == "step_started" && event["type"].as_str() != Some(node.kind.as_str()))
         {
             return Err(Refusal::Executor);
