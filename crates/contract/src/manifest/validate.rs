@@ -502,16 +502,11 @@ fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractErr
         if !skill_path.is_file() {
             continue;
         }
-        let Some(dir_name) = child.file_name() else {
-            continue;
-        };
-        let source = read_skill_source(name, &skill_path)?;
-        if validate_skill_content(name, &skill_path, Some(dir_name), &source).is_err() {
-            // Only SKILL.md content is malformed here: I/O, path, symlink,
-            // entry-count and unsupported-entry faults are still hard errors
-            // above. The engine reports the isolated entry as a diagnostic.
-            continue;
-        }
+        // Admission enforces only that SKILL.md is readable UTF-8 (a hard
+        // error). Content classification has one owner: engine catalog
+        // construction isolates malformed members with diagnostics and keeps
+        // them unselectable, so parsing the content here would discard it.
+        read_skill_source(name, &skill_path)?;
     }
     Ok(())
 }
