@@ -508,8 +508,9 @@ them during development; production assets share qcg's origin.
 
 The bundled generator's Connections panel uses the MCP endpoints above. It
 does not receive, store, or display access tokens. For headless runs, complete
-OAuth authorization once through the loopback server before starting a
-generator that binds an OAuth MCP tool.
+OAuth authorization once through the server before starting a generator that
+binds an OAuth MCP tool (loopback by default; set `OAUTH_PUBLIC_ORIGIN` for an
+HTTPS reverse proxy).
 
 ## External delivery pattern
 
@@ -523,8 +524,11 @@ keeps network delivery explicit and journaled.
 On a loopback listener every request must carry a loopback `Host` for the
 bound port (`127.0.0.1`, `localhost`, `::1`, or the bound address); any other
 `Host` is rejected with `403` before authentication, which blocks
-DNS-rebinding pages from driving the local API. Non-loopback binds leave
-`Host` validation to the reverse proxy.
+DNS-rebinding pages from driving the local API. `OAUTH_PUBLIC_ORIGIN`, when
+set, is one exact HTTPS origin (no userinfo, path, query, or fragment) used as
+the MCP OAuth callback origin and accepted as `Origin`/`Host` as well; no other
+origin is allowed. Unset keeps the loopback-only behavior, and malformed values
+refuse boot. Non-loopback binds leave `Host` validation to the reverse proxy.
 
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
 Allowed request headers are `Authorization`, `Content-Type`, `idempotency-key`,

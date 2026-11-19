@@ -29,7 +29,7 @@ use axum::routing::{get, put};
 #[cfg(feature = "server-cors")]
 use policy::IDEMPOTENCY_HEADER;
 use service::LocalService;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -78,6 +78,9 @@ pub async fn serve_with_resolved_policy(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedServerPolicy {
     pub container_timeouts: policy::ContainerTimeouts,
+    /// Exact public HTTPS origin for MCP OAuth behind a TLS reverse proxy;
+    /// `None` keeps the loopback-only fallback.
+    pub oauth_public_origin: Option<String>,
     pub read_cache_max_bytes: usize,
     pub idempotency_timing: super::idempotency::config::IdempotencyTiming,
     pub idempotency_ttl: std::time::Duration,
@@ -146,6 +149,48 @@ fn reject_zero_explicit_max(config: &ServerConfig) -> Result<(), String> {
     }
     Ok(())
 }
+/// Resolves the exact public HTTPS origin MCP OAuth uses behind a TLS
+/// reverse proxy. Unset keeps today's loopback-only behavior. A malformed
+/// value refuses boot instead of silently widening the accepted origins.
+fn resolve_oauth_public_origin() -> Result<Option<String>, String> {
+    match std::env::var("OAUTH_PUBLIC_ORIGIN") {
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("invalid OAUTH_PUBLIC_ORIGIN: {error}")),
+        Ok(value) => parse_oauth_public_origin(&value).map(Some),
+    }
+}
+
+/// Parses one strict HTTPS origin: no whitespace, userinfo, path beyond the
+/// root, query, or fragment. `Url` lowercases the host and keeps an explicit
+/// port; its single serialized trailing slash is trimmed so callback URLs
+/// and exact Origin/Host comparisons stay canonical.
+fn parse_oauth_public_origin(value: &str) -> Result<String, String> {
+    let invalid = || {
+        format!(
+            "invalid OAUTH_PUBLIC_ORIGIN `{value}`: must be an absolute HTTPS origin with no whitespace, userinfo, path, query, or fragment"
+        )
+    };
+    if value.is_empty() || value.chars().any(char::is_whitespace) {
+        return Err(invalid());
+    }
+    let parsed = url::Url::parse(value).map_err(|_| invalid())?;
+    if parsed.scheme() != "https"
+        || parsed.host_str().is_none_or(str::is_empty)
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !matches!(parsed.path(), "" | "/")
+    {
+        return Err(invalid());
+    }
+    Ok(parsed
+        .as_str()
+        .strip_suffix('/')
+        .unwrap_or(parsed.as_str())
+        .to_string())
+}
+
 pub fn resolve_server_policy(config: &ServerConfig) -> Result<ResolvedServerPolicy, String> {
     resolve_server_policy_with_container_timeouts(config, policy::ContainerTimeouts::from_env()?)
 }
@@ -159,6 +204,7 @@ pub fn resolve_server_policy_with_container_timeouts(
     // validation. Missing registry with no explicit path means built-ins.
     service::preload_operational_limits(config.providers_path.as_deref())
         .map_err(|error| format!("invalid providers registry: {error}"))?;
+    let oauth_public_origin = resolve_oauth_public_origin()?;
     let idempotency_timing = super::idempotency::config::IdempotencyTiming::resolve()?;
     let idempotency_ttl = super::idempotency::effective_idempotency_ttl()
         .map_err(|detail| format!("invalid idempotency configuration: {detail}"))?;
@@ -356,6 +402,7 @@ pub fn resolve_server_policy_with_container_timeouts(
     }
     Ok(ResolvedServerPolicy {
         container_timeouts,
+        oauth_public_origin,
         metrics_policy,
         read_cache_max_bytes,
         idempotency_timing,
@@ -389,6 +436,30 @@ pub fn resolve_server_policy_with_container_timeouts(
         shutdown_task_grace,
     })
 }
+/// Derives the frozen MCP OAuth state from the bound address and the
+/// optional public origin. Loopback aliases come only from the bound port;
+/// a configured public origin contributes exactly one accepted Origin/Host
+/// and is also the callback origin. No other origin enters this set.
+fn oauth_state_for_listener(
+    actual_addr: SocketAddr,
+    public_origin: Option<&str>,
+) -> (Option<String>, BTreeSet<String>, Option<String>) {
+    let oauth_origin = public_origin.map(str::to_string).or_else(|| {
+        actual_addr
+            .ip()
+            .is_loopback()
+            .then(|| format!("http://{actual_addr}"))
+    });
+    let mut oauth_allowed_origins = loopback_oauth_origins(actual_addr);
+    if let Some(origin) = public_origin {
+        oauth_allowed_origins.insert(origin.to_string());
+    }
+    let oauth_callback_url = oauth_origin
+        .as_ref()
+        .map(|origin| format!("{origin}/api/mcp/oauth/callback"));
+    (oauth_origin, oauth_allowed_origins, oauth_callback_url)
+}
+
 pub(crate) async fn serve_with_resolved_policy_and_deadline(
     policy: ResolvedServerPolicy,
     config: ServerConfig,
@@ -408,6 +479,7 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // instead of degrading silently.
     let ResolvedServerPolicy {
         container_timeouts,
+        oauth_public_origin,
         metrics_policy,
         read_cache_max_bytes,
         idempotency_timing,
@@ -503,14 +575,8 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             queued_resumer_secs,
         },
     )?;
-    let oauth_origin = actual_addr
-        .ip()
-        .is_loopback()
-        .then(|| format!("http://{actual_addr}"));
-    let oauth_allowed_origins = loopback_oauth_origins(actual_addr);
-    let oauth_callback_url = oauth_origin
-        .as_ref()
-        .map(|origin| format!("{origin}/api/mcp/oauth/callback"));
+    let (oauth_origin, oauth_allowed_origins, oauth_callback_url) =
+        oauth_state_for_listener(actual_addr, oauth_public_origin.as_deref());
     // One shutdown token for both the server surface and the service
     // itself: an embedded service alone must still be stoppable, and a
     // cancelled token must reach resident tasks, SSE, and admissions
@@ -1227,7 +1293,7 @@ async fn windows_shutdown_signal(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::server::middleware::sha256_bytes;
+    use crate::server::middleware::{allowed_hosts_from_origins, sha256_bytes};
     use crate::test_state;
 
     /// Boots a service that admits exactly one active run, so a queueing or
@@ -2369,6 +2435,76 @@ command = ["sh", "-c", "sleep 30"]"#,
     }
 
     #[test]
+    fn oauth_public_origin_accepts_only_strict_https_origins() {
+        for (value, expected) in [
+            ("https://qcg.example.com", "https://qcg.example.com"),
+            ("https://qcg.example.com/", "https://qcg.example.com"),
+            (
+                "https://qcg.example.com:8443",
+                "https://qcg.example.com:8443",
+            ),
+            ("https://QCG.example.com", "https://qcg.example.com"),
+        ] {
+            assert_eq!(parse_oauth_public_origin(value).as_deref(), Ok(expected));
+        }
+        for invalid in [
+            "http://qcg.example.com",
+            "https://user@qcg.example.com",
+            "https://user:pw@qcg.example.com",
+            "https://qcg.example.com?x=1",
+            "https://qcg.example.com#frag",
+            "https://qcg.example.com/path",
+            "https://qcg.example.com//",
+            "",
+            "   ",
+            " https://qcg.example.com",
+            "https://qcg.example.com ",
+            "qcg.example.com",
+            "not a url",
+        ] {
+            let error = parse_oauth_public_origin(invalid).unwrap_err();
+            assert!(error.contains("OAUTH_PUBLIC_ORIGIN"), "{invalid}: {error}");
+        }
+    }
+
+    #[test]
+    fn oauth_state_uses_public_origin_without_dropping_the_loopback_fallback() {
+        let addr: SocketAddr = "127.0.0.1:43123".parse().expect("loopback addr");
+        let public = "https://qcg.example.com:8443";
+        let callback = "https://qcg.example.com:8443/api/mcp/oauth/callback";
+
+        let (origin, allowed, url) = oauth_state_for_listener(addr, Some(public));
+        assert_eq!(origin.as_deref(), Some(public));
+        assert_eq!(url.as_deref(), Some(callback));
+        assert!(allowed.contains(public));
+        for alias in loopback_oauth_origins(addr) {
+            assert!(allowed.contains(&alias), "{alias} must stay accepted");
+        }
+        let hosts = allowed_hosts_from_origins(&allowed);
+        assert!(hosts.contains("qcg.example.com:8443"));
+        assert!(
+            !hosts.contains("evil.example"),
+            "no arbitrary Host: {hosts:?}"
+        );
+
+        let (origin, allowed, url) = oauth_state_for_listener(addr, None);
+        assert_eq!(origin.as_deref(), Some("http://127.0.0.1:43123"));
+        assert_eq!(allowed, loopback_oauth_origins(addr));
+        assert_eq!(
+            url.as_deref(),
+            Some("http://127.0.0.1:43123/api/mcp/oauth/callback")
+        );
+
+        let remote: SocketAddr = "192.0.2.1:43123".parse().expect("remote addr");
+        let (origin, allowed, url) = oauth_state_for_listener(remote, None);
+        assert_eq!((origin, url), (None, None));
+        assert!(allowed.is_empty());
+        let (origin, allowed, _) = oauth_state_for_listener(remote, Some(public));
+        assert_eq!(origin.as_deref(), Some(public));
+        assert_eq!(allowed, BTreeSet::from([public.to_string()]));
+    }
+
+    #[test]
     fn bounded_policy_envs_refuse_out_of_range_values() {
         if crate::tests::isolate_environment_test(
             "server::serve::tests::bounded_policy_envs_refuse_out_of_range_values",
@@ -2407,6 +2543,7 @@ command = ["sh", "-c", "sleep 30"]"#,
         }
         unset("GC_RETRY_ATTEMPTS");
         unset("GC_RETRY_DELAY_MS");
+        unset("OAUTH_PUBLIC_ORIGIN");
         let policy = resolve_server_policy(&config).expect("defaults should resolve");
         assert_eq!(
             policy.live_event_channel_capacity,
@@ -2455,6 +2592,22 @@ command = ["sh", "-c", "sleep 30"]"#,
         assert_eq!(policy.shutdown_drain.as_secs(), 30);
         assert_eq!(policy.shutdown_settle.as_secs(), 150);
         assert_eq!(policy.shutdown_task_grace.as_secs(), 5);
+        assert_eq!(policy.oauth_public_origin, None);
+        set("OAUTH_PUBLIC_ORIGIN", "https://qcg.example.com:8443/");
+        assert_eq!(
+            resolve_server_policy(&config)
+                .expect("valid public origin should resolve")
+                .oauth_public_origin
+                .as_deref(),
+            Some("https://qcg.example.com:8443")
+        );
+        set("OAUTH_PUBLIC_ORIGIN", "http://qcg.example.com");
+        assert!(
+            resolve_server_policy(&config)
+                .unwrap_err()
+                .contains("OAUTH_PUBLIC_ORIGIN")
+        );
+        unset("OAUTH_PUBLIC_ORIGIN");
         for value in ["-1", "3601", "no", "18446744073709551616"] {
             set("SHUTDOWN_TASK_GRACE_SECS", value);
             let error = resolve_server_policy(&config).unwrap_err();

@@ -612,8 +612,9 @@ every JSON API route requires the credential when one is configured. On a
 loopback listener the server additionally rejects any request whose `Host`
 is not a loopback host for the bound port (`require_loopback_host` in
 `crates/server/src/server/middleware.rs`, derived from the frozen
-`loopback_oauth_origins` with no new configuration), so a DNS-rebinding page
-cannot drive the API through a foreign `Host`. Non-loopback binds pass the
+`loopback_oauth_origins` plus an optional exact `OAUTH_PUBLIC_ORIGIN` for a
+TLS reverse proxy), so a DNS-rebinding page cannot drive the API through a
+foreign `Host`. Non-loopback binds pass the
 `Host` through: put a reverse proxy with its own `Host` check in front.
 Browser access that must be authenticated at a different boundary goes
 through qpx, which injects the header after validating the caller.

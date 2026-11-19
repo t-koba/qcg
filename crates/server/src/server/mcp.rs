@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use super::config::AppState;
 use super::error::ApiHttpError;
-use super::middleware::require_local_oauth_origin;
+use super::middleware::require_mcp_oauth_origin;
 
 pub(crate) async fn list_mcp_servers(
     State(state): State<Arc<AppState>>,
@@ -27,10 +27,11 @@ pub(crate) async fn start_mcp_authorization(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<McpAuthorizationStart>, ApiHttpError> {
-    require_local_oauth_origin(&state, &headers)?;
-    let callback_url = state.oauth_callback_url.as_deref().ok_or_else(|| {
-        ApiHttpError::forbidden("MCP OAuth is available only on a loopback listener")
-    })?;
+    require_mcp_oauth_origin(&state, &headers)?;
+    let callback_url = state
+        .oauth_callback_url
+        .as_deref()
+        .ok_or_else(|| ApiHttpError::forbidden("MCP OAuth is not available on this listener"))?;
     state
         .service
         .start_mcp_authorization(&id, callback_url)
@@ -44,7 +45,7 @@ pub(crate) async fn clear_mcp_authorization(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiHttpError> {
-    require_local_oauth_origin(&state, &headers)?;
+    require_mcp_oauth_origin(&state, &headers)?;
     state
         .service
         .clear_mcp_authorization(&id)
@@ -58,7 +59,7 @@ pub(crate) async fn cancel_pending_mcp_authorization(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiHttpError> {
-    require_local_oauth_origin(&state, &headers)?;
+    require_mcp_oauth_origin(&state, &headers)?;
     state
         .service
         .cancel_pending_mcp_authorization(&id)
@@ -71,9 +72,10 @@ pub(crate) async fn complete_mcp_authorization(
     State(state): State<Arc<AppState>>,
     OriginalUri(uri): OriginalUri,
 ) -> Result<Response, ApiHttpError> {
-    let origin = state.oauth_origin.as_deref().ok_or_else(|| {
-        ApiHttpError::forbidden("MCP OAuth is available only on a loopback listener")
-    })?;
+    let origin = state
+        .oauth_origin
+        .as_deref()
+        .ok_or_else(|| ApiHttpError::forbidden("MCP OAuth is not available on this listener"))?;
     let path_and_query = uri
         .path_and_query()
         .map(|value| value.as_str())

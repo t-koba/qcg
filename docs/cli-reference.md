@@ -531,6 +531,12 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   `authorization`, `content-type`, `idempotency-key`, and
   `x-qcg-package-sha256`; builds without the
   `server-cors` cargo feature refuse configured origins with an explicit error.
+- `OAUTH_PUBLIC_ORIGIN`: optional exact HTTPS origin for MCP OAuth when qcg
+  sits behind a TLS reverse proxy (for example `https://qcg.example.com:8443`).
+  Unset keeps the loopback-only callback and Origin/Host checks. It is used for
+  the OAuth callback and is the only additional accepted `Origin`/`Host`; no
+  arbitrary origins are allowed. Userinfo, a path, query, fragment, whitespace,
+  and non-HTTPS schemes refuse boot.
 - `PACKAGE_MAX_ENTRIES` (default `1000`), `PACKAGE_MAX_BYTES`
   (default `10485760`): entry and expanded-byte bounds for `qcg package`
   and `qcg install`. `PACKAGE_MAX_ARCHIVE_BYTES` (provisional default

@@ -388,13 +388,13 @@ pub(crate) async fn security_headers_middleware(request: Request, next: Next) ->
     response
 }
 
-pub(crate) fn require_local_oauth_origin(
+pub(crate) fn require_mcp_oauth_origin(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<(), ApiHttpError> {
     if state.oauth_origin.is_none() {
         return Err(ApiHttpError::forbidden(
-            "MCP OAuth is available only on a loopback listener",
+            "MCP OAuth is not available on this listener",
         ));
     }
     if state.oauth_allowed_origins.is_empty() {
@@ -760,6 +760,44 @@ options = ["yes"]"#;
         assert!(allowed_hosts_from_origins(&BTreeSet::new()).is_empty());
     }
 
+    /// Builds a Host/Origin gate state with explicit frozen OAuth fields.
+    fn oauth_gate_state(
+        generators: &Utf8PathBuf,
+        runs: &Utf8PathBuf,
+        oauth_origin: Option<String>,
+        oauth_allowed_origins: BTreeSet<String>,
+    ) -> Arc<AppState> {
+        Arc::new(AppState {
+            service: LocalService::with_generator_roots_policy_and_store_mode(
+                vec![generators.clone()],
+                runs.clone(),
+                None,
+                1,
+                policy::DEFAULT_MAX_TRACKED_RUNS,
+                RunStoreMode::Exclusive,
+                service::ServiceDeploymentPolicy::default(),
+            )
+            .expect("service should initialize"),
+            runs_dir: runs.clone(),
+            oauth_origin,
+            oauth_allowed_origins,
+            oauth_callback_url: None,
+            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
+            idempotency_timing: crate::server::idempotency::config::IdempotencyTiming::DEFAULT,
+            idempotency_ttl: policy::IDEMPOTENCY_TTL,
+            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
+            idempotency_sweep: Default::default(),
+            api_token_digest: None,
+            artifact_limits: service::ArtifactZipLimits::default(),
+            artifact_response_budget:
+                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
+            asset_limit: None,
+            max_request_bytes: None,
+            metrics_policy: MetricsPolicy::default(),
+            shutdown: tokio_util::sync::CancellationToken::new(),
+        })
+    }
+
     #[tokio::test]
     async fn loopback_host_rejects_spoofed_host() {
         use axum::Router;
@@ -777,35 +815,12 @@ options = ["yes"]"#;
         let addr: SocketAddr = "127.0.0.1:8080"
             .parse()
             .expect("loopback addr should parse");
-        let state = Arc::new(AppState {
-            service: LocalService::with_generator_roots_policy_and_store_mode(
-                vec![generators.clone()],
-                runs.clone(),
-                None,
-                1,
-                policy::DEFAULT_MAX_TRACKED_RUNS,
-                RunStoreMode::Exclusive,
-                service::ServiceDeploymentPolicy::default(),
-            )
-            .expect("service should initialize"),
-            runs_dir: runs.clone(),
-            oauth_origin: Some(format!("http://{addr}")),
-            oauth_allowed_origins: loopback_oauth_origins(addr),
-            oauth_callback_url: None,
-            idempotency: tokio::sync::Mutex::new(BTreeMap::new()),
-            idempotency_timing: crate::server::idempotency::config::IdempotencyTiming::DEFAULT,
-            idempotency_ttl: policy::IDEMPOTENCY_TTL,
-            idempotency_max_entries: policy::IDEMPOTENCY_MAX_ENTRIES,
-            idempotency_sweep: Default::default(),
-            api_token_digest: None,
-            artifact_limits: service::ArtifactZipLimits::default(),
-            artifact_response_budget:
-                crate::server::artifact_response::ArtifactResponseBudget::new(None).unwrap(),
-            asset_limit: None,
-            max_request_bytes: None,
-            metrics_policy: MetricsPolicy::default(),
-            shutdown: tokio_util::sync::CancellationToken::new(),
-        });
+        let state = oauth_gate_state(
+            &generators,
+            &runs,
+            Some(format!("http://{addr}")),
+            loopback_oauth_origins(addr),
+        );
         let app = Router::new()
             .route("/healthz", get(|| async { "ok" }))
             .layer(axum::middleware::from_fn_with_state(
@@ -846,5 +861,97 @@ options = ["yes"]"#;
             .await
             .expect("missing host should respond");
         assert_eq!(missing.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn loopback_host_accepts_configured_public_origin_only() {
+        use axum::Router;
+        use axum::body::Body;
+        use axum::routing::get;
+        use tower::ServiceExt as _;
+
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!(
+                "proxy-host-{}-{}",
+                uuid::Uuid::now_v7(),
+                std::process::id()
+            ));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generator dir should create");
+        let addr: SocketAddr = "127.0.0.1:8080".parse().expect("loopback addr");
+        let public = "https://qcg.example.com:8443";
+        let mut origins = loopback_oauth_origins(addr);
+        origins.insert(public.to_string());
+        let state = oauth_gate_state(&generators, &runs, Some(public.to_string()), origins);
+        let app = Router::new()
+            .route("/healthz", get(|| async { "ok" }))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                require_loopback_host,
+            ));
+        let request = |host: &str| {
+            axum::http::Request::builder()
+                .uri("/healthz")
+                .header(axum::http::header::HOST, host)
+                .body(Body::empty())
+                .expect("request should build")
+        };
+        for host in ["qcg.example.com:8443", "127.0.0.1:8080"] {
+            let response = app.clone().oneshot(request(host)).await.unwrap();
+            assert_eq!(response.status(), axum::http::StatusCode::OK, "{host}");
+        }
+        for host in ["evil.example", "qcg.example.com", "qcg.example.com:9443"] {
+            let response = app.clone().oneshot(request(host)).await.unwrap();
+            assert_eq!(
+                response.status(),
+                axum::http::StatusCode::FORBIDDEN,
+                "unconfigured Host must fail closed: {host}"
+            );
+        }
+    }
+
+    #[test]
+    fn mcp_oauth_origin_stays_exact_with_a_public_origin() {
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory path should be UTF-8")
+            .join(format!(
+                "oauth-origin-{}-{}",
+                uuid::Uuid::now_v7(),
+                std::process::id()
+            ));
+        let _temp_guard = TempGuard(root.clone());
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generator dir should create");
+        let public = "https://qcg.example.com:8443";
+        let state = oauth_gate_state(
+            &generators,
+            &runs,
+            Some(public.to_string()),
+            BTreeSet::from([public.to_string()]),
+        );
+        let headers = |origin: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(origin) = origin {
+                headers.insert(
+                    header::ORIGIN,
+                    origin.parse().expect("origin should be a header value"),
+                );
+            }
+            headers
+        };
+        assert!(require_mcp_oauth_origin(&state, &headers(Some(public))).is_ok());
+        assert!(require_mcp_oauth_origin(&state, &headers(None)).is_ok());
+        for origin in [
+            Some("https://evil.example"),
+            Some("http://qcg.example.com:8443"),
+            Some("https://qcg.example.com:8443/path"),
+        ] {
+            let error = require_mcp_oauth_origin(&state, &headers(origin)).unwrap_err();
+            assert_eq!(error.problem.status, 403, "{origin:?}");
+        }
     }
 }

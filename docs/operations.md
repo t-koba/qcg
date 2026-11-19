@@ -1136,15 +1136,17 @@ start: it is refused with `503` during drain, never half-copied.
 
 Unattended limits:
 
-- MCP OAuth authorization needs a browser on loopback and cannot run
-  unattended. Authorize once from the loopback Connections panel on a host
-  with an unlocked OS keyring. Entries live in the unlocked login collection
-  and are not file-backable, so they do not survive container restart or
-  redeploy by themselves (rotation and re-authorization are operator policy;
-  qcg never exports tokens). Headless or container renewal without an
-  unlocked provider fails closed; either run an unlocked Secret Service
-  provider or set `oauth_store = "memory"` and re-authorize from loopback
-  after every restart.
+- MCP OAuth authorization needs a browser that can reach qcg and cannot run
+  unattended. Loopback is the default; an HTTPS reverse proxy can set
+  `OAUTH_PUBLIC_ORIGIN` to its exact public HTTPS origin for the callback and
+  the accepted `Origin`/`Host` (no other origins are allowed). Authorize once
+  from the Connections panel on a host with an unlocked OS keyring. Entries
+  live in the unlocked login collection and are not file-backable, so they do
+  not survive container restart or redeploy by themselves (rotation and
+  re-authorization are operator policy; qcg never exports tokens). Headless or
+  container renewal without an unlocked provider fails closed; either run an
+  unlocked Secret Service provider or set `oauth_store = "memory"` and
+  re-authorize after every restart.
 - A denied confirmation ends the run as `Failed`; retries, backoff, and
   notifications are the orchestrator's job, not qcg's.
 - `keep` (default 50) retains the newest nonfailed terminal runs (success,
