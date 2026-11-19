@@ -250,6 +250,20 @@ mod tests {
     }
 
     #[test]
+    fn public_reserved_namespace_tracks_shipped_registry() {
+        let shipped = shipped_public_profiles();
+        assert!(!shipped.is_empty());
+        for profile in shipped {
+            assert!(
+                is_reserved_public_id(&profile.id),
+                "shipped public profile id must be reserved: {}",
+                profile.id
+            );
+        }
+        assert!(!is_reserved_public_id("not-in-shipped-registry"));
+    }
+
+    #[test]
     fn public_default_ids_cannot_be_overridden_by_regular_rows() {
         let mut spec = remote_spec();
         spec.id = "exa-public".into();

@@ -14,10 +14,6 @@ use super::spec::McpServerSpec;
 use super::transport::{McpAuth, McpTransport};
 use super::validate::validate_remote_url;
 
-/// Ids reserved for shipped public research profiles. Regular `mcp_server`
-/// rows may never claim them; only the trusted public table may define them.
-pub const RESERVED_PUBLIC_IDS: [&str; 2] = ["exa-public", "parallel-public"];
-
 const SHIPPED_REGISTRY: &str = include_str!("../../../../providers.toml");
 
 #[derive(Deserialize)]
@@ -41,6 +37,20 @@ fn shipped_public_tables() -> &'static Map<String, Value> {
     })
 }
 
+/// Ids reserved for shipped public research profiles. The shipped registry
+/// table is their single source: regular `mcp_server` rows may never claim
+/// them, and changing the shipped rows changes this namespace automatically.
+fn reserved_public_ids() -> &'static [&'static str] {
+    static IDS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        shipped_public_tables()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    })
+    .as_slice()
+}
+
 /// Shipped defaults, parsed once from the registry embedded at build time.
 /// This is the fallback for runs without a registry and the base every
 /// configured override inherits.
@@ -59,7 +69,7 @@ pub fn shipped_public_profiles() -> &'static [McpServerSpec] {
                 spec
             })
             .collect();
-        assert_eq!(specs.len(), RESERVED_PUBLIC_IDS.len());
+        assert_eq!(specs.len(), reserved_public_ids().len());
         specs
     })
 }
@@ -91,10 +101,10 @@ impl PublicProfiles {
             if id == "enabled" {
                 continue;
             }
-            if !RESERVED_PUBLIC_IDS.contains(&id.as_str()) {
+            if !reserved_public_ids().contains(&id.as_str()) {
                 return Err(format!(
                     "public MCP profile id `{id}` is not reserved; expected one of {}",
-                    RESERVED_PUBLIC_IDS.join(", ")
+                    reserved_public_ids().join(", ")
                 ));
             }
             let fields = entry
@@ -167,7 +177,7 @@ pub fn parse_public_profiles(text: &str) -> Result<Option<PublicProfiles>, Strin
 }
 
 pub fn is_reserved_public_id(id: &str) -> bool {
-    RESERVED_PUBLIC_IDS.contains(&id)
+    reserved_public_ids().contains(&id)
 }
 
 /// Fail-closed checks for configured public profiles: anonymous, HTTPS,
@@ -180,7 +190,7 @@ pub fn validate_public_spec(spec: &McpServerSpec) -> Result<(), String> {
         return Err(format!(
             "public MCP profile id `{}` is not reserved; expected one of {}",
             spec.id,
-            RESERVED_PUBLIC_IDS.join(", ")
+            reserved_public_ids().join(", ")
         ));
     }
     if spec.transport != McpTransport::StreamableHttp {
