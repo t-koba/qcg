@@ -3826,7 +3826,7 @@ output_file = "draft.txt""#,
 }
 
 #[tokio::test]
-async fn skill_library_child_without_description_fails_contract_validation() {
+async fn skill_library_child_without_description_is_isolated_and_good_child_runs() {
     let fixture_root = run_dir("skill-library-invalid-child-fixture")
         .parent()
         .expect("fixture output should have a parent")
@@ -3894,15 +3894,31 @@ output_file = "draft.txt""#,
     )
     .expect("fixture manifest should be writable");
 
-    let error = run_generator(
+    let run = run_generator(
         fixture_root.clone(),
         "skill-library-invalid-child",
         inputs([]),
         answers([]),
     )
     .await
-    .expect_err("a library child without a description must fail validation");
-    assert!(error.contains("description"), "unexpected error: {error}");
+    .expect("a malformed library child must be isolated instead of failing the run");
+    assert!(
+        run.join("draft.txt").is_file(),
+        "the valid child should still complete the flow and write its output"
+    );
+    assert_journal_has(&run, |event| {
+        event.get("t").and_then(Value::as_str) == Some("resource")
+            && event
+                .get("diagnostics")
+                .and_then(Value::as_array)
+                .is_some_and(|diagnostics| {
+                    diagnostics.iter().any(|diagnostic| {
+                        diagnostic.as_str().is_some_and(|message| {
+                            message.contains("bad") && message.contains("description")
+                        })
+                    })
+                })
+    });
     let _ = std::fs::remove_dir_all(&fixture_root);
 }
 
