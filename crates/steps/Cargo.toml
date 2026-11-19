@@ -31,6 +31,10 @@ toml.workspace = true
 uuid.workspace = true
 zip.workspace = true
 
+[features]
+# Test-only continuation probe, never registered in production registries.
+test-probe = []
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 

@@ -2741,6 +2741,8 @@ pub(crate) fn warn_if_shared_runs_dir_owned(workspace: &Utf8Path) {
 pub(crate) fn app_registry(runtime: Arc<llm::LlmRuntime>) -> engine::StepRegistry {
     let mut registry = steps::deterministic_registry_with_mcp(Arc::new(runtime.mcp.clone()));
     llm_steps::register_llm_steps(&mut registry, runtime);
+    #[cfg(feature = "test-probe")]
+    registry.register(steps::test_probe::RecoverProbeStep);
     registry
 }
 

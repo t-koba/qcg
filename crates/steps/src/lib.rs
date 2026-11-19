@@ -13,6 +13,8 @@ mod foreach;
 mod http;
 mod mcp_call;
 mod patch;
+#[cfg(feature = "test-probe")]
+pub mod test_probe;
 mod transform;
 
 use ask_user::AskUserStep;

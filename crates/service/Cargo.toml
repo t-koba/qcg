@@ -10,6 +10,8 @@ publish.workspace = true
 
 [features]
 test-hooks = []
+# Test-only continuation probe registration for CLI integration tests.
+test-probe = ["steps/test-probe"]
 
 [dependencies]
 async-trait.workspace = true
