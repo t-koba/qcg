@@ -614,8 +614,9 @@ is not a loopback host for the bound port (`require_loopback_host` in
 `crates/server/src/server/middleware.rs`, derived from the frozen
 `loopback_oauth_origins` plus an optional exact `OAUTH_PUBLIC_ORIGIN` for a
 TLS reverse proxy), so a DNS-rebinding page cannot drive the API through a
-foreign `Host`. Non-loopback binds pass the
-`Host` through: put a reverse proxy with its own `Host` check in front.
+foreign `Host`. When `OAUTH_PUBLIC_ORIGIN` is set, that exact `Host` is also
+required on a non-loopback bind; otherwise non-loopback binds pass the `Host`
+through and need a reverse proxy with its own `Host` check in front.
 Browser access that must be authenticated at a different boundary goes
 through qpx, which injects the header after validating the caller.
 

@@ -528,7 +528,9 @@ DNS-rebinding pages from driving the local API. `OAUTH_PUBLIC_ORIGIN`, when
 set, is one exact HTTPS origin (no userinfo, path, query, or fragment) used as
 the MCP OAuth callback origin and accepted as `Origin`/`Host` as well; no other
 origin is allowed. Unset keeps the loopback-only behavior, and malformed values
-refuse boot. Non-loopback binds leave `Host` validation to the reverse proxy.
+refuse boot. With that origin set, the same exact `Host` check also applies on a
+non-loopback bind; without it, non-loopback binds leave `Host` validation to the
+reverse proxy.
 
 CORS is disabled unless one or more exact `--cors-origin` values are supplied.
 Allowed request headers are `Authorization`, `Content-Type`, `idempotency-key`,
