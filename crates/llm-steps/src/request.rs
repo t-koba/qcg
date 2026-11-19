@@ -32,12 +32,20 @@ pub(crate) fn build_request(
     prompt: String,
     response_schema: Option<Value>,
 ) -> Result<ChatRequest, StepError> {
+    let guardrail = ctx
+        .run
+        .contract
+        .manifest
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.fill_system_guardrail.as_deref())
+        .unwrap_or(FILL_SYSTEM_GUARDRAIL);
     build_chat_request(
         ctx,
         node,
         runtime,
         || Ok(vec![build_user_message(ctx, node, prompt)?]),
-        FILL_SYSTEM_GUARDRAIL,
+        guardrail,
         MessageRequestOptions {
             response_schema,
             tools: &[],
@@ -168,14 +176,15 @@ pub(crate) fn build_request_with_messages(
     messages: Vec<ChatMessage>,
     options: MessageRequestOptions<'_>,
 ) -> Result<ChatRequest, StepError> {
-    build_chat_request(
-        ctx,
-        node,
-        runtime,
-        || Ok(messages),
-        AGENT_SYSTEM_GUARDRAIL,
-        options,
-    )
+    let guardrail = ctx
+        .run
+        .contract
+        .manifest
+        .llm
+        .as_ref()
+        .and_then(|llm| llm.agent_system_guardrail.as_deref())
+        .unwrap_or(AGENT_SYSTEM_GUARDRAIL);
+    build_chat_request(ctx, node, runtime, || Ok(messages), guardrail, options)
 }
 
 fn build_chat_request(

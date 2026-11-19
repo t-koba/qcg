@@ -4,6 +4,12 @@ use serde::{Deserialize, Serialize};
 
 use super::resources::{default_max_total_steps, default_template_fuel, default_timeout_seconds};
 
+/// Byte bound on contract-supplied model instruction text: the fill/agent
+/// system guardrails and the retry prompt. This is a format/resource bound
+/// on a manifest string, not a policy limit on model behavior; the shipped
+/// defaults are far below it.
+pub const MAX_MODEL_INSTRUCTION_BYTES: usize = 64 * 1024;
+
 /// A reasoning effort that is either pinned by the contract or rendered from
 /// run variables immediately before the request. Node-level `model.provider`
 /// and `model.model` accept templates too; this is the effort counterpart.
@@ -59,7 +65,12 @@ pub struct LlmConfig {
     /// when the selected route explicitly declares the tier mechanism.
     pub cache_retention: Option<CacheRetention>,
     pub requires: Vec<String>,
+    /// Replaces the shipped system instruction prepended to fill-style requests.
+    pub fill_system_guardrail: Option<String>,
+    /// Replaces the shipped system instruction prepended to agent requests.
+    pub agent_system_guardrail: Option<String>,
     pub system: Option<String>,
+    /// Replaces the shipped retry prompt after a schema validation failure.
     pub retry_prompt: Option<String>,
     pub seed: Option<u64>,
     pub reasoning_effort: Option<ReasoningEffortSpec>,
@@ -169,6 +180,31 @@ pub enum CacheRetention {
 }
 
 impl LlmConfig {
+    /// Fail-closed format bound on the instruction text a contract may put
+    /// in front of model requests. Called during manifest validation.
+    pub fn validate_model_instructions(&self) -> Result<(), String> {
+        for (field, text) in [
+            (
+                "fill_system_guardrail",
+                self.fill_system_guardrail.as_deref(),
+            ),
+            (
+                "agent_system_guardrail",
+                self.agent_system_guardrail.as_deref(),
+            ),
+            ("retry_prompt", self.retry_prompt.as_deref()),
+        ] {
+            if let Some(text) = text
+                && text.len() > MAX_MODEL_INSTRUCTION_BYTES
+            {
+                return Err(format!(
+                    "[llm].{field} exceeds {MAX_MODEL_INSTRUCTION_BYTES} bytes"
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Fail-closed combination rule for the advanced cache controls.
     /// Retention needs `cache = "auto"` with write `allow`; `forbid`
     /// itself is validated against the selected route at dispatch.

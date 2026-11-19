@@ -199,6 +199,8 @@ impl GeneratorMetadataRule {
             ));
         }
         if let Some(llm) = &manifest.llm {
+            llm.validate_model_instructions()
+                .map_err(ContractError::Invalid)?;
             if llm
                 .temperature
                 .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))

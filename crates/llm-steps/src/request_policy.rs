@@ -304,6 +304,19 @@ pub(crate) fn validate_request_policy(
         ));
     }
     if policy
+        .retry_prompt
+        .as_ref()
+        .is_some_and(|value| value.len() > contract::MAX_MODEL_INSTRUCTION_BYTES)
+    {
+        return Err(StepError::failed(
+            &node.id,
+            format!(
+                "request retry_prompt exceeds {} bytes",
+                contract::MAX_MODEL_INSTRUCTION_BYTES
+            ),
+        ));
+    }
+    if policy
         .temperature
         .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
     {
@@ -544,6 +557,21 @@ mod tests {
         assert_eq!(policy.reasoning_effort, Some(ReasoningEffort::High));
         assert_eq!(policy.temperature, None);
         assert_eq!(policy.seed, None);
+    }
+
+    #[test]
+    fn request_retry_prompt_is_bounded() {
+        let node = node();
+        let llm: LlmConfig =
+            serde_json::from_value(json!({ "max_tokens": 128 })).expect("llm config");
+        let inherited = EffectiveRequestPolicy::from_llm(&llm).expect("inherited policy");
+        let request: LlmRequestPolicy = serde_json::from_value(json!({
+            "retry_prompt": "x".repeat(contract::MAX_MODEL_INSTRUCTION_BYTES + 1)
+        }))
+        .expect("request policy");
+        let error = validate_request_policy(&node, &request, None, &inherited)
+            .expect_err("an oversized retry prompt must fail");
+        assert!(error.to_string().contains("exceeds"), "{error}");
     }
 
     #[test]

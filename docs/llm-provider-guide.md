@@ -1417,9 +1417,13 @@ the [TinyFish Search API](https://docs.tinyfish.ai/search-api/reference),
 
 ## Retry Text
 
-`[llm].retry_prompt` is rendered with minijinja and has access to `{{ error }}`
-and `{{ attempt }}`. Invalid retry templates fail the step; qcg does not fall
-back to a hidden prompt.
+`[llm].retry_prompt` replaces qcg's shipped default text and is rendered with
+minijinja; it has access to `{{ error }}` and `{{ attempt }}`. Invalid retry
+templates fail the step; qcg does not fall back to a hidden prompt. It is one
+of three contract-controlled model instructions, alongside
+`[llm].fill_system_guardrail` and `[llm].agent_system_guardrail`: omitting all
+three keeps the shipped bytes, and each is bounded to 64 KiB as a manifest
+format/resource limit, not a policy cap on model behavior.
 
 ## Anonymous free-model endpoints
 

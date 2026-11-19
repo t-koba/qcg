@@ -167,11 +167,25 @@ Fields:
 - `context_overflow`: `error` by default, or explicitly `truncate_head` /
   `truncate_tail`. Truncation is UTF-8 safe, visibly marked, deterministic,
   and recorded as `context_compacted`; no silent compaction occurs.
+- `fill_system_guardrail`: optional replacement for the system instruction
+  prepended to `llm.generate`, `llm.fill`, `llm.choose`, and `llm.repair`
+  requests. `agent_system_guardrail` does the same for `llm.agent` requests,
+  including specialists. Omitting either field keeps qcg's shipped wording
+  byte-for-byte. Like `retry_prompt`, each is bounded to 64 KiB in the
+  manifest (`MAX_MODEL_INSTRUCTION_BYTES`); this is a format/resource bound on
+  a manifest string, not a policy limit on model behavior, and the shipped
+  defaults are far inside it. Unknown `[llm]` keys are rejected. These fields
+  choose instruction text only: tool results and MCP output are still parsed
+  as untrusted data by the same mechanism, and no instruction text is ever
+  taken from model output.
 - `system`: generator-specific system text appended after qcg's
-  mechanism-owned guardrail. Node and specialist `request.system` values are
-  appended in layer order; all are rendered against the node context.
-- `retry_prompt`: minijinja text used after schema validation failures.
-  Available variables are `error` and `attempt`.
+  mechanism-owned guardrail (or its contract replacement above). Node and
+  specialist `request.system` values are appended in layer order; all are
+  rendered against the node context.
+- `retry_prompt`: minijinja text used after schema validation failures, in
+  place of qcg's shipped default. Available variables are `error` and
+  `attempt`. Node and specialist `request.retry_prompt` values override it for
+  that invocation.
 - `seed`: optional best-effort deterministic seed passed only to providers
   that advertise it. It cannot be combined with `reasoning_effort`.
 - `reasoning_effort`: optional `none`, `minimal`, `low`, `medium`, `high`,

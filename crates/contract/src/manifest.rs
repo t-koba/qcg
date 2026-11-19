@@ -560,6 +560,45 @@ version = "0.1.0"
         }
     }
     #[test]
+    fn llm_model_instruction_overrides_are_bounded_and_closed() {
+        let valid = manifest_with_llm_settings(
+            "fill_system_guardrail = \"fill\"\nagent_system_guardrail = \"agent\"\nretry_prompt = \"retry {{ error }}\"\n",
+        );
+        valid
+            .validate()
+            .expect("bounded instruction overrides must validate");
+
+        let oversized = "x".repeat(MAX_MODEL_INSTRUCTION_BYTES + 1);
+        for field in [
+            "fill_system_guardrail",
+            "agent_system_guardrail",
+            "retry_prompt",
+        ] {
+            let settings = format!("{field} = {oversized:?}");
+            let error = manifest_with_llm_settings(&settings)
+                .validate()
+                .expect_err("oversized instruction text must be refused");
+            assert!(
+                error.to_string().contains(&format!("{field} exceeds")),
+                "{error}"
+            );
+        }
+
+        let source = r#"
+[generator]
+id = "instruction-test"
+name = "Instruction Test"
+version = "0.1.0"
+[llm]
+max_tokens = 2048
+unknown_instruction = "nope"
+"#;
+        let error = toml::from_str::<Manifest>(source)
+            .expect_err("unknown [llm] instruction keys must be refused");
+        assert!(error.to_string().contains("unknown field"), "{error}");
+    }
+
+    #[test]
     fn llm_max_tokens_is_required() {
         let mut manifest = manifest_with_llm_settings("");
         manifest.llm.as_mut().expect("LLM config").max_tokens = None;
