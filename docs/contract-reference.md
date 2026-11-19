@@ -338,7 +338,10 @@ containing `SKILL.md` and exposes each one as a skill. It is the opt-in way to
 vendor a skill collection into a package: the declaration names the library
 root, and the skills inside are discovered automatically. Non-directory
 entries, `.git`, `node_modules`, and directories without `SKILL.md` are
-ignored.
+ignored. Every entry counts toward the deployment ceiling
+`[operational_limits].max_skill_library_entries` (4096 by default), which
+contract validation and the execution-time directory walk both enforce; a
+resource `params.max_entries` can only tighten that scan further.
 
 An `exec` resource is the stock declarative extension boundary for an external
 data source. It forbids `path` and `url`, requires

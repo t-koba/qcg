@@ -77,6 +77,13 @@ pub(crate) fn hash_resource_dir(
                 "resource directory `{path}` exceeds max_entries ({limit})"
             )));
         }
+        if let Some(ceiling) = limits.max_entries_ceiling
+            && entries > ceiling
+        {
+            return Err(std::io::Error::other(format!(
+                "skill library directory `{path}` exceeds the deployment ceiling of {ceiling} entries"
+            )));
+        }
         if entry.file_type().is_symlink() {
             return Err(std::io::Error::other(format!(
                 "resource directory `{path}` contains a symbolic link"

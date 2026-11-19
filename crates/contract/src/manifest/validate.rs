@@ -397,8 +397,6 @@ pub(crate) fn validate_resource_files(
     Ok(())
 }
 
-const MAX_SKILL_LIBRARY_ENTRIES: usize = 4096;
-
 fn validate_skill_resource(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
     let skill_path = root.join("SKILL.md");
     if !skill_path.is_file() {
@@ -410,6 +408,10 @@ fn validate_skill_resource(name: &str, root: &Utf8Path) -> Result<(), ContractEr
 }
 
 fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
+    // One deployment-owned ceiling, shared with the engine's bounded skill
+    // library walk. A local CLI contract load and a served admission use the
+    // same resolved value; a registry override applies to both.
+    let ceiling = policy::operational_limits().max_skill_library_entries;
     let entries = std::fs::read_dir(root).map_err(|error| {
         ContractError::Invalid(format!(
             "skill_library resource `{name}` cannot read `{root}`: {error}"
@@ -423,9 +425,9 @@ fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractErr
             ))
         })?;
         inspected += 1;
-        if inspected > MAX_SKILL_LIBRARY_ENTRIES {
+        if inspected > ceiling {
             return Err(ContractError::Invalid(format!(
-                "skill_library resource `{name}` exceeds {MAX_SKILL_LIBRARY_ENTRIES} entries"
+                "skill_library resource `{name}` exceeds {ceiling} entries"
             )));
         }
         let file_type = entry.file_type().map_err(|error| {
@@ -883,5 +885,29 @@ mod tests {
             validate_input_scalar_token(token)
                 .expect_err("out-of-range scalar token must be rejected");
         }
+    }
+
+    #[test]
+    fn skill_library_validation_uses_the_deployment_ceiling() {
+        let ceiling = policy::operational_limits().max_skill_library_entries;
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-skill-library-ceiling-{}", std::process::id())),
+        )
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        for index in 0..ceiling {
+            std::fs::create_dir(root.join(format!("e{index}")))
+                .expect("library entry should be created");
+        }
+        validate_skill_library("lib", &root).expect("exactly the ceiling must still validate");
+        std::fs::create_dir(root.join("over")).expect("extra entry should be created");
+        let error = validate_skill_library("lib", &root)
+            .expect_err("one entry over the deployment ceiling must be refused");
+        assert!(
+            error.to_string().contains(&ceiling.to_string()),
+            "the error must name the configured ceiling: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
     }
 }

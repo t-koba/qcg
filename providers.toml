@@ -80,7 +80,10 @@
 # the values below are the shipped defaults and stay in force when a key or the
 # whole section is absent. Unknown keys and zero counts, byte targets or
 # timeouts refuse registry parsing. Contract values above a ceiling are
-# refused, never clamped. `provider_request_timeout_seconds` is the timeout for
+# refused, never clamped. `max_skill_library_entries` bounds the directory
+# scan for `skill_library` resources in validation and at execution; a
+# contract's own `max_entries` may tighten that scan further.
+# `provider_request_timeout_seconds` is the timeout for
 # provider rows that omit their own `timeout_seconds` (an explicit row value
 # wins); `catalog_fetch_timeout_seconds` bounds both external catalog fetches
 # and per-provider model discovery.
@@ -89,6 +92,7 @@
 # agent_tool_calls = 10
 # agent_iterations = 32
 # fallback_models = 8
+# max_skill_library_entries = 4096
 # web_search_results = 20
 # retry_attempts = 16
 # retry_backoff_ms = 60000

@@ -3999,6 +3999,10 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
     assert_eq!(limits.retry_backoff_ms, 100);
     assert_eq!(limits.agent_iterations, policy::MAX_AGENT_ITERATIONS);
     assert_eq!(
+        limits.max_skill_library_entries,
+        policy::DEFAULT_MAX_SKILL_LIBRARY_ENTRIES
+    );
+    assert_eq!(
         limits.audit_tool_value_bytes,
         policy::TOOL_EVENT_VALUE_LIMIT_BYTES
     );
@@ -4015,21 +4019,25 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
         policy::DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS
     );
 
-    let unknown = ProvidersFile::parse("[operational_limits]\nmax_calls = 4\n")
-        .expect_err("unknown operational key must refuse the registry");
-    assert!(unknown.contains("unknown field"), "{unknown}");
+    for key in ["max_calls", "max_skill_library_files"] {
+        let text = format!("[operational_limits]\n{key} = 4\n");
+        let unknown = ProvidersFile::parse(&text)
+            .expect_err("unknown operational key must refuse the registry");
+        assert!(unknown.contains("unknown field"), "{unknown}");
+    }
 
     // The configured values are the effective ceilings: raising above the
     // defaults parses and validates so a deployment can declare an eleventh
-    // tool call.
+    // tool call and a larger skill library.
     let raised = ProvidersFile::parse(
-        "[operational_limits]\nagent_tool_calls = 11\npatch_target_bytes = 16777216\naudit_tool_value_bytes = 65536\ndirect_mcp_tool_value_bytes = 131072\nprovider_request_timeout_seconds = 600\ncatalog_fetch_timeout_seconds = 120\n",
+        "[operational_limits]\nagent_tool_calls = 11\nmax_skill_library_entries = 8192\npatch_target_bytes = 16777216\naudit_tool_value_bytes = 65536\ndirect_mcp_tool_value_bytes = 131072\nprovider_request_timeout_seconds = 600\ncatalog_fetch_timeout_seconds = 120\n",
     )
     .expect("a raised deployment ceiling must parse");
     let limits = raised
         .operational_limits
         .expect("the raised section must be retained");
     assert_eq!(limits.agent_tool_calls, 11);
+    assert_eq!(limits.max_skill_library_entries, 8192);
     assert_eq!(limits.patch_target_bytes, 16 * 1024 * 1024);
     assert_eq!(limits.audit_tool_value_bytes, 64 * 1024);
     assert_eq!(limits.direct_mcp_tool_value_bytes, 128 * 1024);
@@ -4097,6 +4105,14 @@ fn operational_limits_section_is_strict_with_defaults_as_floor() {
     let zero = ProvidersFile::parse("[operational_limits]\nagent_tool_calls = 0\n")
         .expect_err("a zero count must refuse the registry");
     assert!(zero.contains("agent_tool_calls"), "{zero}");
+
+    let zero_ceiling =
+        ProvidersFile::parse("[operational_limits]\nmax_skill_library_entries = 0\n")
+            .expect_err("a zero skill library ceiling must refuse the registry");
+    assert!(
+        zero_ceiling.contains("max_skill_library_entries"),
+        "{zero_ceiling}"
+    );
 }
 
 #[path = "tests/retry_policy.rs"]

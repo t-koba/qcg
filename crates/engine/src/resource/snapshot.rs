@@ -1,5 +1,5 @@
 use crate::{EngineError, HttpRequest, RunContext};
-use contract::ResourceDef;
+use contract::{ResourceDef, ResourceKind};
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -145,6 +145,11 @@ fn cached_snapshot_is_fresh(
 pub(crate) struct DirectoryLimits {
     pub(crate) max_files: Option<usize>,
     pub(crate) max_entries: Option<usize>,
+    /// Deployment ceiling on a `skill_library` walk. Never part of contract
+    /// params: it comes from the resolved operational limits so every read
+    /// path enforces the same deployment policy.
+    #[serde(skip)]
+    pub(crate) max_entries_ceiling: Option<usize>,
     pub(crate) max_depth: Option<usize>,
     pub(crate) max_bytes: Option<u64>,
     pub(crate) max_selected_bytes: Option<usize>,
@@ -154,10 +159,12 @@ pub(crate) fn directory_limits(
     name: &str,
     resource: &ResourceDef,
 ) -> Result<DirectoryLimits, ResourceError> {
-    let limits: DirectoryLimits = serde_json::from_value(Value::Object(resource.params.clone()))
-        .map_err(|error| ResourceError::InvalidConfiguration {
-            resource: name.to_string(),
-            message: error.to_string(),
+    let mut limits: DirectoryLimits =
+        serde_json::from_value(Value::Object(resource.params.clone())).map_err(|error| {
+            ResourceError::InvalidConfiguration {
+                resource: name.to_string(),
+                message: error.to_string(),
+            }
         })?;
     if limits.max_files == Some(0)
         || limits.max_entries == Some(0)
@@ -169,6 +176,9 @@ pub(crate) fn directory_limits(
             resource: name.to_string(),
             message: "max_files, max_entries, max_depth, max_bytes, and max_selected_bytes must be greater than zero".into(),
         });
+    }
+    if resource.kind == ResourceKind::SkillLibrary {
+        limits.max_entries_ceiling = Some(policy::operational_limits().max_skill_library_entries);
     }
     Ok(limits)
 }

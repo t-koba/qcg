@@ -113,6 +113,11 @@ pub const MAX_WEB_SEARCH_RESULTS: usize = 20;
 /// The effective ceiling is `OperationalLimits::fallback_models`.
 pub const MAX_FALLBACK_MODELS: usize = 8;
 
+/// Default ceiling for entries scanned in one `skill_library` resource.
+/// Contract validation has always refused larger libraries; the effective
+/// ceiling is `OperationalLimits::max_skill_library_entries`.
+pub const DEFAULT_MAX_SKILL_LIBRARY_ENTRIES: usize = 4096;
+
 /// Default ceiling for retry attempts on one node or hook.
 /// The effective ceiling is `OperationalLimits::retry_attempts`.
 pub const MAX_RETRY_ATTEMPTS: u32 = 16;
@@ -203,7 +208,7 @@ pub const DEFAULT_MCP_TIMEOUT_SECONDS: u64 = 120;
 /// Default cap, in bytes, for MCP responses.
 pub const DEFAULT_MCP_MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
-/// Deployment ceilings for the eleven operational limits shared by contract
+/// Deployment ceilings for the twelve operational limits shared by contract
 /// validation and execution. This is policy, not mechanism: the configured
 /// values are the effective ceilings themselves. Defaults preserve today's
 /// values; a deployment may tighten or raise a ceiling in `providers.toml`.
@@ -223,6 +228,10 @@ pub struct OperationalLimits {
     /// Maximum fallback models declared on one tool.
     #[serde(default = "default_fallback_models")]
     pub fallback_models: usize,
+    /// Maximum entries scanned in one `skill_library` resource. Defaults to
+    /// the 4096-entry value contract validation has always enforced.
+    #[serde(default = "default_max_skill_library_entries")]
+    pub max_skill_library_entries: usize,
     /// Maximum `web.search` results per call.
     #[serde(default = "default_web_search_results")]
     pub web_search_results: usize,
@@ -263,6 +272,9 @@ const fn default_agent_iterations() -> usize {
 const fn default_fallback_models() -> usize {
     MAX_FALLBACK_MODELS
 }
+const fn default_max_skill_library_entries() -> usize {
+    DEFAULT_MAX_SKILL_LIBRARY_ENTRIES
+}
 const fn default_web_search_results() -> usize {
     MAX_WEB_SEARCH_RESULTS
 }
@@ -294,6 +306,7 @@ impl Default for OperationalLimits {
             agent_tool_calls: default_agent_tool_calls(),
             agent_iterations: default_agent_iterations(),
             fallback_models: default_fallback_models(),
+            max_skill_library_entries: default_max_skill_library_entries(),
             web_search_results: default_web_search_results(),
             retry_attempts: default_retry_attempts(),
             retry_backoff_ms: default_retry_backoff_ms(),
@@ -317,6 +330,7 @@ impl OperationalLimits {
             ("agent_tool_calls", self.agent_tool_calls),
             ("agent_iterations", self.agent_iterations),
             ("fallback_models", self.fallback_models),
+            ("max_skill_library_entries", self.max_skill_library_entries),
             ("web_search_results", self.web_search_results),
             ("retry_attempts", self.retry_attempts as usize),
             (
@@ -349,6 +363,7 @@ const DEFAULT_DEPLOYMENT_LIMITS: OperationalLimits = OperationalLimits {
     agent_tool_calls: MAX_AGENT_TOOL_CALLS,
     agent_iterations: MAX_AGENT_ITERATIONS,
     fallback_models: MAX_FALLBACK_MODELS,
+    max_skill_library_entries: DEFAULT_MAX_SKILL_LIBRARY_ENTRIES,
     web_search_results: MAX_WEB_SEARCH_RESULTS,
     retry_attempts: MAX_RETRY_ATTEMPTS,
     retry_backoff_ms: MAX_RETRY_BACKOFF_MS,
@@ -515,6 +530,7 @@ mod operational_limits_tests {
                 agent_tool_calls: 10,
                 agent_iterations: 32,
                 fallback_models: 8,
+                max_skill_library_entries: 4096,
                 web_search_results: 20,
                 retry_attempts: 16,
                 retry_backoff_ms: 60_000,
@@ -533,9 +549,33 @@ mod operational_limits_tests {
 
     #[test]
     fn unknown_keys_are_refused() {
-        let error = serde_json::from_str::<OperationalLimits>(r#"{"max_calls": 4}"#)
-            .expect_err("strict config must reject unknown keys");
-        assert!(error.to_string().contains("max_calls"), "{error}");
+        for key in ["max_calls", "max_skill_library_files"] {
+            let json = format!(r#"{{"{key}": 4}}"#);
+            let error = serde_json::from_str::<OperationalLimits>(&json)
+                .expect_err("strict config must reject unknown keys");
+            assert!(error.to_string().contains(key), "{error}");
+        }
+    }
+
+    #[test]
+    fn skill_library_ceiling_defaults_and_overrides_independently() {
+        assert_eq!(
+            serde_json::from_str::<OperationalLimits>("{}")
+                .unwrap()
+                .max_skill_library_entries,
+            DEFAULT_MAX_SKILL_LIBRARY_ENTRIES
+        );
+        let raised: OperationalLimits =
+            serde_json::from_str(r#"{"max_skill_library_entries": 8192}"#).unwrap();
+        raised.validate().expect("a raised ceiling must be valid");
+        assert_eq!(raised.max_skill_library_entries, 8192);
+        assert_eq!(raised.fallback_models, MAX_FALLBACK_MODELS);
+        let lowered: OperationalLimits =
+            serde_json::from_str(r#"{"max_skill_library_entries": 16}"#).unwrap();
+        lowered
+            .validate()
+            .expect("a tightened ceiling must be valid");
+        assert_eq!(lowered.max_skill_library_entries, 16);
     }
 
     #[test]
@@ -607,6 +647,7 @@ mod operational_limits_tests {
             r#"{"agent_tool_calls": 20}"#,
             r#"{"agent_iterations": 64}"#,
             r#"{"fallback_models": 16}"#,
+            r#"{"max_skill_library_entries": 16384}"#,
             r#"{"web_search_results": 40}"#,
             r#"{"retry_attempts": 32}"#,
             r#"{"retry_backoff_ms": 120000}"#,
@@ -628,6 +669,10 @@ mod operational_limits_tests {
             (r#"{"agent_tool_calls": 0}"#, "agent_tool_calls"),
             (r#"{"agent_iterations": 0}"#, "agent_iterations"),
             (r#"{"fallback_models": 0}"#, "fallback_models"),
+            (
+                r#"{"max_skill_library_entries": 0}"#,
+                "max_skill_library_entries",
+            ),
             (r#"{"web_search_results": 0}"#, "web_search_results"),
             (r#"{"retry_attempts": 0}"#, "retry_attempts"),
             (

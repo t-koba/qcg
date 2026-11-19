@@ -234,4 +234,67 @@ mod tests {
         super::types::reject_snapshot_name_collisions(&case_alias)
             .expect_err("case-insensitive filename aliases must be refused");
     }
+
+    #[test]
+    fn skill_library_limits_attach_the_deployment_ceiling() {
+        let library: ResourceDef = serde_json::from_value(json!({
+            "type": "skill_library",
+            "params": {}
+        }))
+        .expect("skill library should deserialize");
+        assert_eq!(
+            directory_limits("lib", &library)
+                .expect("library limits should resolve")
+                .max_entries_ceiling,
+            Some(policy::DEFAULT_MAX_SKILL_LIBRARY_ENTRIES)
+        );
+
+        let docs: ResourceDef = serde_json::from_value(json!({ "type": "dir" }))
+            .expect("directory resource should deserialize");
+        assert_eq!(
+            directory_limits("docs", &docs)
+                .expect("directory limits should resolve")
+                .max_entries_ceiling,
+            None,
+            "the skill library ceiling must not cap ordinary directories"
+        );
+    }
+
+    #[test]
+    fn skill_library_walk_enforces_the_ceiling_without_changing_explicit_bounds() {
+        let root = test_directory("skill-ceiling");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("directory should be created");
+        for name in ["a", "b", "c"] {
+            std::fs::write(root.join(name), name).expect("file should be written");
+        }
+
+        hash_resource_dir(&root, DirectoryLimits::default())
+            .expect("an unguarded walk keeps the unbounded contract default");
+        let ceiling_error = hash_resource_dir(
+            &root,
+            DirectoryLimits {
+                max_entries_ceiling: Some(2),
+                ..DirectoryLimits::default()
+            },
+        )
+        .expect_err("the deployment ceiling must stop the walk");
+        assert!(
+            ceiling_error.to_string().contains("ceiling of 2 entries"),
+            "{ceiling_error}"
+        );
+        let bound_error = hash_resource_dir(
+            &root,
+            DirectoryLimits {
+                max_entries: Some(2),
+                ..DirectoryLimits::default()
+            },
+        )
+        .expect_err("an explicit contract bound still applies");
+        assert!(
+            bound_error.to_string().contains("max_entries"),
+            "{bound_error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
 }

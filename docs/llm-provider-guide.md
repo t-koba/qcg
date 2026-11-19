@@ -291,13 +291,14 @@ URL is a registry field.
 ## Operational limits
 
 The same registry carries the deployment ceilings and timeout defaults for
-the eleven operational limits shared by contract validation and execution:
+the twelve operational limits shared by contract validation and execution:
 
 ```toml
 [operational_limits]
 agent_tool_calls = 10       # includes web.search max_calls
 agent_iterations = 32
 fallback_models = 8
+max_skill_library_entries = 4096 # skill_library directory scan ceiling
 web_search_results = 20
 retry_attempts = 16
 retry_backoff_ms = 60000
@@ -319,13 +320,14 @@ always wins, and both catalog network paths use the one configured value.
 Contracts declare their own values (`max_calls`,
 `max_iterations`, `fallback_models`, `max_results`, `retry.max_attempts`,
 `retry.backoff_ms`, runtime output limits, and `[audit].max_tool_value_bytes`);
-a declared value above the
-effective ceiling is refused at validation and at execution, never silently
-clamped. The ceiling is installed before contracts are validated (CLI local
-runs preload it before `Contract::load`; `serve` installs it while resolving
-server policy) and frozen when the registry is parsed, so validation and
-execution observe the same values for the process. `retry_backoff_ms = 0`
-means no delay and is valid.
+a declared value above the effective ceiling is refused at validation and at
+execution, never silently clamped. The skill library ceiling differs: it
+bounds the entries actually scanned, not the declared `max_entries`, so a
+resource can only tighten that scan further. The ceiling is installed before
+contracts are validated (CLI local runs preload it before `Contract::load`;
+`serve` installs it while resolving server policy) and frozen when the registry
+is parsed, so validation and execution observe the same values for the process.
+`retry_backoff_ms = 0` means no delay and is valid.
 
 ### ChatGPT subscription authentication
 
