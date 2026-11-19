@@ -81,6 +81,8 @@ export interface RunTab {
   pendingPackageSha256: string | null;
   /** Stable idempotency key reused across cancel retries. */
   cancelKey: string | null;
+  /** Stable idempotency key reused across continuation retries. */
+  continueKey: string | null;
 }
 
 function emptyTab(runId: string, generatorId: string, generatorName: string): RunTab {
@@ -107,6 +109,7 @@ function emptyTab(runId: string, generatorId: string, generatorName: string): Ru
     pendingInputs: null,
     pendingPackageSha256: null,
     cancelKey: null,
+    continueKey: null,
   };
 }
 
@@ -386,12 +389,18 @@ export class RunStore {
     // Defense in depth: only a failed run may be continued, even if a button
     // or a script tries to invoke this outside the terminal failed view.
     if (tab.runState !== "failed" || this.runState !== "failed") return;
+    // A lost response or a failed admission must not mint a second child:
+    // every retry of this continuation replays the same idempotency key.
+    if (!tab.continueKey) {
+      tab.continueKey = randomId();
+      this.tabs = { ...this.tabs };
+    }
     tab.pendingAction = "starting";
     const op = randomId();
     tab.pendingOp = op;
     this.saveCurrentView();
     try {
-      const snapshot = await this.api.continueRun(tab.runId, randomId());
+      const snapshot = await this.api.continueRun(tab.runId, tab.continueKey);
       this.applySnapshot(snapshot);
       this.selectTab(snapshot.run_id);
       void this.withError(() => this.refreshRuns());

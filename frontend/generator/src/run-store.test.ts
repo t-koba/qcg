@@ -265,13 +265,61 @@ describe("continuing a failed run", () => {
     expect(continueRun).not.toHaveBeenCalled();
   });
 
-  it("keeps the failed run state when the continuation fails and clears its pending operation", async () => {
+  it("keeps the failed run state and its continuation key when the request fails", async () => {
     const store = failedStore();
-    store.api.continueRun = vi.fn().mockRejectedValue(new Error("request lost")) as typeof store.api.continueRun;
+    const continueRun = vi.fn().mockRejectedValue(new Error("request lost"));
+    store.api.continueRun = continueRun as typeof store.api.continueRun;
 
     await expect(store.continueCurrentRun()).rejects.toThrow("request lost");
+    const key = store.tabs.test.continueKey;
+    expect(key).toEqual(expect.any(String));
     expect(store.currentRun).toBe("test");
     expect(store.tabs.test).toMatchObject({ runState: "failed", pendingAction: null, pendingOp: null });
+
+    // A failed admission is ambiguous too: the retry must replay the same key.
+    await expect(store.continueCurrentRun()).rejects.toThrow("request lost");
+    expect(continueRun).toHaveBeenNthCalledWith(2, "test", key);
+    expect(store.tabs.test.continueKey).toBe(key);
+  });
+
+  it("reuses the continuation key after a committed response is lost so only one child exists", async () => {
+    const store = failedStore();
+    const keys: Array<string | undefined> = [];
+    const children: string[] = [];
+    const committed = new Map<string, RunSnapshot>();
+    const continueRun = vi.fn(async (_runId: string, key?: string) => {
+      keys.push(key);
+      let child = key ? committed.get(key) : undefined;
+      if (!child) {
+        child = {
+          ...snapshot(1, "queued"),
+          run_id: `child-${children.length + 1}`,
+          parent_run_id: "test",
+        };
+        children.push(child.run_id);
+        if (key) committed.set(key, child);
+      }
+      // The first POST committed a child, but its response never reached the UI.
+      if (keys.length === 1) throw new Error("response lost after commit");
+      return child;
+    });
+    store.api.continueRun = continueRun as typeof store.api.continueRun;
+
+    await expect(store.continueCurrentRun()).rejects.toThrow("response lost after commit");
+    expect(store.currentRun).toBe("test");
+    expect(store.tabs.test).toMatchObject({ runState: "failed", pendingAction: null, pendingOp: null });
+    expect(children).toHaveLength(1);
+
+    await store.continueCurrentRun();
+
+    expect(keys).toHaveLength(2);
+    expect(keys[0]).toEqual(expect.any(String));
+    expect(keys[1]).toBe(keys[0]);
+    // Same key: the server replays the committed child instead of creating another.
+    expect(children).toHaveLength(1);
+    expect(store.currentRun).toBe(children[0]);
+    expect(store.tabs[children[0]].runState).toBe("queued");
+    expect(Object.keys(store.tabs).sort()).toEqual([children[0], "test"].sort());
   });
 
   it("does not continue while another action is pending or the tab is a placeholder", async () => {
