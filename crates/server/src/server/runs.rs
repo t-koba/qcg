@@ -152,6 +152,47 @@ pub(crate) async fn start_run(
     with_idempotency(call).await
 }
 
+/// HTTP continuation of a terminally failed run. The source is never named
+/// in a refusal: every category maps to its fixed redacted reason text.
+pub(crate) async fn continue_run(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(source_id): Path<String>,
+) -> Result<Response, ApiHttpError> {
+    let reserved = state
+        .service
+        .reserve_fork_run_id(&source_id)
+        .await
+        .map_err(ApiHttpError::from_api)?;
+    let service = state.service.clone();
+    let source_id_query = source_id.clone();
+    with_idempotency(IdempotentCall {
+        state: &state,
+        headers: &headers,
+        scope: "continue_run",
+        target: &source_id,
+        body: &[],
+        digest_context: None,
+        created: true,
+        reserved_run_id: Some(reserved),
+        execute: |context| async move {
+            let reserved_id = context.reserved_run_id;
+            if reserved_id.is_none() {
+                return Err(api::ApiError::Internal {
+                    detail: "idempotency reservation is missing; commit refused".into(),
+                });
+            }
+            service
+                .continue_run_with_id(&source_id_query, reserved_id)
+                .await
+                .map_err(|refusal| api::ApiError::Conflict {
+                    detail: refusal.reason().to_owned(),
+                })
+        },
+    })
+    .await
+}
+
 const PACKAGE_SHA256_HEADER: &str = "x-qcg-package-sha256";
 
 fn reviewed_package_sha256(headers: &HeaderMap) -> Result<String, ApiHttpError> {

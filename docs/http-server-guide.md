@@ -97,6 +97,7 @@ event, artifact, and journal routes. Principal paths include:
 - `GET /api/runs/{id}`
 - `DELETE /api/runs/{id}` (terminal, unpinned runs only; active runs need cancel first)
 - `POST /api/runs/{id}/invalidation` (durably succeeded runs only)
+- `POST /api/runs/{id}/continue` (terminally failed runs only; creates a verified child run)
 - `PUT /api/runs/{id}/questions/{qid}`
 - `PUT /api/runs/{id}/confirmations/{cid}`
 - `POST /api/runs/{id}:cancel`
@@ -282,8 +283,9 @@ Direct service and unkeyed HTTP cancels still generate fresh IDs.
 
 This is process-crash recovery, not a power-loss durability guarantee. A
 same-key, same-request retry reconciles the tested post-acceptance/pre-Ready
-windows: start/fork reuse their reserved run identity, answer/confirmation
-retry the identical request against journaled service state, and cancel reuses
+windows: start/fork/continue reuse their reserved run identity,
+answer/confirmation retry the identical request against journaled service
+state, and cancel reuses
 its accepted mailbox identity. Process death releases the OS gate but retains Pending evidence; a
 retry may adopt it only under the existing same-digest rules. There is no
 age-only retirement or automatic conclusion that an operation had no effects;
@@ -400,6 +402,7 @@ selects the default; zero, negative, non-integer, overflowing, or non-Unicode
 values refuse startup. Cadence and regular-temp age are independent of the Pending adoption lease.
 
 The same header is accepted by `POST /api/runs/{id}/fork`,
+`POST /api/runs/{id}/continue`,
 `PUT /api/runs/{id}/questions/{qid}`,
 `PUT /api/runs/{id}/confirmations/{cid}`, and `POST /api/runs/{id}:cancel`.
 Once a mapping expires (not when its cache entry is evicted), that key no
@@ -418,6 +421,17 @@ response preserves that completed state instead of writing a second terminal
 event.
 The `{path...}` notation above denotes the nested wildcard captured by the
 server; the OpenAPI document names that wildcard parameter `path`.
+
+### Continuing a failed run
+
+`POST /api/runs/{id}/continue` takes no request body. It admits a child of a
+terminally failed run from source-relative durable evidence: successful source
+outcomes are preserved, the remaining nodes rerun, and the child inherits the
+source's budget and lineage. The route accepts `Idempotency-Key`; a keyed retry
+replays the same child snapshot instead of admitting another child. Every
+refusal is a fixed redacted category, such as an unavailable source, a source
+that is not terminally failed, or in-flight work; no path, value, or I/O detail
+is returned.
 
 ## MCP authorization
 
@@ -537,6 +551,7 @@ The complete file is verified before delivering a successful range response.
 `GET /api/runs/{id}/artifacts`, `GET /api/runs/{id}/artifacts/{path...}`,
 `GET /api/runs/{id}/artifacts.zip`, `GET /api/runs/{id}/bundle`,
 `GET /api/runs/{id}`, `POST /api/runs`, `POST /api/runs/{id}/fork`,
+`POST /api/runs/{id}/continue`,
 `PUT /api/runs/{id}/questions/{qid}`,
 `PUT /api/runs/{id}/confirmations/{cid}`, and
 `POST /api/runs/{id}:cancel` responses share a server-only provisional profile
@@ -559,7 +574,8 @@ never unlimited.
 `67108864`, 64 MiB) bounds aggregate response-owned bytes for concurrent
 `GET /api/runs/{id}`, `GET /api/runs/{id}/artifacts`,
 `GET /api/runs/{id}/artifacts/{path...}`, `POST /api/runs`,
-`POST /api/runs/{id}/fork`, `PUT /api/runs/{id}/questions/{qid}`,
+`POST /api/runs/{id}/fork`, `POST /api/runs/{id}/continue`,
+`PUT /api/runs/{id}/questions/{qid}`,
 `PUT /api/runs/{id}/confirmations/{cid}`, and
 `POST /api/runs/{id}:cancel` responses, including unkeyed responses and
 in-memory and durable idempotency replays after restart. The default admits four
@@ -581,9 +597,9 @@ verification, allocation and conditional-response errors release them. One
 body larger than the budget returns `413`; temporary aggregate exhaustion
 returns `503`, before response buffering (or single-artifact body reads).
 These limits do not change the existing per-response byte and entry limits.
-A mutation may have committed before response admission fails; start/fork
-errors retain `Location`. Once a keyed mutation commits, its Ready record
-survives response-admission failure. After a temporary `503`, retrying with the
+A mutation may have committed before response admission fails;
+start/fork/continue errors retain `Location`. Once a keyed mutation commits,
+its Ready record survives response-admission failure. After a temporary `503`, retrying with the
 same idempotency key replays the run snapshot once capacity is available, without
 repeating the mutation.
 For `413`, raise the applicable configured byte limit if that response must be

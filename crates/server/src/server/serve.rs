@@ -16,7 +16,7 @@ use super::run_detail::{
     read_artifact, read_artifacts_zip, read_cost_metrics, read_journal, read_run_bundle,
     run_artifacts, run_events, run_snapshot,
 };
-use super::runs::{fork_run, list_runs, start_run};
+use super::runs::{continue_run, fork_run, list_runs, start_run};
 use anyhow::Result;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -919,6 +919,7 @@ pub(crate) fn build_router(
             axum::routing::post(invalidate_run),
         )
         .route("/api/runs/{id}/fork", axum::routing::post(fork_run))
+        .route("/api/runs/{id}/continue", axum::routing::post(continue_run))
         .route("/api/runs/{id}/questions/{qid}", put(answer_run))
         .route("/api/runs/{id}/confirmations/{cid}", put(confirm_run))
         .route("/api/runs/{id}/events", get(run_events))

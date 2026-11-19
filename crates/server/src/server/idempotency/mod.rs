@@ -31,6 +31,12 @@ use crate::server::config::AppState;
 use crate::server::error::ApiHttpError;
 use crate::server::runs::respond_with_snapshot;
 
+/// Scopes that reserve and adopt a child run id. Their claim target is not a
+/// pre-existing run directory, unlike ordinary mutations on a known run.
+fn creates_run(scope: &str) -> bool {
+    matches!(scope, "start_run" | "fork_run" | "continue_run")
+}
+
 pub(crate) fn request_digest(
     scope: &str,
     target: &str,
@@ -311,7 +317,7 @@ where
                         }
                         // Only run creation needs orphan-sidecar discovery.
                         // Mutations bind to their target without a store scan.
-                        if carried_adopted.is_none() && matches!(scope, "start_run" | "fork_run") {
+                        if carried_adopted.is_none() && creates_run(scope) {
                             let runs_dir = state.runs_dir.clone();
                             let key = idempotency_key.clone();
                             if let Some(orphan) = {
@@ -353,7 +359,7 @@ where
                             reserved,
                             policy_ttl,
                             state.idempotency_timing,
-                            !matches!(scope, "start_run" | "fork_run"),
+                            !creates_run(scope),
                             binding.cloned(),
                         )
                         .await?
@@ -646,7 +652,7 @@ where
         }
     };
     // Start/fork sidecars recover Ready loss; mutation targets need neither scan nor sidecar.
-    if matches!(scope, "start_run" | "fork_run")
+    if creates_run(scope)
         && let Err(error) = write_orphan_record_async(
             gate.clone(),
             state.runs_dir.clone(),

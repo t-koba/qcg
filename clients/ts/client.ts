@@ -416,6 +416,10 @@ export class QcgClient {
     return this.requestJson<paths["/api/runs/{id}/confirmations/{cid}"]["put"]["responses"][200]["content"]["application/json"] | null>("PUT", `/api/runs/${encodeURIComponent(id)}/confirmations/${encodeURIComponent(cid)}`, { body: body ?? options?.body, headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
   }
 
+  async continueRun(id: string, options?: { headers?: Record<string, string>; idempotencyKey?: string }): Promise<paths["/api/runs/{id}/continue"]["post"]["responses"][201]["content"]["application/json"] | null> {
+    return this.requestJson<paths["/api/runs/{id}/continue"]["post"]["responses"][201]["content"]["application/json"] | null>("POST", `/api/runs/${encodeURIComponent(id)}/continue`, { headers: this.withIdempotency(options?.headers, options?.idempotencyKey) });
+  }
+
   async runEvents(id: string, options?: { headers?: Record<string, string> }): Promise<string | null> {
     return this.requestText("GET", `/api/runs/${encodeURIComponent(id)}/events`, { headers: options?.headers });
   }

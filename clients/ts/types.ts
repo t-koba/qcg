@@ -1637,13 +1637,19 @@ type QcgInline219 = string;
 
 type QcgInline220 = string;
 
-type QcgInline221 = unknown;
+type QcgInline221 = string;
 
 type QcgInline222 = string;
 
 type QcgInline223 = string;
 
-type QcgInline224 = string;
+type QcgInline224 = unknown;
+
+type QcgInline225 = string;
+
+type QcgInline226 = string;
+
+type QcgInline227 = string;
 
 export type paths = {
     "/api/generators": {
@@ -2808,6 +2814,95 @@ export type paths = {
         "patch"?: never;
         "trace"?: never;
     };
+    "/api/runs/{id}/continue": {
+        "parameters": {
+            "query"?: never;
+            "header"?: never;
+            "path"?: never;
+            "cookie"?: never;
+        };
+        "get"?: never;
+        "put"?: never;
+        "post": {
+            "parameters": {
+                "query"?: never;
+                "header"?: {
+                    "Idempotency-Key"?: QcgInline207;
+                };
+                "path": {
+                    "id": QcgInline206;
+                };
+                "cookie"?: never;
+            };
+            "requestBody"?: never;
+            "responses": {
+                "201": {
+                    "headers": {
+                        "Location"?: QcgInline208;
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/json": components["schemas"]["RunSnapshot"];
+                    };
+                };
+                "400": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                "401": components["responses"]["Unauthorized"];
+                "409": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                "413": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                "422": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                "429": components["responses"]["TooManyRequests"];
+                "500": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+                "503": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
+            };
+        };
+        "delete"?: never;
+        "options"?: never;
+        "head"?: never;
+        "patch"?: never;
+        "trace"?: never;
+    };
     "/api/runs/{id}/events": {
         "parameters": {
             "query"?: never;
@@ -2819,10 +2914,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Last-Event-ID"?: QcgInline207;
+                    "Last-Event-ID"?: QcgInline210;
                 };
                 "path": {
-                    "id": QcgInline206;
+                    "id": QcgInline209;
                 };
                 "cookie"?: never;
             };
@@ -2833,7 +2928,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "text/event-stream": QcgInline208;
+                        "text/event-stream": QcgInline211;
                     };
                 };
                 "400": {
@@ -2885,10 +2980,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline210;
+                    "Idempotency-Key"?: QcgInline213;
                 };
                 "path": {
-                    "id": QcgInline209;
+                    "id": QcgInline212;
                 };
                 "cookie"?: never;
             };
@@ -2900,7 +2995,7 @@ export type paths = {
             "responses": {
                 "201": {
                     "headers": {
-                        "Location"?: QcgInline211;
+                        "Location"?: QcgInline214;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -2979,7 +3074,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline212;
+                    "id": QcgInline215;
                 };
                 "cookie"?: never;
             };
@@ -3067,7 +3162,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline213;
+                    "id": QcgInline216;
                 };
                 "cookie"?: never;
             };
@@ -3078,7 +3173,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/x-ndjson": QcgInline214;
+                        "application/x-ndjson": QcgInline217;
                     };
                 };
                 "400": {
@@ -3129,7 +3224,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline215;
+                    "id": QcgInline218;
                 };
                 "cookie"?: never;
             };
@@ -3191,11 +3286,11 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline218;
+                    "Idempotency-Key"?: QcgInline221;
                 };
                 "path": {
-                    "id": QcgInline216;
-                    "qid": QcgInline217;
+                    "id": QcgInline219;
+                    "qid": QcgInline220;
                 };
                 "cookie"?: never;
             };
@@ -3285,10 +3380,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline220;
+                    "Idempotency-Key"?: QcgInline223;
                 };
                 "path": {
-                    "id": QcgInline219;
+                    "id": QcgInline222;
                 };
                 "cookie"?: never;
             };
@@ -3357,7 +3452,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/json": QcgInline221;
+                        "application/json": QcgInline224;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -3400,7 +3495,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "text/plain; version=0.0.4": QcgInline222;
+                        "text/plain; version=0.0.4": QcgInline225;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -3582,7 +3677,7 @@ export type components = {
     "responses": {
         "TooManyRequests": {
             "headers": {
-                "Retry-After"?: QcgInline223;
+                "Retry-After"?: QcgInline226;
                 [name: string]: unknown;
             };
             "content": {
@@ -3591,7 +3686,7 @@ export type components = {
         };
         "Unauthorized": {
             "headers": {
-                "WWW-Authenticate"?: QcgInline224;
+                "WWW-Authenticate"?: QcgInline227;
                 [name: string]: unknown;
             };
             "content": {

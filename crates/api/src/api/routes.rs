@@ -463,6 +463,22 @@ pub const API_ROUTES: &[ApiRoute] = &[
     },
     ApiRoute {
         method: "post",
+        path: "/api/runs/{id}/continue",
+        summary: "Continue a terminally failed run into a verified child run",
+        response: ApiResponse {
+            status: 201,
+            description: "Continued run",
+            body: ResponseBody::Json(Some(ResponseSchema::Ref("RunSnapshot"))),
+            headers: LOCATION_HEADERS,
+        },
+        additional_responses: NO_ADDITIONAL_RESPONSES,
+        request_schema: None,
+        request_headers: IDEMPOTENCY_HEADERS,
+        query_parameters: NO_QUERY_PARAMETERS,
+        errors: ERR_START_RUN,
+    },
+    ApiRoute {
+        method: "post",
         path: "/api/runs/{id}/invalidation",
         summary: "Invalidate a durably successful run (immutable; exact retries are no-ops)",
         response: ApiResponse {

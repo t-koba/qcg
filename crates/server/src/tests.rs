@@ -1,5 +1,5 @@
 use super::*;
-use api::{AnswerPayload, ForkRun, RunListQuery, StartRun};
+use api::{AnswerPayload, ForkRun, RunListQuery, RunStatus, StartRun};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -2133,6 +2133,182 @@ async fn idempotent_fork_reuses_run_and_conflicts_on_digest() {
     .expect_err("reused key with different body must conflict");
     assert_eq!(conflict.problem.status, StatusCode::CONFLICT.as_u16());
     let _ = std::fs::remove_dir_all(&runs);
+}
+
+/// A refusal is a fixed redacted category, never the source id or a path
+/// built from it, even when the caller supplies a path-shaped source id.
+#[tokio::test]
+async fn continue_run_refuses_unknown_source_without_leaking_paths() {
+    let workspace = Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("workspace root should exist")
+        .to_path_buf();
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .expect("temporary directory path should be UTF-8")
+        .join(format!("continue-refusal-{}", uuid::Uuid::now_v7()));
+    let state = Arc::new(test_state(
+        crate::test_service(workspace.join("fixtures/generators"), runs.clone(), None)
+            .expect("service should initialize"),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let source = format!("{}/missing-source", runs);
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        IDEMPOTENCY_HEADER,
+        HeaderValue::from_static("continue-unknown"),
+    );
+    let error = crate::continue_run(State(Arc::clone(&state)), headers, Path(source))
+        .await
+        .expect_err("unknown source must be refused");
+    assert_eq!(error.problem.status, StatusCode::CONFLICT.as_u16());
+    assert_eq!(
+        error.problem.detail,
+        service::ContinuationRefusal::Source.reason()
+    );
+    assert!(
+        !error.problem.detail.contains(runs.as_str()),
+        "refusal must not disclose a runs path"
+    );
+    assert!(
+        !error.problem.detail.contains("missing-source"),
+        "refusal must not disclose the source id"
+    );
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn http_continuation_creates_a_child_from_a_failed_default_policy_run() {
+    let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+        .expect("temporary directory path should be UTF-8")
+        .join(format!("continue-http-{}", uuid::Uuid::now_v7()));
+    let generators = runs
+        .parent()
+        .expect("temp directory")
+        .join(format!("continue-generators-{}", uuid::Uuid::now_v7()));
+    let source_dir = generators.join("continue-source");
+    std::fs::create_dir_all(&source_dir).expect("generator directory");
+    // An explicit file-input limit is required for source-relative continuation
+    // planning; the fixture generators do not declare one.
+    std::fs::write(
+        source_dir.join("qcg.toml"),
+        r#"
+[generator]
+id = "continue-source"
+name = "Continue Source"
+version = "0.1.0"
+description = "Read-only checks over two file inputs."
+
+[runtime]
+file_input_limit_bytes = 4096
+
+[[inputs.stages]]
+id = "files"
+
+[[inputs.stages.fields]]
+id = "good"
+required = true
+type = "file"
+
+[[inputs.stages.fields]]
+id = "bad"
+required = true
+type = "file"
+
+[[flow]]
+id = "check_good"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "{{ inputs.good }}"
+
+[[flow]]
+id = "check_bad"
+type = "check.format"
+
+[flow.params]
+content = "json"
+source = "{{ inputs.bad }}"
+
+[permissions]
+fs_read = ["workspace"]
+fs_write = []
+network = []
+commands = []
+side_effects = "none"
+
+[permissions.containers]
+enabled = false
+"#,
+    )
+    .expect("generator manifest");
+    let state = Arc::new(test_state(
+        crate::test_service(generators.clone(), runs.clone(), None)
+            .expect("service should initialize"),
+        runs.clone(),
+        None,
+        tokio_util::sync::CancellationToken::new(),
+    ));
+    let source_id = state
+        .service
+        .start_run(StartRun {
+            generator_id: "continue-source".into(),
+            inputs: BTreeMap::from([
+                ("good".into(), json!({"name": "good.json", "text": "{}"})),
+                ("bad".into(), json!({"name": "bad.json", "text": "{"})),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("failed source should be admitted");
+    wait_for_terminal(&state.service, &source_id).await;
+    assert_eq!(
+        state
+            .service
+            .snapshot(source_id.clone())
+            .await
+            .expect("source snapshot")
+            .state,
+        RunStatus::Failed
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        IDEMPOTENCY_HEADER,
+        HeaderValue::from_static("continue-once"),
+    );
+    let response = crate::continue_run(
+        State(Arc::clone(&state)),
+        headers.clone(),
+        Path(source_id.clone()),
+    )
+    .await
+    .expect("failed source should continue over HTTP");
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()[header::LOCATION]
+        .to_str()
+        .expect("Location should be ASCII")
+        .to_owned();
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("child body should be readable");
+    let child: api::RunSnapshot =
+        serde_json::from_slice(&body).expect("child body should be a run snapshot");
+    assert_eq!(location, format!("/api/runs/{}", child.run_id));
+    assert_ne!(child.run_id, source_id);
+
+    // A keyed retry replays the same child instead of admitting another one.
+    let replay = crate::continue_run(State(Arc::clone(&state)), headers, Path(source_id))
+        .await
+        .expect("keyed retry should replay the child");
+    assert_eq!(replay.status(), StatusCode::CREATED);
+    assert_eq!(replay.headers()[header::LOCATION], location);
+    let _ = std::fs::remove_dir_all(&runs);
+    let _ = std::fs::remove_dir_all(&generators);
 }
 
 #[tokio::test]

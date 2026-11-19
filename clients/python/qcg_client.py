@@ -469,6 +469,9 @@ class QcgClient:
     def confirm_run(self, id, cid, body=None, headers=None, idempotency_key=None) -> RunSnapshot | None:
         return self._request_json("PUT", f"/api/runs/{_encode_segment(id)}/confirmations/{_encode_segment(cid)}", body=body, headers=headers, idempotency_key=idempotency_key)
 
+    def continue_run(self, id, headers=None, idempotency_key=None) -> RunSnapshot | None:
+        return self._request_json("POST", f"/api/runs/{_encode_segment(id)}/continue", headers=headers, idempotency_key=idempotency_key)
+
     def run_events(self, id, headers=None):
         return self._request_text("GET", f"/api/runs/{_encode_segment(id)}/events", headers=headers)
 

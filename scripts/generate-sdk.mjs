@@ -40,6 +40,7 @@ const OPERATION_NAMES = {
   "POST /api/runs/{id}/invalidation": "invalidateRun",
   "POST /api/runs/{id}:cancel": "cancelRun",
   "POST /api/runs/{id}/fork": "forkRun",
+  "POST /api/runs/{id}/continue": "continueRun",
   "GET /api/runs/{id}/events": "runEvents",
   "GET /api/runs/{id}/artifacts": "listArtifacts",
   "GET /api/runs/{id}/artifacts.zip": "downloadArtifactsZip",

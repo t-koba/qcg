@@ -15,6 +15,7 @@
   "/api/runs/{id}/artifacts/{path}",
   "/api/runs/{id}/bundle",
   "/api/runs/{id}/confirmations/{cid}",
+  "/api/runs/{id}/continue",
   "/api/runs/{id}/events",
   "/api/runs/{id}/fork",
   "/api/runs/{id}/invalidation",

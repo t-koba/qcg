@@ -735,6 +735,17 @@ impl LocalService {
         &self,
         source_id: &str,
     ) -> Result<String, crate::continuation::ContinuationRefusal> {
+        self.continue_run_with_id(source_id, None).await
+    }
+
+    /// Same continuation admission with a child id reserved by the caller.
+    /// The reservation is adopted by the prepared fork, so an idempotent HTTP
+    /// retry cannot mint a second child; refusals stay fixed and redacted.
+    pub async fn continue_run_with_id(
+        &self,
+        source_id: &str,
+        reserved_id: Option<String>,
+    ) -> Result<String, crate::continuation::ContinuationRefusal> {
         use crate::continuation::{ContinuationRefusal, plan_fingerprint, prepare_plan};
 
         self.ensure_running()
@@ -783,7 +794,7 @@ impl LocalService {
                 at_seq,
                 ..Default::default()
             },
-            None,
+            reserved_id,
             Some(&prepared),
             || {
                 // Runs under the target admission and source execution lease.
