@@ -2154,9 +2154,9 @@ fn anthropic_api_version_defaults_and_resolves() {
 #[test]
 fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
     for extra in [
-        "api_version = \"2026-10-21\"\ncapabilities = { temperature = true }\n",
-        "api_version = \"2026-10-21\"\ncapabilities = { top_p = true }\n",
-        "api_version = \"2027-01-01\"\ncapabilities = { temperature = true, top_p = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2026-10-21\"\ncapabilities = { temperature = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2026-10-21\"\ncapabilities = { top_p = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2027-01-01\"\ncapabilities = { temperature = true, top_p = true }\n",
     ] {
         let error = ProvidersFile::parse(&test_provider_row(
             "anthropic-new",
@@ -2177,14 +2177,14 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
         "anthropic-new",
         "anthropic_messages",
         "https://example.invalid",
-        "api_version = \"2026-10-21\"\ncapabilities = { temperature = false, top_p = false }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2026-10-21\"\ncapabilities = { temperature = false, top_p = false }\n",
     ))
     .expect("disabled sampling must load on removed versions");
     assert_eq!(file.provider[0].anthropic_api_version(), "2026-10-21");
     // Versions before the changeover keep the current capability rules.
     for extra in [
-        "capabilities = { temperature = true, top_p = true }\n",
-        "api_version = \"2026-10-20\"\ncapabilities = { temperature = true, top_p = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\ncapabilities = { temperature = true, top_p = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2026-10-20\"\ncapabilities = { temperature = true, top_p = true }\n",
     ] {
         ProvidersFile::parse(&test_provider_row(
             "anthropic-old",
@@ -2199,7 +2199,7 @@ fn anthropic_api_version_changeover_rejects_sampling_capabilities() {
         "anthropic-model",
         "anthropic_messages",
         "https://example.invalid",
-        "api_version = \"2026-10-21\"\n\n[[provider.models]]\nid = \"model\"\ncapabilities = { temperature = true }\n",
+        "sampling_removed_api_version = \"2026-10-21\"\napi_version = \"2026-10-21\"\n\n[[provider.models]]\nid = \"model\"\ncapabilities = { temperature = true }\n",
     ))
     .expect_err("model sampling must fail on removed versions");
     assert!(error.contains("anthropic-model"), "{error}");
@@ -2251,7 +2251,7 @@ fn anthropic_api_version_rejects_other_apis_and_malformed_versions() {
 
 #[test]
 fn anthropic_sampling_removal_version_is_read_from_the_provider_row() {
-    // Omitting the rule keeps today's changeover.
+    // Omitting the rule imposes no date-based restriction.
     let file = ProvidersFile::parse(&test_provider_row(
         "anthropic-shipped",
         "anthropic_messages",
@@ -2259,10 +2259,7 @@ fn anthropic_sampling_removal_version_is_read_from_the_provider_row() {
         "",
     ))
     .expect("default row must validate");
-    assert_eq!(
-        file.provider[0].anthropic_sampling_removed_version(),
-        "2026-10-21"
-    );
+    assert_eq!(file.provider[0].anthropic_sampling_removed_version(), None);
     assert!(!file.provider[0].sampling_removed());
 
     // A row may move the cutoff earlier: its own version and rule apply.
@@ -2287,7 +2284,10 @@ fn anthropic_sampling_removal_version_is_read_from_the_provider_row() {
     ))
     .expect("later row rule must keep sampling");
     let spec = &file.provider[0];
-    assert_eq!(spec.anthropic_sampling_removed_version(), "2030-01-01");
+    assert_eq!(
+        spec.anthropic_sampling_removed_version(),
+        Some("2030-01-01")
+    );
     assert!(!spec.sampling_removed());
     assert_eq!(spec.anthropic_api_version(), "2026-10-21");
 
@@ -2303,6 +2303,34 @@ fn anthropic_sampling_removal_version_is_read_from_the_provider_row() {
         error.contains("version `2025-01-01` or later removes sampling parameters"),
         "{error}"
     );
+}
+
+#[test]
+fn anthropic_row_without_cutoff_keeps_sampling_parameters() {
+    for api_version in ["2026-10-21", "2027-01-01"] {
+        let extra = format!(
+            "api_version = \"{api_version}\"\ncapabilities = {{ temperature = true, top_p = true }}\n\n[[provider.models]]\nid = \"model\"\ncapabilities = {{ temperature = true, top_p = true }}\n"
+        );
+        let file = ProvidersFile::parse(&test_provider_row(
+            "anthropic-no-cutoff",
+            "anthropic_messages",
+            "https://example.invalid",
+            &extra,
+        ))
+        .unwrap_or_else(|error| panic!("row without a cutoff must validate: {error}"));
+        let spec = &file.provider[0];
+        assert_eq!(spec.anthropic_api_version(), api_version);
+        assert_eq!(spec.anthropic_sampling_removed_version(), None);
+        assert!(!spec.sampling_removed());
+        assert!(spec.capabilities.temperature);
+        assert!(spec.capabilities.top_p);
+        let capabilities = spec
+            .model("model")
+            .expect("declared model")
+            .effective_capabilities(&spec.capabilities);
+        assert!(capabilities.temperature);
+        assert!(capabilities.top_p);
+    }
 }
 
 #[test]

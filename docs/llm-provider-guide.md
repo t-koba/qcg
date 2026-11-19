@@ -98,17 +98,19 @@ Fields:
   Bearer authorization.
 - `api_version`: Anthropic `anthropic-version` header value (`YYYY-MM-DD`,
   default `2023-06-01`). Valid only for `anthropic_messages`; it is rejected
-  for other APIs and when empty or malformed. Rows reaching their
-  `sampling_removed_api_version` remove `temperature` and `top_p`, so such
-  rows must set both capabilities false; earlier versions keep the current
-  capability rules. Catalog metadata cannot re-enable them: merged model
-  capabilities are clamped for such rows. The version selects only the
-  header value; response and streaming shapes are unchanged.
+  for other APIs and when empty or malformed. Rows that configure
+  `sampling_removed_api_version` and reach it remove `temperature` and `top_p`,
+  so such rows must set both capabilities false; earlier versions and rows
+  without a cutoff keep the current capability rules. Catalog metadata cannot
+  re-enable them: merged model capabilities are clamped for such rows. The
+  version selects only the header value; response and streaming shapes are
+  unchanged.
 - `sampling_removed_api_version`: first `YYYY-MM-DD` API version whose rows
-  remove `temperature` and `top_p` (default `2026-10-21`). Valid only for
-  `anthropic_messages`; empty or malformed values are refused. This is the
-  owning row's date-keyed rule: validation and catalog clamping use its value
-  instead of a built-in vendor cutoff, so a row may move the changeover
+  remove `temperature` and `top_p`. There is no default cutoff: omitting the
+  key means no date-based restriction, so `api_version` alone never removes
+  sampling. Valid only for `anthropic_messages`; empty or malformed values are
+  refused. This is the owning row's date-keyed rule: validation and catalog
+  clamping use its value, so a row may move the changeover
   earlier or later without a code change. Unknown keys are refused.
 - `path_template`: optional request path where `{model}` expands to the model
   name from the contract. `{model}` expands as path segments so namespaced

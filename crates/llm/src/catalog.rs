@@ -1306,6 +1306,7 @@ id = "anthropic-new"
 api = "anthropic_messages"
 base_url = "https://example.test/v1"
 api_version = "2026-10-21"
+sampling_removed_api_version = "2026-10-21"
 
 [[provider.models]]
 id = "declared"
@@ -1403,6 +1404,55 @@ sampling_removed_api_version = "2025-01-01"
             .expect("effective capabilities");
         assert!(!capabilities.temperature);
         assert!(!capabilities.top_p);
+    }
+
+    #[test]
+    fn anthropic_row_without_cutoff_keeps_catalog_sampling_capabilities() {
+        let file = ProvidersFile::parse(
+            r#"
+[[provider]]
+id = "anthropic-free"
+api = "anthropic_messages"
+base_url = "https://example.test/v1"
+api_version = "2026-10-21"
+"#,
+        )
+        .expect("registry must parse");
+        let service = CatalogService::new(file.provider, None).expect("catalog service");
+        let mut external =
+            map_models_dev(r#"{"anthropic-free":{"models":{"external":{"temperature":true}}}}"#)
+                .expect("external catalog");
+        for model in external
+            .providers
+            .get_mut("anthropic-free")
+            .expect("external provider")
+            .values_mut()
+        {
+            model
+                .capabilities
+                .as_mut()
+                .expect("mapped capabilities")
+                .top_p = true;
+        }
+        {
+            let mut snapshot = service
+                .snapshot
+                .write()
+                .unwrap_or_else(|error| error.into_inner());
+            snapshot.external = external;
+        }
+        service.rebuild_models();
+        let capabilities = service
+            .model_capabilities("anthropic-free", "external")
+            .expect("effective capabilities");
+        assert!(capabilities.temperature);
+        assert!(capabilities.top_p);
+        let spec = service
+            .model_spec("anthropic-free", "external")
+            .expect("model spec");
+        let capabilities = spec.capabilities.expect("merged capabilities");
+        assert!(capabilities.temperature);
+        assert!(capabilities.top_p);
     }
 
     #[test]
