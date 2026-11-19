@@ -603,6 +603,42 @@ fn failed_restore_requires_history_without_changing_public_replay() {
 }
 
 #[test]
+fn failed_history_admits_only_source_local_memo_writes_and_unsettled_skips() {
+    let limits = JournalLimits::default();
+    let traces = OutcomeTraces::default();
+    let mut events = failed_history();
+    // A fresh memo write belongs to the active provider call. Its sidecar is
+    // source-local evidence; no parent journal is referenced.
+    events.insert(
+        5,
+        json!({"t":"llm_memo", "node":"a", "request_digest":"req", "memo_ref":"memo"}),
+    );
+    number_history(&mut events);
+    assert!(history::proves_failed_history(&events, &traces, limits).is_some());
+
+    // A memo served from another run is not proven by this source journal.
+    let mut reused = events.clone();
+    reused[5]["reused_from"] = json!({"run_id":"parent", "seq":7});
+    assert!(history::proves_failed_history(&reused, &traces, limits).is_none());
+
+    // A skipped dependent has no outcome or charge and is reset by the
+    // planner; it must not masquerade as a settled owner.
+    let skip = |node: &str| {
+        json!({"t":"step_skipped", "node":node,
+            "reason":{"code":"when_false", "message":"condition was false"}})
+    };
+    let mut skipped = events.clone();
+    skipped.insert(10, skip("c"));
+    number_history(&mut skipped);
+    assert!(history::proves_failed_history(&skipped, &traces, limits).is_some());
+
+    let mut settled_skip = events.clone();
+    settled_skip.insert(10, skip("a"));
+    number_history(&mut settled_skip);
+    assert!(history::proves_failed_history(&settled_skip, &traces, limits).is_none());
+}
+
+#[test]
 fn failed_history_requires_clean_marker_and_newline_terminated_journal() {
     let f = Fixture::new();
     let events = failed_history();
