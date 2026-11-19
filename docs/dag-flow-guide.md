@@ -110,6 +110,17 @@ that failed, and a missing or altered recorded response is repeated. Effects
 other than model calls are never reused, and answers and confirmations are
 supplied again with the fork request. A step's `reuse` key can set `never`.
 
+A terminally failed run can instead be continued with `qcg runs continue <id>`
+(offline with `--runs-dir`), `POST /api/runs/{id}/continue`, or the **Continue
+run** action in the web UI. Continuation creates a linked child rather than
+walking the DAG again: successful source outcomes are preserved, only the
+failure and nodes whose recorded reads are proven stale are reset, and the
+child inherits the source's exact budget. The source run stays byte-immutable.
+When the recorded reads, execution history, effects or budget cannot be
+proven, continuation fails closed with a fixed redacted reason. Interrupted
+and canceled runs and ambiguous external, MCP or `foreach` cases are not
+eligible yet.
+
 Parallel starts and finishes are marked with `"parallel": true` in the journal.
 
 `foreach` has a separate bounded concurrency setting under `[flow.params]`:
