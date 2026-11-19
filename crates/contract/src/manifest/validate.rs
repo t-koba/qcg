@@ -8,6 +8,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::Read as _;
 
 use super::assets::{AssetRule, validate_field_value, validate_input_sizes};
 use super::contract::{ContractError, stripped_error_message};
@@ -358,11 +359,35 @@ pub(crate) fn validate_asset_files(
     Ok(())
 }
 
+/// Per-resource selected-content budget, shared with the engine's directory
+/// resource loader. An absent param means no explicit budget; a present value
+/// must be a positive integer, matching the engine's `max_selected_bytes`
+/// rule instead of introducing a second contract-side policy.
+fn resource_selected_byte_limit(
+    name: &str,
+    resource: &ResourceDef,
+) -> Result<Option<usize>, ContractError> {
+    let Some(value) = resource.params.get("max_selected_bytes") else {
+        return Ok(None);
+    };
+    let limit = value
+        .as_u64()
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or_else(|| {
+            ContractError::Invalid(format!(
+                "resource `{name}` param `max_selected_bytes` must be a positive integer fitting usize"
+            ))
+        })?;
+    Ok(Some(limit))
+}
+
 pub(crate) fn validate_resource_files(
     root: &Utf8Path,
     resources: &BTreeMap<String, ResourceDef>,
 ) -> Result<(), ContractError> {
     for (name, resource) in resources {
+        let selected_byte_limit = resource_selected_byte_limit(name, resource)?;
         let Some(path) = resource.path.as_deref() else {
             continue;
         };
@@ -389,22 +414,26 @@ pub(crate) fn validate_resource_files(
             )));
         }
         match resource.kind.as_str() {
-            "skill" => validate_skill_resource(name, &resolved)?,
-            "skill_library" => validate_skill_library(name, &resolved)?,
+            "skill" => validate_skill_resource(name, &resolved, selected_byte_limit)?,
+            "skill_library" => validate_skill_library(name, &resolved, selected_byte_limit)?,
             _ => {}
         }
     }
     Ok(())
 }
 
-fn validate_skill_resource(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
+fn validate_skill_resource(
+    name: &str,
+    root: &Utf8Path,
+    selected_byte_limit: Option<usize>,
+) -> Result<(), ContractError> {
     let skill_path = root.join("SKILL.md");
     if !skill_path.is_file() {
         return Err(ContractError::Invalid(format!(
             "skill resource `{name}` must contain SKILL.md at `{skill_path}`"
         )));
     }
-    read_and_validate_skill(name, &skill_path, root.file_name())
+    read_and_validate_skill(name, &skill_path, root.file_name(), selected_byte_limit)
 }
 
 /// Counts every directory and file below `root`, matching the engine's
@@ -461,7 +490,11 @@ fn count_library_entries(name: &str, root: &Utf8Path, ceiling: usize) -> Result<
     Ok(())
 }
 
-fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractError> {
+fn validate_skill_library(
+    name: &str,
+    root: &Utf8Path,
+    selected_byte_limit: Option<usize>,
+) -> Result<(), ContractError> {
     // One deployment-owned ceiling, shared with the engine's bounded skill
     // library walk. A local CLI contract load and a served admission use the
     // same resolved value; a registry override applies to both.
@@ -502,23 +535,45 @@ fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractErr
         if !skill_path.is_file() {
             continue;
         }
-        // Admission enforces only that SKILL.md is readable UTF-8 (a hard
-        // error). Content classification has one owner: engine catalog
-        // construction isolates malformed members with diagnostics and keeps
-        // them unselectable, so parsing the content here would discard it.
-        read_skill_source(name, &skill_path)?;
+        // Admission enforces only that SKILL.md is readable UTF-8 within the
+        // resource's selected-bytes budget (both hard errors). Content
+        // classification has one owner: engine catalog construction isolates
+        // malformed members with diagnostics and keeps them unselectable, so
+        // parsing the content here would discard it.
+        read_skill_source(name, &skill_path, selected_byte_limit)?;
     }
     Ok(())
 }
 
 /// Reads SKILL.md without accepting a substitute: every read/encoding fault
-/// stays a hard contract error for both `skill` and `skill_library`.
-fn read_skill_source(resource: &str, skill_path: &Utf8Path) -> Result<String, ContractError> {
-    std::fs::read_to_string(skill_path).map_err(|error| {
+/// stays a hard contract error for both `skill` and `skill_library`. With a
+/// configured selected-bytes budget, at most one byte past the budget is read
+/// so an oversized file is refused before it is fully allocated.
+fn read_skill_source(
+    resource: &str,
+    skill_path: &Utf8Path,
+    selected_byte_limit: Option<usize>,
+) -> Result<String, ContractError> {
+    let read_error = |error: std::io::Error| {
         ContractError::Invalid(format!(
             "skill resource `{resource}` cannot read `{skill_path}`: {error}"
         ))
-    })
+    };
+    let Some(limit) = selected_byte_limit else {
+        return std::fs::read_to_string(skill_path).map_err(read_error);
+    };
+    let file = std::fs::File::open(skill_path).map_err(read_error)?;
+    let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+    let mut source = String::new();
+    file.take(read_limit)
+        .read_to_string(&mut source)
+        .map_err(read_error)?;
+    if source.len() > limit {
+        return Err(ContractError::Invalid(format!(
+            "skill resource `{resource}` SKILL.md `{skill_path}` exceeds max_selected_bytes {limit}"
+        )));
+    }
+    Ok(source)
 }
 
 /// Content-only check, kept separate from the read so a library can skip one
@@ -543,8 +598,9 @@ fn read_and_validate_skill(
     resource: &str,
     skill_path: &Utf8Path,
     expected_name: Option<&str>,
+    selected_byte_limit: Option<usize>,
 ) -> Result<(), ContractError> {
-    let source = read_skill_source(resource, skill_path)?;
+    let source = read_skill_source(resource, skill_path, selected_byte_limit)?;
     validate_skill_content(resource, skill_path, expected_name, &source)
         .map_err(ContractError::Invalid)
 }
@@ -964,9 +1020,10 @@ mod tests {
             std::fs::create_dir(root.join(format!("e{index}")))
                 .expect("library entry should be created");
         }
-        validate_skill_library("lib", &root).expect("exactly the ceiling must still validate");
+        validate_skill_library("lib", &root, None)
+            .expect("exactly the ceiling must still validate");
         std::fs::create_dir(root.join("over")).expect("extra entry should be created");
-        let error = validate_skill_library("lib", &root)
+        let error = validate_skill_library("lib", &root, None)
             .expect_err("one entry over the deployment ceiling must be refused");
         assert!(
             error.to_string().contains(&ceiling.to_string()),
@@ -995,10 +1052,10 @@ mod tests {
             )
             .expect("SKILL.md should be written");
         }
-        validate_skill_library("lib", &root)
+        validate_skill_library("lib", &root, None)
             .expect("skill dirs and their files exactly at the ceiling must validate");
         std::fs::write(root.join("extra.txt"), "extra").expect("extra entry should be created");
-        validate_skill_library("lib", &root)
+        validate_skill_library("lib", &root, None)
             .expect_err("one recursive entry over the ceiling must be refused");
         std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
     }
@@ -1018,7 +1075,7 @@ mod tests {
             .status()
             .expect("mkfifo should run");
         assert!(status.success(), "mkfifo failed: {status}");
-        let error = validate_skill_library("lib", &root)
+        let error = validate_skill_library("lib", &root, None)
             .expect_err("an unsupported entry must be refused before execution sees it");
         assert!(
             error.to_string().contains("unsupported"),
@@ -1038,7 +1095,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("library root should be created");
         std::os::unix::fs::symlink("nowhere", root.join("link"))
             .expect("symlink should be created");
-        let error = validate_skill_library("lib", &root)
+        let error = validate_skill_library("lib", &root, None)
             .expect_err("a symlink must be refused before execution sees it");
         assert!(
             error.to_string().contains("symbolic link"),
@@ -1068,9 +1125,9 @@ mod tests {
         )
         .expect("valid SKILL.md should be written");
 
-        validate_skill_library("lib", &root)
+        validate_skill_library("lib", &root, None)
             .expect("one malformed member must not invalidate the rest of the library");
-        let error = validate_skill_resource("strict", &broken)
+        let error = validate_skill_resource("strict", &broken, None)
             .expect_err("an explicit skill must reject the same malformed content");
         assert!(
             error.to_string().contains("frontmatter"),
@@ -1080,9 +1137,9 @@ mod tests {
         // A different content-format fault is isolated the same way.
         std::fs::write(broken.join("SKILL.md"), "---\nname: broken\n---\n")
             .expect("missing-description SKILL.md should be written");
-        validate_skill_library("lib", &root)
+        validate_skill_library("lib", &root, None)
             .expect("a missing description must also be isolated per member");
-        let error = validate_skill_resource("strict", &broken)
+        let error = validate_skill_resource("strict", &broken, None)
             .expect_err("an explicit skill must reject a missing description");
         assert!(
             error.to_string().contains("description"),
@@ -1103,8 +1160,148 @@ mod tests {
         std::fs::create_dir_all(&broken).expect("malformed skill directory should be created");
         std::fs::write(broken.join("SKILL.md"), [0xff, 0xfe])
             .expect("non-UTF-8 SKILL.md should be written");
-        let error = validate_skill_library("lib", &root)
+        let error = validate_skill_library("lib", &root, None)
             .expect_err("a non-UTF-8 SKILL.md is an I/O fault, not a content fault");
+        assert!(
+            error.to_string().contains("cannot read"),
+            "unexpected refusal: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    fn skill_resource_def(
+        kind: &str,
+        path: &str,
+        max_selected_bytes: Option<usize>,
+    ) -> ResourceDef {
+        let params = match max_selected_bytes {
+            Some(limit) => serde_json::json!({ "max_selected_bytes": limit }),
+            None => serde_json::json!({}),
+        };
+        serde_json::from_value(serde_json::json!({
+            "type": kind,
+            "path": path,
+            "params": params,
+        }))
+        .expect("test resource must deserialize")
+    }
+
+    fn admission_temp_root(label: &str) -> camino::Utf8PathBuf {
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-admission-{label}-{}", std::process::id())),
+        )
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("temporary root should be created");
+        root
+    }
+
+    fn budgeted_resources(
+        name: &str,
+        kind: &str,
+        path: &str,
+        limit: usize,
+    ) -> BTreeMap<String, ResourceDef> {
+        BTreeMap::from([(
+            name.to_string(),
+            skill_resource_def(kind, path, Some(limit)),
+        )])
+    }
+
+    #[test]
+    fn resource_selected_byte_limit_requires_a_positive_usize() {
+        let mut resource = skill_resource_def("skill", "skill", None);
+        assert_eq!(
+            resource_selected_byte_limit("demo", &resource).expect("absent param is unbounded"),
+            None
+        );
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(-1),
+            serde_json::json!(1.5),
+            serde_json::json!("128"),
+        ] {
+            resource
+                .params
+                .insert("max_selected_bytes".into(), invalid.clone());
+            let error = resource_selected_byte_limit("demo", &resource)
+                .expect_err("an invalid budget must be a hard contract error");
+            assert!(
+                error.to_string().contains("max_selected_bytes"),
+                "error must name the param: {error}"
+            );
+        }
+        resource
+            .params
+            .insert("max_selected_bytes".into(), serde_json::json!(128));
+        assert_eq!(
+            resource_selected_byte_limit("demo", &resource).expect("positive integer must pass"),
+            Some(128)
+        );
+    }
+
+    #[test]
+    fn admission_applies_selected_bytes_to_standalone_skill() {
+        let root = admission_temp_root("standalone-bytes");
+        let skill = root.join("skill");
+        std::fs::create_dir(&skill).expect("skill directory should be created");
+        let source = "---\nname: demo\ndescription: Demo.\n---\nBody.\n";
+        let skill_file = skill.join("SKILL.md");
+        std::fs::write(&skill_file, source).expect("SKILL.md should be written");
+        let len = source.len();
+
+        let exact = budgeted_resources("demo", "skill", "skill", len);
+        validate_resource_files(&root, &exact).expect("the exact byte count must validate");
+        let tight = budgeted_resources("demo", "skill", "skill", len - 1);
+        let error = validate_resource_files(&root, &tight)
+            .expect_err("one byte under the source length must be refused");
+        assert!(
+            error.to_string().contains("max_selected_bytes"),
+            "the error must name the configured budget: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn admission_applies_selected_bytes_to_library_members() {
+        let root = admission_temp_root("library-bytes");
+        let library = root.join("lib");
+        let member = library.join("alpha");
+        std::fs::create_dir_all(&member).expect("library member should be created");
+        let source = "---\nname: alpha\ndescription: Alpha.\n---\nBody.\n";
+        std::fs::write(member.join("SKILL.md"), source).expect("SKILL.md should be written");
+        let len = source.len();
+
+        let tight = budgeted_resources("lib", "skill_library", "lib", len - 1);
+        let error = validate_resource_files(&root, &tight)
+            .expect_err("an oversized library member must be refused");
+        assert!(
+            error.to_string().contains("max_selected_bytes"),
+            "the error must name the configured budget: {error}"
+        );
+        let exact = budgeted_resources("lib", "skill_library", "lib", len);
+        validate_resource_files(&root, &exact)
+            .expect("an exact-bound library member must validate");
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn admission_keeps_content_classification_out_of_the_bounded_reader() {
+        let root = admission_temp_root("content-faults");
+        let library = root.join("lib");
+        let member = library.join("alpha");
+        std::fs::create_dir_all(&member).expect("library member should be created");
+        let skill_file = member.join("SKILL.md");
+        let resources = budgeted_resources("lib", "skill_library", "lib", 1024);
+
+        std::fs::write(&skill_file, "plain markdown, no frontmatter\n")
+            .expect("readable malformed SKILL.md should be written");
+        validate_resource_files(&root, &resources)
+            .expect("content parsing stays with the engine, not admission");
+
+        std::fs::write(&skill_file, [0xff, 0xfe]).expect("non-UTF-8 SKILL.md should be written");
+        let error = validate_resource_files(&root, &resources)
+            .expect_err("non-UTF-8 SKILL.md remains a hard error");
         assert!(
             error.to_string().contains("cannot read"),
             "unexpected refusal: {error}"
