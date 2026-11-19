@@ -5,11 +5,15 @@ exports use the CLI-owned client in `src/http.rs`:
 
 - Each request has a **120-second total timeout**, including connection,
   redirects and response-body consumption (when consumed).
-- At most **three redirects** are followed. Every target must keep the initial
-  URL's host and userinfo (username and password); ports may change. Same-host
-  HTTP-to-HTTP, HTTP-to-HTTPS, and HTTPS-to-HTTPS redirects are allowed, including
-  across ports. Once any hop uses HTTPS, no later hop may use HTTP. Cross-host
-  redirects, HTTPS downgrades, and userinfo changes fail the command.
+- At most **three redirects** are followed, never to a URL already visited.
+  Same-host targets must keep the initial userinfo (username and password);
+  ports may change. Same-host HTTP-to-HTTP, HTTP-to-HTTPS, and HTTPS-to-HTTPS
+  redirects are allowed, including across ports. Cross-host redirects are
+  allowed only to credential-free HTTPS URLs: this client sends no credentials
+  or cookies, so a release URL can hand a download to a CDN. Once any hop uses
+  HTTPS, no later hop may use HTTP. HTTPS downgrades, cross-origin HTTP,
+  userinfo changes, non-HTTP(S) schemes, and loops fail the command with a
+  fixed `CLI redirect refused` error.
 - Remote registry indexes have a **16 MiB** cap, reusing
   `policy::DEFAULT_HTTP_BODY_LIMIT_BYTES`. Both advertised Content-Length and
   streamed bytes are checked before buffering beyond the cap. Local `file://`

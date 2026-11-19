@@ -1,15 +1,27 @@
 use reqwest::{Client, Url, redirect::Policy};
 
 const MAX_REDIRECTS: usize = 3;
+
+/// This client carries no credentials or cookies, so a release URL may hand a
+/// download off to a CDN: a credential-free HTTPS target on another host is
+/// safe to follow. Same-host targets keep the initial userinfo, and no hop may
+/// downgrade from HTTPS or revisit a URL.
 fn redirect_allowed(next: &Url, previous: &[Url]) -> bool {
-    previous.len() <= MAX_REDIRECTS
-        && previous.first().is_some_and(|initial| {
-            (next.host_str(), next.username(), next.password())
-                == (initial.host_str(), initial.username(), initial.password())
-                && (next.scheme() == "https"
-                    || next.scheme() == "http"
-                        && !previous.iter().any(|url| url.scheme() == "https"))
-        })
+    let Some(initial) = previous.first() else {
+        return false;
+    };
+    if previous.len() > MAX_REDIRECTS
+        || previous.contains(next)
+        || !matches!(next.scheme(), "http" | "https")
+        || (next.scheme() == "http" && previous.iter().any(|url| url.scheme() == "https"))
+    {
+        return false;
+    }
+    if next.host_str() == initial.host_str() {
+        (next.username(), next.password()) == (initial.username(), initial.password())
+    } else {
+        next.scheme() == "https" && next.username().is_empty() && next.password().is_none()
+    }
 }
 
 pub(crate) fn client() -> reqwest::Result<Client> {
@@ -44,84 +56,128 @@ pub(crate) async fn get(url: &str, limit: Option<u64>) -> anyhow::Result<Vec<u8>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::error::Error as _;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     #[test]
-    fn redirect_policy_preserves_host_and_userinfo_without_https_downgrades() {
-        for (initial, allowed, refused) in [
-            (
-                "http://registry.example/index.toml",
-                vec![
-                    "http://registry.example/next",
-                    "http://registry.example:8080/next",
-                    "https://registry.example/next",
-                    "https://registry.example:8443/next",
-                ],
-                vec![
-                    "http://other.example/next",
-                    "https://other.example/next",
-                    "https://user@registry.example/next",
-                    "ftp://registry.example/next",
-                ],
-            ),
-            (
-                "https://registry.example:8443/index.toml",
-                vec![
-                    "https://registry.example/next",
-                    "https://registry.example:9443/next",
-                ],
-                vec![
-                    "http://registry.example/next",
-                    "http://registry.example:8080/next",
-                    "https://other.example:8443/next",
-                    "https://user@registry.example:8443/next",
-                ],
-            ),
-            (
-                "http://user:password@registry.example/index.toml",
-                vec!["https://user:password@registry.example:8443/next"],
-                vec![
-                    "https://registry.example/next",
-                    "https://other:password@registry.example/next",
-                    "https://user:changed@registry.example/next",
-                    "https://user@registry.example/next",
-                ],
-            ),
+    fn redirect_policy_allows_cross_origin_https_without_credentials() {
+        let previous = [Url::parse("https://releases.example/archive.tar.gz").unwrap()];
+        for target in [
+            "https://cdn.example/archive.tar.gz",
+            "https://cdn.example:9443/archive.tar.gz",
+            "https://other.example/path?token=x",
         ] {
-            let previous = [Url::parse(initial).unwrap()];
-            for target in allowed {
-                assert!(
-                    redirect_allowed(&Url::parse(target).unwrap(), &previous),
-                    "{initial} -> {target}"
-                );
-            }
-            for target in refused {
-                assert!(
-                    !redirect_allowed(&Url::parse(target).unwrap(), &previous),
-                    "{initial} -> {target}"
-                );
-            }
+            assert!(
+                redirect_allowed(&Url::parse(target).unwrap(), &previous),
+                "{target}"
+            );
+        }
+        for target in [
+            "http://cdn.example/archive.tar.gz",
+            "https://user@cdn.example/archive.tar.gz",
+            "https://user:password@cdn.example/archive.tar.gz",
+            "ftp://cdn.example/archive.tar.gz",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                !redirect_allowed(&Url::parse(target).unwrap(), &previous),
+                "{target}"
+            );
         }
     }
 
     #[test]
-    fn redirect_policy_bounds_the_chain_and_remembers_https_upgrade() {
-        let http = Url::parse("http://registry.example/archive").unwrap();
-        let https = Url::parse("https://registry.example:8443/archive").unwrap();
-        let previous = [http.clone(), https.clone()];
-        assert!(redirect_allowed(&https, &previous));
-        assert!(!redirect_allowed(&http, &previous));
-        assert!(!redirect_allowed(&http, &[https.clone(), http.clone()]));
-        assert!(!redirect_allowed(&https, &[]));
+    fn redirect_policy_refuses_https_downgrade_on_every_hop() {
+        let http = Url::parse("http://releases.example/archive").unwrap();
+        let https = Url::parse("https://releases.example/archive").unwrap();
+        let cdn_http = Url::parse("http://cdn.example/archive").unwrap();
+        for target in [&http, &cdn_http] {
+            assert!(!redirect_allowed(target, std::slice::from_ref(&https)));
+            assert!(!redirect_allowed(target, &[http.clone(), https.clone()]));
+        }
+        // With no HTTPS anywhere in the chain, same-host plain HTTP still works.
         assert!(redirect_allowed(
-            &https,
-            &vec![https.clone(); MAX_REDIRECTS]
+            &Url::parse("http://releases.example:8080/archive").unwrap(),
+            std::slice::from_ref(&http)
         ));
-        assert!(!redirect_allowed(
-            &https,
-            &vec![https.clone(); MAX_REDIRECTS + 1]
+        assert!(redirect_allowed(&https, &[http]));
+    }
+
+    #[test]
+    fn redirect_policy_refuses_cross_origin_http_and_allows_https_upgrade() {
+        let http = Url::parse("http://127.0.0.1:8080/archive").unwrap();
+        for target in [
+            "http://127.0.0.2:8080/archive",
+            "http://other.example/archive",
+            "ftp://other.example/archive",
+        ] {
+            assert!(
+                !redirect_allowed(&Url::parse(target).unwrap(), std::slice::from_ref(&http)),
+                "{target}"
+            );
+        }
+        // An upgrade to HTTPS is allowed even when the host changes.
+        assert!(redirect_allowed(
+            &Url::parse("https://cdn.example/archive").unwrap(),
+            &[http]
         ));
+    }
+
+    #[test]
+    fn redirect_policy_keeps_same_host_userinfo_and_refuses_foreign_userinfo() {
+        let initial = Url::parse("http://user:password@releases.example/archive").unwrap();
+        assert!(redirect_allowed(
+            &Url::parse("https://user:password@releases.example:8443/archive").unwrap(),
+            std::slice::from_ref(&initial)
+        ));
+        for target in [
+            "https://releases.example/archive",
+            "https://other:password@releases.example/archive",
+            "https://user:changed@releases.example/archive",
+            "https://user@releases.example/archive",
+            "https://user:password@cdn.example/archive",
+        ] {
+            assert!(
+                !redirect_allowed(&Url::parse(target).unwrap(), std::slice::from_ref(&initial)),
+                "{target}"
+            );
+        }
+        // Dropping userinfo across hosts forwards nothing to the CDN.
+        assert!(redirect_allowed(
+            &Url::parse("https://cdn.example/archive").unwrap(),
+            &[initial]
+        ));
+    }
+
+    #[test]
+    fn redirect_policy_bounds_hops_and_refuses_visited_urls() {
+        let chain: Vec<Url> = (0..MAX_REDIRECTS)
+            .map(|hop| Url::parse(&format!("https://releases.example/{hop}")).unwrap())
+            .collect();
+        let next = Url::parse("https://releases.example/final").unwrap();
+        assert!(redirect_allowed(&next, &chain));
+        let mut over_budget = chain;
+        over_budget.push(next.clone());
+        assert!(!redirect_allowed(&next, &over_budget));
+
+        // A loop is refused well inside the hop budget.
+        let first = Url::parse("https://releases.example/archive").unwrap();
+        let cdn = Url::parse("https://cdn.example/archive").unwrap();
+        assert!(!redirect_allowed(&first, &[first.clone(), cdn.clone()]));
+        assert!(!redirect_allowed(&cdn, &[first.clone(), cdn.clone()]));
+        assert!(!redirect_allowed(&first, &[]));
+    }
+
+    // reqwest prefixes its own `Display` with the visited URL; the message
+    // supplied by the policy is the fixed, URL-free source error.
+    fn assert_fixed_redirect_error(error: &reqwest::Error) {
+        assert!(error.is_redirect(), "{error:#}");
+        assert_eq!(
+            error.source().map(ToString::to_string).as_deref(),
+            Some("CLI redirect refused"),
+            "{error:#}"
+        );
     }
 
     // A single bounded loopback response; no external server, TLS or DNS needed.
@@ -183,7 +239,7 @@ mod tests {
     async fn client_refuses_cross_host_redirect_instead_of_returning_success() {
         let (url, server) = serve("HTTP/1.1 302 Found\r\nLocation: http://localhost:1/other\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()).await;
         let error = client().unwrap().get(&url).send().await.unwrap_err();
-        assert!(error.is_redirect(), "{error:#}");
+        assert_fixed_redirect_error(&error);
         server.await.unwrap();
     }
 
@@ -201,24 +257,45 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_follows_same_host_redirects_but_bounds_a_loop() {
+    async fn client_refuses_a_redirect_to_a_visited_url() {
+        let (url, server) = serve(
+            "HTTP/1.1 302 Found\r\nLocation: /index.toml\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .into(),
+        )
+        .await;
+        let error = client().unwrap().get(&url).send().await.unwrap_err();
+        assert_fixed_redirect_error(&error);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn client_bounds_distinct_same_host_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/start", listener.local_addr().unwrap());
+        let url = format!("http://{}/hop-0", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             tokio::time::timeout(Duration::from_secs(5), async {
-            for _ in 0..=MAX_REDIRECTS {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                while !request.ends_with(b"\r\n\r\n") {
-                    request.push(socket.read_u8().await.unwrap());
-                    assert!(request.len() < 8192);
+                for hop in 0..=MAX_REDIRECTS {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                        assert!(request.len() < 8192);
+                    }
+                    let next = hop + 1;
+                    socket
+                        .write_all(
+                            format!("HTTP/1.1 302 Found\r\nLocation: /hop-{next}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                                .as_bytes(),
+                        )
+                        .await
+                        .unwrap();
                 }
-                socket.write_all(b"HTTP/1.1 302 Found\r\nLocation: /start\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await.unwrap();
-            }
-        }).await.unwrap();
+            })
+            .await
+            .unwrap();
         });
         let error = client().unwrap().get(&url).send().await.unwrap_err();
-        assert!(error.is_redirect(), "{error:#}");
+        assert_fixed_redirect_error(&error);
         server.await.unwrap();
     }
 }
