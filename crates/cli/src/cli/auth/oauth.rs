@@ -10,8 +10,12 @@ use serde::Deserialize;
 use std::{io, time::Duration};
 use url::Url;
 
-pub(super) const ISSUER: &str = "https://auth.openai.com";
-pub(super) const RESOURCE: &str = "https://api.openai.com/v1";
+// Shipped values live in policy; the alias keeps the fixed default visible to
+// the test that pins today's token-request wire format.
+#[cfg(test)]
+pub(super) use policy::DEFAULT_RESOURCE as RESOURCE;
+use policy::SubscriptionAuthConfig;
+
 const BODY_LIMIT: usize = 256 * 1024;
 
 fn refused() -> io::Error {
@@ -77,9 +81,10 @@ pub(super) struct Provider {
     pub(super) metadata: CoreProviderMetadata,
     pub(super) http: Http,
     revocation: Option<String>,
+    config: SubscriptionAuthConfig,
 }
 impl Provider {
-    pub(super) async fn discover(issuer: &str) -> Result<Self> {
+    pub(super) async fn discover(issuer: &str, config: &SubscriptionAuthConfig) -> Result<Self> {
         let http = Http::new(issuer)?;
         // Keep the library's discovery issuer checks and JWK parsing. Capture only the
         // optional RFC 7009 endpoint, which CoreProviderMetadata otherwise ignores.
@@ -123,6 +128,7 @@ impl Provider {
             metadata,
             http,
             revocation: revocation.into_inner().map_err(|_| refused())?,
+            config: config.clone(),
         })
     }
     pub(super) fn authorize(
@@ -138,21 +144,19 @@ impl Provider {
         )
         .set_redirect_uri(RedirectUrl::new(redirect.into())?);
         let (challenge, verifier) = PkceCodeChallenge::new_random_sha256();
-        let builder = client
+        let mut builder = client
             .authorize_url(
                 CoreAuthenticationFlow::AuthorizationCode,
                 CsrfToken::new_random,
                 Nonce::new_random,
             )
-            .add_scope(Scope::new("profile".into()))
-            .add_scope(Scope::new("email".into()))
-            .add_scope(Scope::new("offline_access".into()))
-            .add_scope(Scope::new("resource.invoke".into()))
-            .add_scope(Scope::new("chatgpt.tokens.use.direct".into()))
-            .add_extra_param("resource", RESOURCE)
+            .add_extra_param("resource", self.config.resource())
             .add_extra_param("ext_agent_host_id", host);
-        let builder = if client_id == "dynamic_agent_client" {
-            builder.add_extra_param("agent_name_hint", "qcg")
+        for scope in self.config.scopes() {
+            builder = builder.add_scope(Scope::new(scope));
+        }
+        let builder = if client_id == self.config.registration_client_id() {
+            builder.add_extra_param("agent_name_hint", self.config.client_id_hint())
         } else {
             builder
         };
@@ -181,7 +185,7 @@ impl Provider {
             .exchange_code(AuthorizationCode::new(code))
             .map_err(|_| anyhow::anyhow!("token endpoint unavailable"))?
             .set_pkce_verifier(verifier)
-            .add_extra_param("resource", RESOURCE)
+            .add_extra_param("resource", self.config.resource())
             .request_async(&|request| self.http.send(request))
             .await
             .map_err(|_| anyhow::anyhow!("code exchange failed (details redacted)"))
@@ -195,7 +199,7 @@ impl Provider {
         client
             .exchange_refresh_token(&RefreshToken::new(token.into()))
             .map_err(|_| anyhow::anyhow!("token endpoint unavailable"))?
-            .add_extra_param("resource", RESOURCE)
+            .add_extra_param("resource", self.config.resource())
             .request_async(&|request| self.http.send(request))
             .await
             .map_err(|_| anyhow::anyhow!("refresh failed; sign in again (details redacted)"))

@@ -1619,6 +1619,7 @@ fn query_rejects_credential_environment_placeholders() {
             public_mcp_server: None,
             catalog: None,
             operational_limits: None,
+            subscription_auth: None,
         }
         .validate()
         .expect_err("credential query interpolation must be rejected");
@@ -3955,6 +3956,34 @@ fn default_cache_controls_are_omitted_from_serialized_requests() {
     let explicit = serde_json::to_value(&explicit).expect("explicit controls should serialize");
     assert_eq!(explicit["cache_write"], "forbid");
     assert_eq!(explicit["cache_retention"], "extended");
+}
+
+#[test]
+fn subscription_auth_section_is_strict_and_keeps_shipped_defaults() {
+    let empty = ProvidersFile::parse("").expect("an empty registry must parse");
+    assert_eq!(empty.subscription_auth, None);
+    let file = ProvidersFile::parse(
+        "[subscription_auth]\nissuer = \"https://issuer.example\"\nresource = \"https://api.example/v1\"\nscopes = [\"custom.read\"]\nclient_id_hint = \"agent\"\n",
+    )
+    .expect("a configured subscription auth section must parse");
+    let config = file.subscription_auth.expect("section must be retained");
+    assert_eq!(config.issuer(), "https://issuer.example");
+    assert_eq!(config.resource(), "https://api.example/v1");
+    assert_eq!(config.scopes(), vec!["custom.read"]);
+    assert_eq!(config.client_id_hint(), "agent");
+    assert_eq!(
+        config.registration_client_id(),
+        policy::DEFAULT_REGISTRATION_CLIENT_ID
+    );
+
+    for source in [
+        "[subscription_auth]\nauthorization_endpoint = \"https://issuer.example/authorize\"\n",
+        "[subscription_auth]\nissuer = \"http://issuer.example\"\n",
+    ] {
+        let error =
+            ProvidersFile::parse(source).expect_err("refused section must fail the registry");
+        assert!(error.contains("invalid providers registry"), "{error}");
+    }
 }
 
 #[test]

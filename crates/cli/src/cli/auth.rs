@@ -5,8 +5,11 @@ mod tests;
 
 use super::args::AuthCommand;
 use anyhow::{Result, bail};
-use oauth::{ISSUER, Provider};
+use oauth::Provider;
 use openidconnect::{Nonce, OAuth2TokenResponse, core::CoreTokenResponse};
+#[cfg(test)]
+pub(super) use policy::DEFAULT_REGISTRATION_CLIENT_ID as REGISTRATION;
+use policy::SubscriptionAuthConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -17,7 +20,6 @@ use std::{
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const SERVICE: &str = "qcg.chatgpt.oauth";
-const REGISTRATION: &str = "dynamic_agent_client";
 const CALLBACK_PATH: &str = "/auth/callback";
 const CALLBACK_TIMEOUT: Duration = Duration::from_secs(300);
 const CREDENTIAL_LIMIT: usize = 512 * 1024;
@@ -195,9 +197,13 @@ fn account_key(label: &str) -> Result<String> {
         hex::encode(Sha256::digest(label.as_bytes()))
     ))
 }
-fn selected_id<'a>(selected: Option<&'a str>, issued: Option<&'a str>) -> Result<&'a str> {
+fn selected_id<'a>(
+    selected: Option<&'a str>,
+    issued: Option<&'a str>,
+    registration_id: &str,
+) -> Result<&'a str> {
     let valid =
-        |id: &str| !id.is_empty() && id != REGISTRATION && !id.chars().any(char::is_control);
+        |id: &str| !id.is_empty() && id != registration_id && !id.chars().any(char::is_control);
     if selected.is_some_and(|id| !valid(id)) || issued.is_some_and(|id| !valid(id)) {
         bail!("callback client binding failed");
     }
@@ -212,7 +218,7 @@ struct Callback {
     code: Result<String>,
     client_id: Option<String>,
 }
-fn parse_callback(target: &str, state: &str) -> Result<Callback> {
+fn parse_callback(target: &str, state: &str, expected_issuer: &str) -> Result<Callback> {
     let url = url::Url::parse(&format!("http://localhost{target}"))
         .map_err(|_| anyhow::anyhow!("invalid callback"))?;
     if !target.starts_with('/') || url.path() != CALLBACK_PATH || url.fragment().is_some() {
@@ -226,6 +232,16 @@ fn parse_callback(target: &str, state: &str) -> Result<Callback> {
         {
             bail!("duplicate callback field");
         }
+    }
+    // RFC 9207: when the authorization server supplies `iss`, it must be the
+    // configured issuer on both success and error callbacks. Absence keeps
+    // compatibility with providers that do not implement the extension; no
+    // other value is ever accepted or echoed.
+    if values
+        .get("iss")
+        .is_some_and(|actual| actual != expected_issuer)
+    {
+        bail!("callback issuer validation failed");
     }
     if values.get("state").map(String::as_str) != Some(state) {
         bail!("callback state validation failed");
@@ -245,7 +261,11 @@ fn parse_callback(target: &str, state: &str) -> Result<Callback> {
         client_id: values.remove("client_id"),
     })
 }
-async fn callback(listener: &tokio::net::TcpListener, state: &str) -> Result<Callback> {
+async fn callback(
+    listener: &tokio::net::TcpListener,
+    state: &str,
+    expected_issuer: &str,
+) -> Result<Callback> {
     tokio::time::timeout(CALLBACK_TIMEOUT, async {
         loop {
             let (mut socket, _) = listener.accept().await.map_err(|_| anyhow::anyhow!("callback receiver failed"))?;
@@ -259,7 +279,7 @@ async fn callback(listener: &tokio::net::TcpListener, state: &str) -> Result<Cal
                 let mut parts = text.lines().next().unwrap_or_default().split_whitespace();
                 if parts.next() != Some("GET") { bail!("invalid callback method"); }
                 let target = parts.next().ok_or_else(|| anyhow::anyhow!("invalid callback"))?;
-                parse_callback(target, state)
+                parse_callback(target, state, expected_issuer)
             }).await;
             let Ok(Ok(result)) = request else {
                 let _ = socket.write_all(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\nContent-Length: 0\r\n\r\n").await;
@@ -361,13 +381,14 @@ async fn refresh(
 async fn logout(
     store: &impl Store,
     issuer: Option<&str>,
+    config: &SubscriptionAuthConfig,
     current: Option<Credential>,
     forget: bool,
 ) -> Result<bool> {
     // Keep tokens available for retry if the process stops during revocation.
     // Regardless of the remote outcome, clear local tokens before returning.
     let confirmed = if let (Some(issuer), Some(current)) = (issuer, current) {
-        match Provider::discover(issuer).await {
+        match Provider::discover(issuer, config).await {
             Ok(provider) => {
                 let revoked = provider.revoke(&current.client_id, &current.refresh).await;
                 // A pending refresh may have consumed this token before saving
@@ -385,7 +406,15 @@ async fn logout(
     }
     Ok(confirmed)
 }
-pub(crate) async fn run(command: AuthCommand) -> Result<()> {
+fn subscription_auth(providers_path: Option<&camino::Utf8Path>) -> Result<SubscriptionAuthConfig> {
+    service::subscription_auth_config(providers_path)
+        .map_err(|error| anyhow::anyhow!("subscription auth configuration: {error}"))
+}
+
+pub(crate) async fn run(
+    command: AuthCommand,
+    providers_path: Option<&camino::Utf8Path>,
+) -> Result<()> {
     let (AuthCommand::Login { ref account }
     | AuthCommand::Status { ref account, .. }
     | AuthCommand::Logout { ref account, .. }) = command;
@@ -394,9 +423,21 @@ pub(crate) async fn run(command: AuthCommand) -> Result<()> {
     let _lock = lock(&dir, &key).await?;
     let store = Keyring::open(&key)?;
     if let AuthCommand::Logout { local, forget, .. } = command {
-        // A damaged record must not prevent local deletion.
+        // A damaged record or registry must not prevent local deletion.
         let current = store.load().ok().flatten();
-        let confirmed = logout(&store, (!local).then_some(ISSUER), current, forget).await?;
+        let config = if local {
+            SubscriptionAuthConfig::default()
+        } else {
+            subscription_auth(providers_path)?
+        };
+        let confirmed = logout(
+            &store,
+            (!local).then_some(config.issuer()),
+            &config,
+            current,
+            forget,
+        )
+        .await?;
         println!(
             "Local credentials cleared; account registration {}. Remote revocation {}.",
             if forget { "forgotten" } else { "retained" },
@@ -408,6 +449,7 @@ pub(crate) async fn run(command: AuthCommand) -> Result<()> {
         );
         return Ok(());
     }
+    let config = subscription_auth(providers_path)?;
     let current = store.load()?;
     let registration = store.load_registration()?;
     if let (Some(current), Some(registration)) = (&current, &registration)
@@ -422,21 +464,29 @@ pub(crate) async fn run(command: AuthCommand) -> Result<()> {
                 .await
                 .map_err(|_| anyhow::anyhow!("cannot bind sign-in callback on 127.0.0.1:1455"))?;
             let redirect = "http://localhost:1455/auth/callback";
-            let provider = Provider::discover(ISSUER).await?;
+            let provider = Provider::discover(config.issuer(), &config).await?;
             let selected = registration
                 .as_ref()
                 .map(|r| r.client_id.as_str())
                 .or_else(|| current.as_ref().map(|c| c.client_id.as_str()));
             if let Some(id) = selected {
-                selected_id(Some(id), None)?;
+                selected_id(Some(id), None, config.registration_client_id())?;
             }
-            let auth = provider.authorize(selected.unwrap_or(REGISTRATION), &host, redirect)?;
+            let auth = provider.authorize(
+                selected.unwrap_or_else(|| config.registration_client_id()),
+                &host,
+                redirect,
+            )?;
             // The only provider URL printed is one constructed locally. Tokens,
             // provider errors and callback URLs are never printed or logged.
             println!("Open this URL in your browser to sign in:\n{}", auth.url);
-            let response = callback(&listener, auth.state.secret()).await?;
+            let response = callback(&listener, auth.state.secret(), config.issuer()).await?;
             let code = response.code?;
-            let id = selected_id(selected, response.client_id.as_deref())?;
+            let id = selected_id(
+                selected,
+                response.client_id.as_deref(),
+                config.registration_client_id(),
+            )?;
             let tokens = provider.exchange(id, redirect, code, auth.verifier).await?;
             let saved = credential(&provider, id, &auth.nonce, tokens)?;
             let previous_subject = registration
@@ -472,7 +522,7 @@ pub(crate) async fn run(command: AuthCommand) -> Result<()> {
                     bail!("previous refresh unconfirmed; sign in again");
                 }
                 if current.expires <= now().saturating_add(60) {
-                    let provider = Provider::discover(ISSUER).await?;
+                    let provider = Provider::discover(config.issuer(), &config).await?;
                     current = refresh(&store, &provider, current).await?;
                 }
             }

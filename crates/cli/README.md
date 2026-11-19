@@ -44,6 +44,10 @@ openidconnect 4.0.1's HTTP interface (no library-default HTTP client), with a
 30-second request timeout, no redirects, same-issuer-origin endpoints and a
 256 KiB response-body bound enforced on advertised and streamed bytes.
 Callback requests have an 8 KiB bound and a five-second read timeout.
+`[subscription_auth]` in `providers.toml` can override the issuer, resource,
+scopes, registration client id and client-id hint; omitted keys keep the shipped
+values, and endpoint URLs remain discovered under the issuer's HTTPS origin.
+Callback `iss` values, when supplied, are checked against the same issuer.
 
 See [CLI authentication](../../docs/cli-reference.md#chatgpt-subscription-credentials-standalone)
 for explicit account selection, keyring persistence, callback, refresh and logout

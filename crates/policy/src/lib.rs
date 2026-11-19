@@ -33,6 +33,7 @@ pub mod retention;
 pub mod scheduling;
 pub mod schema;
 pub mod service;
+pub mod subscription_auth;
 pub mod tier;
 
 pub use audit::{
@@ -91,6 +92,10 @@ pub use schema::{
     compile_bounded_validator, validate_bounded_json_schema,
 };
 pub use service::{binary_stem, default_service_name};
+pub use subscription_auth::{
+    DEFAULT_CLIENT_ID_HINT, DEFAULT_ISSUER, DEFAULT_REGISTRATION_CLIENT_ID, DEFAULT_RESOURCE,
+    DEFAULT_SCOPES, SubscriptionAuthConfig,
+};
 pub use tier::{
     CostRates, CostTier, CostTierError, carry_pinned_rates, max_cost_rates, select_cost_tier,
     validate_cost_tiers,

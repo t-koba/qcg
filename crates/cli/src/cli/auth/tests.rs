@@ -203,7 +203,12 @@ impl Mock {
         }
     }
     async fn provider(&self) -> Provider {
-        Provider::discover(&self.issuer).await.unwrap()
+        self.provider_with_config(&SubscriptionAuthConfig::default())
+            .await
+    }
+
+    async fn provider_with_config(&self, config: &SubscriptionAuthConfig) -> Provider {
+        Provider::discover(&self.issuer, config).await.unwrap()
     }
     fn forms(&self, path: &str) -> Vec<std::collections::BTreeMap<String, String>> {
         self.state
@@ -280,13 +285,13 @@ async fn registration_callback_pkce_exchange_and_reauthorization() {
     });
     let callback = tokio::time::timeout(
         Duration::from_secs(5),
-        callback(&listener, auth.state.secret()),
+        callback(&listener, auth.state.secret(), policy::DEFAULT_ISSUER),
     )
     .await
     .unwrap()
     .unwrap();
     send.await.unwrap();
-    let issued = selected_id(None, callback.client_id.as_deref()).unwrap();
+    let issued = selected_id(None, callback.client_id.as_deref(), REGISTRATION).unwrap();
     mock.state.lock().unwrap().token = response(Some(claims(
         &mock.issuer,
         issued,
@@ -315,19 +320,19 @@ async fn registration_callback_pkce_exchange_and_reauthorization() {
     assert!(!reauth_query.contains_key("agent_name_hint"));
     assert_eq!(reauth_query["ext_agent_host_id"], "stable-host");
     assert_eq!(
-        selected_id(Some(&saved.client_id), None).unwrap(),
+        selected_id(Some(&saved.client_id), None, REGISTRATION).unwrap(),
         "issued-client"
     );
     assert_eq!(
-        selected_id(Some(&saved.client_id), Some("issued-client")).unwrap(),
+        selected_id(Some(&saved.client_id), Some("issued-client"), REGISTRATION).unwrap(),
         "issued-client"
     );
-    assert!(selected_id(Some(&saved.client_id), Some("mismatch")).is_err());
+    assert!(selected_id(Some(&saved.client_id), Some("mismatch"), REGISTRATION).is_err());
     for selected in ["", REGISTRATION, "bad\nclient"] {
-        assert!(selected_id(Some(selected), None).is_err());
+        assert!(selected_id(Some(selected), None, REGISTRATION).is_err());
     }
     assert_eq!(
-        selected_id(None, Some("opaque:/id+")).unwrap(),
+        selected_id(None, Some("opaque:/id+"), REGISTRATION).unwrap(),
         "opaque:/id+"
     );
     for issued in [
@@ -336,7 +341,7 @@ async fn registration_callback_pkce_exchange_and_reauthorization() {
         Some(REGISTRATION),
         Some("private-provider-text\n"),
     ] {
-        assert!(selected_id(None, issued).is_err());
+        assert!(selected_id(None, issued, REGISTRATION).is_err());
     }
 }
 
@@ -349,15 +354,61 @@ fn callback_rejects_state_duplicates_errors_and_unsafe_paths_without_echo() {
         "/other?state=test&code=secret-code",
         "/auth/callback?state=test&code=secret-code#private-provider-text",
     ] {
-        redacted(parse_callback(target, "test").err().unwrap());
+        redacted(
+            parse_callback(target, "test", policy::DEFAULT_ISSUER)
+                .err()
+                .unwrap(),
+        );
     }
     for target in [
         "/auth/callback?state=test&error=access_denied&error_description=private-provider-text",
         "/auth/callback?state=test",
     ] {
-        redacted(parse_callback(target, "test").unwrap().code.err().unwrap());
+        redacted(
+            parse_callback(target, "test", policy::DEFAULT_ISSUER)
+                .unwrap()
+                .code
+                .err()
+                .unwrap(),
+        );
     }
-    assert!(parse_callback("/auth/callback?state=test&code=secret-code", "test").is_ok());
+    assert!(
+        parse_callback(
+            "/auth/callback?state=test&code=secret-code",
+            "test",
+            policy::DEFAULT_ISSUER
+        )
+        .is_ok()
+    );
+}
+
+#[test]
+fn callback_refuses_a_foreign_issuer_on_success_and_error_without_echo() {
+    let target = |iss: &str, extra: &str| {
+        format!("/auth/callback?state=test&iss={iss}&code=secret-code{extra}")
+    };
+    for extra in ["", "&error=access_denied"] {
+        let error = parse_callback(
+            &target("https%3A%2F%2Fevil.example", extra),
+            "test",
+            policy::DEFAULT_ISSUER,
+        )
+        .err()
+        .unwrap();
+        assert_eq!(error.to_string(), "callback issuer validation failed");
+        redacted(error);
+    }
+    let callback = parse_callback(
+        &target(
+            &url::form_urlencoded::byte_serialize(policy::DEFAULT_ISSUER.as_bytes())
+                .collect::<String>(),
+            "",
+        ),
+        "test",
+        policy::DEFAULT_ISSUER,
+    )
+    .unwrap();
+    assert_eq!(callback.code.unwrap(), "secret-code");
 }
 
 #[tokio::test]
@@ -553,6 +604,7 @@ async fn lock_and_reread_serialize_refresh_and_skip_unexpired_credentials() {
 #[tokio::test]
 async fn logout_success_failure_and_local_only_always_clear_locally() {
     let mock = Mock::new().await;
+    let config = SubscriptionAuthConfig::default();
     for status in [200, 400, 500] {
         mock.state.lock().unwrap().revoke_status = status;
         let start = mock.state.lock().unwrap().requests.len();
@@ -560,9 +612,15 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
         store.clear_after_revoke_since = Some((mock.state.clone(), start));
         let registration = store.load_registration().unwrap();
         assert_eq!(
-            logout(&store, Some(&mock.issuer), store.load().unwrap(), false)
-                .await
-                .unwrap(),
+            logout(
+                &store,
+                Some(&mock.issuer),
+                &config,
+                store.load().unwrap(),
+                false
+            )
+            .await
+            .unwrap(),
             status == 200
         );
         assert!(store.load().unwrap().is_none());
@@ -580,16 +638,22 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
     let mut store = Memory::new(Some(ambiguous));
     store.clear_after_revoke_since = Some((mock.state.clone(), start));
     assert!(
-        !logout(&store, Some(&mock.issuer), store.load().unwrap(), false)
-            .await
-            .unwrap()
+        !logout(
+            &store,
+            Some(&mock.issuer),
+            &config,
+            store.load().unwrap(),
+            false
+        )
+        .await
+        .unwrap()
     );
     assert!(store.load().unwrap().is_none());
 
     let before = mock.state.lock().unwrap().requests.len();
     let store = Memory::new(Some(expired()));
     assert!(
-        !logout(&store, None, store.load().unwrap(), false)
+        !logout(&store, None, &config, store.load().unwrap(), false)
             .await
             .unwrap()
     );
@@ -606,9 +670,15 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
     let before = mock.forms("/revoke").len();
     let store = Memory::new(Some(expired()));
     assert!(
-        !logout(&store, Some(&mock.issuer), store.load().unwrap(), false)
-            .await
-            .unwrap()
+        !logout(
+            &store,
+            Some(&mock.issuer),
+            &config,
+            store.load().unwrap(),
+            false
+        )
+        .await
+        .unwrap()
     );
     assert!(store.load().unwrap().is_none());
     assert_eq!(mock.forms("/revoke").len(), before);
@@ -616,9 +686,15 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
     mock.state.lock().unwrap().metadata["issuer"] = json!("https://evil.example");
     let store = Memory::new(Some(expired()));
     assert!(
-        !logout(&store, Some(&mock.issuer), store.load().unwrap(), false)
-            .await
-            .unwrap()
+        !logout(
+            &store,
+            Some(&mock.issuer),
+            &config,
+            store.load().unwrap(),
+            false
+        )
+        .await
+        .unwrap()
     );
     assert!(store.load().unwrap().is_none());
     for form in mock.forms("/revoke") {
@@ -629,7 +705,7 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
     let store = Memory::new(Some(expired()));
     let before = store.load_registration().unwrap().unwrap();
     assert!(
-        !logout(&store, None, store.load().unwrap(), false)
+        !logout(&store, None, &config, store.load().unwrap(), false)
             .await
             .unwrap()
     );
@@ -649,7 +725,7 @@ async fn logout_success_failure_and_local_only_always_clear_locally() {
     let query: std::collections::BTreeMap<_, _> = reauth.url.query_pairs().into_owned().collect();
     assert_eq!(query["client_id"], retained.client_id);
     assert!(!query.contains_key("agent_name_hint"));
-    assert!(!logout(&store, None, None, true).await.unwrap());
+    assert!(!logout(&store, None, &config, None, true).await.unwrap());
     assert!(store.load().unwrap().is_none());
     assert!(store.load_registration().unwrap().is_none());
 }
@@ -672,7 +748,12 @@ async fn bounded_http_refuses_oversized_streams_redirects_and_foreign_origins() 
         .unwrap();
     redacted(provider.http.send(request).await.err().unwrap().into());
     mock.state.lock().unwrap().metadata["issuer"] = json!("https://evil.example");
-    redacted(Provider::discover(&mock.issuer).await.err().unwrap());
+    redacted(
+        Provider::discover(&mock.issuer, &SubscriptionAuthConfig::default())
+            .await
+            .err()
+            .unwrap(),
+    );
 }
 
 #[test]
@@ -768,4 +849,123 @@ async fn lock_is_cross_process_and_released_on_close() {
     }
     assert!(dir.join("acquired").exists());
     std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn configured_subscription_auth_values_are_used_on_the_wire() {
+    let mock = Mock::new().await;
+    let config = SubscriptionAuthConfig {
+        issuer: Some(mock.issuer.clone()),
+        resource: Some("https://resource.example/v9".into()),
+        scopes: Some(vec!["custom.one".into(), "custom.two".into()]),
+        registration_client_id: Some("custom-registration".into()),
+        client_id_hint: Some("custom-agent".into()),
+    };
+    // Discovery follows the configured issuer, never the resource or a
+    // resource-rooted fallback. The loopback mock stands in for its HTTPS host.
+    let provider = Provider::discover(config.issuer(), &config).await.unwrap();
+    let redirect = "http://localhost:1455/auth/callback";
+    let auth = provider
+        .authorize(config.registration_client_id(), "stable-host", redirect)
+        .unwrap();
+    let query: std::collections::BTreeMap<_, _> = auth.url.query_pairs().into_owned().collect();
+    assert_eq!(query["client_id"], "custom-registration");
+    assert_eq!(query["resource"], "https://resource.example/v9");
+    assert_eq!(query["agent_name_hint"], "custom-agent");
+    assert_eq!(query["redirect_uri"], redirect);
+    let scopes: Vec<_> = query["scope"].split_whitespace().collect();
+    assert!(scopes.contains(&"custom.one") && scopes.contains(&"custom.two"));
+    assert!(!scopes.iter().any(|scope| scope.starts_with("chatgpt.")));
+    assert!(scopes.contains(&"openid"));
+    assert!(
+        selected_id(
+            Some("custom-registration"),
+            None,
+            config.registration_client_id()
+        )
+        .is_err()
+            && selected_id(Some(REGISTRATION), None, config.registration_client_id()).is_ok()
+    );
+
+    provider
+        .exchange("issued-client", redirect, "code".into(), auth.verifier)
+        .await
+        .unwrap();
+    provider
+        .refresh("issued-client", "old-refresh")
+        .await
+        .unwrap();
+    let forms = mock.forms("/token");
+    assert_eq!(forms.len(), 2);
+    assert_eq!(forms[0]["grant_type"], "authorization_code");
+    assert_eq!(forms[0]["redirect_uri"], redirect);
+    assert_eq!(forms[1]["grant_type"], "refresh_token");
+    for form in forms {
+        assert_eq!(form["resource"], "https://resource.example/v9");
+    }
+}
+
+#[tokio::test]
+async fn discovery_refuses_changed_issuer_and_cross_origin_endpoints() {
+    let mock = Mock::new().await;
+    let config = SubscriptionAuthConfig::default();
+    mock.state.lock().unwrap().metadata["authorization_endpoint"] =
+        json!("https://evil.example/authorize");
+    let error = Provider::discover(&mock.issuer, &config)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("authorization endpoint refused"),
+        "{error:#}"
+    );
+
+    mock.state.lock().unwrap().metadata["authorization_endpoint"] =
+        json!(format!("{}/authorize", mock.issuer));
+    mock.state.lock().unwrap().metadata["token_endpoint"] = json!("https://evil.example/token");
+    let provider = Provider::discover(&mock.issuer, &config).await.unwrap();
+    redacted(
+        provider
+            .refresh("issued-client", "old-refresh")
+            .await
+            .err()
+            .unwrap(),
+    );
+
+    mock.state.lock().unwrap().metadata["issuer"] = json!("https://evil.example");
+    let error = Provider::discover(&mock.issuer, &config)
+        .await
+        .err()
+        .unwrap();
+    assert!(
+        format!("{error:#}").contains("OIDC discovery failed"),
+        "{error:#}"
+    );
+}
+
+#[test]
+fn subscription_auth_is_loaded_strictly_from_the_registry() {
+    let dir = std::env::temp_dir().join(format!("qcg-auth-config-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&dir).unwrap();
+    let path = dir.join("providers.toml");
+    let utf8 = camino::Utf8Path::from_path(&path).unwrap();
+    std::fs::write(
+        &path,
+        "[subscription_auth]\nissuer = \"https://issuer.example\"\nclient_id_hint = \"agent\"\n",
+    )
+    .unwrap();
+    let config = service::subscription_auth_config(Some(utf8)).unwrap();
+    assert_eq!(config.issuer(), "https://issuer.example");
+    assert_eq!(config.client_id_hint(), "agent");
+    assert_eq!(config.resource(), oauth::RESOURCE);
+
+    std::fs::write(&path, "[subscription_auth]\nunknown_key = 1\n").unwrap();
+    assert!(service::subscription_auth_config(Some(utf8)).is_err());
+    std::fs::write(
+        &path,
+        "[subscription_auth]\nissuer = \"http://issuer.example\"\n",
+    )
+    .unwrap();
+    assert!(service::subscription_auth_config(Some(utf8)).is_err());
+    std::fs::remove_dir_all(&dir).unwrap();
 }

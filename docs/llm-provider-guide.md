@@ -268,6 +268,25 @@ Fields:
   describe transport mechanisms; generator and node policy never belongs in
   this registry.
 
+## Standalone subscription auth
+
+The same registry carries the OIDC inputs of `qcg auth`, independent of
+generator execution:
+
+```toml
+[subscription_auth]
+issuer = "https://auth.openai.com"
+resource = "https://api.openai.com/v1"
+scopes = ["profile", "email", "offline_access", "resource.invoke", "chatgpt.tokens.use.direct"]
+registration_client_id = "dynamic_agent_client"
+client_id_hint = "qcg"
+```
+
+Every key is optional and the values shown are the shipped defaults. Unknown
+keys are refused. Only the issuer may select an authorization server: its HTTPS
+origin anchors discovery and every token/revocation request, and no endpoint
+URL is a registry field.
+
 ## Operational limits
 
 The same registry carries the deployment ceilings for the nine operational

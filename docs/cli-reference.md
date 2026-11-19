@@ -354,6 +354,31 @@ not interpret the provider's `earliest_refresh_at` extension. Refresh ID tokens,
 present, are validated; an omitted nonce is allowed only on refresh, and a nonce
 that is present must match the original sign-in.
 
+All three commands resolve the same `[subscription_auth]` section of
+`providers.toml` (or the shipped defaults when it is absent):
+
+```toml
+[subscription_auth]
+issuer = "https://auth.openai.com"
+resource = "https://api.openai.com/v1"
+scopes = ["profile", "email", "offline_access", "resource.invoke", "chatgpt.tokens.use.direct"]
+registration_client_id = "dynamic_agent_client"
+client_id_hint = "qcg"
+```
+
+Every key is optional; the values above are today's defaults and are used
+byte-for-byte when a key is omitted. `client_id_hint` is sent as
+`agent_name_hint` on first registration, and `registration_client_id` is the
+client id reserved for that registration. Changing the section changes future
+requests, not stored credentials; use a different account label for a different
+issuer. Discovery always starts at the configured issuer's
+`/.well-known/openid-configuration`; `resource` is never used to derive an
+endpoint. HTTPS-only issuer and resource, issuer self-attestation, same-origin
+request checks, no redirects, exact redirect URI, discovery/token bounds and
+OIDC signature validation and RFC 9207 `iss` checking on both callback paths
+(when the provider supplies `iss`) are not configurable; unknown keys,
+non-HTTPS URLs and unbounded values refuse registry parsing.
+
 Opaque credential records and the stable host ID live only in the OS keyring
 (service `qcg.chatgpt.oauth`). A locked or unavailable keyring fails closed; there
 is no plaintext or in-memory fallback. Non-secret advisory lock files live under

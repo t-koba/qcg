@@ -182,23 +182,26 @@ impl LlmRouter {
     }
 
     pub fn from_file(path: &Utf8Path) -> Result<Self, RegistryError> {
-        let read_error = |source| RegistryError::Read {
-            path: path.to_path_buf(),
-            source,
-        };
-        let mut file = File::open(path).map_err(read_error)?;
-        let metadata = file.metadata().map_err(read_error)?;
-        if !metadata.is_file() {
-            return Err(RegistryError::Invalid {
-                message: format!("providers registry `{path}` is not a regular file"),
-            });
-        }
-        let mut bytes = Vec::new();
-        file.by_ref().read_to_end(&mut bytes).map_err(read_error)?;
-        let text = String::from_utf8(bytes).map_err(|error| RegistryError::Invalid {
-            message: format!("providers registry `{path}` is not valid UTF-8: {error}"),
-        })?;
+        let text = read_registry_text(path)?;
         Self::from_str_at(&text, path)
+    }
+
+    /// Reads the standalone subscription OIDC inputs from the same registry
+    /// runs use. A missing registry means all shipped defaults. Parsing checks
+    /// the whole file but installs no operational limits and builds no runtime:
+    /// login and logout only need this one section.
+    pub fn subscription_auth_config(
+        explicit: Option<&Utf8Path>,
+    ) -> Result<policy::SubscriptionAuthConfig, RegistryError> {
+        let Some(path) = optional_registry_path(explicit)? else {
+            return Ok(policy::SubscriptionAuthConfig::default());
+        };
+        let text = read_registry_text(&path)?;
+        let file = ProvidersFile::parse(&text).map_err(|message| RegistryError::Parse {
+            path: path.clone(),
+            message,
+        })?;
+        Ok(file.subscription_auth.unwrap_or_default())
     }
 
     pub fn parse_text(text: &str) -> Result<Self, RegistryError> {
@@ -454,6 +457,46 @@ impl LlmProvider for LlmRouter {
 /// Buffer between the provider's stream and the consumer while a
 /// pre-first-delta retry is still possible.
 const STREAM_PROXY_CAPACITY: usize = 64;
+
+fn read_registry_text(path: &Utf8Path) -> Result<String, RegistryError> {
+    let read_error = |source| RegistryError::Read {
+        path: path.to_path_buf(),
+        source,
+    };
+    let mut file = File::open(path).map_err(read_error)?;
+    let metadata = file.metadata().map_err(read_error)?;
+    if !metadata.is_file() {
+        return Err(RegistryError::Invalid {
+            message: format!("providers registry `{path}` is not a regular file"),
+        });
+    }
+    let mut bytes = Vec::new();
+    file.by_ref().read_to_end(&mut bytes).map_err(read_error)?;
+    String::from_utf8(bytes).map_err(|error| RegistryError::Invalid {
+        message: format!("providers registry `{path}` is not valid UTF-8: {error}"),
+    })
+}
+
+/// Same resolution as `load_optional`, without loading an LLM runtime.
+fn optional_registry_path(
+    explicit: Option<&Utf8Path>,
+) -> Result<Option<Utf8PathBuf>, RegistryError> {
+    if let Some(path) = explicit {
+        return Ok(Some(path.to_owned()));
+    }
+    if let Some(env_path) = std::env::var_os("PROVIDERS") {
+        let path =
+            Utf8PathBuf::from_path_buf(std::path::PathBuf::from(&env_path)).map_err(|_| {
+                RegistryError::Invalid {
+                    message: format!("`PROVIDERS` is not valid UTF-8: {env_path:?}"),
+                }
+            })?;
+        return Ok(Some(path));
+    }
+    Ok(candidate_paths(false)
+        .into_iter()
+        .find(|path| path.is_file()))
+}
 
 fn candidate_paths(include_env: bool) -> Vec<Utf8PathBuf> {
     let mut candidates = Vec::new();

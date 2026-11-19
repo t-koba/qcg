@@ -1010,6 +1010,10 @@ pub struct ProvidersFile {
     /// Optional deployment ceilings for the shared operational limits.
     #[serde(default)]
     pub operational_limits: Option<policy::OperationalLimits>,
+    /// Standalone subscription OIDC inputs. Absent keeps the shipped values;
+    /// endpoint URLs stay derived from `issuer` by issuer-anchored discovery.
+    #[serde(default)]
+    pub subscription_auth: Option<policy::SubscriptionAuthConfig>,
 }
 
 impl ProvidersFile {
@@ -1026,6 +1030,10 @@ impl ProvidersFile {
         }
         if let Some(limits) = &self.operational_limits {
             limits.validate()?;
+        }
+        if let Some(auth) = &self.subscription_auth {
+            auth.validate()
+                .map_err(|error| format!("invalid providers registry: {error}"))?;
         }
         let mut seen = BTreeMap::new();
         for spec in &self.provider {

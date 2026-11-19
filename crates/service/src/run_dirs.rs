@@ -2760,6 +2760,16 @@ pub fn preload_operational_limits(providers_path: Option<&Utf8Path>) -> Result<(
         .map_err(|error| ServiceError::Invalid(error.to_string()))
 }
 
+/// Resolves the standalone subscription OIDC inputs for `qcg auth`. Missing
+/// registry means shipped defaults; a present but invalid section refuses the
+/// operation through the registry's strict parser.
+pub fn subscription_auth_config(
+    providers_path: Option<&Utf8Path>,
+) -> Result<policy::SubscriptionAuthConfig, ServiceError> {
+    llm::LlmRouter::subscription_auth_config(providers_path)
+        .map_err(|error| ServiceError::Invalid(error.to_string()))
+}
+
 pub fn load_llm_runtime(
     providers_path: Option<&Utf8Path>,
 ) -> Result<Arc<llm::LlmRuntime>, ServiceError> {
