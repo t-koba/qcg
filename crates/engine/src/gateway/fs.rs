@@ -439,7 +439,8 @@ impl FsGateway {
 
     /// Opens a diagnostic input below a separately source-bound root, using
     /// the same no-follow handle walk as workspace diagnostics. Non-Unix
-    /// builds refuse because they lack this handle-relative guarantee.
+    /// builds use the documented best-effort canonicalize-and-containment
+    /// fallback (E13); callers still verify the file's digest.
     pub(crate) fn open_diagnostic_read_under_root(
         root: &Utf8Path,
         path: &str,
@@ -461,9 +462,51 @@ impl FsGateway {
         }
         #[cfg(not(unix))]
         {
-            let _ = (root, path);
-            Err(std::io::Error::other("no handle-relative diagnostic read on this platform").into())
+            let target = Self::resolve_diagnostic_read(root, path)?;
+            std::fs::File::open(target).map_err(GatewayError::Io)
         }
+    }
+
+    /// Best-effort diagnostic path resolution for platforms without
+    /// handle-relative opens (E13). Path spelling is validated before
+    /// resolution, the target is canonicalized and must stay below the
+    /// canonical root, and a missing leaf remains a NotFound so callers can
+    /// distinguish absence from an I/O failure. Unlike the Unix handle walk
+    /// this cannot close the resolve/open race; callers verify content.
+    #[cfg_attr(unix, allow(dead_code))]
+    fn resolve_diagnostic_read(root: &Utf8Path, path: &str) -> Result<Utf8PathBuf, GatewayError> {
+        let denied = || GatewayError::PathDenied {
+            path: Utf8PathBuf::from(path),
+            workspace: root.to_path_buf(),
+        };
+        let relative = Utf8Path::new(path);
+        if path.contains('\0')
+            || path.contains('\\')
+            || relative.is_absolute()
+            || path.split('/').any(|part| part.is_empty())
+            || relative
+                .components()
+                .any(|component| !matches!(component, camino::Utf8Component::Normal(_)))
+        {
+            return Err(denied());
+        }
+        let root = dunce::canonicalize(root).map_err(|_| denied())?;
+        if !root.is_dir() {
+            return Err(denied());
+        }
+        let root = Utf8PathBuf::from_path_buf(root).map_err(|_| denied())?;
+        let target = dunce::canonicalize(root.join(relative)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                GatewayError::Io(error)
+            } else {
+                denied()
+            }
+        })?;
+        let target = Utf8PathBuf::from_path_buf(target).map_err(|_| denied())?;
+        if !target.starts_with(&root) {
+            return Err(denied());
+        }
+        Ok(target)
     }
 
     pub fn resolve_read(&self, path: &str) -> Result<Utf8PathBuf, GatewayError> {
@@ -1982,6 +2025,80 @@ mod commit_fence_tests {
             worker.is_revoked(),
             "the worker clone must observe the outer revoke"
         );
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_read_tests {
+    use super::super::error::GatewayError;
+    use super::FsGateway;
+    use camino::Utf8PathBuf;
+
+    #[test]
+    fn resolution_accepts_a_contained_file() {
+        let dir = crate::test_support::TestDir::create("diagnostic-read-ok");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("nested/file.txt"), b"{}").unwrap();
+        let expected =
+            Utf8PathBuf::from_path_buf(dunce::canonicalize(root.join("nested/file.txt")).unwrap())
+                .unwrap();
+        assert_eq!(
+            FsGateway::resolve_diagnostic_read(&root, "nested/file.txt").unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn resolution_refuses_escaping_and_aliased_paths() {
+        let dir = crate::test_support::TestDir::create("diagnostic-read-deny");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        std::fs::create_dir_all(root.join("nested")).unwrap();
+        std::fs::write(root.join("outside.txt"), b"x").unwrap();
+        for path in [
+            "../outside.txt",
+            "nested/../../outside.txt",
+            "/etc/passwd",
+            "nested\\file.txt",
+            "nested//file.txt",
+            "./nested/file.txt",
+        ] {
+            assert!(
+                matches!(
+                    FsGateway::resolve_diagnostic_read(&root, path),
+                    Err(GatewayError::PathDenied { .. })
+                ),
+                "{path} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_keeps_a_missing_leaf_distinct() {
+        let dir = crate::test_support::TestDir::create("diagnostic-read-missing");
+        let root = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        assert!(matches!(
+            FsGateway::resolve_diagnostic_read(&root, "absent.txt"),
+            Err(GatewayError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolution_refuses_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let dir = crate::test_support::TestDir::create("diagnostic-read-link");
+        let base = Utf8PathBuf::from_path_buf(dir.path().to_owned()).unwrap();
+        let root = base.join("inner");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(base.join("outer")).unwrap();
+        std::fs::write(base.join("outer/outside.txt"), b"x").unwrap();
+        symlink("../outer/outside.txt", root.join("link.txt")).unwrap();
+        assert!(matches!(
+            FsGateway::resolve_diagnostic_read(&root, "link.txt"),
+            Err(GatewayError::PathDenied { .. })
+        ));
     }
 }
 
