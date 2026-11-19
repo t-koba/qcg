@@ -989,6 +989,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn skill_library_validation_refuses_unsupported_entries_like_execution() {
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-skill-library-fifo-{}", std::process::id())),
+        )
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        let fifo = root.join("pipe");
+        let status = std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should run");
+        assert!(status.success(), "mkfifo failed: {status}");
+        let error = validate_skill_library("lib", &root)
+            .expect_err("an unsupported entry must be refused before execution sees it");
+        assert!(
+            error.to_string().contains("unsupported"),
+            "unexpected refusal: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn skill_library_validation_refuses_symlinks_like_execution() {
         let root = camino::Utf8PathBuf::from_path_buf(
             std::env::temp_dir().join(format!("qcg-skill-library-symlink-{}", std::process::id())),
