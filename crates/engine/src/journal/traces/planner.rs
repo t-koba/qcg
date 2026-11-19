@@ -906,6 +906,29 @@ fn supported_state(state: &RunState, contract: &Contract) -> Result<(), Refusal>
     Ok(())
 }
 
+/// Validate the durable elapsed evidence for the source's budget mode.
+///
+/// ActiveExecution runs carry a closed active ledger. WallClock runs carry no
+/// ledger at all: their exact consumption is the durable `started_at` anchor,
+/// which the reset child inherits, so `wall_elapsed` charges the same window
+/// to the child. Never accept a ledger in a mode that cannot produce one, or
+/// an unanchored WallClock source whose consumption cannot be inherited.
+fn exact_elapsed(budget: &BudgetState) -> bool {
+    match budget.elapsed_budget_mode {
+        policy::ElapsedBudgetMode::ActiveExecution => budget
+            .elapsed
+            .as_ref()
+            .is_some_and(|elapsed| elapsed.active_started_at.is_none()),
+        policy::ElapsedBudgetMode::WallClock => {
+            budget.elapsed.is_none()
+                && budget
+                    .started_at
+                    .as_deref()
+                    .is_some_and(|started| chrono::DateTime::parse_from_rfc3339(started).is_ok())
+        }
+    }
+}
+
 fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
     if budget.legacy_budget_resume_pending
         || budget.legacy_step_budget_unknown
@@ -915,11 +938,7 @@ fn exact_budget(budget: &BudgetState) -> Result<(), Refusal> {
         || budget.step_budget_seed.is_none()
         || budget.step_budget_charged_at_seed.is_none()
         || budget.step_budget_consumed().is_err()
-        || budget.elapsed_budget_mode != policy::ElapsedBudgetMode::ActiveExecution
-        || budget
-            .elapsed
-            .as_ref()
-            .is_none_or(|elapsed| elapsed.active_started_at.is_some())
+        || !exact_elapsed(budget)
         || budget.repair_attempts != 0
         || budget.regenerate_attempts != 0
         || budget.llm_calls != 0

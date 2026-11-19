@@ -207,9 +207,12 @@ JSON event output go to stdout.
   the sealed source journal, dependency traces, executor declarations and
   complete read-only evidence. Any ineligible or unproven source is refused
   with one fixed redacted reason and a nonzero exit; no path, value or I/O
-  detail is printed. Sources whose journal does not satisfy the private
-  source-history proof (including service-owned active-execution journals)
-  currently fail closed. `--json` prints `{"child_run_id": "..."}` on success.
+  detail is printed. Both elapsed-budget modes are eligible when their
+  evidence is exact: ActiveExecution sources need a closed active ledger,
+  and WallClock sources (the product default) need a valid durable budget
+  start that the child inherits so the same elapsed window is charged.
+  Sources without that proof fail closed. `--json` prints
+  `{"child_run_id": "..."}` on success.
 - `qcg runs invalidate <id> --reason "..." --actor-label "..."
   [--runs-dir dir] [--json]` irreversibly invalidates a durably successful
   run's result without changing its execution status or journal. Both strings

@@ -2548,3 +2548,52 @@ async fn public_entry_refuses_a_changed_executor_declaration() {
         ContinuationRefusal::Executor
     );
 }
+
+#[test]
+fn exact_elapsed_accepts_only_mode_consistent_durable_evidence() {
+    let closed = || api::ElapsedAccountedEventData {
+        active_nanoseconds: 0,
+        active_started_at: None,
+    };
+    let mut budget = BudgetState {
+        elapsed_budget_mode: policy::ElapsedBudgetMode::ActiveExecution,
+        elapsed: Some(closed()),
+        started_at: Some("2026-01-01T00:00:00Z".into()),
+        ..Default::default()
+    };
+    assert!(exact_elapsed(&budget));
+
+    budget.elapsed.as_mut().unwrap().active_started_at = Some("2026-01-01T00:00:01Z".into());
+    assert!(
+        !exact_elapsed(&budget),
+        "an open active ledger is not exact"
+    );
+
+    budget.elapsed = None;
+    assert!(
+        !exact_elapsed(&budget),
+        "ActiveExecution must have a closed ledger"
+    );
+
+    budget.elapsed_budget_mode = policy::ElapsedBudgetMode::WallClock;
+    assert!(
+        exact_elapsed(&budget),
+        "an anchored ledgerless WallClock source is exact"
+    );
+
+    budget.started_at = None;
+    assert!(
+        !exact_elapsed(&budget),
+        "a WallClock source must be anchored"
+    );
+
+    budget.started_at = Some("not-a-timestamp".into());
+    assert!(!exact_elapsed(&budget), "a malformed anchor is not exact");
+
+    budget.started_at = Some("2026-01-01T00:00:00Z".into());
+    budget.elapsed = Some(closed());
+    assert!(
+        !exact_elapsed(&budget),
+        "a WallClock source must not carry an active ledger"
+    );
+}

@@ -224,7 +224,7 @@ async fn continuation_creates_linked_child_preserving_successful_outcomes() {
             event["t"] == "step_started"
                 && event["seq"].as_u64().is_some_and(|seq| seq > admission_seq)
         })
-        .map(|event| event["node"].as_str().unwrap_or(""))
+        .map(|event| event["node"].as_str().unwrap_or("").to_owned())
         .collect::<Vec<_>>();
     assert_eq!(rerun, vec!["check_bad"]);
 
@@ -241,4 +241,104 @@ async fn continuation_creates_linked_child_preserving_successful_outcomes() {
         assert!(!reason.contains('/'));
         assert!(!reason.contains(&source_id));
     }
+}
+
+/// The product default is WallClock elapsed-budget mode. A failed run created
+/// under that default must be continuable: the child inherits the durable
+/// `started_at` anchor so `wall_elapsed` charges the source's consumed window,
+/// and it still preserves every successful source outcome.
+#[tokio::test]
+#[cfg(unix)]
+async fn continuation_creates_child_from_default_wallclock_source() {
+    let root = temp_run_dir("continuation-wallclock");
+    source_generator(&root, "continue-source", CONTINUE_MANIFEST);
+    let service = crate::LocalService::with_generator_roots_policy_and_store_mode(
+        vec![root.join("generators")],
+        root.join("runs"),
+        None,
+        policy::DEFAULT_MAX_ACTIVE_RUNS,
+        policy::DEFAULT_MAX_TRACKED_RUNS,
+        crate::RunStoreMode::Exclusive,
+        crate::ServiceDeploymentPolicy::default(),
+    )
+    .expect("default-policy service");
+    let source_id = service
+        .start_run(StartRun {
+            generator_id: "continue-source".into(),
+            inputs: BTreeMap::from([
+                ("good".into(), json!({"name": "good.json", "text": "{}"})),
+                ("bad".into(), json!({"name": "bad.json", "text": "{"})),
+            ]),
+            ..Default::default()
+        })
+        .await
+        .expect("wallclock source admitted");
+    wait_for_snapshot(&service, &source_id, RunStatus::Failed).await;
+
+    let source_dir = service.run_dir_for(&source_id).await.expect("source dir");
+    let source_journal =
+        std::fs::read_to_string(source_dir.join("meta/journal.jsonl")).expect("journal");
+    let source_events = source_journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .collect::<Vec<_>>();
+    let source_started_at = source_events
+        .iter()
+        .find(|event| event["t"] == "run_queued")
+        .expect("source queue")["ts"]
+        .clone();
+
+    let child_id = service
+        .continue_run(&source_id)
+        .await
+        .expect("default WallClock source continues");
+    let child_dir = service.run_dir_for(&child_id).await.expect("child dir");
+    let journal = std::fs::read_to_string(child_dir.join("meta/journal.jsonl")).expect("journal");
+    let events = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .collect::<Vec<_>>();
+    let overlay = events
+        .iter()
+        .find(|event| event["t"] == "child_reset_overlay")
+        .expect("child_reset_overlay");
+    let candidate = &overlay["overlay"]["candidate"];
+    let budget = &candidate["inherited_budget"];
+    assert_eq!(budget["elapsed_budget_mode"], "wall_clock");
+    assert!(budget["elapsed"].is_null());
+    assert_eq!(budget["started_at"], source_started_at);
+    assert_eq!(candidate["preserved_outcomes"], json!(["check_good"]));
+    assert_eq!(
+        candidate["reset_nodes"]
+            .as_object()
+            .expect("reset nodes")
+            .keys()
+            .collect::<Vec<_>>(),
+        vec!["check_bad"]
+    );
+
+    wait_for_snapshot(&service, &child_id, RunStatus::Failed).await;
+    let child_journal =
+        std::fs::read_to_string(child_dir.join("meta/journal.jsonl")).expect("journal");
+    let admission_seq = events
+        .iter()
+        .find(|event| event["t"] == "run_queued" && event["parent_run_id"] == source_id)
+        .expect("child queue")["seq"]
+        .as_u64()
+        .expect("seq");
+    let rerun = child_journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("event"))
+        .filter(|event| {
+            event["t"] == "step_started"
+                && event["seq"].as_u64().is_some_and(|seq| seq > admission_seq)
+        })
+        .map(|event| event["node"].as_str().unwrap_or("").to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(rerun, vec!["check_bad"]);
+    assert_eq!(
+        std::fs::read_to_string(source_dir.join("meta/journal.jsonl")).expect("journal"),
+        source_journal,
+        "continuation must not modify the source"
+    );
 }
