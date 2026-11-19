@@ -411,6 +411,22 @@ fn subscription_auth(providers_path: Option<&camino::Utf8Path>) -> Result<Subscr
         .map_err(|error| anyhow::anyhow!("subscription auth configuration: {error}"))
 }
 
+/// Local credential deletion never depends on the registry. A damaged or
+/// unreadable registry skips remote revocation but falls back to the shipped
+/// values so logout can still clear the local record.
+fn logout_config(
+    providers_path: Option<&camino::Utf8Path>,
+    local: bool,
+) -> (Option<String>, SubscriptionAuthConfig) {
+    if local {
+        return (None, SubscriptionAuthConfig::default());
+    }
+    match subscription_auth(providers_path) {
+        Ok(config) => (Some(config.issuer().to_owned()), config),
+        Err(_) => (None, SubscriptionAuthConfig::default()),
+    }
+}
+
 pub(crate) async fn run(
     command: AuthCommand,
     providers_path: Option<&camino::Utf8Path>,
@@ -425,19 +441,8 @@ pub(crate) async fn run(
     if let AuthCommand::Logout { local, forget, .. } = command {
         // A damaged record or registry must not prevent local deletion.
         let current = store.load().ok().flatten();
-        let config = if local {
-            SubscriptionAuthConfig::default()
-        } else {
-            subscription_auth(providers_path)?
-        };
-        let confirmed = logout(
-            &store,
-            (!local).then_some(config.issuer()),
-            &config,
-            current,
-            forget,
-        )
-        .await?;
+        let (issuer, config) = logout_config(providers_path, local);
+        let confirmed = logout(&store, issuer.as_deref(), &config, current, forget).await?;
         println!(
             "Local credentials cleared; account registration {}. Remote revocation {}.",
             if forget { "forgotten" } else { "retained" },

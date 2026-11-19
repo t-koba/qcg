@@ -967,5 +967,14 @@ fn subscription_auth_is_loaded_strictly_from_the_registry() {
     )
     .unwrap();
     assert!(service::subscription_auth_config(Some(utf8)).is_err());
+
+    // Logout must still clear local credentials when the registry is damaged:
+    // a failed parse skips remote revocation instead of blocking deletion.
+    let (issuer, config) = logout_config(Some(utf8), false);
+    assert!(issuer.is_none());
+    assert_eq!(config.issuer(), "https://auth.openai.com");
+    let (issuer, local_config) = logout_config(Some(utf8), true);
+    assert!(issuer.is_none());
+    assert_eq!(local_config.issuer(), "https://auth.openai.com");
     std::fs::remove_dir_all(&dir).unwrap();
 }
