@@ -17,8 +17,8 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{ErrorKind, Read};
 
 /// Fixed, redacted refusal categories; never embed paths, values or I/O errors.
-#[derive(Debug, PartialEq, Eq)]
-enum Refusal {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContinuationRefusal {
     SourceBinding,
     Unsealed,
     History,
@@ -30,6 +30,69 @@ enum Refusal {
     InputIo,
     Limit,
     ResetDependency,
+    NotFailed,
+}
+
+// The private analysis keeps its original name; only the public entry may
+// expose a refusal, and only through the fixed categories above.
+type Refusal = ContinuationRefusal;
+
+impl ContinuationRefusal {
+    /// One fixed, redacted reason per category. No caller-supplied text,
+    /// path, value or I/O detail can reach this string.
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::SourceBinding => {
+                "source run is not bound to this journal, contract and workspace"
+            }
+            Self::Unsealed => "source journal is not cleanly sealed",
+            Self::History => "source history is incomplete or invalid",
+            Self::IncompleteTrace => "source outcome dependency evidence is incomplete",
+            Self::Executor => "executor is not continuation-safe or its declaration changed",
+            Self::UnsupportedState => "source state has unsupported continuation liabilities",
+            Self::Budget => "source budget is not exact and inheritable",
+            Self::InputIdentity => "source input identity is unresolved",
+            Self::InputIo => "source input evidence is unavailable",
+            Self::Limit => "configured size limit exceeded",
+            Self::ResetDependency => "reset dependency graph is not safely resolvable",
+            Self::NotFailed => "source run is not terminally failed",
+        }
+    }
+}
+
+impl std::fmt::Display for ContinuationRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+impl std::error::Error for ContinuationRefusal {}
+
+/// Bounded entry point for a source-only continuation plan. It loads the
+/// service-owned run layout itself and never accepts caller-supplied state,
+/// events, contract or workspace bytes. The result is point-in-time evidence,
+/// not authorization to fork or reset anything.
+#[doc(hidden)]
+pub fn plan_continuation(
+    source_dir: &Utf8Path,
+    registry: &StepRegistry,
+    limits: JournalLimits,
+) -> Result<ResetPlanCandidate, ContinuationRefusal> {
+    let journal = source_dir.join("meta").join("journal.jsonl");
+    let events = read_journal_values(&journal, limits)
+        .map_err(|_| Refusal::History)?
+        .events;
+    let state =
+        RunState::fold_journal_with_limits(&journal, limits).map_err(|_| Refusal::History)?;
+    if state.terminal != Some(TerminalState::Failed) {
+        return Err(Refusal::NotFailed);
+    }
+    let contract_root = source_dir.join("generator-package");
+    let contract = Contract::load(&contract_root).map_err(|_| Refusal::SourceBinding)?;
+    let workspace = FsGateway::new(source_dir.join("workspace"), &contract.manifest.permissions);
+    analyze_source(
+        &journal, &state, &events, &contract, registry, &workspace, limits,
+    )
 }
 
 /// Opaque point-in-time evidence identity, not authorization or a lease. It
@@ -72,6 +135,19 @@ impl ResetPlanCandidate {
     /// Some(SHA) requires those bytes; None requires the path to remain absent.
     /// Private overlay decoding cannot reconstruct these requirements and must
     /// not be used to prepare another fork. No candidate construction is exposed.
+    /// The last durable sequence of the analyzed source, used to pin the
+    /// child's checkpoint history to exactly this sealed source journal.
+    #[doc(hidden)]
+    pub fn source_last_seq(&self) -> u64 {
+        self.source_last_seq
+    }
+
+    /// Exact inherited budget evidence, never a replacement budget input.
+    #[doc(hidden)]
+    pub fn inherited_budget(&self) -> &BudgetState {
+        &self.inherited_budget
+    }
+
     #[doc(hidden)]
     pub fn required_file_observations(
         &self,

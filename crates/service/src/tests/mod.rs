@@ -4,6 +4,8 @@ pub(crate) mod cancel;
 pub(crate) mod cancel_observation;
 #[cfg(unix)]
 mod container_effects;
+#[cfg(unix)]
+mod continuation;
 pub(crate) mod endpoints;
 pub(crate) mod execution;
 pub(crate) mod fork_adoption;

@@ -379,6 +379,25 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 )
                 .await?
             }
+            RunsCommand::Continue { id, runs_dir, json } => {
+                let deployment = CliDeployment::from_env(providers_path.clone())?;
+                let service = local_cli_service(Utf8PathBuf::new(), runs_dir, deployment)?;
+                match service.continue_run(&id).await {
+                    Ok(child_id) => {
+                        if json {
+                            println!(
+                                "{}",
+                                serde_json::to_string_pretty(&json!({
+                                    "child_run_id": child_id,
+                                }))?
+                            );
+                        } else {
+                            println!("continued {id} -> {child_id}");
+                        }
+                    }
+                    Err(refusal) => anyhow::bail!("continuation refused: {}", refusal.reason()),
+                }
+            }
             RunsCommand::Fork {
                 id,
                 at_seq,

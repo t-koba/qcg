@@ -2484,3 +2484,67 @@ async fn ordinary_fork_does_not_require_reset_executor_proofs() {
     );
     assert!(executed.lock().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn public_entry_plans_only_from_the_sealed_source_run_layout() {
+    let f = Fixture::with_package(Some("1"), true).await;
+    let run_dir = f.path.parent().unwrap().parent().unwrap();
+    let planned = plan_continuation(run_dir, &registry(), JournalLimits::default()).unwrap();
+    assert_eq!(
+        serde_json::to_value(&planned).unwrap(),
+        serde_json::to_value(f.analyze().unwrap()).unwrap()
+    );
+    assert_eq!(planned.retry_roots, ["b"]);
+    assert_eq!(planned.preserved_outcomes, ["a"]);
+    assert_eq!(
+        serde_json::to_value(&planned.inherited_budget).unwrap(),
+        serde_json::to_value(&f.state.budget).unwrap()
+    );
+}
+
+#[tokio::test]
+async fn public_entry_refuses_unsealed_and_non_failed_sources() {
+    let f = Fixture::with_package(Some("1"), true).await;
+    let run_dir = f.path.parent().unwrap().parent().unwrap();
+    let marker = crate::journal::writer::clean_shutdown_marker_path(&f.path);
+    std::fs::remove_file(&marker).unwrap();
+    assert_eq!(
+        plan_continuation(run_dir, &registry(), JournalLimits::default()).unwrap_err(),
+        ContinuationRefusal::Unsealed
+    );
+    let mut events = f.events.clone();
+    for event in &mut events {
+        if event["t"] == "run_finished" {
+            event["status"] = json!("success");
+        }
+    }
+    std::fs::write(
+        &f.path,
+        events
+            .iter()
+            .map(|event| format!("{event}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    crate::journal::writer::write_clean_shutdown_marker(&f.path).unwrap();
+    assert_eq!(
+        plan_continuation(run_dir, &registry(), JournalLimits::default()).unwrap_err(),
+        ContinuationRefusal::NotFailed
+    );
+    assert_eq!(
+        ContinuationRefusal::NotFailed.reason(),
+        "source run is not terminally failed"
+    );
+}
+
+#[tokio::test]
+async fn public_entry_refuses_a_changed_executor_declaration() {
+    let f = Fixture::with_package(Some("1"), true).await;
+    let run_dir = f.path.parent().unwrap().parent().unwrap();
+    let mut changed = StepRegistry::new();
+    changed.register(Probe(None));
+    assert_eq!(
+        plan_continuation(run_dir, &changed, JournalLimits::default()).unwrap_err(),
+        ContinuationRefusal::Executor
+    );
+}

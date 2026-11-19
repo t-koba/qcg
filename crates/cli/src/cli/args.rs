@@ -366,6 +366,14 @@ pub(crate) enum RunsCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Continue a terminal failed run as a new linked child run.
+    Continue {
+        id: String,
+        #[arg(long = "runs-dir", default_value = ".data/runs")]
+        runs_dir: Utf8PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Fork {
         id: String,
         #[arg(long = "at-seq", required_unless_present = "reuse")]

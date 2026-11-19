@@ -726,6 +726,84 @@ impl LocalService {
         .await
     }
 
+    /// Offline continuation of a terminal failed run. The plan is computed
+    /// under the source execution lease and bound to a prepared fork; the
+    /// child is admitted by the existing reset-bound machinery with lineage
+    /// to the source and the source's exact inherited budget. Every refusal
+    /// is a fixed redacted category.
+    pub async fn continue_run(
+        &self,
+        source_id: &str,
+    ) -> Result<String, crate::continuation::ContinuationRefusal> {
+        use crate::continuation::{ContinuationRefusal, plan_fingerprint, prepare_plan};
+
+        self.ensure_running()
+            .map_err(|_| ContinuationRefusal::Unavailable)?;
+        let source_dir = self
+            .run_dir_for(source_id)
+            .await
+            .map_err(|_| ContinuationRefusal::Source)?;
+        let state = self
+            .authoritative_state(&source_dir)
+            .await
+            .map_err(|_| ContinuationRefusal::Source)?;
+        if state.terminal != Some(engine::TerminalState::Failed) {
+            return Err(ContinuationRefusal::NotFailed);
+        }
+        if state.package_sha256.is_none() {
+            return Err(ContinuationRefusal::Source);
+        }
+        // The existing loader verifies the pinned package bytes and contract.
+        let contract = crate::run_package::load(&source_dir, &state)
+            .map_err(|_| ContinuationRefusal::Source)?;
+        let limits = engine::JournalLimits::from(&contract.manifest.runtime);
+        let registry = crate::run_dirs::app_registry(self.inner.llm_runtime.clone());
+        // The lease covers live analysis and manifest observation. The
+        // prepared-fork machinery takes its own source lease for the copy and
+        // rechecks the bound bytes; the bind gate below rechecks the plan
+        // under that lease, so neither window can silently change the source.
+        let (candidate, prepared, fingerprint) = {
+            let _lease = self
+                .fork_source_copy_lease(source_id, &source_dir)
+                .await
+                .map_err(|_| ContinuationRefusal::InFlight)?;
+            let candidate = engine::plan_continuation(&source_dir, &registry, limits)?;
+            let prepared = prepare_plan(&source_dir, &candidate)?;
+            let fingerprint = plan_fingerprint(&candidate)?;
+            (candidate, prepared, fingerprint)
+        };
+        let at_seq = candidate.source_last_seq();
+        let recheck_dir = source_dir.clone();
+        let recheck_registry = registry;
+        let recheck_fingerprint = fingerprint;
+        let recheck_limits = limits;
+        self.fork_run_prepared(
+            source_id,
+            ForkRun {
+                at_seq,
+                ..Default::default()
+            },
+            None,
+            Some(&prepared),
+            || {
+                // Runs under the target admission and source execution lease.
+                let current =
+                    engine::plan_continuation(&recheck_dir, &recheck_registry, recheck_limits)
+                        .map_err(|refusal| ApiError::invalid(refusal.reason()))?;
+                let rechecked = plan_fingerprint(&current)
+                    .map_err(|refusal| ApiError::invalid(refusal.reason()))?;
+                if rechecked != recheck_fingerprint {
+                    return Err(ApiError::Conflict {
+                        detail: "source continuation evidence changed".into(),
+                    });
+                }
+                Ok(())
+            },
+        )
+        .await
+        .map_err(|_| ContinuationRefusal::Admission)
+    }
+
     pub async fn fork_run(&self, source_id: &str, request: ForkRun) -> Result<String, ApiError> {
         self.fork_run_with_id(source_id, request, None).await
     }

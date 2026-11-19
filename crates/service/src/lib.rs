@@ -16,6 +16,9 @@ mod idempotency_refs;
 mod invalidation;
 pub use idempotency_refs::MAX_IDEMPOTENCY_FILE_BYTES;
 pub use invalidation::require_run_directory;
+mod continuation;
+#[doc(hidden)]
+pub use continuation::ContinuationRefusal;
 mod fork_commit;
 mod fork_plan;
 #[doc(hidden)]

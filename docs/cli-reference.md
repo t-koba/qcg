@@ -200,6 +200,16 @@ JSON event output go to stdout.
   the remaining DAG as a new run. `--reuse` instead restarts from the source's
   initial state and serves the source's recorded model responses to identical
   requests (see the DAG flow guide); `--at-seq` may be combined with it.
+- `qcg runs continue <id> [--runs-dir dir] [--json]` continues a terminal
+  failed run as a new linked child run. The source stays byte-immutable; the
+  child keeps every successful source outcome and the exact inherited budget,
+  and resets only proven-stale nodes. Eligibility is checked offline against
+  the sealed source journal, dependency traces, executor declarations and
+  complete read-only evidence. Any ineligible or unproven source is refused
+  with one fixed redacted reason and a nonzero exit; no path, value or I/O
+  detail is printed. Sources whose journal does not satisfy the private
+  source-history proof (including service-owned active-execution journals)
+  currently fail closed. `--json` prints `{"child_run_id": "..."}` on success.
 - `qcg runs invalidate <id> --reason "..." --actor-label "..."
   [--runs-dir dir] [--json]` irreversibly invalidates a durably successful
   run's result without changing its execution status or journal. Both strings
@@ -446,7 +456,7 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   operation budgets in seconds, each in `1..=3600`. Unset selects the default;
   malformed, zero, overflowing, or out-of-range values refuse server startup
   before bind and CLI execution. The CLI resolves the bundle for `run` except
-  `--plan`, `eval`, `runs replay/fork`, and `serve`/`dev`. `models` and the
+  `--plan`, `eval`, `runs replay/fork/continue`, and `serve`/`dev`. `models` and the
   non-executing `runs invalidate`, `runs delete`, and `runs export` commands do
   not consume daemon policy; service construction uses defaults. Unrelated
   commands such as `new` are unaffected. All execution paths receive one
