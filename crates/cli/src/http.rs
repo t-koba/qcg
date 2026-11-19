@@ -213,12 +213,11 @@ mod tests {
         );
     }
 
-    // Drain the full request before answering. If a loopback server drops a
-    // socket while request bytes are still unread (a POST body, or the whole
-    // request for a server that never reads), Windows TCP answers with RST
-    // (os error 10053), which races the response and turns a redirect
-    // assertion into a connection abort. Linux/macOS discard the unread bytes
-    // and send FIN, so the flake only showed up on windows-latest.
+    // Drain the full request before answering. Closing a socket while request
+    // bytes are still unread (a POST body, or the whole request for a server
+    // that never reads) can reset the connection and race the response, turning
+    // a redirect assertion into a connection abort; the flake was observed on
+    // windows-latest (os error 10053).
     async fn read_request(socket: &mut tokio::net::TcpStream) {
         let mut head = Vec::new();
         while !head.ends_with(b"\r\n\r\n") {
