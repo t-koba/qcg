@@ -174,7 +174,9 @@ Fields:
   byte-for-byte. Like `retry_prompt`, each is bounded to 64 KiB in the
   manifest (`MAX_MODEL_INSTRUCTION_BYTES`); this is a format/resource bound on
   a manifest string, not a policy limit on model behavior, and the shipped
-  defaults are far inside it. Unknown `[llm]` keys are rejected. These fields
+  defaults are far inside it. Empty or whitespace-only replacements are
+  refused so a contract cannot silently delete the shipped instructions.
+  Unknown `[llm]` keys are rejected. These fields
   choose instruction text only: tool results and MCP output are still parsed
   as untrusted data by the same mechanism, and no instruction text is ever
   taken from model output.

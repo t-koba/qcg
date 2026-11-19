@@ -584,6 +584,25 @@ version = "0.1.0"
             );
         }
 
+        for field in [
+            "fill_system_guardrail",
+            "agent_system_guardrail",
+            "retry_prompt",
+        ] {
+            for empty in ["\"\"", "\"   \""] {
+                let settings = format!("{field} = {empty}");
+                let error = manifest_with_llm_settings(&settings)
+                    .validate()
+                    .expect_err("empty instruction text must be refused");
+                assert!(
+                    error
+                        .to_string()
+                        .contains(&format!("{field} must not be empty")),
+                    "{error}"
+                );
+            }
+        }
+
         let source = r#"
 [generator]
 id = "instruction-test"

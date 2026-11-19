@@ -194,12 +194,15 @@ impl LlmConfig {
             ),
             ("retry_prompt", self.retry_prompt.as_deref()),
         ] {
-            if let Some(text) = text
-                && text.len() > MAX_MODEL_INSTRUCTION_BYTES
-            {
-                return Err(format!(
-                    "[llm].{field} exceeds {MAX_MODEL_INSTRUCTION_BYTES} bytes"
-                ));
+            if let Some(text) = text {
+                if text.trim().is_empty() {
+                    return Err(format!("[llm].{field} must not be empty when configured"));
+                }
+                if text.len() > MAX_MODEL_INSTRUCTION_BYTES {
+                    return Err(format!(
+                        "[llm].{field} exceeds {MAX_MODEL_INSTRUCTION_BYTES} bytes"
+                    ));
+                }
             }
         }
         Ok(())
