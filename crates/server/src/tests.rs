@@ -1,5 +1,5 @@
 use super::*;
-use api::{AnswerPayload, ForkRun, RunListQuery, RunStatus, StartRun};
+use api::{AnswerPayload, ForkRun, RunListQuery, StartRun};
 use axum::Json;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
@@ -2273,7 +2273,7 @@ enabled = false
             .await
             .expect("source snapshot")
             .state,
-        RunStatus::Failed
+        api::RunStatus::Failed
     );
 
     let mut headers = HeaderMap::new();
