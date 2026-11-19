@@ -1,7 +1,10 @@
 use crate::{EngineError, RunContext};
 use async_trait::async_trait;
 use camino::Utf8Path;
-use contract::{ResourceDef, ResourceKind, SkillDoc, is_skill_library_entry, skill_metadata_value};
+use contract::{
+    ResourceDef, ResourceKind, SkillDiagnostic, SkillDoc, is_skill_library_entry,
+    skill_metadata_value,
+};
 use serde_json::json;
 
 use super::content::{
@@ -131,14 +134,9 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             .map_err(|error| EngineError::Failed(error.to_string()))?;
         let (sha256, files) = hash_resource_dir(&full_path, limits)?;
         validate_resource_pin(name, resource, &sha256)?;
-        let skills = scan_skill_library(name, &full_path, limits, &files)
+        let scan = scan_skill_library(name, &full_path, limits, &files)
             .map_err(|error| EngineError::Failed(error.to_string()))?;
-        let mut diagnostics = Vec::new();
-        for (dir, doc) in &skills {
-            for diagnostic in &doc.diagnostics {
-                diagnostics.push(format!("{dir}: {}", diagnostic.message));
-            }
-        }
+        let diagnostics = library_diagnostics(&scan);
         for diagnostic in &diagnostics {
             tracing::warn!("skill_library resource `{name}`: {diagnostic}");
         }
@@ -182,12 +180,12 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             })?;
         match selector {
             None => {
-                let skills = scan_skill_library(name, &root, limits, &files)?;
-                Ok(serde_json::to_string_pretty(&skill_catalog(&skills))?)
+                let scan = scan_skill_library(name, &root, limits, &files)?;
+                Ok(serde_json::to_string_pretty(&skill_catalog(&scan))?)
             }
             Some(ResourceSelector::Named(selector)) if selector == "catalog" => {
-                let skills = scan_skill_library(name, &root, limits, &files)?;
-                Ok(serde_json::to_string_pretty(&skill_catalog(&skills))?)
+                let scan = scan_skill_library(name, &root, limits, &files)?;
+                Ok(serde_json::to_string_pretty(&skill_catalog(&scan))?)
             }
             Some(ResourceSelector::Named(selector))
                 if selector == "tree" || selector == "files" =>
@@ -199,18 +197,18 @@ impl ResourceLoader for SkillLibraryResourceLoader {
             }
             Some(ResourceSelector::Named(selector)) => {
                 if let Some(skill) = selector.strip_prefix("meta/") {
-                    let skills = scan_skill_library(name, &root, limits, &files)?;
-                    let doc = library_skill(name, &skills, skill)?;
+                    let scan = scan_skill_library(name, &root, limits, &files)?;
+                    let doc = library_entry(name, &scan, skill)?;
                     return Ok(serde_json::to_string_pretty(&skill_metadata_value(doc))?);
                 }
                 if let Some(skill) = selector.strip_prefix("instructions/") {
-                    let skills = scan_skill_library(name, &root, limits, &files)?;
-                    let doc = library_skill(name, &skills, skill)?;
+                    let scan = scan_skill_library(name, &root, limits, &files)?;
+                    let doc = library_entry(name, &scan, skill)?;
                     return Ok(doc.instructions.clone());
                 }
                 if let Some(skill) = selector.strip_prefix("tree/") {
-                    let skills = scan_skill_library(name, &root, limits, &files)?;
-                    library_skill(name, &skills, skill)?;
+                    let scan = scan_skill_library(name, &root, limits, &files)?;
+                    library_entry(name, &scan, skill)?;
                     let skill_root = root.join(skill);
                     let (skill_sha256, skill_files) = hash_resource_dir(&skill_root, limits)
                         .map_err(|source| ResourceError::Read {
@@ -238,8 +236,8 @@ impl ResourceLoader for SkillLibraryResourceLoader {
                         resource: name.to_string(),
                     });
                 }
-                let skills = scan_skill_library(name, &root, limits, &files)?;
-                library_skill(name, &skills, skill)?;
+                let scan = scan_skill_library(name, &root, limits, &files)?;
+                library_entry(name, &scan, skill)?;
                 let skill_root = root.join(skill);
                 let file = resolve_resource_file(name, &skill_root, relative)?;
                 read_to_string_bounded(&file, limits.max_selected_bytes)
@@ -251,12 +249,34 @@ impl ResourceLoader for SkillLibraryResourceLoader {
     }
 }
 
+/// A library member whose SKILL.md is content-malformed. The directory is
+/// kept so catalog/snapshot diagnostics can name it and selectors can refuse
+/// it; the original parse/validation reason is never discarded.
+#[derive(Debug)]
+struct SkippedSkill {
+    dir: String,
+    reason: String,
+}
+
+impl SkippedSkill {
+    fn diagnostic(&self) -> String {
+        format!("SKILL.md is malformed and was skipped: {}", self.reason)
+    }
+}
+
+/// Valid members plus content-malformed members isolated from them.
+#[derive(Debug)]
+struct LibraryScan {
+    skills: Vec<(String, SkillDoc)>,
+    skipped: Vec<SkippedSkill>,
+}
+
 fn scan_skill_library(
     resource: &str,
     root: &Utf8Path,
     limits: DirectoryLimits,
     files: &[ResourceFileSnapshot],
-) -> Result<Vec<(String, SkillDoc)>, ResourceError> {
+) -> Result<LibraryScan, ResourceError> {
     // Reuse the bounded whole-tree walk's file list instead of starting an
     // unbounded second directory traversal. It already counted every entry
     // against max_entries and rejected symlinks.
@@ -270,19 +290,47 @@ fn scan_skill_library(
     children.sort();
     children.dedup();
     let mut skills = Vec::new();
+    let mut skipped = Vec::new();
     for child in children {
         let skill_root = root.join(&child);
         if !skill_root.join("SKILL.md").is_file() {
             continue;
         }
-        let doc = read_skill_doc(resource, &skill_root, limits.max_selected_bytes)?;
-        skills.push((child, doc));
+        match read_skill_doc(resource, &skill_root, limits.max_selected_bytes) {
+            Ok(doc) => skills.push((child, doc)),
+            // `read_skill_doc` only produces this variant for SKILL.md parse
+            // and validation failures; bounded reads, symlinks and path
+            // safety return other variants and still fail the whole library.
+            Err(ResourceError::InvalidSkill { message, .. }) => skipped.push(SkippedSkill {
+                dir: child,
+                reason: message,
+            }),
+            Err(error) => return Err(error),
+        }
     }
-    Ok(skills)
+    Ok(LibraryScan { skills, skipped })
 }
 
-fn skill_catalog(skills: &[(String, SkillDoc)]) -> Vec<serde_json::Value> {
-    skills
+/// Snapshot diagnostics: soft skill warnings plus isolated content faults,
+/// both prefixed with the library member directory.
+fn library_diagnostics(scan: &LibraryScan) -> Vec<String> {
+    let mut diagnostics = Vec::new();
+    for (dir, doc) in &scan.skills {
+        for diagnostic in &doc.diagnostics {
+            diagnostics.push(format!("{dir}: {}", diagnostic.message));
+        }
+    }
+    for skipped in &scan.skipped {
+        diagnostics.push(format!("{}: {}", skipped.dir, skipped.diagnostic()));
+    }
+    diagnostics
+}
+
+/// Catalog entries stay sorted by directory name. Skipped members are visible
+/// with their reason but flagged, and `library_entry` keeps them unselectable.
+fn skill_catalog(scan: &LibraryScan) -> Vec<serde_json::Value> {
+    let mut entries: Vec<(&str, serde_json::Value)> = scan
+        .skills
         .iter()
         .map(|(dir, doc)| {
             let mut entry = json!({
@@ -299,9 +347,40 @@ fn skill_catalog(skills: &[(String, SkillDoc)]) -> Vec<serde_json::Value> {
             {
                 object.insert("diagnostics".into(), json!(doc.diagnostics));
             }
-            entry
+            (dir.as_str(), entry)
         })
-        .collect()
+        .collect();
+    entries.extend(scan.skipped.iter().map(|skipped| {
+        (
+            skipped.dir.as_str(),
+            json!({
+                "name": skipped.dir,
+                "skipped": true,
+                "diagnostics": [SkillDiagnostic::warning(skipped.diagnostic())],
+            }),
+        )
+    }));
+    entries.sort_by_key(|(dir, _)| *dir);
+    entries.into_iter().map(|(_, entry)| entry).collect()
+}
+
+/// Refuses an isolated member with its malformed reason before the ordinary
+/// lookup; an absent key keeps the existing "no skill directory" refusal.
+fn library_entry<'a>(
+    resource: &str,
+    scan: &'a LibraryScan,
+    key: &str,
+) -> Result<&'a SkillDoc, ResourceError> {
+    if let Some(skipped) = scan.skipped.iter().find(|skipped| skipped.dir == key) {
+        return Err(ResourceError::InvalidSkill {
+            resource: resource.to_string(),
+            message: format!(
+                "cannot select skill_library entry `{key}`: {}",
+                skipped.diagnostic()
+            ),
+        });
+    }
+    library_skill(resource, &scan.skills, key)
 }
 
 fn library_skill<'a>(
@@ -368,8 +447,9 @@ pub fn discover_skill_docs(
         source,
     })?;
     if is_library {
-        let skills = scan_skill_library(name, root, limits, &files)?;
-        Ok(skills
+        let scan = scan_skill_library(name, root, limits, &files)?;
+        Ok(scan
+            .skills
             .into_iter()
             .map(|(dir, doc)| DiscoveredSkill {
                 library_dir: Some(dir),
@@ -466,11 +546,12 @@ mod tests {
         );
         let (_, files) =
             hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
-        let skills = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
+        let scan = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
             .expect("library should scan");
-        let names: Vec<&str> = skills.iter().map(|(dir, _)| dir.as_str()).collect();
+        let names: Vec<&str> = scan.skills.iter().map(|(dir, _)| dir.as_str()).collect();
         assert_eq!(names, vec!["alpha", "beta"]);
-        let catalog = skill_catalog(&skills);
+        assert!(scan.skipped.is_empty());
+        let catalog = skill_catalog(&scan);
         assert_eq!(catalog[0]["name"], "alpha");
         assert_eq!(catalog[1]["description"], "Beta.");
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
@@ -486,12 +567,12 @@ mod tests {
         );
         let (_, files) =
             hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
-        let skills = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
+        let scan = scan_skill_library("skills", &root, DirectoryLimits::default(), &files)
             .expect("library should scan");
-        let doc = library_skill("skills", &skills, "alpha").expect("alpha should resolve");
+        let doc = library_skill("skills", &scan.skills, "alpha").expect("alpha should resolve");
         assert_eq!(doc.description, "Alpha.");
         let error =
-            library_skill("skills", &skills, "missing").expect_err("unknown skill must fail");
+            library_skill("skills", &scan.skills, "missing").expect_err("unknown skill must fail");
         assert!(error.to_string().contains("missing"), "{error}");
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
     }
@@ -623,5 +704,127 @@ mod tests {
             "{error}"
         );
         std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn scan_skill_library_isolates_a_malformed_member_and_keeps_it_unselectable() {
+        let root = temp_dir("malformed-member");
+        write_skill(
+            &root,
+            "good",
+            "---\nname: good\ndescription: Good.\n---\nBody.\n",
+        );
+        write_skill(&root, "broken", "plain markdown, no frontmatter\n");
+        let (_, files) =
+            hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
+        let scan = scan_skill_library("lib", &root, DirectoryLimits::default(), &files)
+            .expect("a malformed member must not fail the library scan");
+        assert_eq!(
+            scan.skills
+                .iter()
+                .map(|(dir, _)| dir.as_str())
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        assert_eq!(scan.skipped.len(), 1);
+        assert_eq!(scan.skipped[0].dir, "broken");
+        assert!(
+            scan.skipped[0].reason.contains("frontmatter"),
+            "the parse reason must be retained: {}",
+            scan.skipped[0].reason
+        );
+
+        let diagnostics = library_diagnostics(&scan);
+        assert!(
+            diagnostics
+                .iter()
+                .any(|item| item.starts_with("broken: ") && item.contains("frontmatter")),
+            "snapshot diagnostics must name the skipped member: {diagnostics:?}"
+        );
+        let catalog = skill_catalog(&scan);
+        assert_eq!(catalog.len(), 2);
+        assert_eq!(catalog[0]["name"], "broken");
+        assert_eq!(catalog[0]["skipped"].as_bool(), Some(true));
+        assert!(
+            catalog[0]["diagnostics"][0]["message"]
+                .as_str()
+                .expect("catalog diagnostic message")
+                .contains("frontmatter")
+        );
+        assert_eq!(catalog[1]["name"], "good");
+
+        let error = library_entry("lib", &scan, "broken")
+            .expect_err("a skipped skill must refuse selection");
+        assert!(
+            error.to_string().contains("broken") && error.to_string().contains("frontmatter"),
+            "the refusal must name the entry and its malformed reason: {error}"
+        );
+        assert!(library_entry("lib", &scan, "good").is_ok());
+        let error =
+            library_entry("lib", &scan, "missing").expect_err("absent keys keep their refusal");
+        assert!(
+            error.to_string().contains("no skill directory"),
+            "unexpected refusal: {error}"
+        );
+
+        let resource = resource_def("skill_library", json!({}));
+        let found = discover_skill_docs("lib", &resource, &root)
+            .expect("discovery should succeed with one valid member");
+        assert_eq!(
+            found
+                .iter()
+                .map(|item| item.library_dir.as_deref().expect("library member"))
+                .collect::<Vec<_>>(),
+            vec!["good"]
+        );
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn scan_skill_library_keeps_oversized_malformed_files_hard() {
+        let root = temp_dir("malformed-oversize");
+        write_skill(&root, "broken", "plain markdown, no frontmatter\n");
+        let len = std::fs::metadata(root.join("broken/SKILL.md"))
+            .expect("skill file should be readable")
+            .len() as usize;
+        let (_, files) =
+            hash_resource_dir(&root, DirectoryLimits::default()).expect("library should hash");
+        let limits = DirectoryLimits {
+            max_selected_bytes: Some(len - 1),
+            ..DirectoryLimits::default()
+        };
+        let error = scan_skill_library("lib", &root, limits, &files)
+            .expect_err("an oversized SKILL.md must fail even when its content is malformed");
+        assert!(matches!(error, ResourceError::Read { .. }), "{error}");
+        assert!(error.to_string().contains("max_bytes"), "{error}");
+        std::fs::remove_dir_all(root).expect("temporary directory should be removed");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skill_docs_refuses_library_symlinks_and_unsupported_entries() {
+        let symlink_root = temp_dir("library-symlink");
+        std::fs::create_dir_all(&symlink_root).expect("library root should be created");
+        std::os::unix::fs::symlink("nowhere", symlink_root.join("link"))
+            .expect("symlink should be created");
+        let resource = resource_def("skill_library", json!({}));
+        let error = discover_skill_docs("lib", &resource, &symlink_root)
+            .expect_err("a symlink in a library must stay a hard failure");
+        assert!(error.to_string().contains("symbolic link"), "{error}");
+        std::fs::remove_dir_all(symlink_root).expect("temporary directory should be removed");
+
+        let fifo_root = temp_dir("library-fifo");
+        std::fs::create_dir_all(&fifo_root).expect("library root should be created");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(fifo_root.join("pipe"))
+                .status()
+                .expect("mkfifo should run")
+                .success()
+        );
+        let error = discover_skill_docs("lib", &resource, &fifo_root)
+            .expect_err("an unsupported library entry must stay a hard failure");
+        assert!(error.to_string().contains("unsupported"), "{error}");
+        std::fs::remove_dir_all(fifo_root).expect("temporary directory should be removed");
     }
 }

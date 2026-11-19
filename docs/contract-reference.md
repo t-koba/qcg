@@ -319,8 +319,9 @@ frontmatter follows the agentskills.io specification: required `name` and
 and `allowed-tools`. `allowed-tools` is informational and never grants
 permissions. Conformant YAML is parsed for plain, quoted, folded (`>`), and
 literal (`|`) scalars; missing `name` or `description`, unparseable
-frontmatter, and a missing `SKILL.md` fail explicitly. Unknown top-level keys
-(ecosystem extensions) are ignored with a warning diagnostic so skills authored
+frontmatter, and a missing `SKILL.md` fail explicitly for a `skill` resource.
+Unknown top-level keys (ecosystem extensions) are ignored with a warning
+diagnostic so skills authored
 for other harnesses load without forking; a misspelled required field still
 fails through the missing `name`/`description` check. Soft violations such as
 a name that differs from the directory name are recorded as diagnostics in the
@@ -338,7 +339,17 @@ containing `SKILL.md` and exposes each one as a skill. It is the opt-in way to
 vendor a skill collection into a package: the declaration names the library
 root, and the skills inside are discovered automatically. Non-directory
 entries, `.git`, `node_modules`, and directories without `SKILL.md` are
-ignored. Every directory and file in the library subtree counts toward the
+ignored. A member whose `SKILL.md` has malformed content (unparseable
+frontmatter or a missing/invalid `name` or `description`) is isolated: contract
+validation accepts the remaining library, the snapshot logs a diagnostic
+prefixed with the member directory, the catalog lists the member with
+`skipped: true` and its diagnostic, and selecting it fails with the malformed
+reason. Structural and safety defects are still hard errors: I/O and non-UTF-8
+reads, oversized files, symlinks, unsupported entries, unsafe paths, and entry
+count or `pin_sha256` violations fail the whole library. An explicit `skill`
+resource still rejects the same malformed `SKILL.md`; `qcg skill validate --library`
+remains a strict authoring check. Every directory and file in the library
+subtree counts toward the
 deployment ceiling `[operational_limits].max_skill_library_entries` (4096 by
 default); contract validation and the execution-time directory walk use the
 same recursive count, so a library that validates is not rejected later for

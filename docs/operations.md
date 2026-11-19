@@ -436,13 +436,17 @@ server-hosted generators.
 ## Skill resources and diagnostics
 
 `skill` and `skill_library` resources follow the agentskills.io format.
-Names, descriptions, and unparseable frontmatter are hard errors at contract
-load; unknown top-level keys (ecosystem extensions) are ignored with a warning
-diagnostic, while a misspelled required field still fails through the missing
-name/description check. Soft violations (name length, character set, or a name
+For an explicit `skill`, names, descriptions, and unparseable frontmatter are
+hard errors at contract load; unknown top-level keys (ecosystem extensions)
+are ignored with a warning diagnostic, while a misspelled required field still
+fails through the missing name/description check. A `skill_library` isolates
+content-malformed members instead: they are skipped with a snapshot diagnostic
+and a flagged catalog entry, and selecting one fails with its malformed reason.
+Structural defects (I/O, non-UTF-8, symlinks, unsupported entries, bounds) still
+fail the whole library. Soft violations (name length, character set, or a name
 that differs from the directory name) are recorded as diagnostics on the run's
-resource snapshot and logged with `tracing` instead of failing the run. Validate a skill or a
-library before packaging with:
+resource snapshot and logged with `tracing` instead of failing the run. Validate
+a skill or a library before packaging with:
 
 ```bash
 qcg skill validate path/to/skill

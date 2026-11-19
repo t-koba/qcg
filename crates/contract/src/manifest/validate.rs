@@ -505,8 +505,42 @@ fn validate_skill_library(name: &str, root: &Utf8Path) -> Result<(), ContractErr
         let Some(dir_name) = child.file_name() else {
             continue;
         };
-        read_and_validate_skill(name, &skill_path, Some(dir_name))?;
+        let source = read_skill_source(name, &skill_path)?;
+        if validate_skill_content(name, &skill_path, Some(dir_name), &source).is_err() {
+            // Only SKILL.md content is malformed here: I/O, path, symlink,
+            // entry-count and unsupported-entry faults are still hard errors
+            // above. The engine reports the isolated entry as a diagnostic.
+            continue;
+        }
     }
+    Ok(())
+}
+
+/// Reads SKILL.md without accepting a substitute: every read/encoding fault
+/// stays a hard contract error for both `skill` and `skill_library`.
+fn read_skill_source(resource: &str, skill_path: &Utf8Path) -> Result<String, ContractError> {
+    std::fs::read_to_string(skill_path).map_err(|error| {
+        ContractError::Invalid(format!(
+            "skill resource `{resource}` cannot read `{skill_path}`: {error}"
+        ))
+    })
+}
+
+/// Content-only check, kept separate from the read so a library can skip one
+/// malformed SKILL.md without hiding a filesystem failure. The explicit
+/// `skill` resource maps the same errors to a hard contract error.
+fn validate_skill_content(
+    resource: &str,
+    skill_path: &Utf8Path,
+    expected_name: Option<&str>,
+    source: &str,
+) -> Result<(), String> {
+    let doc = parse_skill_doc(source).map_err(|error| {
+        format!("skill resource `{resource}` has invalid frontmatter in `{skill_path}`: {error}")
+    })?;
+    validate_skill_doc(&doc, expected_name).map_err(|error| {
+        format!("skill resource `{resource}` is invalid in `{skill_path}`: {error}")
+    })?;
     Ok(())
 }
 
@@ -515,22 +549,9 @@ fn read_and_validate_skill(
     skill_path: &Utf8Path,
     expected_name: Option<&str>,
 ) -> Result<(), ContractError> {
-    let source = std::fs::read_to_string(skill_path).map_err(|error| {
-        ContractError::Invalid(format!(
-            "skill resource `{resource}` cannot read `{skill_path}`: {error}"
-        ))
-    })?;
-    let doc = parse_skill_doc(&source).map_err(|error| {
-        ContractError::Invalid(format!(
-            "skill resource `{resource}` has invalid frontmatter in `{skill_path}`: {error}"
-        ))
-    })?;
-    validate_skill_doc(&doc, expected_name).map_err(|error| {
-        ContractError::Invalid(format!(
-            "skill resource `{resource}` is invalid in `{skill_path}`: {error}"
-        ))
-    })?;
-    Ok(())
+    let source = read_skill_source(resource, skill_path)?;
+    validate_skill_content(resource, skill_path, expected_name, &source)
+        .map_err(ContractError::Invalid)
 }
 
 pub fn validate_form_values(
@@ -1026,6 +1047,71 @@ mod tests {
             .expect_err("a symlink must be refused before execution sees it");
         assert!(
             error.to_string().contains("symbolic link"),
+            "unexpected refusal: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn skill_library_validation_isolates_malformed_members_but_explicit_skill_fails() {
+        let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir().join(format!(
+            "qcg-skill-library-malformed-{}",
+            std::process::id()
+        )))
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).expect("malformed skill directory should be created");
+        std::fs::write(broken.join("SKILL.md"), "plain markdown, no frontmatter\n")
+            .expect("malformed SKILL.md should be written");
+        let good = root.join("good");
+        std::fs::create_dir_all(&good).expect("valid skill directory should be created");
+        std::fs::write(
+            good.join("SKILL.md"),
+            "---\nname: good\ndescription: Good.\n---\n\nDo this.\n",
+        )
+        .expect("valid SKILL.md should be written");
+
+        validate_skill_library("lib", &root)
+            .expect("one malformed member must not invalidate the rest of the library");
+        let error = validate_skill_resource("strict", &broken)
+            .expect_err("an explicit skill must reject the same malformed content");
+        assert!(
+            error.to_string().contains("frontmatter"),
+            "explicit skill should report the parse fault: {error}"
+        );
+
+        // A different content-format fault is isolated the same way.
+        std::fs::write(broken.join("SKILL.md"), "---\nname: broken\n---\n")
+            .expect("missing-description SKILL.md should be written");
+        validate_skill_library("lib", &root)
+            .expect("a missing description must also be isolated per member");
+        let error = validate_skill_resource("strict", &broken)
+            .expect_err("an explicit skill must reject a missing description");
+        assert!(
+            error.to_string().contains("description"),
+            "explicit skill should report the missing description: {error}"
+        );
+        std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
+    }
+
+    #[test]
+    fn skill_library_validation_keeps_non_utf8_skill_content_hard() {
+        let root = camino::Utf8PathBuf::from_path_buf(
+            std::env::temp_dir().join(format!("qcg-skill-library-non-utf8-{}", std::process::id())),
+        )
+        .expect("temporary path should be UTF-8");
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("library root should be created");
+        let broken = root.join("broken");
+        std::fs::create_dir_all(&broken).expect("malformed skill directory should be created");
+        std::fs::write(broken.join("SKILL.md"), [0xff, 0xfe])
+            .expect("non-UTF-8 SKILL.md should be written");
+        let error = validate_skill_library("lib", &root)
+            .expect_err("a non-UTF-8 SKILL.md is an I/O fault, not a content fault");
+        assert!(
+            error.to_string().contains("cannot read"),
             "unexpected refusal: {error}"
         );
         std::fs::remove_dir_all(&root).expect("temporary directory should be removed");
