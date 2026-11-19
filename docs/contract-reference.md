@@ -5014,9 +5014,10 @@ fields are rejected when their structs define a closed schema.
    per-value size threshold for `tool_call` arguments and results; it must be
    between 1 and the deployment ceiling
    (`[operational_limits].audit_tool_value_bytes` and
-   `direct_mcp_tool_value_bytes`, 32 KiB and 64 KiB by default). Unset retains
-   the 32 KiB default (64 KiB for direct `mcp.call` events); an explicit value
-   narrows or, when the deployment raises the ceiling, raises either path.
+   `direct_mcp_tool_value_bytes`, 32 KiB and 64 KiB by default). Unset resolves
+   to the lower of the shipped default and the corresponding deployment
+   ceiling (32/64 KiB with default ceilings); an explicit value narrows or,
+   when the deployment raises the ceiling, raises either path.
    Values above the configured ceiling are rejected. Values exceeding the effective
    threshold are replaced by the existing `{type, bytes, truncated}` marker;
    secret redaction and source extraction still happen before that replacement.

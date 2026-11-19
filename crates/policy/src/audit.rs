@@ -145,24 +145,36 @@ pub struct AuditConfig {
 }
 
 impl AuditConfig {
-    /// Resolves the per-value tool-call event threshold. Unset keeps the
-    /// shipped 32 KiB default; an explicit value is honored as configured.
-    /// Contract validation refuses values above the deployment ceiling
-    /// (`[operational_limits].audit_tool_value_bytes` and
-    /// `direct_mcp_tool_value_bytes`), never clamping silently.
+    /// Resolves the per-value tool-call event threshold under the effective
+    /// deployment ceiling. An explicit value is honored as configured;
+    /// contract validation refuses values above the ceiling instead of
+    /// clamping them. Unset resolves to the lower of the shipped 32 KiB
+    /// default and `[operational_limits].audit_tool_value_bytes`.
     pub fn tool_event_value_limit_bytes(&self) -> usize {
-        self.max_tool_value_bytes
-            .unwrap_or(TOOL_EVENT_VALUE_LIMIT_BYTES)
+        self.tool_event_value_limit_bytes_with(crate::operational_limits())
     }
 
-    /// Resolves the direct `mcp.call` event detail limit. Unset keeps the
-    /// shipped 64 KiB limit; an explicit `max_tool_value_bytes` is honored
-    /// as configured, even above the shipped default, when the deployment
-    /// ceiling allows it. Contract validation refuses values above the
-    /// ceiling instead of clamping.
-    pub fn direct_tool_event_value_limit_bytes(&self) -> usize {
+    pub fn tool_event_value_limit_bytes_with(&self, limits: &crate::OperationalLimits) -> usize {
         self.max_tool_value_bytes
-            .unwrap_or(crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES)
+            .unwrap_or_else(|| TOOL_EVENT_VALUE_LIMIT_BYTES.min(limits.audit_tool_value_bytes))
+    }
+
+    /// Resolves the direct `mcp.call` event detail limit. An explicit
+    /// `max_tool_value_bytes` is honored even above the shipped default when
+    /// the deployment ceiling allows it. Unset resolves to the lower of the
+    /// shipped 64 KiB default and
+    /// `[operational_limits].direct_mcp_tool_value_bytes`.
+    pub fn direct_tool_event_value_limit_bytes(&self) -> usize {
+        self.direct_tool_event_value_limit_bytes_with(crate::operational_limits())
+    }
+
+    pub fn direct_tool_event_value_limit_bytes_with(
+        &self,
+        limits: &crate::OperationalLimits,
+    ) -> usize {
+        self.max_tool_value_bytes.unwrap_or_else(|| {
+            crate::DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES.min(limits.direct_mcp_tool_value_bytes)
+        })
     }
 
     /// Raises this configuration to the deployment floor. A `Standard` floor
@@ -497,5 +509,34 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(limits.validate(), Err("audit max_bytes"));
+    }
+}
+
+#[cfg(test)]
+mod audit_ceiling_tests {
+    use super::*;
+
+    #[test]
+    fn omitted_tool_value_thresholds_respect_lowered_deployment_ceilings() {
+        let limits = crate::OperationalLimits {
+            audit_tool_value_bytes: 1024,
+            direct_mcp_tool_value_bytes: 2048,
+            ..Default::default()
+        };
+        let config = AuditConfig::default();
+        assert_eq!(config.tool_event_value_limit_bytes_with(&limits), 1024);
+        assert_eq!(
+            config.direct_tool_event_value_limit_bytes_with(&limits),
+            2048
+        );
+        let explicit = AuditConfig {
+            max_tool_value_bytes: Some(512),
+            ..Default::default()
+        };
+        assert_eq!(explicit.tool_event_value_limit_bytes_with(&limits), 512);
+        assert_eq!(
+            explicit.direct_tool_event_value_limit_bytes_with(&limits),
+            512
+        );
     }
 }
