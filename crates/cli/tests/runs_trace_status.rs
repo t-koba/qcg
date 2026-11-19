@@ -216,6 +216,21 @@ fn trace_with_collector(root: &Utf8PathBuf, id: &str, body: &str) -> Output {
         assert!(request.len() < 8192);
     }
     assert!(String::from_utf8_lossy(&request).starts_with("POST /v1/traces "));
+    // Drain the request body before replying. A real collector consumes the
+    // whole payload first; closing a socket with unread request bytes makes
+    // Windows send RST (os error 10054), which loses the response for the
+    // client even though the reply was written before the close.
+    let content_length = String::from_utf8_lossy(&request)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().unwrap())
+        })
+        .expect("trace POST has Content-Length");
+    assert!(content_length <= 4 * 1024 * 1024);
+    let mut body = vec![0_u8; content_length];
+    socket.read_exact(&mut body).unwrap();
     socket.write_all(response.as_bytes()).unwrap();
     drop(socket);
     child.wait_with_output().unwrap()
