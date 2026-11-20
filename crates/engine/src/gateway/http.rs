@@ -1336,7 +1336,7 @@ mod tests {
                 .request(request("POST", "http://allowed.example/".into(), None))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, entered.notified())
             .await
             .expect("resolver should enter its gate");
         // Advance only after the blocking resolver is definitely running.
@@ -1344,7 +1344,8 @@ mod tests {
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(60)).await;
         tokio::time::resume();
-        let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        let result =
+            tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, &mut task).await;
         task.abort();
         drop(gate);
         let error = result
@@ -1366,11 +1367,12 @@ mod tests {
                 .request(request("POST", "http://allowed.example/".into(), None))
                 .await
         });
-        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, entered.notified())
             .await
             .expect("resolver should enter its gate");
         cancellation.cancel();
-        let result = tokio::time::timeout(Duration::from_secs(5), &mut task).await;
+        let result =
+            tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, &mut task).await;
         task.abort();
         drop(gate);
         assert!(matches!(

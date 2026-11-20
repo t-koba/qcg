@@ -62,7 +62,7 @@ async fn parallel_fact_payloads_reference_only_typed_interactions_and_agent_owne
         let task = tasks.spawn(async move { (node, outcome) });
         nodes.insert(task.id(), id.into());
     }
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, async {
         while let Some(joined) = tasks.join_next_with_id().await {
             record_wave_join(&journal, &mut nodes, &joined, "fail_fast", "fail_fast").unwrap();
         }

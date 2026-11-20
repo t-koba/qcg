@@ -2,6 +2,18 @@
 //! Production code must not depend on developer-machine tempdir behavior;
 //! tests use this guard instead of the `tempfile` crate.
 
+/// Wall-clock deadlock guard for in-memory concurrency tests.
+///
+/// The wrapped work finishes in well under a second. This guard only fires to
+/// fail a genuinely hung engine (a step that never resolves its semaphore, a
+/// wave that never joins, and so on). It is deliberately generous so that a
+/// runner-wide scheduling stall on a loaded CI worker cannot turn correct
+/// behavior into a false `Elapsed` failure. This is a liveness detector, not a
+/// semantic timing bound: assertions about elapsed time and configured gateway
+/// timeouts keep their own values.
+#[cfg(test)]
+pub(crate) const TEST_LIVENESS_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
 #[cfg(test)]
 use std::path::{Path, PathBuf};
 #[cfg(test)]

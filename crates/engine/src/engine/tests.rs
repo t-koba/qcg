@@ -3388,7 +3388,7 @@ async fn parallel_parent_cancellation_settles_reported_sibling_outcomes() {
             )
             .await
     });
-    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, async {
         loop {
             if event_receiver
                 .recv()
@@ -3404,7 +3404,7 @@ async fn parallel_parent_cancellation_settles_reported_sibling_outcomes() {
     .await
     .expect("the completed sibling must be joined before cancellation");
     cancellation.cancel();
-    let error = tokio::time::timeout(std::time::Duration::from_secs(5), run)
+    let error = tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, run)
         .await
         .expect("parent cancellation must settle the wave")
         .expect("run task stays alive")
@@ -5540,7 +5540,7 @@ async fn budget_boundary_exact_succeeds_and_over_fails() {
 #[tokio::test]
 async fn parallel_hitl_interruption_resumes_siblings() {
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::test_support::TEST_LIVENESS_GUARD,
         parallel_hitl_interruption(true),
     )
     .await
@@ -5550,7 +5550,7 @@ async fn parallel_hitl_interruption_resumes_siblings() {
 #[tokio::test]
 async fn parallel_hitl_interruption_refuses_unknown_effects() {
     tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::test_support::TEST_LIVENESS_GUARD,
         parallel_hitl_interruption(false),
     )
     .await

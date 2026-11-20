@@ -616,7 +616,7 @@ mod tests {
     }
 
     pub(super) async fn completed(task: &tokio::task::AbortHandle) {
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, async {
             while !task.is_finished() {
                 tokio::task::yield_now().await;
             }

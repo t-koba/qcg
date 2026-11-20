@@ -106,7 +106,7 @@ async fn parallel_facts_attribute_fail_fast_abort_beside_interaction() {
     let (manifest, registry, _) = setup(&["terminal", "pending"]);
     let dir = temp_run_dir("wave-facts-terminal");
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::test_support::TEST_LIVENESS_GUARD,
         run_wave(manifest, registry, dir.clone()),
     )
     .await
@@ -130,7 +130,7 @@ async fn parallel_facts_attribute_panic_without_payload() {
     let (manifest, registry, _) = setup(&["panic", "pending"]);
     let dir = temp_run_dir("wave-facts-panic");
     let result = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
+        crate::test_support::TEST_LIVENESS_GUARD,
         run_wave(manifest, registry, dir.clone()),
     )
     .await
@@ -168,7 +168,7 @@ async fn parallel_facts_attribute_parent_cancellation() {
         ready.acquire_many(2).await.unwrap().forget();
         cancellation.cancel();
     };
-    let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let (result, ()) = tokio::time::timeout(crate::test_support::TEST_LIVENESS_GUARD, async {
         tokio::join!(run, cancel)
     })
     .await
@@ -191,7 +191,7 @@ async fn parallel_facts_success_replays_and_streams_without_state_changes() {
     let dir = temp_run_dir("wave-facts-replay");
     for _ in 0..2 {
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            crate::test_support::TEST_LIVENESS_GUARD,
             run_wave(manifest.clone(), registry.clone(), dir.clone()),
         )
         .await
