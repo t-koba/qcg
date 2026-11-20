@@ -251,7 +251,7 @@ mod tests {
     }
 
     #[test]
-    fn declared_destination_grants_its_network_and_no_other_reach() {
+    fn declared_destination_selects_one_dedicated_network_in_argv() {
         let declared = ContainerNetwork::destination("api.example.com")
             .expect("a canonical host is a valid destination");
         let undeclared = ContainerNetwork::destination("attacker.example")
@@ -288,8 +288,9 @@ mod tests {
         assert!(!argv.contains(&"bridge".to_string()));
         assert!(!argv.contains(&"host".to_string()));
         assert!(!argv.contains(&"trusted_host".to_string()));
-        // Deny half: the network belonging to an undeclared host is absent
-        // from argv, so that host cannot be reached through this runner.
+        // The network derived from an undeclared host is absent from argv.
+        // This proves only which network qcg selects: the selected network's
+        // egress rules are provisioned and owned by the deployment.
         assert!(
             !argv.iter().any(|arg| arg == undeclared_network),
             "undeclared destination network must never appear in argv: {argv:?}"
