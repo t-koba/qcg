@@ -260,6 +260,59 @@ class OrchestrationLogic(unittest.TestCase):
         self.assertEqual(env["NO_PROXY"], "*")
 
 
+class QcgDiagnostics(unittest.TestCase):
+    def test_failing_qcg_keeps_a_bounded_sanitized_excerpt(self):
+        stderr = (
+            "\x1b[31mError: run failed: probe: container exit 1\x1b[0m\n"
+            "PASSWORD=hunter2\n"
+            "Authorization: Bearer abc123def456\n"
+            "connect https://user:pass@example.invalid/ failed\x08\n"
+            + "diagnostic noise " * 300
+        )
+        stdout = (
+            "\x1b[33mWARN: retry scheduled\x1b[0m\n"
+            '{"kind":"tool_invoked","data":{"token":"s3cr3t"}}\n'
+            + "event noise " * 300
+        )
+        completed = subprocess.CompletedProcess(
+            ["qcg", "run"], 1, stdout, stderr)
+        result = probe.result_template()
+
+        probe.record_qcg_diagnostics(completed, result)
+
+        error_excerpt = result["qcg"]["stderr_excerpt"]
+        output_excerpt = result["qcg"]["stdout_excerpt"]
+        self.assertIn("Error: run failed: probe: container exit 1", error_excerpt)
+        self.assertLessEqual(len(error_excerpt), probe.EXCERPT_LIMIT)
+        self.assertLessEqual(len(output_excerpt), probe.EXCERPT_LIMIT)
+        self.assertNotIn("\x1b", error_excerpt + output_excerpt)
+        self.assertNotIn("\x08", error_excerpt)
+        self.assertIn("PASSWORD=<redacted>", error_excerpt)
+        for secret in ("hunter2", "abc123def456", "user:pass", "s3cr3t"):
+            with self.subTest(secret=secret):
+                self.assertNotIn(secret, error_excerpt + output_excerpt)
+
+    def test_successful_qcg_adds_no_excerpt(self):
+        event = {"kind": "run_finished", "data": {"status": "success"}}
+        completed = subprocess.CompletedProcess(
+            ["qcg", "run"], 0, json.dumps(event) + "\n", "\x1b[31mignored\x1b[0m\n")
+        result = probe.result_template()
+
+        probe.record_qcg_diagnostics(completed, result)
+
+        self.assertNotIn("stderr_excerpt", result["qcg"])
+        self.assertNotIn("stdout_excerpt", result["qcg"])
+
+    def test_qcg_with_no_parsed_events_is_failure_even_with_zero_exit(self):
+        completed = subprocess.CompletedProcess(
+            ["qcg", "run"], 0, "not-json\n", "Error: no events\n")
+        result = probe.result_template()
+
+        probe.record_qcg_diagnostics(completed, result)
+
+        self.assertIn("Error: no events", result["qcg"]["stderr_excerpt"])
+
+
 class Guards(unittest.TestCase):
     def test_remote_docker_hosts_are_refused(self):
         for endpoint in ("tcp://localhost:2375", "http://127.0.0.1:2375",

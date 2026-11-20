@@ -46,6 +46,21 @@ RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 SOCKET = re.compile(r"unix:///[-A-Za-z0-9._/]+\Z")
 
+EXCERPT_LIMIT = 2000
+REDACTED = "<redacted>"
+ANSI_ESCAPE = re.compile(
+    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
+)
+CONTROL_CHAR = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+SECRET_ASSIGNMENT = re.compile(
+    r"""(?i)(?P<key>["']?(?:password|passwd|secret|token|api[_-]?key|apikey|"""
+    r"""credential|authorization|access[_-]?key|private[_-]?key)["']?\s*[:=]\s*)"""
+    r"""(?P<quote>["']?)(?P<value>[^\s,;"']+)(?P=quote)"""
+)
+ENV_ASSIGNMENT = re.compile(r"(?m)(?P<key>\b[A-Z][A-Z0-9_]{2,}\s*=\s*)(?P<value>[^\s;]+)")
+BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
+URL_CREDENTIALS = re.compile(r"(?i)(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+:[^/@\s]+@)")
+
 
 def network_name(host):
     """Derive the runner network exactly as ContainerNetwork::destination does."""
@@ -232,6 +247,30 @@ def parse_events(stdout):
     return events
 
 
+def _sanitize_excerpt(text):
+    """Neutralize untrusted child output before it enters a result artifact."""
+    text = ANSI_ESCAPE.sub("", text or "")
+    text = CONTROL_CHAR.sub(" ", text)
+    text = BEARER_TOKEN.sub(f"Bearer {REDACTED}", text)
+    text = SECRET_ASSIGNMENT.sub(
+        lambda match: f"{match.group('key')}{match.group('quote')}{REDACTED}{match.group('quote')}",
+        text,
+    )
+    text = ENV_ASSIGNMENT.sub(lambda match: f"{match.group('key')}{REDACTED}", text)
+    text = URL_CREDENTIALS.sub(lambda match: f"{match.group('scheme')}{REDACTED}@", text)
+    return text[:EXCERPT_LIMIT]
+
+
+def record_qcg_diagnostics(completed, result):
+    """Keep a bounded qcg stderr/stdout excerpt only for a failed invocation."""
+    if completed.returncode == 0 and parse_events(completed.stdout or ""):
+        return result
+    qcg = result["qcg"]
+    qcg["stderr_excerpt"] = _sanitize_excerpt(completed.stderr)
+    qcg["stdout_excerpt"] = _sanitize_excerpt(completed.stdout)
+    return result
+
+
 def free_port():
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
         probe.bind(("127.0.0.1", 0))
@@ -365,6 +404,7 @@ class Probe:
                 command, cwd=directory, env=self.env, capture_output=True, text=True,
                 check=False, timeout=self.deadline.remaining(),
             )
+            record_qcg_diagnostics(completed, result)
             result["qcg"]["exit_code"] = completed.returncode
             self._read_events(parse_events(completed.stdout), result)
 
