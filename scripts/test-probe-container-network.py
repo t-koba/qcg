@@ -267,6 +267,7 @@ class QcgDiagnostics(unittest.TestCase):
     CLOSED_CLASSES = {
         "runtime_missing", "daemon_unavailable", "network_denied",
         "invalid_destination", "image_unresolved", "contract_invalid",
+        "event_divergence", "registry_error", "unavailable", "storage_error",
         "check_failed", "timeout", "resource_error", "unclassified",
     }
     CREDENTIALS = (
@@ -312,6 +313,40 @@ class QcgDiagnostics(unittest.TestCase):
         ("operation timeout reached", "timeout"),
         ("local resource exhausted", "resource_error"),
         ("run budget exceeded", "resource_error"),
+        # Contract::load (failed to read/parse manifest, invalid graph).
+        ("Error: failed to parse manifest `generator/qcg.toml`: expected a table",
+         "contract_invalid"),
+        ("invalid manifest: missing generator id", "contract_invalid"),
+        ("invalid graph: unknown node `probe`", "contract_invalid"),
+        # Top-level direct-run event pipeline guards.
+        ("Error: direct run event stream diverged from journal in `/data/runs/probe`",
+         "event_divergence"),
+        ("Error: direct run collected no events", "event_divergence"),
+        # Providers registry / provider resolution (preload and engine run).
+        ("Error: invalid providers registry: providers registry file was not found",
+         "registry_error"),
+        ("Error: run failed: unknown provider `openai`", "registry_error"),
+        ("Error: provider not found for model `gpt-x`", "registry_error"),
+        ("Error: invalid provider configuration for `anthropic`", "registry_error"),
+        # Admission and service availability.
+        ("Error: server is shutting down; refusing to spawn engine execution",
+         "unavailable"),
+        ("Error: continuation service is unavailable", "unavailable"),
+        # Journal, io, and path failures from the engine and contract loader.
+        ("Error: invalid journal JSON at line 4: expected value", "storage_error"),
+        ("Error: failed to read manifest `generator/qcg.toml`", "storage_error"),
+        ("Error: no such file or directory (os error 2)", "storage_error"),
+        ("Error: path `/etc/passwd` is outside allowed workspace `/tmp/ws`",
+         "storage_error"),
+        ("Error: package root `/tmp/ws` could not be canonicalized: stale",
+         "storage_error"),
+        ("Error: package path `../escape` escapes package root `/tmp/ws`",
+         "storage_error"),
+        ("Error: package path `../escape` is not a safe relative path",
+         "storage_error"),
+        ("Error: path is not valid UTF-8", "storage_error"),
+        # Typed size limits (ApiError::TooLarge / ServiceError::TooLarge).
+        ("Error: payload is too large: 9000 > 4096 bytes", "resource_error"),
     )
 
     def record(self, stderr, stdout="", returncode=1):
@@ -339,6 +374,10 @@ class QcgDiagnostics(unittest.TestCase):
 
     def test_error_class_always_uses_the_closed_vocabulary(self):
         self.assertEqual(probe.ERROR_CLASSES, self.CLOSED_CLASSES)
+        self.assertEqual(
+            {error_class for error_class, _ in probe.ERROR_SIGNATURES},
+            self.CLOSED_CLASSES - {"unclassified"},
+        )
         for stderr in ("", "unexpected condition\n", "no known signature\n",
                        *self.CREDENTIALS):
             with self.subTest(stderr=stderr):
@@ -353,6 +392,21 @@ class QcgDiagnostics(unittest.TestCase):
         for stderr, expected in self.SIGNATURES:
             with self.subTest(stderr=stderr):
                 self.assertEqual(self.record(stderr)["qcg"]["error_class"], expected)
+
+    def test_real_divergence_message_maps_to_event_divergence(self):
+        # Exact direct-run guard text from service/src/lifecycle.rs, prefixed
+        # the way anyhow reports a CLI error; it names the journal but is not
+        # a storage fault, and its path must never enter the result artifact.
+        stderr = (
+            "Error: direct run event stream diverged from journal in "
+            "`/data/runs/qcg-network-probe-1234`\n"
+        )
+        result = self.record(stderr)
+        self.assertEqual(result["qcg"]["error_class"], "event_divergence")
+        serialized = json.dumps(result)
+        for text in ("diverged", "qcg-network-probe-1234", "Error:"):
+            with self.subTest(text=text):
+                self.assertNotIn(text, serialized)
 
     def test_signature_priority_is_deterministic(self):
         result = self.record("check failed\nruntime unavailable\n")

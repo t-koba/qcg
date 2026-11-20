@@ -51,10 +51,15 @@ DIAGNOSTIC_LINE_CAP = 1000
 ERROR_CLASSES = frozenset({
     "runtime_missing", "daemon_unavailable", "network_denied",
     "invalid_destination", "image_unresolved", "contract_invalid",
+    "event_divergence", "registry_error", "unavailable", "storage_error",
     "check_failed", "timeout", "resource_error", "unclassified",
 })
 # Fixed qcg failure signatures, in priority order. A case-insensitive
 # substring match selects the first class; unclassified is the safe fallback.
+# Specific top-level causes precede generic ones: an event-pipeline divergence
+# names the journal but is not a storage fault, a registry/provider failure can
+# name an unavailable service, and a real run failure can wrap any root cause
+# in "run failed:".
 ERROR_SIGNATURES = (
     ("runtime_missing", ("runtime unavailable", "was not found on path",
                          "container runtime was not found")),
@@ -66,11 +71,20 @@ ERROR_SIGNATURES = (
     ("image_unresolved", ("image not found", "manifest unknown", "invalid image",
                           "is not valid for", "image was not resolved")),
     ("contract_invalid", ("invalid contract", "contract load failed",
-                          "failed to parse contract")),
+                          "failed to parse contract", "failed to parse manifest",
+                          "invalid manifest", "invalid graph")),
+    ("event_divergence", ("event stream diverged", "collected no events")),
+    ("registry_error", ("providers registry", "provider not found", "unknown provider",
+                        "invalid provider")),
+    ("unavailable", ("server is shutting down", "unavailable")),
+    ("storage_error", ("journal", "failed to read manifest", "no such file or directory",
+                       "is outside allowed workspace", "could not be canonicalized",
+                       "escapes package root", "not a safe relative path",
+                       "not valid utf-8")),
     ("check_failed", ("check failed", "run failed:", "container command exited")),
     ("timeout", ("timed out", "timeout")),
     ("resource_error", ("resource exhausted", "budget exceeded",
-                        "resource declaration is invalid")),
+                        "resource declaration is invalid", "payload is too large")),
 )
 
 
