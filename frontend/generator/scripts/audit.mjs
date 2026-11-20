@@ -6,12 +6,10 @@ import { pathToFileURL } from "node:url";
 // is a time-boxed, reviewable record: once its review date passes the gate
 // fails closed and forces re-triage, so a suppression cannot quietly become
 // permanent. Every other moderate-or-higher advisory always fails the gate.
-const exceptions = [{
-  id: "GHSA-fc5q-39xc-vjpf",
-  reason: "picomatch <=4.0.7 is dev-only in this private demo generator with zero runtime deps; as of 2026-11-18 there is no patched release and npm's only proposed fix is a rejected Vitest 4 -> 3 downgrade",
-  owner: "qcg maintainers",
-  reviewBy: "2027-05-18",
-}];
+// The former GHSA-fc5q-39xc-vjpf (dev-only picomatch) exception was retired on
+// 2026-11-20 after the upstream advisory was withdrawn as not a security issue.
+// No production advisory is currently excepted.
+const exceptions = [];
 const severities = ["info", "low", "moderate", "high", "critical"];
 
 function isPlainObject(value) {

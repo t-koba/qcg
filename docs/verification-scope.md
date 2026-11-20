@@ -44,10 +44,11 @@ npm verification includes development dependencies. Vite/Vitest/esbuild/
 Playwright/Hey API execute on developer or CI machines. Svelte
 runtime and compiled application/WASM ship in the SPA; the build tools and
 Node modules do not ship as server endpoints. `npm run audit:gate` runs
-`npm audit --audit-level=moderate` with one exact-ID exception (GHSA-fc5q-39xc-vjpf,
-a dev-only picomatch advisory with no patched release); any other moderate-or-higher
-advisory fails closed. It is a required gate in CI and in `scripts/check-ci-local.sh`,
-and the exception is removed once a patched picomatch is available. The lockfile is
+`npm audit --audit-level=moderate` and fails on any moderate-or-higher advisory.
+The former dev-only picomatch exception (GHSA-fc5q-39xc-vjpf) was retired on
+2026-11-20 because the upstream advisory was withdrawn as not a security issue;
+no exception is currently active. It is a required gate in CI and in
+`scripts/check-ci-local.sh`. The lockfile is
 reviewed rather than force-upgraded outside parent compatibility constraints, and
 where a dependency pins a vulnerable transitive version exactly, an npm `overrides`
 entry pins the fixed version instead of a fork or a vendored patch; no dependency is
