@@ -30,8 +30,7 @@ impl LocalService {
         run_id: String,
         start_seq: u64,
     ) -> broadcast::Receiver<RunEvent> {
-        let (sender, receiver) =
-            broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
+        let (sender, receiver) = self.new_live_event_channel();
         {
             let mut pollers = self
                 .inner

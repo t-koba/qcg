@@ -90,16 +90,26 @@ impl LocalService {
         self.inner.deployment_policy.live_event_channel_capacity
     }
 
-    /// Observes the frozen capacity through a real live-event channel built
-    /// with this service's effective deployment policy. More sends than the
-    /// accepted maximum force the receiver to lag; `Lagged(n)` reports the
-    /// overwritten messages, so the remainder is what the channel retained.
+    /// The single construction owner for per-run live-event channels: every
+    /// production allocation and the capacity probe build their broadcast
+    /// pair here, from this service's frozen deployment policy.
+    pub(crate) fn new_live_event_channel(
+        &self,
+    ) -> (broadcast::Sender<RunEvent>, broadcast::Receiver<RunEvent>) {
+        broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity)
+    }
+
+    /// Observes the frozen capacity through the same live-event channel
+    /// constructor real runs use. More sends than the accepted maximum force
+    /// the receiver to lag; `Lagged(n)` reports the overwritten messages, so
+    /// the remainder is what the channel retained.
     pub fn live_event_channel_capacity_probe(&self) -> usize {
-        let (sender, mut receiver) =
-            broadcast::channel::<u64>(self.inner.deployment_policy.live_event_channel_capacity);
+        let (sender, mut receiver) = self.new_live_event_channel();
         let sent = policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY + 1;
-        for value in 0..sent as u64 {
-            sender.send(value).expect("probe channel has a receiver");
+        for seq in 0..sent as u64 {
+            sender
+                .send(RunEvent::lagged("capacity-probe", seq))
+                .expect("probe channel has a receiver");
         }
         match receiver.try_recv() {
             Err(broadcast::error::TryRecvError::Lagged(missed)) => sent - missed as usize,
@@ -1913,8 +1923,7 @@ impl LocalService {
         )?;
         warn_if_shared_runs_dir_owned(&run.output_dir);
         // Ephemeral direct records share API queue order: priority 0, FIFO.
-        let (events, mut receiver) =
-            broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
+        let (events, mut receiver) = self.new_live_event_channel();
         let ephemeral_dir = run_dir.to_owned();
         {
             let mut runs = self.inner.runs.write().await;

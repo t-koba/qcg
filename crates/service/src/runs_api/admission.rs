@@ -660,8 +660,7 @@ impl LocalService {
         // admissions allocate nothing (E03).
         let cancellation = CancellationToken::new();
         let task = Arc::new(Mutex::new(None));
-        let (events, _) =
-            broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
+        let (events, _) = self.new_live_event_channel();
         let mut staged = RunRecord {
             contract_sha256: contract.sha256.clone(),
             contract,
@@ -1154,8 +1153,7 @@ impl LocalService {
         // admissions allocate nothing (E03).
         let cancellation = CancellationToken::new();
         let task = Arc::new(Mutex::new(None));
-        let (events, _) =
-            broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity);
+        let (events, _) = self.new_live_event_channel();
         let mut staged = RunRecord {
             contract_sha256: contract.sha256.clone(),
             contract,
