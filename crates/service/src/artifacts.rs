@@ -476,6 +476,132 @@ pub(crate) fn api_internal(error: impl std::fmt::Display) -> ApiError {
     ApiError::internal(error.to_string())
 }
 
-pub(crate) fn event_kinds(events: &[RunEvent]) -> Vec<String> {
-    events.iter().map(|event| event.kind.clone()).collect()
+/// Whether the live event tail is a prefix of durable journal truth.
+///
+/// `(seq, kind)` identifies an event position: a shorter tail is a truncated
+/// view of the journal and is safe to replace with it, while a differing
+/// position is a real divergence. An empty tail is a valid prefix.
+pub(crate) fn event_stream_prefixes_journal(collected: &[RunEvent], journal: &[RunEvent]) -> bool {
+    collected.len() <= journal.len()
+        && collected
+            .iter()
+            .zip(journal)
+            .all(|(live, durable)| live.seq == durable.seq && live.kind == durable.kind)
+}
+
+/// Resolves a direct run's live tail against the journal, the authoritative
+/// source of every durable event. Empty, lagged, and prefix tails converge
+/// onto the journal; `None` means a conflicting event was streamed and the
+/// run must fail instead of silently adopting one side.
+pub(crate) fn accepted_direct_events(
+    collected: Vec<RunEvent>,
+    journal: Vec<RunEvent>,
+) -> Option<Vec<RunEvent>> {
+    let converged = collected.is_empty()
+        || collected.iter().any(|event| event.kind == "lagged")
+        || event_stream_prefixes_journal(&collected, &journal);
+    converged.then_some(journal)
+}
+
+#[cfg(test)]
+mod event_stream_prefix_tests {
+    use super::{accepted_direct_events, event_stream_prefixes_journal};
+    use api::RunEvent;
+    use serde_json::json;
+
+    fn event(seq: u64, kind: &str) -> RunEvent {
+        serde_json::from_value(json!({
+            "seq": seq,
+            "ts": "2026-01-01T00:00:00Z",
+            "run_id": "test-run",
+            "trace_id": "test-trace",
+            "span_id": "test-span",
+            "kind": kind,
+            "data": {},
+        }))
+        .expect("test event should decode")
+    }
+
+    fn coords(events: &[RunEvent]) -> Vec<(u64, String)> {
+        events
+            .iter()
+            .map(|event| (event.seq, event.kind.clone()))
+            .collect()
+    }
+
+    fn assert_resolves_to(input: Vec<RunEvent>, journal: &[RunEvent]) {
+        let resolved = accepted_direct_events(input, journal.to_vec())
+            .expect("live tail should converge onto the journal");
+        assert_eq!(coords(&resolved), coords(journal));
+    }
+
+    #[test]
+    fn collected_strict_prefix_accepts_journal_tail() {
+        // The CI race: the last append reached the journal before the
+        // broadcast drained, so the live tail stops one event early.
+        let collected = vec![event(1, "stream_open"), event(2, "stream_delta")];
+        let journal = vec![
+            event(1, "stream_open"),
+            event(2, "stream_delta"),
+            event(3, "stream_close"),
+        ];
+
+        assert!(event_stream_prefixes_journal(&collected, &journal));
+        assert_resolves_to(collected, &journal);
+    }
+
+    #[test]
+    fn conflicting_event_at_same_position_is_divergence() {
+        let collected = vec![event(1, "stream_open"), event(2, "stream_delta")];
+        let journal = vec![event(1, "stream_open"), event(2, "stream_close")];
+
+        assert!(!event_stream_prefixes_journal(&collected, &journal));
+        assert!(
+            accepted_direct_events(collected, journal).is_none(),
+            "a conflicting event at the same position must still fail the run"
+        );
+    }
+
+    #[test]
+    fn event_absent_from_journal_is_divergence() {
+        let collected = vec![event(1, "stream_open"), event(2, "stream_delta")];
+        let journal = vec![event(1, "stream_open")];
+
+        assert!(!event_stream_prefixes_journal(&collected, &journal));
+        assert!(accepted_direct_events(collected, journal).is_none());
+    }
+
+    #[test]
+    fn same_kinds_with_different_seq_is_divergence() {
+        let collected = vec![event(1, "stream_open"), event(3, "stream_delta")];
+        let journal = vec![event(1, "stream_open"), event(2, "stream_delta")];
+
+        assert!(!event_stream_prefixes_journal(&collected, &journal));
+        assert!(accepted_direct_events(collected, journal).is_none());
+    }
+
+    #[test]
+    fn full_equality_is_prefix() {
+        let collected = vec![event(1, "stream_open"), event(2, "stream_close")];
+        let journal = collected.clone();
+
+        assert!(event_stream_prefixes_journal(&collected, &journal));
+        assert_resolves_to(collected, &journal);
+    }
+
+    #[test]
+    fn empty_collected_is_valid_prefix() {
+        let journal = vec![event(1, "stream_open"), event(2, "stream_close")];
+
+        assert!(event_stream_prefixes_journal(&[], &journal));
+        assert_resolves_to(Vec::new(), &journal);
+    }
+
+    #[test]
+    fn lagged_tail_converges_to_journal() {
+        let journal = vec![event(1, "stream_open"), event(2, "stream_close")];
+        let collected = vec![event(1, "stream_open"), RunEvent::lagged("test-run", 9)];
+
+        assert_resolves_to(collected, &journal);
+    }
 }

@@ -1,4 +1,4 @@
-use crate::artifacts::{api_internal, event_kinds};
+use crate::artifacts::{accepted_direct_events, api_internal};
 use crate::queue::{PriorityPermits, queue_head};
 use crate::run_dirs::{
     app_registry, claim_run_execution_owner, consume_cancel_control, direct_run_id,
@@ -2056,22 +2056,21 @@ impl LocalService {
                     .map(|event| RunEvent::from_flat(&event))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(api_internal)?;
-                if collected.is_empty() {
-                    collected = journal_events;
-                } else if collected.iter().any(|event| event.kind == "lagged") {
-                    // A lagged live tail dropped broadcasts; the durable
-                    // journal is authoritative, so converge onto it instead of
-                    // erroring (E12).
-                    collected = journal_events;
-                } else if event_kinds(&collected) != event_kinds(&journal_events) {
-                    self.remove_ephemeral_now(&run_id).await;
-                    std::mem::forget(_ephemeral_guard);
-                    return Err(api_internal(format!(
-                        "direct run event stream diverged from journal in `{}`",
-                        run.output_dir
-                    )));
+                // An empty or lagged tail, or a tail cut short before the
+                // last journal append, is not a divergence: every event is
+                // durable, so the journal is authoritative (E12). A
+                // conflicting event still fails the run.
+                match accepted_direct_events(collected, journal_events) {
+                    Some(events) => events,
+                    None => {
+                        self.remove_ephemeral_now(&run_id).await;
+                        std::mem::forget(_ephemeral_guard);
+                        return Err(api_internal(format!(
+                            "direct run event stream diverged from journal in `{}`",
+                            run.output_dir
+                        )));
+                    }
                 }
-                collected
             }
         };
         self.remove_ephemeral_now(&run_id).await;
