@@ -812,6 +812,7 @@ mod tests {
             providers_path: None,
             container_timeouts: policy::ContainerTimeouts::default(),
             retention: policy::RetentionPolicy::default(),
+            max_total_steps: None,
         };
         let error = run_eval(
             Utf8PathBuf::from("/nonexistent/generator"),

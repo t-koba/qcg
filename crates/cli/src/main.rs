@@ -36,6 +36,10 @@ pub(crate) struct CliDeployment {
     container_timeouts: policy::ContainerTimeouts,
     /// Retention budget every sweep path applies, resolved once.
     retention: policy::RetentionPolicy,
+    /// Per-run step ceiling frozen with the other deployment inputs. The
+    /// service-owned resolver checks it on every CLI startup; `None` keeps
+    /// the engine default.
+    max_total_steps: Option<usize>,
 }
 
 impl CliDeployment {
@@ -44,10 +48,15 @@ impl CliDeployment {
             policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
         let retention = policy::RetentionPolicy::from_env()
             .map_err(|detail| anyhow::anyhow!("invalid GC configuration: {detail}"))?;
+        let max_total_steps = service::ServiceDeploymentPolicy::default()
+            .with_max_total_steps_env()
+            .map_err(anyhow::Error::msg)?
+            .max_total_steps;
         Ok(Self {
             providers_path,
             container_timeouts,
             retention,
+            max_total_steps,
         })
     }
 
@@ -56,6 +65,7 @@ impl CliDeployment {
             providers_path,
             container_timeouts: policy::ContainerTimeouts::default(),
             retention: policy::RetentionPolicy::default(),
+            max_total_steps: None,
         }
     }
 }
@@ -80,6 +90,7 @@ pub(crate) fn local_cli_service(
             gc_keep: deployment.retention.keep,
             gc_keep_failed: deployment.retention.keep_failed,
             max_directory_scan_entries: deployment.retention.max_scan_entries,
+            max_total_steps: deployment.max_total_steps,
             ..service::ServiceDeploymentPolicy::default()
         }
         .with_scheduling_env()
@@ -929,6 +940,289 @@ mod tests {
         );
         let stem = policy::binary_stem().expect("test binary has a stem");
         assert_eq!(hint, format!("{stem} models --refresh"));
+    }
+
+    fn journal_events(runs: &Utf8PathBuf, run_id: &str) -> Vec<serde_json::Value> {
+        let journal = runs.join(run_id).join("meta/journal.jsonl");
+        let text = std::fs::read_to_string(&journal)
+            .unwrap_or_else(|error| panic!("journal {} should read: {error}", journal));
+        text.lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    fn event<'a>(events: &'a [serde_json::Value], kind: &str) -> &'a serde_json::Value {
+        events
+            .iter()
+            .find(|value| value.get("t").and_then(serde_json::Value::as_str) == Some(kind))
+            .unwrap_or_else(|| panic!("journal should contain a {kind} event"))
+    }
+
+    async fn wait_for_terminal_events(runs: Utf8PathBuf, run_id: String) -> Vec<serde_json::Value> {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let events = journal_events(&runs, &run_id);
+                if events.iter().any(|value| {
+                    value.get("t").and_then(serde_json::Value::as_str) == Some("run_finished")
+                }) {
+                    return events;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the run should reach a terminal journal event within the bound")
+    }
+
+    /// Fixed check for the accepted `MAX_TOTAL_STEPS` finding: the CLI's
+    /// startup resolver and the serve flag both freeze one non-default
+    /// ceiling, and the same admission path journals and enforces it.
+    ///
+    /// Executed here: `CliDeployment::from_env` (the `qcg run` startup
+    /// resolver), `local_cli_service`, service admission for the CLI-built
+    /// service, real `resolve_server_policy` + an in-process `serve` HTTP
+    /// listener, and its `POST /api/runs` admission. Not executed: the
+    /// `qcg` executable and clap's flag parse (the serve flag is represented
+    /// by its `ServerConfig` field), and `qcg run`'s `run_generator_path`
+    /// (direct runs do not journal `effective_max_total_steps`, so the CLI
+    /// service is admitted through the same API path the listener uses).
+    /// `tests/max_total_steps.rs` covers the literal binary and that direct
+    /// execution path separately.
+    #[tokio::test]
+    async fn max_total_steps_ceiling_matches_on_cli_and_serve_boots() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory should be UTF-8")
+            .join(format!("max-steps-parity-{}", Uuid::now_v7()));
+        let generators = root.join("generators");
+        let cli_runs = root.join("cli-runs");
+        let serve_runs = root.join("serve-runs");
+        std::fs::create_dir_all(generators.join("tiny-three-steps"))
+            .expect("generator directory should create");
+        // Three deterministic steps against a ceiling of two: both paths
+        // must record the same effective budget and refuse the third step.
+        std::fs::write(
+            generators
+                .join("tiny-three-steps")
+                .join(contract::MANIFEST_FILE),
+            r#"[generator]
+id = "tiny-three-steps"
+name = "Tiny Three Steps"
+version = "0.1.0"
+[[inputs.stages]]
+id = "basic"
+[permissions]
+fs_read = []
+fs_write = ["workspace"]
+network = []
+commands = []
+side_effects = "none"
+side_effects_scope = "invocation"
+[permissions.containers]
+enabled = false
+[[flow]]
+id = "one"
+type = "write"
+[flow.params]
+content = "one"
+output_file = "one.txt"
+[[flow]]
+id = "two"
+type = "write"
+[flow.params]
+content = "two"
+output_file = "two.txt"
+[[flow]]
+id = "three"
+type = "write"
+[flow.params]
+content = "three"
+output_file = "three.txt"
+"#,
+        )
+        .expect("fixture manifest should write");
+
+        let variable = "MAX_TOTAL_STEPS";
+        // SAFETY: the isolated child process owns this environment.
+        unsafe { std::env::remove_var(variable) };
+        let default_cli = CliDeployment::from_env(None).expect("unset ceiling should boot via CLI");
+        assert_eq!(default_cli.max_total_steps, None);
+        let mut config = server::ServerConfig {
+            generators_dir: generators.clone(),
+            providers_path: None,
+            extra_generators_dirs: Vec::new(),
+            runs_dir: serve_runs.clone(),
+            max_active_runs: 1,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
+            cors_origins: Vec::new(),
+            api_token: None,
+            max_request_bytes: None,
+            max_artifact_bytes: None,
+            max_artifact_response_bytes: None,
+            max_artifact_entries: None,
+            max_asset_bytes: None,
+            max_total_steps: None,
+        };
+        let default_server = server::resolve_server_policy(&config).expect("unset should resolve");
+        assert_eq!(default_server.max_total_steps, None);
+
+        // SAFETY: the isolated child process owns this environment.
+        unsafe { std::env::set_var(variable, "2") };
+        let deployment = CliDeployment::from_env(None).expect("valid ceiling should boot via CLI");
+        assert_eq!(deployment.max_total_steps, Some(2));
+        config.max_total_steps = Some(2);
+        let server_policy =
+            server::resolve_server_policy(&config).expect("valid ceiling should resolve");
+        assert_eq!(server_policy.max_total_steps, Some(2));
+
+        let package_sha256 = service::package::package_identity_sha256(
+            &generators.join("tiny-three-steps"),
+            &service::PackageLimits::default(),
+        )
+        .expect("package identity should compute");
+        let request = api::StartRun {
+            generator_id: "tiny-three-steps".into(),
+            ..Default::default()
+        };
+        let cli_service = local_cli_service(generators.clone(), cli_runs.clone(), deployment)
+            .expect("CLI service should construct");
+        let cli_id = cli_service
+            .start_run_with_package_identity(request.clone(), None, &package_sha256)
+            .await
+            .expect("CLI-built service should admit the run");
+        drop(cli_service);
+
+        // Real serve listener: the same policy resolution and service
+        // construction the binary uses, with the flag carried by config.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("loopback listener should bind");
+        let addr = listener
+            .local_addr()
+            .expect("listener should have an address");
+        let server_task = tokio::spawn(server::serve_with_resolved_policy(
+            server_policy,
+            config.clone(),
+            listener,
+        ));
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("HTTP client should build");
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if client
+                    .get(format!("http://{addr}/healthz"))
+                    .send()
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the serve listener should start within the bound");
+
+        let detail: api::GeneratorDetail = client
+            .get(format!("http://{addr}/api/generators/tiny-three-steps"))
+            .send()
+            .await
+            .expect("generator detail should respond")
+            .error_for_status()
+            .expect("generator detail should succeed")
+            .json()
+            .await
+            .expect("generator detail should deserialize");
+        let response = client
+            .post(format!("http://{addr}/api/runs"))
+            .header(
+                reqwest::header::HeaderName::from_static(policy::IDEMPOTENCY_HEADER),
+                uuid::Uuid::now_v7().to_string(),
+            )
+            .header("x-qcg-package-sha256", &detail.package_sha256)
+            .json(&request)
+            .send()
+            .await
+            .expect("start request should respond");
+        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        server_task.abort();
+        let _ = server_task.await;
+
+        let serve_id = std::fs::read_dir(&serve_runs)
+            .expect("serve runs directory should exist")
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .find(|name| name.starts_with("tiny-three-steps-"))
+            .expect("the listener should have admitted one run");
+        let cli_events = wait_for_terminal_events(cli_runs.clone(), cli_id.clone()).await;
+        let serve_events = wait_for_terminal_events(serve_runs.clone(), serve_id).await;
+
+        let expected_origin = format!(
+            "service-ceiling:2 caps contract:{}",
+            engine::RunOptions::default_max_total_steps()
+        );
+        for events in [&cli_events, &serve_events] {
+            let queued = event(events, "run_queued");
+            assert_eq!(queued["effective_max_total_steps"], 2);
+            assert_eq!(queued["effective_policy_origin"], expected_origin);
+            // The over-ceiling third step is refused at the same recorded
+            // budget on both paths, not merely reported in the journal.
+            let finished = event(events, "run_finished");
+            assert_eq!(finished["status"], "failed");
+            assert_eq!(
+                finished["failures"][0]["failure"]["code"],
+                "budget_exceeded"
+            );
+            assert_eq!(
+                finished["failures"][0]["failure"]["exhaustion"]["allowed"],
+                2
+            );
+        }
+        assert_eq!(
+            event(&cli_events, "run_queued")["effective_max_total_steps"],
+            event(&serve_events, "run_queued")["effective_max_total_steps"],
+            "both startup paths must journal the same effective ceiling"
+        );
+        assert_eq!(
+            event(&cli_events, "run_finished")["failures"][0]["failure"],
+            event(&serve_events, "run_finished")["failures"][0]["failure"],
+            "both startup paths must refuse the over-ceiling request identically"
+        );
+
+        // Same startup boundary refuses an invalid ceiling on both paths.
+        // SAFETY: the isolated child process owns this environment.
+        unsafe { std::env::set_var(variable, "0") };
+        let zero_cli = match CliDeployment::from_env(None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("zero ceiling must refuse CLI startup"),
+        };
+        let mut zero_config = config.clone();
+        zero_config.max_total_steps = Some(0);
+        let zero_serve = server::resolve_server_policy(&zero_config)
+            .expect_err("zero ceiling must refuse serve startup");
+        assert!(
+            zero_cli.contains("MAX_TOTAL_STEPS must be greater than zero"),
+            "{zero_cli}"
+        );
+        assert!(
+            zero_serve.contains("MAX_TOTAL_STEPS must be greater than zero"),
+            "{zero_serve}"
+        );
+        // SAFETY: the isolated child process owns this environment.
+        unsafe { std::env::set_var(variable, "many") };
+        let bad_cli = match CliDeployment::from_env(None) {
+            Err(error) => error.to_string(),
+            Ok(_) => panic!("unparseable ceiling must refuse CLI startup"),
+        };
+        assert!(bad_cli.contains("MAX_TOTAL_STEPS"), "{bad_cli}");
+        // SAFETY: the isolated child process owns this environment.
+        unsafe { std::env::remove_var(variable) };
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Both startup paths must freeze the same live channel capacity into

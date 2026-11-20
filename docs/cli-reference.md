@@ -301,8 +301,10 @@ search provider HTTP clients and MCP OAuth token managers are shared by runs in
 one service process. Each run still owns an independent MCP protocol session.
 
 `--max-total-steps` (or `MAX_TOTAL_STEPS`) caps every run below its
-contract budget; omitted means the engine default. The enforced value and its
-origin are recorded per run so admission, snapshots, and the journal agree.
+contract budget; omitted means the engine default. `qcg run` reads the same
+`MAX_TOTAL_STEPS` ceiling, and zero or an unparseable value refuses startup
+on both paths. The enforced value and its origin are recorded per admitted
+run so admission, snapshots, and the journal agree.
 
 For OAuth MCP profiles, use the loopback server's SPA Connections panel. The
 server exposes the MCP authorization endpoints documented in the
@@ -424,6 +426,9 @@ path is unchanged. Only offline mocks have been tested, not real accounts. See
   `qcg runs gc` sweep is not automatic and still runs.
 - `MAX_ACTIVE_RUNS`: maximum concurrently executing API runs for `qcg serve`
   (default `8`).
+- `MAX_TOTAL_STEPS`: deployment ceiling for per-run steps. `qcg serve` also
+  accepts `--max-total-steps`; `qcg run` reads the variable directly. Unset
+  keeps the engine default; zero or a non-integer refuses startup.
 - `RUN_STORE`: `exclusive` or `shared-filesystem`.
 - `API_TOKEN`: optional bearer token applied to the server API when set.
 - `GENERATORS_DIR`: default directory for generator list/install/uninstall

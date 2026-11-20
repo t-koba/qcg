@@ -122,6 +122,7 @@ pub(crate) async fn run_dev(
                 providers_path: config.providers_path.clone(),
                 container_timeouts,
                 retention,
+                max_total_steps: config.max_total_steps,
             },
             generator_id,
         )

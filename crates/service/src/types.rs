@@ -146,7 +146,41 @@ impl From<ServiceError> for ApiError {
         }
     }
 }
+/// Deployment binding for the per-run total step ceiling. Both startup
+/// paths resolve it through [`resolve_max_total_steps`] before building a
+/// service, so direct runs and the HTTP listener enforce one frozen value.
+pub const MAX_TOTAL_STEPS_ENV: &str = "MAX_TOTAL_STEPS";
+
+/// Single resolver for the deployment step ceiling, whether supplied by
+/// `serve --max-total-steps` or parsed from `MAX_TOTAL_STEPS` by direct runs.
+/// `None` keeps the engine default; zero is refused instead of silently
+/// blocking every run.
+pub fn resolve_max_total_steps(flag: Option<usize>) -> Result<Option<usize>, String> {
+    match flag {
+        Some(0) => Err("MAX_TOTAL_STEPS must be greater than zero".to_string()),
+        other => Ok(other),
+    }
+}
+
 impl ServiceDeploymentPolicy {
+    /// Resolves the step ceiling from `MAX_TOTAL_STEPS` for startup paths
+    /// without a clap flag. Unset means the engine default; any other
+    /// unparseable value fails closed at boot.
+    pub fn with_max_total_steps_env(mut self) -> Result<Self, String> {
+        let value = match std::env::var(MAX_TOTAL_STEPS_ENV) {
+            Ok(value) => value,
+            Err(std::env::VarError::NotPresent) => return Ok(self),
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(format!("{MAX_TOTAL_STEPS_ENV} must be UTF-8"));
+            }
+        };
+        let parsed = value
+            .parse::<usize>()
+            .map_err(|error| format!("invalid {MAX_TOTAL_STEPS_ENV} `{value}`: {error}"))?;
+        self.max_total_steps = resolve_max_total_steps(Some(parsed))?;
+        Ok(self)
+    }
+
     /// Resolve host scheduling environment once before constructing a service.
     /// Callers cannot supply any of these choices on a run request.
     pub fn with_scheduling_env(mut self) -> Result<Self, String> {
@@ -498,6 +532,19 @@ impl FinishTransition {
 #[cfg(test)]
 mod policy_tests {
     use super::ResolvedExecutionPolicy;
+
+    #[test]
+    fn deployment_ceiling_resolution_is_shared_and_fails_closed() {
+        use crate::{MAX_TOTAL_STEPS_ENV, ServiceDeploymentPolicy, resolve_max_total_steps};
+        assert_eq!(resolve_max_total_steps(None), Ok(None));
+        assert_eq!(resolve_max_total_steps(Some(3)), Ok(Some(3)));
+        assert_eq!(
+            resolve_max_total_steps(Some(0)),
+            Err("MAX_TOTAL_STEPS must be greater than zero".into())
+        );
+        assert_eq!(MAX_TOTAL_STEPS_ENV, "MAX_TOTAL_STEPS");
+        assert_eq!(ServiceDeploymentPolicy::default().max_total_steps, None);
+    }
 
     #[test]
     fn service_ceiling_caps_contract_with_origin() {

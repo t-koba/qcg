@@ -45,14 +45,11 @@ pub(crate) fn effective_max_request_bytes(flag: Option<usize>) -> usize {
     flag.unwrap_or(policy::DEFAULT_MAX_REQUEST_BYTES)
 }
 
-/// Effective service step ceiling: `MAX_TOTAL_STEPS` overrides nothing
-/// by itself (the flag carries the env binding); zero is rejected at boot
-/// instead of silently blocking every run.
+/// Server call site for the service-owned step ceiling resolver. The flag
+/// carries the `MAX_TOTAL_STEPS` env binding; the service validates it for
+/// every startup path, so `qcg run` cannot silently ignore the ceiling.
 pub(crate) fn effective_max_total_steps(flag: Option<usize>) -> Result<Option<usize>, String> {
-    match flag {
-        Some(0) => Err("MAX_TOTAL_STEPS must be greater than zero".into()),
-        other => Ok(other),
-    }
+    service::resolve_max_total_steps(flag)
 }
 
 #[cfg(test)]
