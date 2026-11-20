@@ -21,6 +21,10 @@ pub(crate) struct ContainerOutput {
     pub(crate) status: i32,
     pub(crate) stdout: String,
     pub(crate) stderr: String,
+    /// Exact runner argv used by the container backend, including the
+    /// destination `--network`; the journal event exposes this as durable
+    /// proof for the network probe.
+    pub(crate) invoked_argv: Vec<String>,
 }
 
 pub(crate) fn build_tool_backend_candidate(
@@ -230,6 +234,7 @@ pub(crate) async fn execute_container_backend_candidate(
         status: output.status,
         stdout: output.stdout,
         stderr: output.stderr,
+        invoked_argv: output.invoked_argv,
     })
 }
 

@@ -52,6 +52,9 @@ pub struct CommandOutput {
     pub stdout_bytes: Vec<u8>,
     /// Raw stderr bytes retained for diagnostics without lossy decoding.
     pub stderr_bytes: Vec<u8>,
+    /// Exact argv handed to the host process. For container workloads this is
+    /// the full runner invocation, including the destination `--network`.
+    pub invoked_argv: Vec<String>,
 }
 
 impl CmdGateway {
@@ -610,6 +613,7 @@ impl CmdGateway {
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
             stdout_bytes: stdout,
             stderr_bytes: stderr,
+            invoked_argv: argv.to_vec(),
         })
     }
 }
@@ -876,6 +880,24 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn run_host_process_records_exact_invoked_argv() {
+        let workspace = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory should be UTF-8");
+        let gateway = CmdGateway::new(Permissions::default(), workspace);
+        let argv = vec![
+            "echo".to_string(),
+            "invoked-argv".to_string(),
+            "--flag=value with spaces".to_string(),
+        ];
+        let output = gateway
+            .run_host_process(&argv, 5, None, None, None)
+            .await
+            .expect("harmless host command should run");
+        assert_eq!(output.status, 0);
+        assert_eq!(output.invoked_argv, argv);
     }
 
     #[test]

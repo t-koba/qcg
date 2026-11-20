@@ -136,6 +136,10 @@ impl StepExecutor for CheckContainerStep {
             ctx.run.contract.manifest.runtime.command_input_limit_bytes,
         )?;
         let (tool, candidate) = check_container_backend_invocation(image, command, &params.mounts);
+        let output = execute_container_backend_candidate(ctx, node, &tool, candidate).await?;
+        // This is the exact runner argv (including the destination
+        // `--network`) used by the container backend: the durable proof the
+        // network probe reads. Clone it so `output` stays usable below.
         ctx.journal
             .event(
                 "tool_backend_resolved",
@@ -143,12 +147,11 @@ impl StepExecutor for CheckContainerStep {
                     "node": node.id,
                     "tool": "check.container",
                     "backend": "container",
-                    "argv": candidate.argv.clone(),
+                    "argv": output.invoked_argv.clone(),
                 }),
             )
             .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
 
-        let output = execute_container_backend_candidate(ctx, node, &tool, candidate).await?;
         let mut findings = Vec::new();
         let status_matches = params.expect.as_ref().map_or(output.status == 0, |expect| {
             if !expect.exit_code_in.is_empty() {
@@ -275,6 +278,52 @@ command = ["sh", "-c", "echo ok"]
         assert_eq!(candidate.container_mounts.len(), 1);
         assert_eq!(candidate.container_mounts[0].target, "/work");
         assert_eq!(candidate.container_mounts[0].mode, "ro");
+    }
+
+    #[test]
+    fn container_output_exposes_runner_argv_for_network_proof() {
+        use crate::container_backend::ContainerOutput;
+        use container::{ContainerLimits, ContainerNetwork, DockerRunSpec, docker_run_argv};
+
+        let network = ContainerNetwork::destination("api.example.com")
+            .expect("declared destination should resolve");
+        let resources = ContainerLimits::default();
+        let workload = vec!["sh".to_string(), "-c".to_string(), "echo ok".to_string()];
+        let runner_argv = docker_run_argv(&DockerRunSpec {
+            binary: "docker",
+            runtime_flag: None,
+            name: "qcg-test",
+            labels: &[],
+            mounts: &[],
+            workdir: None,
+            env_names: &[],
+            image: "alpine@sha256:abc",
+            workload: &workload,
+            stdin_pipe: false,
+            network: &network,
+            resources: &resources,
+        });
+        // check.container journals `invoked_argv` verbatim as `argv`: the
+        // runner invocation (one destination --network), not the workload.
+        let output = ContainerOutput {
+            runtime: "docker".into(),
+            status: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+            invoked_argv: runner_argv.clone(),
+        };
+        let selected = output
+            .invoked_argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--network")
+            .map(|pair| pair[1].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(selected, vec![network.network_name().unwrap()]);
+        assert!(
+            output
+                .invoked_argv
+                .starts_with(&["docker".to_string(), "run".to_string()])
+        );
     }
 
     #[test]

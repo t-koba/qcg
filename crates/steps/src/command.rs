@@ -646,6 +646,7 @@ mod tests {
                 stdout,
                 stderr: String::new(),
                 stderr_bytes: vec![],
+                invoked_argv: Vec::new(),
             };
             let result = structured_outcome(&mut harness.context(), &node, &params, &output).await;
             if token == "18446744073709551615" {
