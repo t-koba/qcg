@@ -692,8 +692,15 @@ credentials are never inherited implicitly. The complete command vector must
 also be present in the contract's `[permissions].commands`. Child stderr is
 discarded so mapped credential values cannot be copied into qcg logs. Process
 control variables such as `LD_PRELOAD`, `DYLD_INSERT_LIBRARIES`, `NODE_OPTIONS`,
-and language runtime search paths cannot be supplied by either environment
-field. On Unix the server starts in a dedicated process group, so cancellation
+`PYTHONPATH`, `PYTHONHOME`, `RUBYOPT`, and `PERL5OPT` may be set through either
+environment field only in an `[[mcp_server]]` row from the operator-controlled
+providers registry. The row records that origin at parse time; it is not a
+registry key and cannot be asserted by a generator contract, skill, or
+tool-described server. A server definition reconstructed from any such
+untrusted source still refuses those names. Credential-like names still must
+use `env_from`, and the command permission, destination ceiling, and decider
+rules are unchanged. On Unix the server starts in a dedicated process group,
+so cancellation
 and bounded shutdown signal descendants that remain in that group. A descendant
 can leave the group, and qcg SIGKILL bypasses this cleanup; see
 [host-process crash-recovery limits](host-process-crash-recovery.md).

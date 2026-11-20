@@ -60,10 +60,11 @@ pub fn shipped_public_profiles() -> &'static [McpServerSpec] {
         let specs: Vec<McpServerSpec> = shipped_public_tables()
             .iter()
             .map(|(id, entry)| {
-                let spec: McpServerSpec = entry
+                let mut spec: McpServerSpec = entry
                     .clone()
                     .try_into()
                     .expect("shipped public MCP profile must be a valid spec");
+                spec.mark_operator_registry();
                 assert_eq!(&spec.id, id, "shipped profile key must match its id");
                 validate_public_spec(&spec).expect("shipped public MCP profile must be safe");
                 spec
@@ -132,9 +133,10 @@ impl PublicProfiles {
                 .iter()
                 .position(|spec| spec.id == *id)
                 .expect("reserved public ids ship a row");
-            let spec: McpServerSpec = merged
+            let mut spec: McpServerSpec = merged
                 .try_into()
                 .map_err(|error| format!("invalid public MCP profile `{id}`: {error}"))?;
+            spec.mark_operator_registry();
             if spec.id != *id {
                 return Err(format!(
                     "public MCP profile `{id}` must not override its id"

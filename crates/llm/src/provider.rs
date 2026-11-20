@@ -1019,8 +1019,13 @@ pub struct ProvidersFile {
 
 impl ProvidersFile {
     pub fn parse(text: &str) -> Result<Self, String> {
-        let file: ProvidersFile =
+        let mut file: ProvidersFile =
             toml::from_str(text).map_err(|error| format!("invalid providers registry: {error}"))?;
+        // The only point where an MCP row becomes trusted: this is the
+        // operator-controlled registry text, not generator or tool data.
+        for spec in &mut file.mcp_server {
+            spec.mark_operator_registry();
+        }
         file.validate()?;
         Ok(file)
     }

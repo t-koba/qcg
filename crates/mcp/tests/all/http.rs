@@ -225,6 +225,7 @@ fn spec(id: &str, url: &str) -> McpServerSpec {
 
 fn spec_with_lifecycle(id: &str, url: &str, lifecycle: mcp::McpLifecycle) -> McpServerSpec {
     McpServerSpec {
+        origin: mcp::McpSpecOrigin::Untrusted,
         id: id.to_string(),
         transport: McpTransport::StreamableHttp,
         lifecycle,

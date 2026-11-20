@@ -11,6 +11,7 @@ mod tests {
     use std::time::Duration;
     fn remote_spec() -> McpServerSpec {
         McpServerSpec {
+            origin: mcp::McpSpecOrigin::Untrusted,
             id: "tinyfish".into(),
             transport: McpTransport::StreamableHttp,
             lifecycle: McpLifecycle::Initialize,
@@ -708,6 +709,97 @@ mod tests {
         assert!(spec.validate().is_err());
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn operator_registry_stdio_child_starts_with_node_options() {
+        use tokio_util::sync::CancellationToken;
+
+        let mut spec = stdio_spec();
+        let capture = std::env::temp_dir().join(format!(
+            "qcg-mcp-node-options-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7().as_simple()
+        ));
+        // A capture child is deliberately not an MCP server: the handshake
+        // fails, but a successfully spawned child writes the value it started
+        // with. The file is the fixed check: it is absent on the old code,
+        // which rejects this row before any process starts.
+        let expected = "--require /opt/operator/hooks.cjs";
+        spec.command = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "printf '%s' \"$NODE_OPTIONS\" > \"$QCG_ENV_CAPTURE\"".into(),
+        ];
+        spec.env.insert("NODE_OPTIONS".into(), expected.to_owned());
+        spec.env.insert(
+            "QCG_ENV_CAPTURE".into(),
+            capture.to_string_lossy().into_owned(),
+        );
+        spec.timeout_seconds = 2;
+        let command = spec.command.clone();
+        // `from_config` is the runtime half of the providers-registry choke
+        // point: rows it receives are operator configuration.
+        let runtime = McpRuntime::from_config(None, vec![spec])
+            .expect("operator registry rows may set process-control env");
+        let access = McpAccess {
+            network_hosts: BTreeSet::new(),
+            commands: vec![McpCommandAccess::trusted_host(command)],
+            workspace: std::env::temp_dir(),
+            host_cgroup: None,
+            effects: None,
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            runtime.connect("local", &access, CancellationToken::new()),
+        )
+        .await;
+        let captured = std::fs::read_to_string(&capture)
+            .expect("stdio child must start with NODE_OPTIONS in its environment");
+        assert_eq!(captured, expected);
+        std::fs::remove_file(&capture).ok();
+    }
+
+    #[test]
+    fn untrusted_definitions_keep_the_process_control_env_refusal() {
+        for name in [
+            "NODE_OPTIONS",
+            "PYTHONPATH",
+            "PYTHONHOME",
+            "LD_PRELOAD",
+            "PATH",
+        ] {
+            let mut from_env = stdio_spec();
+            from_env.env.insert(name.into(), "payload".into());
+            let error = from_env
+                .validate()
+                .expect_err("untrusted env must stay refused");
+            assert!(error.contains("process control variable"), "{error}");
+            let error = McpRuntime::from_specs(vec![from_env])
+                .expect_err("untrusted runtime profile must stay refused");
+            assert!(error.contains("process control variable"), "{error}");
+
+            let mut from_env_from = stdio_spec();
+            from_env_from.env_from.insert(name.into(), "SOURCE".into());
+            assert!(
+                from_env_from.validate().is_err(),
+                "untrusted env_from must stay refused for {name}"
+            );
+        }
+
+        // A definition rebuilt from serialized (generator/tool) data cannot
+        // claim the operator origin, whether or not the key is accepted.
+        let forged = toml::from_str::<McpServerSpec>(
+            "id = 'local'\ntransport = 'stdio'\ncommand = ['demo-server']\norigin = 'operator_registry'\nenv = { NODE_OPTIONS = 'payload' }\n",
+        );
+        match forged {
+            Ok(spec) => {
+                assert_eq!(spec.origin, McpSpecOrigin::Untrusted);
+                assert!(spec.validate().is_err());
+            }
+            Err(error) => assert!(error.to_string().contains("origin"), "{error}"),
+        }
+    }
+
     #[cfg(not(feature = "mcp-oauth"))]
     #[test]
     fn oauth_specs_are_rejected_without_the_oauth_feature() {
@@ -909,6 +1001,7 @@ mod tests {
 
     fn stdio_spec() -> McpServerSpec {
         McpServerSpec {
+            origin: mcp::McpSpecOrigin::Untrusted,
             id: "local".into(),
             transport: McpTransport::Stdio,
             lifecycle: McpLifecycle::Initialize,

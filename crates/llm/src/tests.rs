@@ -2618,6 +2618,32 @@ model = { provider = "missing", model = "model" }
 }
 
 #[test]
+fn registry_rows_may_set_process_control_environment() {
+    let text = r#"
+[[mcp_server]]
+id = "local-tools"
+transport = "stdio"
+command = ["my-mcp-server", "--stdio"]
+env = { NODE_OPTIONS = "--require /opt/hooks.cjs", PYTHONPATH = "/opt/lib" }
+env_from = { PYTHONHOME = "OPERATOR_PYTHONHOME" }
+auth = "none"
+"#;
+    let file = ProvidersFile::parse(text).expect("operator registry controls process env");
+    let spec = &file.mcp_server[0];
+    assert_eq!(spec.origin, mcp::McpSpecOrigin::OperatorRegistry);
+    assert_eq!(spec.env["NODE_OPTIONS"], "--require /opt/hooks.cjs");
+    assert_eq!(spec.env["PYTHONPATH"], "/opt/lib");
+    assert_eq!(spec.env_from["PYTHONHOME"], "OPERATOR_PYTHONHOME");
+
+    // Origin is not a registry key: untrusted serialized data cannot assert it.
+    let forged = text.replace(
+        "auth = \"none\"",
+        "origin = \"operator_registry\"\nauth = \"none\"",
+    );
+    assert!(ProvidersFile::parse(&forged).is_err());
+}
+
+#[test]
 fn router_reports_configuration_errors_from_specs() {
     let router = LlmRouter::parse_text(&test_provider_row(
         "keyed",

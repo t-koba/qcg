@@ -23,6 +23,7 @@ fn command(session_id: &str) -> Vec<String> {
 
 fn spec(id: &str, command: Vec<String>) -> McpServerSpec {
     McpServerSpec {
+        origin: mcp::McpSpecOrigin::Untrusted,
         id: id.to_owned(),
         transport: McpTransport::Stdio,
         lifecycle: mcp::McpLifecycle::Initialize,

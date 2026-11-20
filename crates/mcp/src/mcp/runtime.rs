@@ -33,9 +33,9 @@ use super::spec::McpServerSpec;
 #[cfg(feature = "mcp-oauth")]
 use super::transport::OAuthCredentialStore;
 use super::transport::{McpAuth, McpTransport};
-use super::validate::required_env;
 #[cfg(feature = "mcp-oauth")]
 use super::validate::{auth_error, is_secure_remote_url, validate_redirect_uri};
+use super::validate::{forbidden_process_env_name, required_env};
 
 pub(crate) struct McpClient;
 
@@ -140,14 +140,18 @@ impl McpRuntime {
         public: Option<Vec<McpServerSpec>>,
         mut regular: Vec<McpServerSpec>,
     ) -> Result<Self, String> {
-        let public = match public {
+        let mut public = match public {
             Some(specs) => specs,
             None => shipped_public_profiles().to_vec(),
         };
-        for spec in &public {
+        for spec in &mut public {
+            spec.mark_operator_registry();
             validate_public_spec(spec)?;
         }
-        for spec in &regular {
+        for spec in &mut regular {
+            // Rows passed to this constructor come from the providers
+            // registry, so their process environment is operator policy.
+            spec.mark_operator_registry();
             if is_reserved_public_id(&spec.id) {
                 return Err(format!(
                     "MCP server id `{}` is reserved for a public profile; configure it in `public_mcp_server`",
@@ -755,6 +759,17 @@ impl McpRuntime {
         access: &McpAccess,
         cancellation: CancellationToken,
     ) -> Result<McpSession, McpError> {
+        // Validation already refuses these names for untrusted definitions;
+        // re-check at the launch boundary so no future profile can smuggle a
+        // process-control override into a spawned child.
+        for name in profile.spec.env.keys().chain(profile.spec.env_from.keys()) {
+            if forbidden_process_env_name(name, profile.spec.origin) {
+                return Err(McpError::Configuration(format!(
+                    "MCP server `{}` env must not override process control variable `{name}`",
+                    profile.id()
+                )));
+            }
+        }
         let permission = access
             .commands
             .iter()

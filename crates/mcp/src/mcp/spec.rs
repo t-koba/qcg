@@ -24,14 +24,31 @@ use super::transport::{
     default_transport,
 };
 use super::validate::{
-    dangerous_process_env_name, reserved_transport_header, valid_env_name, valid_id,
+    forbidden_process_env_name, reserved_transport_header, valid_env_name, valid_id,
     validate_destination, validate_host, validate_remote_url_with_policy,
 };
+
+/// Where a server definition was authored. A generator contract, skill, or
+/// tool-described server can only name an already configured server; it never
+/// supplies a definition. Definitions rebuilt from such data keep `Untrusted`
+/// and remain under the process-control environment refusal.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum McpSpecOrigin {
+    #[default]
+    Untrusted,
+    /// A row parsed from the operator-controlled providers registry.
+    OperatorRegistry,
+}
 
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct McpServerSpec {
     pub id: String,
+    /// Serde deliberately cannot set this: only the registry parse choke
+    /// points call [`McpServerSpec::mark_operator_registry`]. It is included
+    /// in `Debug` so a trusted row is auditable in diagnostics.
+    #[serde(skip)]
+    pub origin: McpSpecOrigin,
     #[serde(default = "default_transport")]
     pub transport: McpTransport,
     #[serde(default = "default_lifecycle")]
@@ -110,6 +127,7 @@ impl std::fmt::Debug for McpServerSpec {
         formatter
             .debug_struct("McpServerSpec")
             .field("id", &self.id)
+            .field("origin", &self.origin)
             .field("transport", &self.transport)
             .field("lifecycle", &self.lifecycle)
             .field("url", &self.url.as_ref().map(|_| "<configured>"))
@@ -155,6 +173,13 @@ impl std::fmt::Debug for McpServerSpec {
 }
 
 impl McpServerSpec {
+    /// Marks a row as operator registry configuration. Called only where the
+    /// providers registry (or shipped public table) is parsed, never from
+    /// serialized or model-visible data.
+    pub fn mark_operator_registry(&mut self) {
+        self.origin = McpSpecOrigin::OperatorRegistry;
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         self.validate_with_url().map(|_| ())
     }
@@ -249,7 +274,7 @@ impl McpServerSpec {
                     self.id
                 ));
             }
-            if dangerous_process_env_name(target) {
+            if forbidden_process_env_name(target, self.origin) {
                 return Err(format!(
                     "MCP server `{}` env_from must not override process control variable `{target}`",
                     self.id
@@ -265,7 +290,7 @@ impl McpServerSpec {
         if let Some(name) = self
             .env
             .keys()
-            .find(|name| dangerous_process_env_name(name))
+            .find(|name| forbidden_process_env_name(name, self.origin))
         {
             return Err(format!(
                 "MCP server `{}` env must not override process control variable `{name}`",

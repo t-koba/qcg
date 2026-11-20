@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use url::Url;
 
 use super::error::McpError;
+use super::spec::McpSpecOrigin;
 
 pub(crate) fn required_env(name: &str) -> Result<String, McpError> {
     match std::env::var(name) {
@@ -107,6 +108,13 @@ pub(crate) fn dangerous_process_env_name(value: &str) -> bool {
             | "RUBYOPT"
             | "PERL5OPT"
     )
+}
+
+/// The deny-list above applies to definitions that may come from untrusted
+/// content. Only a server row parsed from the operator's providers registry
+/// may override one of these names; origins are never set by serialized data.
+pub(crate) fn forbidden_process_env_name(value: &str, origin: McpSpecOrigin) -> bool {
+    origin == McpSpecOrigin::Untrusted && dangerous_process_env_name(value)
 }
 
 pub(crate) fn reserved_transport_header(value: &str) -> bool {
