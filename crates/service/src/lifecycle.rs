@@ -90,6 +90,23 @@ impl LocalService {
         self.inner.deployment_policy.live_event_channel_capacity
     }
 
+    /// Observes the frozen capacity through a real live-event channel built
+    /// with this service's effective deployment policy. More sends than the
+    /// accepted maximum force the receiver to lag; `Lagged(n)` reports the
+    /// overwritten messages, so the remainder is what the channel retained.
+    pub fn live_event_channel_capacity_probe(&self) -> usize {
+        let (sender, mut receiver) =
+            broadcast::channel::<u64>(self.inner.deployment_policy.live_event_channel_capacity);
+        let sent = policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY + 1;
+        for value in 0..sent as u64 {
+            sender.send(value).expect("probe channel has a receiver");
+        }
+        match receiver.try_recv() {
+            Err(broadcast::error::TryRecvError::Lagged(missed)) => sent - missed as usize,
+            _ => unreachable!("sends exceed the accepted channel capacity"),
+        }
+    }
+
     /// Freezes deployment policy before recovery or resident tasks can see it (E04).
     pub fn with_generator_roots_policy_and_store_mode(
         generator_roots: Vec<Utf8PathBuf>,

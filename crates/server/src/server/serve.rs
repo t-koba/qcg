@@ -457,6 +457,47 @@ fn oauth_state_for_listener(
     (oauth_origin, oauth_allowed_origins, oauth_callback_url)
 }
 
+/// Builds the service from the frozen server policy and config: the single
+/// policy-to-service handoff for every serve boot. Construct with frozen
+/// policy; post-construction setters could race recovery (E04).
+pub fn build_service_from_resolved_policy(
+    policy: &ResolvedServerPolicy,
+    config: &ServerConfig,
+) -> Result<LocalService, service::ServiceError> {
+    let mut roots = vec![config.generators_dir.clone()];
+    roots.extend(config.extra_generators_dirs.clone());
+    LocalService::with_generator_roots_policy_and_store_mode(
+        roots,
+        config.runs_dir.clone(),
+        config.providers_path.clone(),
+        config.max_active_runs,
+        config.max_tracked_runs,
+        config.run_store_mode,
+        service::ServiceDeploymentPolicy {
+            container_timeouts: policy.container_timeouts,
+            read_cache_max_bytes: policy.read_cache_max_bytes,
+            max_total_steps: policy.max_total_steps,
+            preemption_enabled: policy.preemption_enabled,
+            elapsed_budget_mode: policy.elapsed_budget_mode,
+            preemption_mode: policy.preemption_mode,
+            preemption_queue_position: policy.preemption_queue_position,
+            audit_floor: policy.audit_floor,
+            gc_keep: policy.gc_keep,
+            gc_keep_failed: policy.gc_keep_failed,
+            gc_interval_secs: policy.gc_interval_secs,
+            gc_retry_attempts: policy.gc_retry_attempts,
+            gc_retry_delay_ms: policy.gc_retry_delay_ms,
+            max_parallel_steps: policy.max_parallel_steps,
+            parallel_compatibility: Default::default(),
+            live_event_channel_capacity: policy.live_event_channel_capacity,
+            journal_poll_interval_millis: policy.journal_poll_interval_millis,
+            max_directory_scan_entries: policy.max_directory_scan_entries,
+            shared_store_rescan_secs: policy.shared_store_rescan_secs,
+            queued_resumer_secs: policy.queued_resumer_secs,
+        },
+    )
+}
+
 pub(crate) async fn serve_with_resolved_policy_and_deadline(
     policy: ResolvedServerPolicy,
     config: ServerConfig,
@@ -474,11 +515,10 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
     // preemption, and idempotency retention are startup choices with
     // explicit environment overrides (3.2). Invalid knobs refuse to boot
     // instead of degrading silently.
+    let service = build_service_from_resolved_policy(&policy, &config)?;
     let ResolvedServerPolicy {
-        container_timeouts,
         oauth_public_origin,
         metrics_policy,
-        read_cache_max_bytes,
         idempotency_timing,
         idempotency_ttl,
         idempotency_max_entries,
@@ -488,26 +528,13 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
         validated_cors,
         auto_gc,
         preemption_enabled,
-        elapsed_budget_mode,
         preemption_mode,
         preemption_queue_position,
         rate_limit,
-        audit_floor,
         otlp,
-        gc_keep,
-        gc_keep_failed,
-        gc_interval_secs,
-        gc_retry_attempts,
-        gc_retry_delay_ms,
-        max_parallel_steps,
-        live_event_channel_capacity,
-        journal_poll_interval_millis,
-        max_directory_scan_entries,
-        shared_store_rescan_secs,
-        queued_resumer_secs,
         shutdown_drain,
-        shutdown_settle: _,
         shutdown_task_grace,
+        ..
     } = policy;
     tracing::info!(
         idempotency_ttl_secs = idempotency_ttl.as_secs(),
@@ -539,39 +566,6 @@ pub(crate) async fn serve_with_resolved_policy_and_deadline(
             .unwrap_or_default(),
         "effective server policy",
     );
-    let mut roots = vec![config.generators_dir.clone()];
-    roots.extend(config.extra_generators_dirs.clone());
-    // Construct with frozen policy; post-construction setters could race recovery (E04).
-    let service = LocalService::with_generator_roots_policy_and_store_mode(
-        roots,
-        config.runs_dir.clone(),
-        config.providers_path.clone(),
-        config.max_active_runs,
-        config.max_tracked_runs,
-        config.run_store_mode,
-        service::ServiceDeploymentPolicy {
-            container_timeouts,
-            read_cache_max_bytes,
-            max_total_steps,
-            preemption_enabled,
-            elapsed_budget_mode,
-            preemption_mode,
-            preemption_queue_position,
-            audit_floor,
-            gc_keep,
-            gc_keep_failed,
-            gc_interval_secs,
-            gc_retry_attempts,
-            gc_retry_delay_ms,
-            max_parallel_steps,
-            parallel_compatibility: Default::default(),
-            live_event_channel_capacity,
-            journal_poll_interval_millis,
-            max_directory_scan_entries,
-            shared_store_rescan_secs,
-            queued_resumer_secs,
-        },
-    )?;
     let (oauth_origin, oauth_allowed_origins, oauth_callback_url) =
         oauth_state_for_listener(actual_addr, oauth_public_origin.as_deref());
     // One shutdown token for both the server surface and the service

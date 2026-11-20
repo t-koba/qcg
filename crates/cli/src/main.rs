@@ -1301,10 +1301,9 @@ output_file = "three.txt"
     }
 
     /// Both startup paths must freeze the same live channel capacity into
-    /// their service policy. The CLI path is observed on the constructed
-    /// service; the server path's frozen field is passed verbatim into the
-    /// service deployment policy by `serve_with_resolved_policy_and_deadline`,
-    /// so observing it needs neither a listener nor a run workload.
+    /// their service policy. Each path constructs its service through its
+    /// own startup code, and the capacity is observed on a real broadcast
+    /// channel built from that constructed service's effective policy.
     #[test]
     fn live_event_channel_capacity_matches_on_cli_and_server_boots() {
         if env_process::isolated() {
@@ -1350,29 +1349,43 @@ output_file = "three.txt"
             CliDeployment::defaults(None),
         )
         .expect("default CLI boot should succeed");
+        let default_cli_capacity = default_cli.live_event_channel_capacity_probe();
+        assert_eq!(default_cli_capacity, policy::LIVE_EVENT_CHANNEL_CAPACITY);
+        drop(default_cli);
+
         let default_server =
             server::resolve_server_policy(&config).expect("default should resolve");
-        assert_eq!(
-            default_cli.live_event_channel_capacity(),
-            policy::LIVE_EVENT_CHANNEL_CAPACITY
-        );
         assert_eq!(
             default_server.live_event_channel_capacity,
             policy::LIVE_EVENT_CHANNEL_CAPACITY
         );
-        drop(default_cli);
+        let default_serve = server::build_service_from_resolved_policy(&default_server, &config)
+            .expect("default serve boot should construct its service");
+        let default_serve_capacity = default_serve.live_event_channel_capacity_probe();
+        assert_eq!(default_serve_capacity, policy::LIVE_EVENT_CHANNEL_CAPACITY);
+        assert_eq!(
+            default_serve_capacity, default_cli_capacity,
+            "both startup paths must observe the configured default"
+        );
+        drop(default_serve);
 
         set("1024");
         let cli = local_cli_service(generators, runs, CliDeployment::defaults(None))
             .expect("valid capacity should boot via CLI");
+        let cli_capacity = cli.live_event_channel_capacity_probe();
+        assert_eq!(cli_capacity, 1024);
+        drop(cli);
+
         let server = server::resolve_server_policy(&config).expect("valid capacity should resolve");
-        assert_eq!(cli.live_event_channel_capacity(), 1024);
+        let serve = server::build_service_from_resolved_policy(&server, &config)
+            .expect("valid capacity should construct the serve service");
+        let serve_capacity = serve.live_event_channel_capacity_probe();
+        assert_eq!(serve_capacity, 1024);
         assert_eq!(
-            server.live_event_channel_capacity,
-            cli.live_event_channel_capacity(),
+            serve_capacity, cli_capacity,
             "both startup paths must freeze the same effective capacity"
         );
-        drop(cli);
+        drop(serve);
 
         for invalid in ["1", "65537", "not-a-number", ""] {
             set(invalid);
