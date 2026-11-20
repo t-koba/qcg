@@ -1022,12 +1022,12 @@ mod tests {
     /// ceiling, and both real execution paths journal and enforce it.
     ///
     /// Executed here: `CliDeployment::from_env` (the `qcg run` startup
-    /// resolver), `local_cli_service` plus the real direct
+    /// resolver), clap's real `qcg serve` argument/env binding,
+    /// `local_cli_service` plus the real direct
     /// `run_generator_path_with_events`, real `resolve_server_policy` + an
     /// in-process `serve` HTTP listener, and its `POST /api/runs` admission.
-    /// Not executed: the `qcg` executable and clap's flag parse (the serve
-    /// flag is represented by its `ServerConfig` field).
-    /// `tests/max_total_steps.rs` covers the literal binary separately.
+    /// Not executed: the `qcg` executable; `tests/max_total_steps.rs`
+    /// covers the literal binary separately.
     #[tokio::test]
     async fn max_total_steps_ceiling_matches_on_cli_and_serve_boots() {
         if env_process::isolated() {
@@ -1113,7 +1113,20 @@ output_file = "three.txt"
         unsafe { std::env::set_var(variable, "2") };
         let deployment = CliDeployment::from_env(None).expect("valid ceiling should boot via CLI");
         assert_eq!(deployment.max_total_steps, Some(2));
-        config.max_total_steps = deployment.max_total_steps;
+        // The serve ceiling comes from the real Serve clap/env binding, not
+        // from the CLI resolver: removing `env = "MAX_TOTAL_STEPS"` from the
+        // Serve arg must leave this parse at None and fail the parity check.
+        let Command::Serve {
+            max_total_steps: serve_max_total_steps,
+            ..
+        } = Cli::try_parse_from(["qcg", "serve"])
+            .expect("serve with a valid ceiling should parse")
+            .command
+        else {
+            panic!("bare serve should parse as the Serve command");
+        };
+        assert_eq!(serve_max_total_steps, Some(2));
+        config.max_total_steps = serve_max_total_steps;
         let server_policy =
             server::resolve_server_policy(&config).expect("valid ceiling should resolve");
         assert_eq!(server_policy.max_total_steps, Some(2));
@@ -1276,8 +1289,18 @@ output_file = "three.txt"
             Err(error) => error.to_string(),
             Ok(_) => panic!("zero ceiling must refuse CLI startup"),
         };
+        let Command::Serve {
+            max_total_steps: zero_serve_max_total_steps,
+            ..
+        } = Cli::try_parse_from(["qcg", "serve"])
+            .expect("serve with a zero ceiling should parse")
+            .command
+        else {
+            panic!("bare serve should parse as the Serve command");
+        };
+        assert_eq!(zero_serve_max_total_steps, Some(0));
         let mut zero_config = config.clone();
-        zero_config.max_total_steps = Some(0);
+        zero_config.max_total_steps = zero_serve_max_total_steps;
         let zero_serve = server::resolve_server_policy(&zero_config)
             .expect_err("zero ceiling must refuse serve startup");
         assert!(
@@ -1295,6 +1318,10 @@ output_file = "three.txt"
             Ok(_) => panic!("unparseable ceiling must refuse CLI startup"),
         };
         assert!(bad_cli.contains("MAX_TOTAL_STEPS"), "{bad_cli}");
+        let bad_serve = Cli::try_parse_from(["qcg", "serve"])
+            .expect_err("an unparseable serve ceiling must refuse clap parsing")
+            .to_string();
+        assert!(bad_serve.contains("MAX_TOTAL_STEPS"), "{bad_serve}");
         // SAFETY: the isolated child process owns this environment.
         unsafe { std::env::remove_var(variable) };
         let _ = std::fs::remove_dir_all(&root);
