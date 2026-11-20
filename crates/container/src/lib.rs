@@ -17,10 +17,10 @@ pub use backend::{Backend, backend_for, binary_available, resolve_backend};
 pub use effect::{EffectLedger, Reclaimed, begin, reclaim};
 pub use error::ContainerError;
 pub use plans::{
-    ContainerNetwork, DockerRunSpec, Mount, docker_run_argv, effect_name, incus_delete_argv,
-    incus_device_add_argv, incus_exec_argv, incus_init_argv, incus_pool_argv, incus_probe_argv,
-    incus_secure_argv, incus_start_argv, incus_stop_argv, is_effect_name, split_pinned_image,
-    validate_guest_path, validate_image_for_backend,
+    ContainerLimits, ContainerNetwork, DockerRunSpec, Mount, docker_run_argv, effect_name,
+    incus_delete_argv, incus_device_add_argv, incus_exec_argv, incus_init_argv, incus_pool_argv,
+    incus_probe_argv, incus_secure_argv, incus_start_argv, incus_stop_argv, is_effect_name,
+    split_pinned_image, validate_guest_path, validate_image_for_backend,
 };
 pub use session::{
     CleanupWaitOutcome, PROBE_INTERVAL, Provision, Session, SessionGuard,
@@ -94,6 +94,7 @@ mod tests {
             workload: &workload(),
             stdin_pipe: true,
             network: &ContainerNetwork::default(),
+            resources: &ContainerLimits::default(),
         });
         assert_eq!(
             argv,
@@ -131,6 +132,124 @@ mod tests {
         );
     }
 
+    /// Fixed check for configurable resource bounds: with today's code the
+    /// specification has no `resources` field and argv always carries the
+    /// hardcoded 256 / 64m values with no memory or CPU flag, so this test
+    /// cannot compile or pass. With the change, the declared bounds reach
+    /// argv while defaults remain byte-identical.
+    #[test]
+    fn configured_resource_bounds_render_into_runner_argv() {
+        use contract::ContainerResources;
+        let declared = ContainerResources {
+            pids_limit: 1024,
+            tmpfs_size: "128m".into(),
+            memory_limit: Some("1g".into()),
+            cpu_limit: Some("2.5".into()),
+        };
+        let resources = ContainerLimits::try_from(&declared).expect("valid declared bounds");
+        let spec = DockerRunSpec {
+            binary: "docker",
+            runtime_flag: None,
+            name: "qcg-x",
+            labels: &[],
+            mounts: &[],
+            workdir: None,
+            env_names: &[],
+            image: "img@sha256:abc",
+            workload: &workload(),
+            stdin_pipe: false,
+            network: &ContainerNetwork::default(),
+            resources: &resources,
+        };
+        let argv = docker_run_argv(&spec);
+        let flag_values = |argv: &[String], flag: &str| {
+            argv.windows(2)
+                .filter(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flag_values(&argv, "--pids-limit"), vec!["1024"]);
+        assert_eq!(
+            flag_values(&argv, "--tmpfs"),
+            vec!["/tmp:rw,noexec,nosuid,size=128m"]
+        );
+        assert_eq!(flag_values(&argv, "--memory"), vec!["1g"]);
+        assert_eq!(flag_values(&argv, "--cpus"), vec!["2.5"]);
+        for flag in [
+            "--network",
+            "none",
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+        ] {
+            assert!(
+                argv.contains(&flag.to_string()),
+                "missing safety flag {flag}"
+            );
+        }
+
+        // Same builder with defaults: the pinned argv shape is unchanged.
+        let defaults = ContainerLimits::default();
+        let default_argv = docker_run_argv(&DockerRunSpec {
+            resources: &defaults,
+            ..spec
+        });
+        assert_eq!(flag_values(&default_argv, "--pids-limit"), vec!["256"]);
+        assert_eq!(
+            flag_values(&default_argv, "--tmpfs"),
+            vec!["/tmp:rw,noexec,nosuid,size=64m"]
+        );
+        assert!(default_argv.iter().all(|arg| arg != "--memory"));
+        assert!(default_argv.iter().all(|arg| arg != "--cpus"));
+
+        // No invalid declaration can be turned into a runner plan.
+        for bad in [
+            ContainerResources {
+                pids_limit: 0,
+                ..declared.clone()
+            },
+            ContainerResources {
+                tmpfs_size: "0m".into(),
+                ..declared.clone()
+            },
+            ContainerResources {
+                tmpfs_size: "64mb".into(),
+                ..declared.clone()
+            },
+            ContainerResources {
+                tmpfs_size: "-1m".into(),
+                ..declared.clone()
+            },
+            ContainerResources {
+                tmpfs_size: "999999999999999999999g".into(),
+                ..declared.clone()
+            },
+            ContainerResources {
+                memory_limit: Some("abc".into()),
+                ..declared.clone()
+            },
+            ContainerResources {
+                cpu_limit: Some("0".into()),
+                ..declared.clone()
+            },
+            ContainerResources {
+                cpu_limit: Some("-1".into()),
+                ..declared.clone()
+            },
+            ContainerResources {
+                cpu_limit: Some("1.2345".into()),
+                ..declared
+            },
+        ] {
+            assert!(
+                ContainerLimits::try_from(&bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
     #[test]
     fn declared_destination_grants_its_network_and_no_other_reach() {
         let declared = ContainerNetwork::destination("api.example.com")
@@ -149,6 +268,7 @@ mod tests {
             workload: &workload(),
             stdin_pipe: false,
             network: &declared,
+            resources: &ContainerLimits::default(),
         });
         let declared_network = declared.network_name().expect("destination has a network");
         let undeclared_network = undeclared
@@ -224,6 +344,7 @@ mod tests {
             workload: &workload(),
             stdin_pipe: true,
             network: &ContainerNetwork::default(),
+            resources: &ContainerLimits::default(),
         });
         assert!(argv.starts_with(&["podman".to_string(), "run".to_string()]));
         assert!(argv.contains(&"/runs/r1/workspace:/src:ro".to_string()));
@@ -246,6 +367,7 @@ mod tests {
             workload: &workload(),
             stdin_pipe: false,
             network: &ContainerNetwork::default(),
+            resources: &ContainerLimits::default(),
         });
         assert_eq!(&argv[0..4], &["docker", "run", "--runtime", "runsc"]);
         assert!(!argv.contains(&"-i".to_string()));

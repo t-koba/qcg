@@ -144,6 +144,24 @@ impl CmdGateway {
         }
     }
 
+    /// Resolves the contract's declared resource bounds into a validated
+    /// runner plan. Re-validated here so a gateway built outside contract
+    /// loading can never render a broken runner invocation.
+    fn container_limits(
+        &self,
+        backend: &container::Backend,
+    ) -> Result<container::ContainerLimits, GatewayError> {
+        let declared = &self.permissions.containers.resources;
+        let limits = container::ContainerLimits::try_from(declared)?;
+        if !declared.is_default() && matches!(backend, container::Backend::Incus { .. }) {
+            return Err(container::ContainerError::InvalidResources {
+                reason: "container resource bounds require a Docker-family runtime".into(),
+            }
+            .into());
+        }
+        Ok(limits)
+    }
+
     pub async fn run(&self, argv: &[String]) -> Result<CommandOutput, GatewayError> {
         self.run_with_limits(
             argv,
@@ -260,6 +278,7 @@ impl CmdGateway {
             })
             .collect();
         let network = self.container_network(&backend)?;
+        let resources = self.container_limits(&backend)?;
         // The intent is journaled and the unique name allocated before any
         // daemon call; both families create the instance under that name.
         let session = provision(
@@ -290,6 +309,7 @@ impl CmdGateway {
                 workload: spec.workload_argv,
                 stdin_pipe: spec.stdin.is_some(),
                 network: &network,
+                resources: &resources,
             }),
             Backend::Incus { binary } => container::incus_exec_argv(
                 binary,
@@ -762,6 +782,96 @@ mod tests {
         assert!(
             managed
                 .container_network(&container::Backend::Incus {
+                    binary: "incus".into()
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn container_resources_from_contract_reach_runner_argv() {
+        use contract::ContainerResources;
+        let declared = ContainerResources {
+            pids_limit: 512,
+            tmpfs_size: "128m".into(),
+            memory_limit: Some("1g".into()),
+            cpu_limit: Some("2.5".into()),
+        };
+        let gateway_for = |resources: ContainerResources| {
+            CmdGateway::new(
+                Permissions {
+                    containers: contract::ContainerPermission {
+                        resources,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                Utf8PathBuf::from("/tmp/engine-test-workspace"),
+            )
+        };
+        let backend = container::Backend::Docker {
+            binary: "docker".into(),
+            runtime_flag: None,
+        };
+        let resources = gateway_for(declared.clone())
+            .container_limits(&backend)
+            .expect("valid declared bounds should reach the runner plan");
+        let argv = container::docker_run_argv(&container::DockerRunSpec {
+            binary: "docker",
+            runtime_flag: None,
+            name: "qcg-x",
+            labels: &[],
+            mounts: &[],
+            workdir: None,
+            env_names: &[],
+            image: "img@sha256:abc",
+            workload: &["echo".to_string(), "confirmed".to_string()],
+            stdin_pipe: false,
+            network: &container::ContainerNetwork::default(),
+            resources: &resources,
+        });
+        let flag_values = |flag: &str| {
+            argv.windows(2)
+                .filter(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(flag_values("--pids-limit"), vec!["512"]);
+        assert_eq!(
+            flag_values("--tmpfs"),
+            vec!["/tmp:rw,noexec,nosuid,size=128m"]
+        );
+        assert_eq!(flag_values("--memory"), vec!["1g"]);
+        assert_eq!(flag_values("--cpus"), vec!["2.5"]);
+
+        // A gateway built outside contract loading still refuses bad values
+        // before any daemon call, and managed backends cannot apply them.
+        for bad in [
+            ContainerResources {
+                pids_limit: 0,
+                ..declared.clone()
+            },
+            ContainerResources {
+                tmpfs_size: "64mb".into(),
+                ..declared.clone()
+            },
+            ContainerResources {
+                memory_limit: Some("-1g".into()),
+                ..declared.clone()
+            },
+            ContainerResources {
+                cpu_limit: Some("0".into()),
+                ..declared.clone()
+            },
+        ] {
+            assert!(
+                gateway_for(bad).container_limits(&backend).is_err(),
+                "gateway must refuse invalid bounds"
+            );
+        }
+        assert!(
+            gateway_for(declared)
+                .container_limits(&container::Backend::Incus {
                     binary: "incus".into()
                 })
                 .is_err()

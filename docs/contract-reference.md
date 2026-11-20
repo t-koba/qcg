@@ -411,8 +411,8 @@ effects are denied unless explicitly declared.
   `@sha256:` and present in `permissions.containers.images`; `trusted_host`
   explicitly grants execution under the qcg OS identity and cannot name an
   image.
-- `containers`: `{ enabled, runtime, images, on_missing, network }`. Enabled containers
-  must select `docker`, `podman`, `docker_runsc`, `incus`, or `lxd`;
+- `containers`: `{ enabled, runtime, images, on_missing, network, resources }`.
+  Enabled containers must select `docker`, `podman`, `docker_runsc`, `incus`, or `lxd`;
   runtime auto-detection is deliberately forbidden. Image pin forms follow
   the runtime: `docker`, `podman`, and `docker_runsc` require
   `name@sha256:<hex>`; `incus` and `lxd` require
@@ -425,6 +425,17 @@ effects are denied unless explicitly declared.
   host must also appear explicitly in `permissions.network`. See
   [security](security.md) for the network name and the operator's egress
   responsibilities.
+  `resources` is `{ pids_limit, tmpfs_size, memory_limit, cpu_limit }` and
+  is optional as a whole. Defaults reproduce the hardened runner argv:
+  `pids_limit = 256`, `tmpfs_size = "64m"`, and no memory or CPU limit (no
+  `--memory` / `--cpus` flag is emitted). Sizes are positive canonical
+  `<digits><b|k|m|g>` strings (for example `"128m"` or `"2g"`) and CPU is a
+  positive decimal core count with at most three fractional digits (for
+  example `"2.5"`). `pids_limit` must be between 1 and 2147483647. Zero,
+  negative, malformed units, overflow, and unknown keys are refused at
+  contract load and again at the gateway. Non-default bounds require a
+  Docker-family runtime; `incus` and `lxd` have no matching runner argv and
+  refuse them rather than silently ignoring the declaration.
 - `side_effects`: `none`, `confirm`, `dry_run_first`, or `allowed`.
 - `side_effects_scope`: `invocation` (default) or `content`. The default
   applies at manifest-parse time only (`SideEffectScope::Invocation` when

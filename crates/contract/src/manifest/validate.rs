@@ -154,6 +154,7 @@ impl Manifest {
         check(HooksRule::validate(self));
         check(CommandPermissionRule.validate(self));
         check(validate_container_network(self));
+        check(validate_container_resources(self));
         check(ToolRule.validate(self));
         check(OutputArtifactRule.validate(self));
         check(AssetRule.validate(self));
@@ -219,6 +220,28 @@ fn validate_container_network(manifest: &Manifest) -> Result<(), ContractError> 
     ) {
         return Err(ContractError::Invalid(
             "container destination requires a Docker-family runtime".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Resource bounds are values, so the same closed grammar is checked at
+/// contract load and again in the gateway before any daemon call. Managed-
+/// instance families have no matching runner argv here: a non-default bound
+/// is refused rather than silently ignored.
+fn validate_container_resources(manifest: &Manifest) -> Result<(), ContractError> {
+    let resources = &manifest.permissions.containers.resources;
+    resources.validate().map_err(ContractError::Invalid)?;
+    if !resources.is_default()
+        && matches!(
+            manifest.permissions.containers.runtime,
+            Some(
+                super::resources::ContainerRuntime::Incus | super::resources::ContainerRuntime::Lxd
+            )
+        )
+    {
+        return Err(ContractError::Invalid(
+            "container resource bounds require a Docker-family runtime".into(),
         ));
     }
     Ok(())

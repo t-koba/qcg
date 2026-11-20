@@ -322,6 +322,17 @@ qcg does not re-check DNS or per-hop redirects for traffic originating inside
 the container. This mode is refused for `incus` and `lxd`, which have no
 destination-scoped network argv here.
 
+Docker-family resource bounds default to `--pids-limit 256` and a bounded
+`--tmpfs /tmp:rw,noexec,nosuid,size=64m`, with memory and CPU limits unset
+(no `--memory` or `--cpus` flag). A deployment may raise them through
+`permissions.containers.resources` (`pids_limit`, `tmpfs_size`,
+`memory_limit`, `cpu_limit`); the values are validated at contract load and
+again in the gateway before any runner invocation, so zero, negative,
+malformed units, overflow, and unknown fields fail closed. Raising a bound
+widens the workload's blast radius: size it to the workload and the host's
+capacity. Non-default bounds are refused for `incus` and `lxd`, which have no
+matching resource argv in this release.
+
 Digest pinning follows the family: Docker-compatible images use
 `name@sha256:<hex>` enforced by the daemon; Incus-like images use
 `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so

@@ -97,6 +97,46 @@ impl ContainerNetwork {
     }
 }
 
+/// Validated resource bounds for one `docker run` invocation.
+///
+/// The contract owns the declaration; this plan is the only way a bound
+/// reaches runner argv and can be built only from a validated declaration
+/// (or the safe defaults). Defaults preserve the pre-configuration argv.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerLimits {
+    pids_limit: u32,
+    tmpfs_size: String,
+    memory_limit: Option<String>,
+    cpu_limit: Option<String>,
+}
+
+impl Default for ContainerLimits {
+    fn default() -> Self {
+        Self {
+            pids_limit: contract::DEFAULT_CONTAINER_PIDS_LIMIT,
+            tmpfs_size: contract::DEFAULT_CONTAINER_TMPFS_SIZE.to_string(),
+            memory_limit: None,
+            cpu_limit: None,
+        }
+    }
+}
+
+impl TryFrom<&contract::ContainerResources> for ContainerLimits {
+    type Error = ContainerError;
+
+    fn try_from(declared: &contract::ContainerResources) -> Result<Self, Self::Error> {
+        declared
+            .validate()
+            .map_err(|reason| ContainerError::InvalidResources { reason })?;
+        Ok(Self {
+            pids_limit: declared.pids_limit,
+            tmpfs_size: declared.tmpfs_size.clone(),
+            memory_limit: declared.memory_limit.clone(),
+            cpu_limit: declared.cpu_limit.clone(),
+        })
+    }
+}
+
 /// Inputs for [`docker_run_argv`], bundled so the builder signature stays
 /// reviewable as options grow.
 #[derive(Debug, Clone)]
@@ -114,6 +154,8 @@ pub struct DockerRunSpec<'a> {
     pub stdin_pipe: bool,
     /// Destination-scoped network reach; `None` means fully isolated.
     pub network: &'a ContainerNetwork,
+    /// Validated pids, `/tmp`, memory, and CPU bounds.
+    pub resources: &'a ContainerLimits,
 }
 
 /// Builds `docker run` argv in one canonical order. The `-v` triple form is
@@ -146,10 +188,18 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
         "--security-opt".into(),
         "no-new-privileges".into(),
         "--pids-limit".into(),
-        "256".into(),
+        spec.resources.pids_limit.to_string(),
         "--tmpfs".into(),
-        "/tmp:rw,noexec,nosuid,size=64m".into(),
+        format!("/tmp:rw,noexec,nosuid,size={}", spec.resources.tmpfs_size),
     ]);
+    // Unset limits add no flag at all: the default argv stays byte-identical
+    // to the hardened shape pinned before bounds were configurable.
+    if let Some(memory) = &spec.resources.memory_limit {
+        argv.extend(["--memory".into(), memory.clone()]);
+    }
+    if let Some(cpu) = &spec.resources.cpu_limit {
+        argv.extend(["--cpus".into(), cpu.clone()]);
+    }
     for mount in spec.mounts {
         argv.push("-v".into());
         argv.push(format!(

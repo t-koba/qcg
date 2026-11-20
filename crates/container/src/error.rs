@@ -10,6 +10,8 @@ pub enum ContainerError {
     },
     #[error("container destination `{host}` is invalid: {reason}")]
     InvalidDestination { host: String, reason: String },
+    #[error("container resource declaration is invalid: {reason}")]
+    InvalidResources { reason: String },
     #[error("container {stage} failed for instance `{instance}`: {detail}")]
     StageFailed {
         stage: &'static str,

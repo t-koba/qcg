@@ -403,6 +403,164 @@ impl ContainerNetwork {
     }
 }
 
+/// Resource bounds declared for one container workload.
+///
+/// Every field defaults to the hardened runner values used before bounds
+/// became configurable: 256 pids, a 64 MiB noexec/nosuid `/tmp`, and no
+/// memory or CPU limit. The contract owns these values; the container plan
+/// only renders a validated declaration into runner argv.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerResources {
+    /// Maximum process ids in one container. Must be positive and fit the
+    /// runner's signed 32-bit `--pids-limit` flag.
+    #[serde(default = "default_container_pids_limit")]
+    pub pids_limit: u32,
+    /// `/tmp` tmpfs size in canonical `<digits><b|k|m|g>` form (e.g. `64m`).
+    #[serde(default = "default_container_tmpfs_size")]
+    pub tmpfs_size: String,
+    /// Memory ceiling in the same size grammar. `None` means no `--memory`.
+    #[serde(default)]
+    pub memory_limit: Option<String>,
+    /// CPU ceiling in cores, `<digits>[.<1-3 digits>]`. `None` means no
+    /// `--cpus` flag.
+    #[serde(default)]
+    pub cpu_limit: Option<String>,
+}
+
+pub const DEFAULT_CONTAINER_PIDS_LIMIT: u32 = 256;
+pub const DEFAULT_CONTAINER_TMPFS_SIZE: &str = "64m";
+
+fn default_container_pids_limit() -> u32 {
+    DEFAULT_CONTAINER_PIDS_LIMIT
+}
+
+fn default_container_tmpfs_size() -> String {
+    DEFAULT_CONTAINER_TMPFS_SIZE.to_string()
+}
+
+impl Default for ContainerResources {
+    fn default() -> Self {
+        Self {
+            pids_limit: DEFAULT_CONTAINER_PIDS_LIMIT,
+            tmpfs_size: DEFAULT_CONTAINER_TMPFS_SIZE.to_string(),
+            memory_limit: None,
+            cpu_limit: None,
+        }
+    }
+}
+
+impl ContainerResources {
+    /// True when every bound equals the runner defaults. Managed-instance
+    /// families have no matching runner argv, so only a default declaration
+    /// is valid for them.
+    pub fn is_default(&self) -> bool {
+        self.pids_limit == DEFAULT_CONTAINER_PIDS_LIMIT
+            && self.tmpfs_size == DEFAULT_CONTAINER_TMPFS_SIZE
+            && self.memory_limit.is_none()
+            && self.cpu_limit.is_none()
+    }
+
+    /// Validates every bound with the closed grammar the runner argv uses.
+    /// Called at contract load and again at the gateway before any daemon
+    /// call; a rejected value never reaches a runner invocation.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pids_limit == 0 || self.pids_limit > i32::MAX as u32 {
+            return Err(format!(
+                "container resources.pids_limit must be between 1 and {}",
+                i32::MAX
+            ));
+        }
+        parse_container_size("resources.tmpfs_size", &self.tmpfs_size)?;
+        if let Some(memory) = &self.memory_limit {
+            parse_container_size("resources.memory_limit", memory)?;
+        }
+        if let Some(cpu) = &self.cpu_limit {
+            parse_container_cpu("resources.cpu_limit", cpu)?;
+        }
+        Ok(())
+    }
+}
+
+/// Parses a Docker-compatible size into bytes. The grammar is deliberately
+/// closed: argv must never carry a sign, whitespace, an alternate unit, or a
+/// value larger than the runner's signed-byte flags accept.
+fn parse_container_size(field: &str, value: &str) -> Result<u64, String> {
+    let invalid =
+        || format!("container {field} must be a positive size with a b/k/m/g unit (e.g. 64m)");
+    let (digits, multiplier) = if let Some(rest) = value.strip_suffix('b') {
+        (rest, 1_u64)
+    } else if let Some(rest) = value.strip_suffix('k') {
+        (rest, 1024_u64)
+    } else if let Some(rest) = value.strip_suffix('m') {
+        (rest, 1024_u64 * 1024)
+    } else if let Some(rest) = value.strip_suffix('g') {
+        (rest, 1024_u64 * 1024 * 1024)
+    } else {
+        return Err(invalid());
+    };
+    if digits.is_empty()
+        || (digits.len() > 1 && digits.starts_with('0'))
+        || !digits.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let count: u64 = digits
+        .parse()
+        .map_err(|_| format!("container {field} size overflows"))?;
+    let bytes = count
+        .checked_mul(multiplier)
+        .ok_or_else(|| format!("container {field} size overflows"))?;
+    if bytes == 0 || bytes > i64::MAX as u64 {
+        return Err(format!("container {field} size is out of range"));
+    }
+    Ok(bytes)
+}
+
+/// Parses a Docker-compatible CPU count into millicpus. Three fractional
+/// digits is the runner's precision; anything else is refused rather than
+/// rounded into a different bound.
+fn parse_container_cpu(field: &str, value: &str) -> Result<u64, String> {
+    let invalid = || {
+        format!(
+            "container {field} must be a positive CPU count with at most three fractional digits (e.g. 1.5)"
+        )
+    };
+    let (whole, fraction) = match value.split_once('.') {
+        Some((whole, fraction)) => (whole, Some(fraction)),
+        None => (value, None),
+    };
+    let fractional = if let Some(fraction) = fraction {
+        if fraction.is_empty()
+            || fraction.len() > 3
+            || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(invalid());
+        }
+        let padded = format!("{fraction}{}", "0".repeat(3 - fraction.len()));
+        padded
+            .parse::<u64>()
+            .map_err(|_| format!("container {field} CPU count overflows"))?
+    } else {
+        0
+    };
+    if whole.is_empty()
+        || (whole.len() > 1 && whole.starts_with('0'))
+        || !whole.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(invalid());
+    }
+    let whole: u64 = whole
+        .parse()
+        .map_err(|_| format!("container {field} CPU count overflows"))?;
+    let millis = whole
+        .checked_mul(1000)
+        .and_then(|millis| millis.checked_add(fractional))
+        .filter(|millis| *millis != 0 && *millis <= i64::MAX as u64)
+        .ok_or_else(|| format!("container {field} CPU count is out of range"))?;
+    Ok(millis)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerPermission {
@@ -417,6 +575,9 @@ pub struct ContainerPermission {
     /// Destination-scoped runner network. Empty means fully isolated.
     #[serde(default)]
     pub network: ContainerNetwork,
+    /// Resource bounds applied to Docker-family runner invocations.
+    #[serde(default)]
+    pub resources: ContainerResources,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

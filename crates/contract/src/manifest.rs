@@ -1255,6 +1255,105 @@ host = "api.example.com"
     }
 
     #[test]
+    fn container_resource_bounds_default_and_fail_closed() {
+        let source = |resources: &str| {
+            format!(
+                r#"
+[generator]
+id = "container-resources"
+version = "0.1.0"
+[permissions]
+network = []
+fs_read = []
+fs_write = []
+commands = []
+side_effects = "none"
+[permissions.containers]
+enabled = true
+runtime = "docker"
+images = ["img@sha256:abc"]
+{resources}"#
+            )
+        };
+        let declared = r#"
+[permissions.containers.resources]
+pids_limit = 1024
+tmpfs_size = "128m"
+memory_limit = "1g"
+cpu_limit = "2.5"
+"#;
+        let valid: Manifest = toml::from_str(&source(declared)).expect("bounds should parse");
+        assert_eq!(
+            valid.permissions.containers.resources,
+            ContainerResources {
+                pids_limit: 1024,
+                tmpfs_size: "128m".into(),
+                memory_limit: Some("1g".into()),
+                cpu_limit: Some("2.5".into()),
+            }
+        );
+        valid
+            .validate()
+            .expect("valid bounds should pass contract load");
+
+        let omitted: Manifest = toml::from_str(&source("")).expect("defaults should parse");
+        assert_eq!(
+            omitted.permissions.containers.resources,
+            ContainerResources::default()
+        );
+        assert_eq!(omitted.permissions.containers.resources.pids_limit, 256);
+        assert_eq!(omitted.permissions.containers.resources.tmpfs_size, "64m");
+        assert!(
+            omitted
+                .permissions
+                .containers
+                .resources
+                .memory_limit
+                .is_none()
+        );
+        assert!(omitted.permissions.containers.resources.cpu_limit.is_none());
+        omitted.validate().expect("defaults remain valid");
+
+        for (table, expected) in [
+            ("pids_limit = 0", "pids_limit"),
+            ("pids_limit = -1", ""),
+            ("pids_limit = 2147483648", ""),
+            ("tmpfs_size = \"0m\"", "tmpfs_size"),
+            ("tmpfs_size = \"64mb\"", "b/k/m/g"),
+            ("tmpfs_size = \"-1m\"", "b/k/m/g"),
+            ("tmpfs_size = \"999999999999999999999g\"", "overflow"),
+            ("memory_limit = \"-1g\"", "b/k/m/g"),
+            ("memory_limit = \"1.5g\"", "b/k/m/g"),
+            ("cpu_limit = \"0\"", "CPU count"),
+            ("cpu_limit = \"-1\"", "CPU count"),
+            ("cpu_limit = \"1.0001\"", "three fractional"),
+            ("cpu_limit = \"1e3\"", "CPU count"),
+            ("unknown_bound = 1", ""),
+        ] {
+            let source = source(&format!("[permissions.containers.resources]\n{table}\n"));
+            match toml::from_str::<Manifest>(&source) {
+                Err(error) => assert!(expected.is_empty(), "unexpected parse error: {error}"),
+                Ok(manifest) => {
+                    let error = manifest
+                        .validate()
+                        .expect_err("invalid resource bound must fail contract load");
+                    assert!(
+                        expected.is_empty() || error.to_string().contains(expected),
+                        "expected {expected:?} in {error}"
+                    );
+                }
+            }
+        }
+
+        let mut managed = valid;
+        managed.permissions.containers.runtime = Some(ContainerRuntime::Incus);
+        let error = managed
+            .validate()
+            .expect_err("managed instances have no resource-bound argv");
+        assert!(error.to_string().contains("Docker-family"), "{error}");
+    }
+
+    #[test]
     fn resource_sources_are_exclusive_and_builtin_sources_are_required() {
         let cases = [
             (

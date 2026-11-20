@@ -842,6 +842,9 @@ impl McpRuntime {
                         // MCP profiles declare no destination-scoped
                         // container network; keep their isolated default.
                         let network = container::ContainerNetwork::default();
+                        // MCP profiles declare no container resource bounds;
+                        // keep the hardened 256-pid / 64m-tmpfs defaults.
+                        let resources = container::ContainerLimits::default();
                         container::docker_run_argv(&container::DockerRunSpec {
                             binary,
                             runtime_flag: runtime_flag.as_deref(),
@@ -854,6 +857,7 @@ impl McpRuntime {
                             workload: &workload,
                             stdin_pipe: true,
                             network: &network,
+                            resources: &resources,
                         })
                     }
                     container::Backend::Incus { binary } => container::incus_exec_argv(
