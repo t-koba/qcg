@@ -510,10 +510,12 @@ effects are denied unless explicitly declared.
   approval for different content and native convergence across resends are
   covered by tests in `run_context.rs`.
 
-Container commands run without a shell with no network and only the run
-workspace mounted at `/work`. Docker-compatible runtimes add a read-only
-root, all capabilities dropped, no-new-privileges, a PID limit, and a
-bounded `/tmp`. Incus-like runtimes (`incus`, `lxd`) launch by image
+Container commands run without a shell, with the isolated `none` network by
+default or exactly one destination-scoped network when
+`permissions.containers.network` declares it, and only the run workspace
+mounted at `/work`. Docker-compatible runtimes add a read-only root, all
+capabilities dropped, no-new-privileges, a PID limit, and a bounded `/tmp`.
+Incus-like runtimes (`incus`, `lxd`) launch by image
 fingerprint with no NIC, a workspace-only disk device, and unprivileged
 confinement.
 The declared runtime is recorded in the command plan, and every backend
