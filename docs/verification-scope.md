@@ -91,6 +91,21 @@ regenerates the server OpenAPI and shared types. The required online audit and
 full frontend checks/build remain CI gates; local offline generation is not
 security-advisory evidence.
 
+### Regenerating schema artifacts
+
+A change to a contract-owned API schema has three checked-in downstream
+artifacts that must move in the same commit: the component index in
+`crates/api/tests/all/schema_components.snapshot.json`, the OpenAPI document
+`docs/openapi.json`, and the generated clients in `clients/`. Run
+`node scripts/update-generated-docs.mjs` for the document and the generated
+blocks in `docs/contract-reference.md` and `docs/run-event-reference.md`, then
+`node scripts/generate-sdk.mjs` for the clients. The component index is the
+sorted list of `api::openapi_components()` schema names; when it changes, take
+the actual value from the failing `schema_component_index_matches_snapshot`
+assertion. Verify with `cargo test -p api`, `bash scripts/check-generated-docs.sh`
+and `bash scripts/check-sdk.sh`. CI reruns the latter two and fails on any diff,
+so a schema change with a stale document or SDK cannot land.
+
 ## Test maintenance policy
 
 Every continuing test should name the behavior it protects and exercise the
