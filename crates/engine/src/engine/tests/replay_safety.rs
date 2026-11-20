@@ -2,6 +2,14 @@ use super::*;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use tokio::sync::Semaphore;
 
+// Liveness guard for the replay-safety tests below. These `timeout` wrappers
+// only fail a genuinely hung engine (for example, a step that never resolves
+// its semaphore); correctness is asserted separately from the folded journal
+// and returned errors. The wrapped runs finish in well under a second, so the
+// guard is deliberately generous: it still fails an infinite hang, but a
+// runner-wide stall cannot turn correct behavior into a false `Elapsed` error.
+const REPLAY_LIVENESS_GUARD: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct ReplaySafeForeachController;
 
 #[async_trait]
@@ -71,12 +79,9 @@ impl StepExecutor for InterruptedIteration {
 
 #[tokio::test]
 async fn foreach_unreported_iteration_blocks_even_when_parent_is_replay_safe() {
-    tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        foreach_unreported_iteration(),
-    )
-    .await
-    .unwrap();
+    tokio::time::timeout(REPLAY_LIVENESS_GUARD, foreach_unreported_iteration())
+        .await
+        .unwrap();
 }
 
 async fn foreach_unreported_iteration() {
@@ -310,7 +315,7 @@ async fn replay_preflight_refuses_entire_mixed_set_before_authorization() {
         options.max_parallel_steps = 3;
         options.answers = answers;
         tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            REPLAY_LIVENESS_GUARD,
             engine.run_with_id(
                 "mixed-replay".into(),
                 dir.join("meta"),
