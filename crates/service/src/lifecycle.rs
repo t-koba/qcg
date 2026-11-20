@@ -1980,6 +1980,62 @@ impl LocalService {
             self.inner.deployment_policy.max_total_steps,
             self.inner.deployment_policy.max_parallel_steps,
         );
+        // The API path journals the resolved ceiling in `run_queued` and
+        // recovery reads that event as the authority. Direct runs use the
+        // same admission shape so one reader serves both paths; the values
+        // come from the policy that drives this engine, never a fresh
+        // environment read. The fresh-journal precondition keeps a resumed
+        // direct run's original identity and step-budget ledger untouched.
+        let journal_path = metadata_dir.join("journal.jsonl");
+        let journal_limits = engine::JournalLimits::from(&contract.manifest.runtime);
+        if !journal_path.exists() {
+            // `append_single_event_if` needs an existing file; initialize it
+            // with the same limits and identity the engine will later open.
+            engine::JournalWriter::create_with_limits(
+                &journal_path,
+                &run_id,
+                false,
+                None,
+                journal_limits,
+            )
+            .map_err(|error| api_internal(format!("cannot create direct run journal: {error}")))?;
+        }
+        match engine::JournalWriter::append_single_event_if(
+            &journal_path,
+            &run_id,
+            "run_queued",
+            json!({
+                "generator": format!("{}@{}", contract.manifest.generator.id, contract.manifest.generator.version),
+                "generator_path": &run.generator_path,
+                "contract_sha256": &contract.sha256,
+                "inputs": &canonical_direct_inputs,
+                "answers": &run.answers,
+                "confirmations": &run.confirmations,
+                "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                "elapsed_budget_mode": self.inner.deployment_policy.elapsed_budget_mode,
+                "retention_days": contract.manifest.retention.days,
+                "effective_max_total_steps": policy.max_total_steps,
+                "effective_policy_origin": policy.origin,
+            }),
+            journal_limits,
+            Some(events.clone()),
+            |state| {
+                if state.last_seq == 0 {
+                    Ok(())
+                } else {
+                    Err(engine::JournalError::PreconditionFailed(
+                        "direct run journal already has an admission".into(),
+                    ))
+                }
+            },
+        ) {
+            Ok(_) | Err(engine::JournalError::PreconditionFailed(_)) => {}
+            Err(error) => {
+                return Err(api_internal(format!(
+                    "cannot journal direct run admission: {error}"
+                )));
+            }
+        }
         let json_events = matches!(mode, DirectEventMode::None) && run.json_events;
         let manifest = Engine::new(app_registry(Arc::clone(&runtime)))
             .with_container_timeouts(self.inner.deployment_policy.container_timeouts)

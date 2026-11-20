@@ -88,6 +88,22 @@ fn direct_run_honors_the_deployment_ceiling() {
         stderr.contains("global step budget exceeded: 2 >= 2"),
         "a request over the ceiling must be refused: {stderr}"
     );
+    let meta = root.join(service::direct_run_meta_dir(Utf8Path::new("out")));
+    let journal = std::fs::read_to_string(meta.join("journal.jsonl"))
+        .unwrap_or_else(|error| panic!("direct run journal should read: {error}"));
+    let queued = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["t"] == "run_queued")
+        .expect("the direct run should journal its admission");
+    assert_eq!(queued["effective_max_total_steps"], 2);
+    assert_eq!(
+        queued["effective_policy_origin"],
+        format!(
+            "service-ceiling:2 caps contract:{}",
+            engine::RunOptions::default_max_total_steps()
+        )
+    );
     let _ = std::fs::remove_dir_all(&root);
 
     let zero = fixture("zero");

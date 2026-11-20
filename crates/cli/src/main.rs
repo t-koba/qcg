@@ -1019,18 +1019,15 @@ mod tests {
 
     /// Fixed check for the accepted `MAX_TOTAL_STEPS` finding: the CLI's
     /// startup resolver and the serve flag both freeze one non-default
-    /// ceiling, and the same admission path journals and enforces it.
+    /// ceiling, and both real execution paths journal and enforce it.
     ///
     /// Executed here: `CliDeployment::from_env` (the `qcg run` startup
-    /// resolver), `local_cli_service`, service admission for the CLI-built
-    /// service, real `resolve_server_policy` + an in-process `serve` HTTP
-    /// listener, and its `POST /api/runs` admission. Not executed: the
-    /// `qcg` executable and clap's flag parse (the serve flag is represented
-    /// by its `ServerConfig` field), and `qcg run`'s `run_generator_path`
-    /// (direct runs do not journal `effective_max_total_steps`, so the CLI
-    /// service is admitted through the same API path the listener uses).
-    /// `tests/max_total_steps.rs` covers the literal binary and that direct
-    /// execution path separately.
+    /// resolver), `local_cli_service` plus the real direct
+    /// `run_generator_path_with_events`, real `resolve_server_policy` + an
+    /// in-process `serve` HTTP listener, and its `POST /api/runs` admission.
+    /// Not executed: the `qcg` executable and clap's flag parse (the serve
+    /// flag is represented by its `ServerConfig` field).
+    /// `tests/max_total_steps.rs` covers the literal binary separately.
     #[tokio::test]
     async fn max_total_steps_ceiling_matches_on_cli_and_serve_boots() {
         if env_process::isolated() {
@@ -1116,26 +1113,55 @@ output_file = "three.txt"
         unsafe { std::env::set_var(variable, "2") };
         let deployment = CliDeployment::from_env(None).expect("valid ceiling should boot via CLI");
         assert_eq!(deployment.max_total_steps, Some(2));
-        config.max_total_steps = Some(2);
+        config.max_total_steps = deployment.max_total_steps;
         let server_policy =
             server::resolve_server_policy(&config).expect("valid ceiling should resolve");
         assert_eq!(server_policy.max_total_steps, Some(2));
 
-        let package_sha256 = service::package::package_identity_sha256(
-            &generators.join("tiny-three-steps"),
-            &service::PackageLimits::default(),
-        )
-        .expect("package identity should compute");
         let request = api::StartRun {
             generator_id: "tiny-three-steps".into(),
             ..Default::default()
         };
         let cli_service = local_cli_service(generators.clone(), cli_runs.clone(), deployment)
             .expect("CLI service should construct");
-        let cli_id = cli_service
-            .start_run_with_package_identity(request.clone(), None, &package_sha256)
-            .await
-            .expect("CLI-built service should admit the run");
+        let cli_output = cli_runs.join("tiny-three-steps-direct");
+        let cli_meta = service::direct_run_meta_dir(&cli_output);
+        let cli_run_dir = cli_meta
+            .parent()
+            .expect("direct run meta should have a run dir");
+        let cli_runs_dir = cli_run_dir
+            .parent()
+            .expect("direct run dir should have a store")
+            .to_owned();
+        let cli_id = cli_run_dir
+            .file_name()
+            .expect("direct run dir should have an id")
+            .to_owned();
+        // The literal CLI run path: a DirectRun through the service's direct
+        // pipeline, not an API admission standing in for it.
+        let cli_direct_error = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            cli_service
+                .run_generator_path_with_events(DirectRun {
+                    generator_path: generators.join("tiny-three-steps"),
+                    inputs: BTreeMap::new(),
+                    output_dir: cli_output,
+                    json_events: false,
+                    interactive: false,
+                    answers: BTreeMap::new(),
+                    confirmations: BTreeMap::new(),
+                    llm_seed_override: None,
+                    cancellation: tokio_util::sync::CancellationToken::new(),
+                })
+                .await
+        })
+        .await
+        .expect("the direct run should finish within the bound")
+        .expect_err("the over-ceiling third step should refuse the direct run")
+        .to_string();
+        assert!(
+            cli_direct_error.contains("global step budget exceeded: 2 >= 2"),
+            "{cli_direct_error}"
+        );
         drop(cli_service);
 
         // Real serve listener: the same policy resolution and service
@@ -1200,7 +1226,7 @@ output_file = "three.txt"
             .map(|entry| entry.file_name().to_string_lossy().into_owned())
             .find(|name| name.starts_with("tiny-three-steps-"))
             .expect("the listener should have admitted one run");
-        let cli_events = wait_for_terminal_events(cli_runs.clone(), cli_id.clone()).await;
+        let cli_events = wait_for_terminal_events(cli_runs_dir, cli_id).await;
         let serve_events = wait_for_terminal_events(serve_runs.clone(), serve_id).await;
         // Tear the listener down only after both admitted runs have reached a
         // terminal journal event. Aborting the server drops `ResidentTasks`,
