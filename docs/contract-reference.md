@@ -411,7 +411,7 @@ effects are denied unless explicitly declared.
   `@sha256:` and present in `permissions.containers.images`; `trusted_host`
   explicitly grants execution under the qcg OS identity and cannot name an
   image.
-- `containers`: `{ enabled, runtime, images, on_missing }`. Enabled containers
+- `containers`: `{ enabled, runtime, images, on_missing, network }`. Enabled containers
   must select `docker`, `podman`, `docker_runsc`, `incus`, or `lxd`;
   runtime auto-detection is deliberately forbidden. Image pin forms follow
   the runtime: `docker`, `podman`, and `docker_runsc` require
@@ -419,6 +419,12 @@ effects are denied unless explicitly declared.
   `<remote>:<path>@sha256:<fingerprint>` and launch by fingerprint so
   exactly the pinned bits run (pre-pull the fingerprint with
   `image copy`).
+  `network` is `{ mode = "none" }` by default (fully isolated). Docker-family
+  runtimes may declare `{ mode = "destination", host = "api.example.com" }`
+  to use the pre-provisioned runner network dedicated to that one host; the
+  host must also appear explicitly in `permissions.network`. See
+  [security](security.md) for the network name and the operator's egress
+  responsibilities.
 - `side_effects`: `none`, `confirm`, `dry_run_first`, or `allowed`.
 - `side_effects_scope`: `invocation` (default) or `content`. The default
   applies at manifest-parse time only (`SideEffectScope::Invocation` when

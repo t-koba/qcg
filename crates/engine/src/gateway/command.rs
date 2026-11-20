@@ -117,6 +117,33 @@ impl CmdGateway {
         self.host_cgroup.as_ref()
     }
 
+    /// Resolves the contract's declared destination to a runner network plan
+    /// before any daemon call. The allowlist is re-checked here so a gateway
+    /// built outside contract loading cannot grant broader reach.
+    fn container_network(
+        &self,
+        backend: &container::Backend,
+    ) -> Result<container::ContainerNetwork, GatewayError> {
+        match &self.permissions.containers.network {
+            contract::ContainerNetwork::None => Ok(container::ContainerNetwork::default()),
+            contract::ContainerNetwork::Destination { host } => {
+                if !self.permissions.network.iter().any(|entry| entry == host) {
+                    return Err(GatewayError::NetworkDenied { host: host.clone() });
+                }
+                let plan = container::ContainerNetwork::destination(host)?;
+                if matches!(backend, container::Backend::Incus { .. }) {
+                    return Err(container::ContainerError::InvalidDestination {
+                        host: host.clone(),
+                        reason: "destination-scoped networking requires a Docker-family runtime"
+                            .into(),
+                    }
+                    .into());
+                }
+                Ok(plan)
+            }
+        }
+    }
+
     pub async fn run(&self, argv: &[String]) -> Result<CommandOutput, GatewayError> {
         self.run_with_limits(
             argv,
@@ -232,6 +259,7 @@ impl CmdGateway {
                 readonly: *readonly,
             })
             .collect();
+        let network = self.container_network(&backend)?;
         // The intent is journaled and the unique name allocated before any
         // daemon call; both families create the instance under that name.
         let session = provision(
@@ -261,6 +289,7 @@ impl CmdGateway {
                 image: spec.image,
                 workload: spec.workload_argv,
                 stdin_pipe: spec.stdin.is_some(),
+                network: &network,
             }),
             Backend::Incus { binary } => container::incus_exec_argv(
                 binary,
@@ -685,6 +714,58 @@ mod tests {
             permissions,
             camino::Utf8PathBuf::from("/tmp/engine-test-workspace"),
         )
+    }
+
+    #[test]
+    fn container_destination_maps_to_its_own_runner_network() {
+        use contract::{ContainerNetwork as DeclaredNetwork, ContainerRuntime};
+        let permissions = Permissions {
+            network: vec!["api.example.com".into()],
+            containers: contract::ContainerPermission {
+                network: DeclaredNetwork::Destination {
+                    host: "api.example.com".into(),
+                },
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let gateway = CmdGateway::new(permissions, Utf8PathBuf::from("/tmp/engine-test-workspace"));
+        let backend = container::Backend::Docker {
+            binary: "docker".into(),
+            runtime_flag: None,
+        };
+        let declared = gateway
+            .container_network(&backend)
+            .expect("declared host should map to its runner network");
+        assert_eq!(
+            declared,
+            container::ContainerNetwork::destination("api.example.com").unwrap()
+        );
+        let undeclared = container::ContainerNetwork::destination("attacker.example").unwrap();
+        assert_ne!(declared.network_name(), undeclared.network_name());
+
+        let mut wildcard = gateway.clone();
+        wildcard.permissions.network = vec!["*".into()];
+        assert!(matches!(
+            wildcard.container_network(&backend),
+            Err(GatewayError::NetworkDenied { .. })
+        ));
+        let mut managed = gateway.clone();
+        assert!(
+            managed
+                .container_network(&container::Backend::Incus {
+                    binary: "incus".into()
+                })
+                .is_err()
+        );
+        managed.permissions.containers.runtime = Some(ContainerRuntime::Incus);
+        assert!(
+            managed
+                .container_network(&container::Backend::Incus {
+                    binary: "incus".into()
+                })
+                .is_err()
+        );
     }
 
     #[test]

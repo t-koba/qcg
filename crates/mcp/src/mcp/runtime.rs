@@ -839,6 +839,9 @@ impl McpRuntime {
                         // `-e NAME` passes the client env value through; the
                         // values themselves are set by the shared env block
                         // below, so they never appear in argv.
+                        // MCP profiles declare no destination-scoped
+                        // container network; keep their isolated default.
+                        let network = container::ContainerNetwork::default();
                         container::docker_run_argv(&container::DockerRunSpec {
                             binary,
                             runtime_flag: runtime_flag.as_deref(),
@@ -850,6 +853,7 @@ impl McpRuntime {
                             image,
                             workload: &workload,
                             stdin_pipe: true,
+                            network: &network,
                         })
                     }
                     container::Backend::Incus { binary } => container::incus_exec_argv(

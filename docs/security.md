@@ -305,8 +305,22 @@ isolation with family-specific mechanisms:
 
 | family | runtimes | network | mounts | capabilities | rootfs | env |
 |---|---|---|---|---|---|---|
-| Docker-compatible | `docker`, `podman`, `docker_runsc` | none | workspace only at `/work` | all dropped, no-new-privileges, PID limit | read-only, bounded `/tmp` | cleared (`PATH`, run `TMPDIR`) |
+| Docker-compatible | `docker`, `podman`, `docker_runsc` | none, or one destination-scoped network when declared | workspace only at `/work` | all dropped, no-new-privileges, PID limit | read-only, bounded `/tmp` | cleared (`PATH`, run `TMPDIR`) |
 | Incus-like | `incus`, `lxd` | no NIC device | workspace-only disk device | unprivileged, no nesting | image default | cleared; explicit flags only |
+
+
+`permissions.containers.network` is `none` by default. A declaration of
+`{ mode = "destination", host = "api.example.com" }` grants exactly one
+destination: the host must be an explicit entry in `permissions.network` (a
+wildcard does not qualify), and the runner is told to use only the network
+named `qcg-egress-<sha256 of the lowercased host>`, never bridge or host
+networking. The deployment owns the egress rules of that pre-provisioned
+runner network; qcg does not create or firewall networks. If the network is
+missing, runner creation fails closed. The runner must allow the declared
+host and deny everything else, including DNS names that resolve elsewhere;
+qcg does not re-check DNS or per-hop redirects for traffic originating inside
+the container. This mode is refused for `incus` and `lxd`, which have no
+destination-scoped network argv here.
 
 Digest pinning follows the family: Docker-compatible images use
 `name@sha256:<hex>` enforced by the daemon; Incus-like images use

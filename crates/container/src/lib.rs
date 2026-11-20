@@ -17,10 +17,10 @@ pub use backend::{Backend, backend_for, binary_available, resolve_backend};
 pub use effect::{EffectLedger, Reclaimed, begin, reclaim};
 pub use error::ContainerError;
 pub use plans::{
-    DockerRunSpec, Mount, docker_run_argv, effect_name, incus_delete_argv, incus_device_add_argv,
-    incus_exec_argv, incus_init_argv, incus_pool_argv, incus_probe_argv, incus_secure_argv,
-    incus_start_argv, incus_stop_argv, is_effect_name, split_pinned_image, validate_guest_path,
-    validate_image_for_backend,
+    ContainerNetwork, DockerRunSpec, Mount, docker_run_argv, effect_name, incus_delete_argv,
+    incus_device_add_argv, incus_exec_argv, incus_init_argv, incus_pool_argv, incus_probe_argv,
+    incus_secure_argv, incus_start_argv, incus_stop_argv, is_effect_name, split_pinned_image,
+    validate_guest_path, validate_image_for_backend,
 };
 pub use session::{
     CleanupWaitOutcome, PROBE_INTERVAL, Provision, Session, SessionGuard,
@@ -93,6 +93,7 @@ mod tests {
             image: "example/tool@sha256:abc",
             workload: &workload(),
             stdin_pipe: true,
+            network: &ContainerNetwork::default(),
         });
         assert_eq!(
             argv,
@@ -131,6 +132,80 @@ mod tests {
     }
 
     #[test]
+    fn declared_destination_grants_its_network_and_no_other_reach() {
+        let declared = ContainerNetwork::destination("api.example.com")
+            .expect("a canonical host is a valid destination");
+        let undeclared = ContainerNetwork::destination("attacker.example")
+            .expect("another canonical host has a distinct network");
+        let argv = docker_run_argv(&DockerRunSpec {
+            binary: "docker",
+            runtime_flag: None,
+            name: "qcg-x",
+            labels: &[],
+            mounts: &[],
+            workdir: None,
+            env_names: &[],
+            image: "img@sha256:abc",
+            workload: &workload(),
+            stdin_pipe: false,
+            network: &declared,
+        });
+        let declared_network = declared.network_name().expect("destination has a network");
+        let undeclared_network = undeclared
+            .network_name()
+            .expect("destination has a network");
+        assert_ne!(declared_network, undeclared_network);
+        // Permit half: the runner is told to use only the network derived
+        // from the declared host, and no other network flag is emitted.
+        assert_eq!(
+            argv.windows(2)
+                .filter(|pair| pair[0] == "--network")
+                .map(|pair| pair[1].as_str())
+                .collect::<Vec<_>>(),
+            vec![declared_network],
+            "exactly one network: the declared destination's own network"
+        );
+        assert!(!argv.contains(&"bridge".to_string()));
+        assert!(!argv.contains(&"host".to_string()));
+        assert!(!argv.contains(&"trusted_host".to_string()));
+        // Deny half: the network belonging to an undeclared host is absent
+        // from argv, so that host cannot be reached through this runner.
+        assert!(
+            !argv.iter().any(|arg| arg == undeclared_network),
+            "undeclared destination network must never appear in argv: {argv:?}"
+        );
+        // The rest of the hardened shape stays byte-for-byte unchanged.
+        for flag in [
+            "--read-only",
+            "--cap-drop",
+            "ALL",
+            "--security-opt",
+            "no-new-privileges",
+        ] {
+            assert!(
+                argv.contains(&flag.to_string()),
+                "missing safety flag {flag}"
+            );
+        }
+
+        // Malformed and empty declarations fail closed instead of
+        // accidentally selecting a broader network.
+        for bad in [
+            "",
+            "  ",
+            "*",
+            "api.example.com:443",
+            "https://api.example.com",
+            "a/b",
+        ] {
+            assert!(
+                ContainerNetwork::destination(bad).is_err(),
+                "{bad:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
     fn docker_run_argv_marks_readonly_mounts_and_server_env() {
         let mounts = [Mount {
             host: Path::new("/runs/r1/workspace"),
@@ -148,6 +223,7 @@ mod tests {
             image: "example/tool@sha256:abc",
             workload: &workload(),
             stdin_pipe: true,
+            network: &ContainerNetwork::default(),
         });
         assert!(argv.starts_with(&["podman".to_string(), "run".to_string()]));
         assert!(argv.contains(&"/runs/r1/workspace:/src:ro".to_string()));
@@ -169,6 +245,7 @@ mod tests {
             image: "img@sha256:abc",
             workload: &workload(),
             stdin_pipe: false,
+            network: &ContainerNetwork::default(),
         });
         assert_eq!(&argv[0..4], &["docker", "run", "--runtime", "runsc"]);
         assert!(!argv.contains(&"-i".to_string()));

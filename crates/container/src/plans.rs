@@ -15,6 +15,88 @@ pub struct Mount<'a> {
     pub readonly: bool,
 }
 
+/// Network reach for one container, chosen before any daemon call.
+///
+/// `None` keeps the runner's isolated mode. `Destination` selects the
+/// pre-provisioned runner network dedicated to one canonical host; the
+/// network's egress rules are deployment policy, but the name is derived
+/// here so no argv can name a network belonging to another destination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContainerNetwork {
+    inner: ContainerNetworkKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContainerNetworkKind {
+    None,
+    Destination { host: String, network: String },
+}
+
+impl Default for ContainerNetwork {
+    fn default() -> Self {
+        Self {
+            inner: ContainerNetworkKind::None,
+        }
+    }
+}
+
+impl ContainerNetwork {
+    /// Builds the network plan for one explicitly declared destination.
+    /// Empty, wildcard, non-canonical, or whitespace-bearing hosts are
+    /// refused before a runner is invoked.
+    pub fn destination(host: &str) -> Result<Self, ContainerError> {
+        let invalid = |reason: &str| ContainerError::InvalidDestination {
+            host: host.to_string(),
+            reason: reason.to_string(),
+        };
+        if host.is_empty()
+            || host == "*"
+            || host.trim() != host
+            || host.chars().any(char::is_whitespace)
+        {
+            return Err(invalid(
+                "must be one non-empty canonical host, not a wildcard",
+            ));
+        }
+        policy::validate_host(host).map_err(|reason| invalid(&reason))?;
+        // Runner network names are DNS-style labels. A fixed-length hex
+        // digest of the canonical host keeps every accepted host within the
+        // runner's name limit and cannot inject extra argv flags. Operator
+        // provisions this exact network with egress limited to `host`.
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(host.to_ascii_lowercase().as_bytes());
+        let network = format!(
+            "qcg-egress-{}",
+            digest
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        );
+        Ok(Self {
+            inner: ContainerNetworkKind::Destination {
+                host: host.to_string(),
+                network,
+            },
+        })
+    }
+
+    /// Runner network name, if this plan grants network reach.
+    pub fn network_name(&self) -> Option<&str> {
+        match &self.inner {
+            ContainerNetworkKind::None => None,
+            ContainerNetworkKind::Destination { network, .. } => Some(network),
+        }
+    }
+
+    /// Declared destination host, if this plan grants network reach.
+    pub fn destination_host(&self) -> Option<&str> {
+        match &self.inner {
+            ContainerNetworkKind::None => None,
+            ContainerNetworkKind::Destination { host, .. } => Some(host),
+        }
+    }
+}
+
 /// Inputs for [`docker_run_argv`], bundled so the builder signature stays
 /// reviewable as options grow.
 #[derive(Debug, Clone)]
@@ -30,6 +112,8 @@ pub struct DockerRunSpec<'a> {
     pub image: &'a str,
     pub workload: &'a [String],
     pub stdin_pipe: bool,
+    /// Destination-scoped network reach; `None` means fully isolated.
+    pub network: &'a ContainerNetwork,
 }
 
 /// Builds `docker run` argv in one canonical order. The `-v` triple form is
@@ -50,9 +134,12 @@ pub fn docker_run_argv(spec: &DockerRunSpec<'_>) -> Vec<String> {
     for (key, value) in spec.labels {
         argv.extend(["--label".into(), format!("{key}={value}")]);
     }
+    // One network flag only: no isolated fallback may accompany a granted
+    // destination, and no bridge/host mode may replace the default `none`.
+    let network = spec.network.network_name().unwrap_or("none");
     argv.extend([
         "--network".into(),
-        "none".into(),
+        network.to_string(),
         "--read-only".into(),
         "--cap-drop".into(),
         "ALL".into(),

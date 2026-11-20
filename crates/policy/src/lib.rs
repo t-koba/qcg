@@ -26,6 +26,7 @@ pub use host_cgroup::{
 };
 pub mod credential;
 pub mod destination_decider;
+pub mod host;
 pub mod limits;
 pub mod params;
 pub mod path;
@@ -51,6 +52,7 @@ pub use destination_decider::{
     DEFAULT_DECIDER_TIMEOUT_SECONDS, MAX_DECIDER_TIMEOUT_SECONDS, MIN_DECIDER_TIMEOUT_SECONDS,
     decider_request_json, decider_verdict_allows, effective_decider_timeout_seconds,
 };
+pub use host::validate_host;
 pub use limits::{
     DEFAULT_CATALOG_FETCH_TIMEOUT_SECONDS, DEFAULT_DIRECT_MCP_TOOL_VALUE_BYTES,
     DEFAULT_GC_INTERVAL_SECS, DEFAULT_GC_KEEP, DEFAULT_GC_KEEP_FAILED,

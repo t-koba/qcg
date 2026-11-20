@@ -376,6 +376,33 @@ fn default_container_mount() -> String {
     "/work".into()
 }
 
+/// Network reach declared for a container workload.
+///
+/// `none` (the default) keeps the runner's fully isolated network mode.
+/// `destination` names exactly one canonical host and selects the runner
+/// network dedicated to it; the deployment owns that network's egress
+/// rules. It is validated against the existing `permissions.network`
+/// allowlist at contract load, and a wildcard entry never qualifies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerNetwork {
+    #[default]
+    None,
+    Destination {
+        host: String,
+    },
+}
+
+impl ContainerNetwork {
+    /// The declared destination host, if any.
+    pub fn destination_host(&self) -> Option<&str> {
+        match self {
+            Self::None => None,
+            Self::Destination { host } => Some(host),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ContainerPermission {
@@ -387,6 +414,9 @@ pub struct ContainerPermission {
     pub images: Vec<String>,
     #[serde(default)]
     pub on_missing: Option<String>,
+    /// Destination-scoped runner network. Empty means fully isolated.
+    #[serde(default)]
+    pub network: ContainerNetwork,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

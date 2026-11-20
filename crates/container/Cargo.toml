@@ -12,6 +12,7 @@ publish.workspace = true
 policy = { path = "../policy" }
 contract = { path = "../contract" }
 getrandom = "0.4"
+sha2.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }

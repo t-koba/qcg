@@ -1179,6 +1179,82 @@ path = "../outside.txt"
         std::fs::remove_dir_all(root).expect("temporary contract directory should be removed");
     }
     #[test]
+    fn container_destination_uses_the_explicit_network_allowlist() {
+        let source = r#"
+[generator]
+id = "container-destination"
+version = "0.1.0"
+[permissions]
+network = ["api.example.com"]
+fs_read = []
+fs_write = []
+commands = []
+side_effects = "none"
+[permissions.containers]
+enabled = true
+runtime = "docker"
+images = ["img@sha256:abc"]
+[permissions.containers.network]
+mode = "destination"
+host = "api.example.com"
+"#;
+        let valid: Manifest = toml::from_str(source).expect("manifest should parse");
+        assert_eq!(
+            valid.permissions.containers.network,
+            ContainerNetwork::Destination {
+                host: "api.example.com".into()
+            }
+        );
+        valid
+            .validate()
+            .expect("explicit destination inside permissions.network should validate");
+
+        let mut undeclared = valid.clone();
+        undeclared.permissions.containers.network = ContainerNetwork::Destination {
+            host: "other.example".into(),
+        };
+        let error = undeclared
+            .validate()
+            .expect_err("undeclared destination must fail closed");
+        assert!(error.to_string().contains("listed explicitly"), "{error}");
+
+        let mut wildcard = valid.clone();
+        wildcard.permissions.network = vec!["*".into()];
+        let error = wildcard
+            .validate()
+            .expect_err("a wildcard ceiling is not an explicit destination");
+        assert!(error.to_string().contains("listed explicitly"), "{error}");
+
+        for bad in ["", "*", "api.example.com:443", "https://api.example.com"] {
+            let mut malformed = valid.clone();
+            malformed.permissions.network = vec![bad.into()];
+            malformed.permissions.containers.network =
+                ContainerNetwork::Destination { host: bad.into() };
+            let error = malformed
+                .validate()
+                .expect_err("malformed destination must fail closed");
+            assert!(error.to_string().contains("canonical host"), "{error}");
+        }
+
+        let mut managed = valid.clone();
+        managed.permissions.containers.runtime = Some(ContainerRuntime::Incus);
+        let error = managed
+            .validate()
+            .expect_err("managed-instance family cannot scope a destination");
+        assert!(error.to_string().contains("Docker-family"), "{error}");
+
+        let mut isolated = valid;
+        isolated.permissions.containers.network = ContainerNetwork::None;
+        isolated
+            .validate()
+            .expect("no destination keeps the isolated default valid");
+        assert_eq!(
+            toml::from_str::<ContainerNetwork>("mode = \"none\"").expect("mode parses"),
+            ContainerNetwork::None
+        );
+    }
+
+    #[test]
     fn resource_sources_are_exclusive_and_builtin_sources_are_required() {
         let cases = [
             (

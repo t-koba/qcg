@@ -8,6 +8,8 @@ pub enum ContainerError {
         backend: String,
         reason: String,
     },
+    #[error("container destination `{host}` is invalid: {reason}")]
+    InvalidDestination { host: String, reason: String },
     #[error("container {stage} failed for instance `{instance}`: {detail}")]
     StageFailed {
         stage: &'static str,

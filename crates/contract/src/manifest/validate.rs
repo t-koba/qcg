@@ -153,6 +153,7 @@ impl Manifest {
         check(FlowNodeRule.validate(self));
         check(HooksRule::validate(self));
         check(CommandPermissionRule.validate(self));
+        check(validate_container_network(self));
         check(ToolRule.validate(self));
         check(OutputArtifactRule.validate(self));
         check(AssetRule.validate(self));
@@ -180,6 +181,47 @@ impl Manifest {
             ))),
         }
     }
+}
+
+/// A container destination is a single canonical host already present in
+/// the existing network allowlist. A wildcard ceiling never qualifies:
+/// granting a container one destination must not widen it to everything.
+fn validate_container_network(manifest: &Manifest) -> Result<(), ContractError> {
+    let Some(host) = manifest.permissions.containers.network.destination_host() else {
+        return Ok(());
+    };
+    if host == "*" {
+        return Err(ContractError::Invalid(
+            "container destination must name one canonical host, not a wildcard".into(),
+        ));
+    }
+    policy::validate_host(host).map_err(|error| {
+        ContractError::Invalid(format!(
+            "container destination `{host}` is not a canonical host: {error}"
+        ))
+    })?;
+    if !manifest
+        .permissions
+        .network
+        .iter()
+        .any(|entry| entry == host)
+    {
+        return Err(ContractError::Invalid(format!(
+            "container destination `{host}` must be listed explicitly in permissions.network"
+        )));
+    }
+    // Managed-instance families have no destination-scoped network argv in
+    // this release; refuse the declaration before any daemon call instead of
+    // silently ignoring it and running with no network.
+    if matches!(
+        manifest.permissions.containers.runtime,
+        Some(super::resources::ContainerRuntime::Incus | super::resources::ContainerRuntime::Lxd)
+    ) {
+        return Err(ContractError::Invalid(
+            "container destination requires a Docker-family runtime".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Raw JSON number boundary for values that feed contract evaluation.
