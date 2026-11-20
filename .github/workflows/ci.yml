@@ -295,3 +295,43 @@ jobs:
             --setenv="HOME=$HOME" --setenv="PATH=$PATH" \
             --setenv="CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" \
             /bin/bash scripts/test-host-cgroup.sh
+
+  # Real-daemon gate on every published head, not a one-off diagnostic: the
+  # hosted Linux runner provisions two isolated Docker bridges so qcg's actual
+  # container must reach only the destination its contract declares.
+  container-network:
+    name: Container destination network (Linux)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          toolchain: 1.100.0  # pinned: a new stable must not turn unchanged code red
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Fetch locked Linux dependencies
+        run: cargo fetch --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build CLI
+        run: cargo build -p cli --locked
+
+      - name: Check probe guards (no Docker required)
+        run: python3 scripts/test-probe-container-network.py
+
+      - name: Probe the real daemon and qcg destination network
+        run: python3 scripts/probe-container-network.py --i-accept-disposable-daemon --result container-network.json
+
+      - name: Retain observed result
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: container-network-${{ github.run_id }}-${{ github.run_attempt }}
+          path: container-network.json
+          if-no-files-found: error

@@ -15,6 +15,7 @@ are matched against Cargo's registered tests and executed in CI.
 | Distribution | `check-dist-bundle.sh`, `verify-bundle.mjs`, `validate-spdx.py` | Extracted required files, Markdown links, SPA/WASM asset presence, full SPDX 2.3 validation, packaged CLI/server startup |
 | Minimal features | `cargo test -p server --no-default-features`, MCP equivalent | Unsupported configuration refuses explicitly |
 | OS | CI Rust and release matrix | Linux, macOS, Windows; Unix file-mode guarantees do not apply to Windows |
+| Container destination network | CI `container-network` job on a hosted Linux Docker daemon (`scripts/probe-container-network.py`) | Real qcg container reaches the declared gateway, cannot reach the undeclared gateway, and its resolved network argv never falls back to host/trusted-host networking |
 | Bounded read performance | [measurement protocol](performance-validation.md) | Read-view counters, HTTP snapshot/list and full-history SSE matrices; release measurements and 54 slow live-tail conditions in both store modes |
 | Product comparison | [comparison protocol](comparison-protocol.md) | Deterministic real qcg/LangGraph/Temporal runs are recorded; Dify runs through a separate native-DSL adapter with the same input/output validator; real LLM comparison requires a common model credential |
 
