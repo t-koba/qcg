@@ -157,6 +157,21 @@ impl ServiceDeploymentPolicy {
             policy::PreemptionQueuePosition::from_env("PREEMPTION_QUEUE_POSITION")?;
         Ok(self)
     }
+
+    /// Resolve the per-run live event broadcast capacity from the deployment
+    /// environment. Every startup path must call this once so the effective
+    /// service channel capacity has a single owner and rejects bad values.
+    pub fn with_live_event_channel_capacity_env(mut self) -> Result<Self, String> {
+        let capacity = policy::parse_bounded_env(
+            "LIVE_EVENT_CHANNEL_CAPACITY",
+            policy::LIVE_EVENT_CHANNEL_CAPACITY as u64,
+            policy::MIN_LIVE_EVENT_CHANNEL_CAPACITY as u64,
+            policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY as u64,
+        )?;
+        self.live_event_channel_capacity = usize::try_from(capacity)
+            .map_err(|_| "LIVE_EVENT_CHANNEL_CAPACITY is not representable".to_string())?;
+        Ok(self)
+    }
 }
 #[derive(Debug, Clone)]
 pub struct LocalService {

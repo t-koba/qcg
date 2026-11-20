@@ -232,14 +232,11 @@ pub fn resolve_server_policy_with_container_timeouts(
     let metrics_policy = super::middleware::resolve_metrics_policy()
         .map_err(|detail| format!("invalid metrics configuration: {detail}"))?;
     let otlp = super::otlp::resolve_otlp_config()?;
-    // Bounded store knobs: strict positive integers, resolved once.
-    let live_event_channel_capacity = usize::try_from(policy::parse_bounded_env(
-        "LIVE_EVENT_CHANNEL_CAPACITY",
-        policy::LIVE_EVENT_CHANNEL_CAPACITY as u64,
-        policy::MIN_LIVE_EVENT_CHANNEL_CAPACITY as u64,
-        policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY as u64,
-    )?)
-    .map_err(|_| "LIVE_EVENT_CHANNEL_CAPACITY is not representable".to_string())?;
+    // Bounded store knobs: strict positive integers, resolved once. The live
+    // channel capacity shares its resolver with the CLI startup path.
+    let live_event_channel_capacity = service::ServiceDeploymentPolicy::default()
+        .with_live_event_channel_capacity_env()?
+        .live_event_channel_capacity;
     let journal_poll_interval_millis = policy::parse_bounded_env(
         "JOURNAL_POLL_INTERVAL_MS",
         policy::JOURNAL_POLL_INTERVAL_MILLIS,

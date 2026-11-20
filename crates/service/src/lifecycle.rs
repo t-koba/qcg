@@ -85,6 +85,11 @@ impl Drop for RemoveEphemeralOnDrop {
 }
 
 impl LocalService {
+    /// Frozen capacity of each per-run live event broadcast channel.
+    pub fn live_event_channel_capacity(&self) -> usize {
+        self.inner.deployment_policy.live_event_channel_capacity
+    }
+
     /// Freezes deployment policy before recovery or resident tasks can see it (E04).
     pub fn with_generator_roots_policy_and_store_mode(
         generator_roots: Vec<Utf8PathBuf>,

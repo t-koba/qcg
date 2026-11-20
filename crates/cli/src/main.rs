@@ -83,6 +83,7 @@ pub(crate) fn local_cli_service(
             ..service::ServiceDeploymentPolicy::default()
         }
         .with_scheduling_env()
+        .and_then(service::ServiceDeploymentPolicy::with_live_event_channel_capacity_env)
         .map_err(anyhow::Error::msg)?,
     )?)
 }
@@ -928,6 +929,98 @@ mod tests {
         );
         let stem = policy::binary_stem().expect("test binary has a stem");
         assert_eq!(hint, format!("{stem} models --refresh"));
+    }
+
+    /// Both startup paths must freeze the same live channel capacity into
+    /// their service policy. The CLI path is observed on the constructed
+    /// service; the server path's frozen field is passed verbatim into the
+    /// service deployment policy by `serve_with_resolved_policy_and_deadline`,
+    /// so observing it needs neither a listener nor a run workload.
+    #[test]
+    fn live_event_channel_capacity_matches_on_cli_and_server_boots() {
+        if env_process::isolated() {
+            return;
+        }
+        let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .expect("temporary directory should be UTF-8")
+            .join(format!("live-event-capacity-{}", Uuid::now_v7()));
+        let generators = root.join("generators");
+        let runs = root.join("runs");
+        std::fs::create_dir_all(&generators).expect("generators dir should create");
+        let config = server::ServerConfig {
+            generators_dir: generators.clone(),
+            providers_path: None,
+            extra_generators_dirs: Vec::new(),
+            runs_dir: runs.clone(),
+            max_active_runs: 1,
+            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
+            run_store_mode: service::RunStoreMode::Exclusive,
+            cors_origins: Vec::new(),
+            api_token: None,
+            max_request_bytes: None,
+            max_artifact_bytes: None,
+            max_artifact_response_bytes: None,
+            max_artifact_entries: None,
+            max_asset_bytes: None,
+            max_total_steps: None,
+        };
+        let variable = "LIVE_EVENT_CHANNEL_CAPACITY";
+        let set = |value: &str| {
+            // SAFETY: the isolated child process owns this environment.
+            unsafe { std::env::set_var(variable, value) };
+        };
+        let unset = || {
+            // SAFETY: the isolated child process owns this environment.
+            unsafe { std::env::remove_var(variable) };
+        };
+
+        unset();
+        let default_cli = local_cli_service(
+            generators.clone(),
+            runs.clone(),
+            CliDeployment::defaults(None),
+        )
+        .expect("default CLI boot should succeed");
+        let default_server =
+            server::resolve_server_policy(&config).expect("default should resolve");
+        assert_eq!(
+            default_cli.live_event_channel_capacity(),
+            policy::LIVE_EVENT_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            default_server.live_event_channel_capacity,
+            policy::LIVE_EVENT_CHANNEL_CAPACITY
+        );
+        drop(default_cli);
+
+        set("1024");
+        let cli = local_cli_service(generators, runs, CliDeployment::defaults(None))
+            .expect("valid capacity should boot via CLI");
+        let server = server::resolve_server_policy(&config).expect("valid capacity should resolve");
+        assert_eq!(cli.live_event_channel_capacity(), 1024);
+        assert_eq!(
+            server.live_event_channel_capacity,
+            cli.live_event_channel_capacity(),
+            "both startup paths must freeze the same effective capacity"
+        );
+        drop(cli);
+
+        for invalid in ["1", "65537", "not-a-number", ""] {
+            set(invalid);
+            let cli_error = local_cli_service(
+                config.generators_dir.clone(),
+                config.runs_dir.clone(),
+                CliDeployment::defaults(None),
+            )
+            .expect_err("invalid capacity must refuse CLI startup")
+            .to_string();
+            let server_error = server::resolve_server_policy(&config)
+                .expect_err("invalid capacity must refuse server startup");
+            assert!(cli_error.contains(variable), "{cli_error}");
+            assert!(server_error.contains(variable), "{server_error}");
+        }
+        unset();
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[cfg(test)]
