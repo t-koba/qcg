@@ -2,6 +2,8 @@
 """Pure guard/logic checks for the real-daemon probe; no Docker is used."""
 
 import importlib.util
+import ipaddress
+import json
 from pathlib import Path
 import subprocess
 import tomllib
@@ -24,10 +26,58 @@ class Derivation(unittest.TestCase):
             probe.network_name("10.231.11.1"),
             "qcg-egress-2c49ac7da4df93d03ec2558b15c5dab4587c4b33d218e19fc05f17a2ac51aba8",
         )
+        self.assertEqual(
+            probe.network_name(probe.UNDECLARED_HOST),
+            "qcg-egress-82e956a267869ebdf918880d43a45fceb75ad751e3f3694d60815d9938707a87",
+        )
         self.assertEqual(probe.network_name("API.Example.com"),
                          probe.network_name("api.example.com"))
         self.assertNotEqual(probe.network_name(probe.DECLARED_HOST),
                             probe.network_name(probe.UNDECLARED_HOST))
+
+    def test_topology_keeps_undeclared_fixture_off_the_host_gateway(self):
+        declared_net = ipaddress.ip_network(probe.SUBNETS["declared"])
+        undeclared_net = ipaddress.ip_network(probe.SUBNETS["undeclared"])
+        self.assertNotEqual(declared_net, undeclared_net)
+        self.assertEqual(probe.GATEWAYS["declared"], probe.DECLARED_HOST)
+        self.assertEqual(probe.DECLARED_HOST, "10.231.10.1")
+        self.assertIn(ipaddress.ip_address(probe.DECLARED_HOST), declared_net)
+
+        self.assertEqual(probe.UNDECLARED_GATEWAY, "10.231.11.1")
+        self.assertEqual(probe.GATEWAYS["undeclared"], probe.UNDECLARED_GATEWAY)
+        self.assertIn(ipaddress.ip_address(probe.UNDECLARED_GATEWAY), undeclared_net)
+        self.assertEqual(probe.UNDECLARED_HOST, "10.231.11.2")
+        self.assertNotEqual(probe.UNDECLARED_HOST, probe.UNDECLARED_GATEWAY)
+        self.assertNotIn(probe.UNDECLARED_HOST, probe.GATEWAYS.values())
+        self.assertIn(ipaddress.ip_address(probe.UNDECLARED_HOST), undeclared_net)
+        self.assertNotIn(ipaddress.ip_address(probe.UNDECLARED_HOST), declared_net)
+
+        # Only the declared gateway gets a host-local HTTP fixture.
+        with patch.object(probe, "free_port", return_value=41337), \
+             patch.object(probe.http.server, "ThreadingHTTPServer") as server, \
+             patch.object(probe.threading, "Thread"):
+            subject = probe.Probe("unix:///var/run/docker.sock", "qcg", 5, probe.Deadline(10))
+            self.assertEqual(subject._start_fixtures(), 41337)
+        self.assertEqual(server.call_count, 1)
+        self.assertEqual(server.call_args.args[0], (probe.DECLARED_HOST, 41337))
+
+    def test_undeclared_fixture_is_a_pinned_container_on_bridge_b(self):
+        token = "a" * 32
+        network = probe.network_name(probe.UNDECLARED_HOST)
+        argv = probe.undeclared_fixture_argv(41337, token, network)
+        self.assertEqual(argv[argv.index("--network") + 1], network)
+        self.assertEqual(argv[argv.index("--ip") + 1], probe.UNDECLARED_HOST)
+        self.assertEqual(argv[argv.index("--label") + 1],
+                         f"{probe.FIXTURE_LABEL}={token}")
+        self.assertIn(probe.PINNED_IMAGE, argv)
+        self.assertEqual(argv.count(probe.PINNED_IMAGE), 1)
+        script = argv[-1]
+        self.assertIn("/index.html", script)
+        self.assertIn("undeclared-ok", script)
+        self.assertIn("httpd -f -p 41337", script)
+        self.assertNotIn(probe.DECLARED_HOST, argv)
+        with self.assertRaises(ValueError):
+            probe.undeclared_fixture_argv(41337, "wrong-token", network)
 
     def test_manifest_declares_only_the_declared_destination(self):
         document = tomllib.loads(probe.render_manifest(41337))
@@ -38,7 +88,10 @@ class Derivation(unittest.TestCase):
         self.assertEqual(params["command"][:2], ["sh", "-c"])
         script = params["command"][2]
         self.assertIn(f"http://{probe.DECLARED_HOST}:41337/", script)
-        self.assertIn(f"! wget -q -O /dev/null http://{probe.UNDECLARED_HOST}:41337/", script)
+        self.assertIn(
+            f"! wget -q -O /dev/null -T 3 -t 1 http://{probe.UNDECLARED_HOST}:41337/", script)
+        self.assertEqual(script.count("-T 3 -t 1"), 2)
+        self.assertNotIn(probe.UNDECLARED_GATEWAY, script)
         self.assertIn("echo PROBE_OK", script)
         self.assertEqual(params["image"], probe.PINNED_IMAGE)
         self.assertEqual(params["expect"], {"stdout_contains": "PROBE_OK"})
@@ -63,6 +116,18 @@ class Derivation(unittest.TestCase):
         })
         self.assertEqual(result["networks"]["declared"]["name"],
                          probe.network_name(probe.DECLARED_HOST))
+        self.assertEqual(result["networks"]["undeclared"]["name"],
+                         probe.network_name(probe.UNDECLARED_HOST))
+        self.assertEqual(result["hosts"]["declared"], probe.DECLARED_HOST)
+        self.assertEqual(result["hosts"]["undeclared"], probe.UNDECLARED_HOST)
+        self.assertEqual(result["hosts"]["undeclared_gateway"], probe.UNDECLARED_GATEWAY)
+        self.assertFalse(result["hosts"]["undeclared_fixture_container"])
+        policy = result["egress_policy"]
+        self.assertFalse(policy["undeclared_fixture_in_separate_bridge"])
+        self.assertFalse(policy["deployment_egress_rules_certified"])
+        for phrase in ("Two isolated Docker bridges", "inter-network FORWARD isolation",
+                       "No deployment-owned egress rules are certified"):
+            self.assertIn(phrase, policy["scope"])
         self.assertFalse(result["pass"])
         self.assertFalse(probe.passed(result))
 
@@ -91,6 +156,7 @@ class OrchestrationLogic(unittest.TestCase):
         result["endpoint_health"]["declared"]["ok"] = True
         result["endpoint_health"]["undeclared"]["ok"] = True
         result["egress_policy"]["separate_bridges"] = True
+        result["egress_policy"]["undeclared_fixture_in_separate_bridge"] = True
         result["qcg"]["exit_code"] = 0
         result["cleanup"]["ok"] = True
         network = network or result["networks"]["declared"]["name"]
@@ -123,6 +189,37 @@ class OrchestrationLogic(unittest.TestCase):
         self.assertFalse(result["assertions"]["no_trusted_host_fallback"])
         self.assertTrue(result["egress_policy"]["trusted_host_fallback"])
         self.assertFalse(probe.passed(result))
+
+    def test_undeclared_fixture_cleanup_requires_the_exact_owner_label(self):
+        subject = probe.Probe("unix:///var/run/docker.sock", "qcg", 5, probe.Deadline(10))
+        cid = "b" * 64
+        subject.undeclared_fixture = cid
+        removed = []
+
+        def owned_call(*args, check=True):
+            if args[:2] == ("container", "inspect"):
+                labels = {probe.FIXTURE_LABEL: subject.token}
+                return subprocess.CompletedProcess(args, 0, json.dumps(labels), "")
+            if args[:2] == ("container", "rm"):
+                removed.append(args)
+                return subprocess.CompletedProcess(args, 0, "", "")
+            raise AssertionError(args)
+
+        subject.call = owned_call
+        self.assertEqual(subject.cleanup(), [])
+        self.assertEqual(removed, [("container", "rm", "--force", cid)])
+
+        removed.clear()
+
+        def foreign_call(*args, check=True):
+            if args[:2] == ("container", "inspect"):
+                labels = {probe.FIXTURE_LABEL: "foreign-owner"}
+                return subprocess.CompletedProcess(args, 0, json.dumps(labels), "")
+            raise AssertionError(args)
+
+        subject.call = foreign_call
+        self.assertEqual(subject.cleanup(), ["undeclared fixture ownership unconfirmed"])
+        self.assertEqual(removed, [])
 
     def test_docker_calls_are_pinned_to_the_vetted_socket(self):
         subject = probe.Probe("unix:///run/docker.sock", "qcg", 5, probe.Deadline(10))

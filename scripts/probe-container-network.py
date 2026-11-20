@@ -2,9 +2,11 @@
 """Real-daemon gate for destination-scoped container networking.
 
 Run only on a disposable local Docker daemon (hosted CI): the probe creates
-two bridge networks, two host-side HTTP fixtures, and invokes a generated qcg
-contract. Every resource it owns is removed in `finally`. All bounds are
-explicit arguments; daemon output is parsed as data and never executed.
+two bridge networks, one host-side HTTP fixture on the declared gateway and
+one short-lived pinned-container fixture on the other bridge, then invokes a
+generated qcg contract. Every resource it owns is removed in `finally`. All
+bounds are explicit arguments; daemon output is parsed as data and never
+executed.
 """
 
 import argparse
@@ -25,16 +27,23 @@ import time
 import uuid
 
 PINNED_IMAGE = "busybox@sha256:fd7dc98638c8e305f4dc34e979f1c0fdfdcaeb0fbf8fcff77ae834b6da3d7e6e"
+# Bridge A: the declared gateway is also the host-side fixture address.
 DECLARED_HOST = "10.231.10.1"
-UNDECLARED_HOST = "10.231.11.1"
-SUBNETS = {DECLARED_HOST: "10.231.10.0/24", UNDECLARED_HOST: "10.231.11.0/24"}
-BODIES = {DECLARED_HOST: b"declared-ok\n", UNDECLARED_HOST: b"undeclared-ok\n"}
+# Bridge B: its gateway stays host-local; the undeclared fixture is a container
+# at a distinct IP so a packet from the qcg container must cross FORWARD chains.
+UNDECLARED_GATEWAY = "10.231.11.1"
+UNDECLARED_HOST = "10.231.11.2"
+SUBNETS = {"declared": "10.231.10.0/24", "undeclared": "10.231.11.0/24"}
+GATEWAYS = {"declared": DECLARED_HOST, "undeclared": UNDECLARED_GATEWAY}
+BODIES = {"declared": b"declared-ok\n", "undeclared": b"undeclared-ok\n"}
 MARKER = "PROBE_OK"
 NETWORK_LABEL = "io.qcg.network-probe"
+FIXTURE_LABEL = "io.qcg.network-probe.undeclared"
 CLEANUP_SECONDS = 60.0
 HEX64 = re.compile(r"[0-9a-f]{64}\Z")
 VERSION = re.compile(r"[0-9]+\.[0-9]+(?:\.[0-9]+)?(?:[-+][0-9A-Za-z.-]+)?\Z")
 RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
+TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 SOCKET = re.compile(r"unix:///[-A-Za-z0-9._/]+\Z")
 
 
@@ -96,17 +105,31 @@ def result_template():
     return {
         "pass": False,
         "runtime": {"server_version": None},
-        "hosts": {"declared": DECLARED_HOST, "undeclared": UNDECLARED_HOST, "port": None},
+        "hosts": {
+            "declared": DECLARED_HOST, "undeclared": UNDECLARED_HOST, "port": None,
+            "undeclared_gateway": UNDECLARED_GATEWAY,
+            "undeclared_fixture_container": None,
+        },
         "networks": {
-            "declared": {"name": declared, "subnet": SUBNETS[DECLARED_HOST],
+            "declared": {"name": declared, "subnet": SUBNETS["declared"],
                          "gateway": None, "driver": None},
-            "undeclared": {"name": undeclared, "subnet": SUBNETS[UNDECLARED_HOST],
+            "undeclared": {"name": undeclared, "subnet": SUBNETS["undeclared"],
                            "gateway": None, "driver": None},
         },
         "egress_policy": {
             "family": "docker-bridge", "separate_bridges": False,
             "declared_gateway_routed": False, "undeclared_gateway_routed": False,
             "trusted_host_fallback": False,
+            "undeclared_fixture_in_separate_bridge": False,
+            "deployment_egress_rules_certified": False,
+            "scope": (
+                "Two isolated Docker bridges: the qcg container is routed to the "
+                "declared bridge-A gateway, where a host-side fixture serves; the "
+                "undeclared fixture is a pinned container at a non-gateway IP on "
+                "bridge B, blocked from the qcg container only by Docker's "
+                "inter-network FORWARD isolation. No deployment-owned egress "
+                "rules are certified."
+            ),
         },
         "image": PINNED_IMAGE,
         "endpoint_health": {
@@ -133,8 +156,8 @@ def render_manifest(port, image=PINNED_IMAGE):
     if not 1 <= port <= 65535 or image != PINNED_IMAGE:
         raise ValueError("manifest inputs are outside the pinned probe shape")
     script = (
-        f"wget -q -O /dev/null http://{DECLARED_HOST}:{port}/ && "
-        f"! wget -q -O /dev/null http://{UNDECLARED_HOST}:{port}/ && "
+        f"wget -q -O /dev/null -T 3 -t 1 http://{DECLARED_HOST}:{port}/ && "
+        f"! wget -q -O /dev/null -T 3 -t 1 http://{UNDECLARED_HOST}:{port}/ && "
         f"echo {MARKER}"
     )
     q = json.dumps
@@ -171,6 +194,21 @@ def render_manifest(port, image=PINNED_IMAGE):
         f"host = {q(DECLARED_HOST)}",
         "",
     ])
+
+
+def undeclared_fixture_argv(port, token, network):
+    """Docker argv for the short-lived, pinned undeclared HTTP fixture."""
+    port = int(port)
+    if not 1 <= port <= 65535 or not isinstance(token, str) or not TOKEN.fullmatch(token):
+        raise ValueError("undeclared fixture inputs are outside the pinned probe shape")
+    body = BODIES["undeclared"].decode().strip()
+    script = f"printf '%s\\n' '{body}' > /index.html && httpd -f -p {port} -h /"
+    return [
+        "run", "--detach", "--name", f"qcg-network-probe-undeclared-{token}",
+        "--network", network, "--ip", UNDECLARED_HOST,
+        "--label", f"{FIXTURE_LABEL}={token}",
+        PINNED_IMAGE, "sh", "-c", script,
+    ]
 
 
 def network_argv_ok(argv, declared, undeclared):
@@ -228,6 +266,7 @@ def passed(result):
         and qcg["marker_seen"]
         and qcg["network_argv_ok"]
         and result["egress_policy"]["separate_bridges"]
+        and result["egress_policy"]["undeclared_fixture_in_separate_bridge"]
         and result["cleanup"]["ok"]
         and all(result["assertions"].values())
     )
@@ -242,6 +281,7 @@ class Probe:
         self.token = uuid.uuid4().hex
         self.owned_networks = {}
         self.servers = []
+        self.undeclared_fixture = None
         self.qcg_run_id = None
         self.stage = "startup"
 
@@ -267,11 +307,12 @@ class Probe:
             self.call("pull", PINNED_IMAGE)  # digest-pinned only; never a mutable tag
 
         self.stage = "network_provision"
-        for key, host in (("declared", DECLARED_HOST), ("undeclared", UNDECLARED_HOST)):
+        for key in ("declared", "undeclared"):
+            gateway = GATEWAYS[key]
             name = result["networks"][key]["name"]
             created = self.call(
-                "network", "create", "--driver", "bridge", "--subnet", SUBNETS[host],
-                "--gateway", host, "--label", f"{NETWORK_LABEL}={self.token}", name,
+                "network", "create", "--driver", "bridge", "--subnet", SUBNETS[key],
+                "--gateway", gateway, "--label", f"{NETWORK_LABEL}={self.token}", name,
             ).stdout.strip()
             if not HEX64.fullmatch(created):
                 raise RuntimeError("network creation unconfirmed")
@@ -280,8 +321,8 @@ class Probe:
             ipam = json.loads(self.call(
                 "network", "inspect", "--format", "{{json .IPAM.Config}}", name).stdout)
             if (driver != "bridge" or len(ipam) != 1
-                    or ipam[0].get("Gateway") != host
-                    or ipam[0].get("Subnet") != SUBNETS[host]):
+                    or ipam[0].get("Gateway") != gateway
+                    or ipam[0].get("Subnet") != SUBNETS[key]):
                 raise RuntimeError("network provision mismatch")
             result["networks"][key]["gateway"] = ipam[0]["Gateway"]
             result["networks"][key]["driver"] = driver
@@ -295,11 +336,18 @@ class Probe:
         self.stage = "endpoint_fixtures"
         port = self._start_fixtures()
         result["hosts"]["port"] = port
-        for key, host in (("declared", DECLARED_HOST), ("undeclared", UNDECLARED_HOST)):
-            result["endpoint_health"][key] = self._health(host, port, BODIES[host])
+        result["endpoint_health"]["declared"] = self._health(
+            DECLARED_HOST, port, BODIES["declared"])
+
+        self.stage = "undeclared_fixture"
+        self._start_undeclared_fixture(port, result)
+
+        self.stage = "endpoint_fixtures"
+        result["endpoint_health"]["undeclared"] = self._wait_health(
+            UNDECLARED_HOST, port, BODIES["undeclared"])
         # A negative container assertion is meaningless if its endpoint was down.
         if not all(result["endpoint_health"][key]["ok"] for key in ("declared", "undeclared")):
-            raise RuntimeError("host-side endpoint health check failed")
+            raise RuntimeError("fixture endpoint health check failed")
 
         self.stage = "qcg_run"
         with tempfile.TemporaryDirectory(prefix="qcg-network-probe-") as directory:
@@ -317,17 +365,37 @@ class Probe:
             self._read_events(parse_events(completed.stdout), result)
 
     def _start_fixtures(self):
+        """Only the declared gateway is a host-local fixture address."""
         port = free_port()
-        for host in (DECLARED_HOST, UNDECLARED_HOST):
-            handler = type("Fixture", (FixtureHandler,), {"body": BODIES[host]})
-            server = http.server.ThreadingHTTPServer((host, port), handler, bind_and_activate=False)
-            server.daemon_threads = True
-            server.server_bind()
-            server.server_activate()
-            thread = threading.Thread(target=server.serve_forever, daemon=True)
-            thread.start()
-            self.servers.append((server, thread))
+        handler = type("Fixture", (FixtureHandler,), {"body": BODIES["declared"]})
+        server = http.server.ThreadingHTTPServer(
+            (DECLARED_HOST, port), handler, bind_and_activate=False)
+        server.daemon_threads = True
+        server.server_bind()
+        server.server_activate()
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.servers.append((server, thread))
         return port
+
+    def _start_undeclared_fixture(self, port, result):
+        """Serve the undeclared body from a container on bridge B, not the host."""
+        network = network_name(UNDECLARED_HOST)
+        created = self.call(
+            *undeclared_fixture_argv(port, self.token, network)).stdout.strip()
+        if not HEX64.fullmatch(created):
+            raise RuntimeError("undeclared fixture container unconfirmed")
+        self.undeclared_fixture = created
+        attached = json.loads(self.call(
+            "container", "inspect", "--format", "{{json .NetworkSettings.Networks}}",
+            created).stdout).get(network, {})
+        if attached.get("IPAddress") != UNDECLARED_HOST:
+            raise RuntimeError("undeclared fixture address mismatch")
+        result["hosts"]["undeclared_fixture_container"] = created
+        result["egress_policy"]["undeclared_fixture_in_separate_bridge"] = (
+            result["networks"]["undeclared"]["name"] == network
+            and result["networks"]["undeclared"]["gateway"] == GATEWAYS["undeclared"]
+        )
 
     def _health(self, host, port, body):
         completed = subprocess.run(
@@ -341,6 +409,15 @@ class Probe:
             "ok": completed.returncode == 0 and completed.stdout.strip() == body.decode().strip(),
             "exit_code": completed.returncode,
         }
+
+    def _wait_health(self, host, port, body):
+        """Give a freshly started container fixture a bounded chance to listen."""
+        deadline = time.monotonic() + min(self.command_timeout, 15.0)
+        while True:
+            health = self._health(host, port, body)
+            if health["ok"] or time.monotonic() >= deadline:
+                return health
+            time.sleep(0.25)
 
     def _read_events(self, events, result):
         run_ids = {event["run_id"] for event in events
@@ -385,8 +462,8 @@ class Probe:
         policy["trusted_host_fallback"] = fallback
 
         # With trusted-host/host networking this container could reach BOTH
-        # gateways. The negative assertion plus the resolved network argv is
-        # therefore also the no-fallback proof.
+        # fixtures, including the container fixture on bridge B. The negative
+        # assertion plus the resolved network argv is the no-fallback proof.
         qcg_ok = (result["qcg"]["exit_code"] == 0
                   and result["qcg"]["run_finished_status"] == "success"
                   and result["qcg"]["marker_seen"])
@@ -399,6 +476,23 @@ class Probe:
 
     def cleanup(self):
         errors = []
+        # The undeclared fixture container must go before its bridge can be removed.
+        if self.undeclared_fixture is not None:
+            try:
+                cid = self.undeclared_fixture
+                if not HEX64.fullmatch(cid):
+                    errors.append("undeclared fixture identity unconfirmed")
+                else:
+                    labels = json.loads(self.call(
+                        "container", "inspect", "--format", "{{json .Config.Labels}}",
+                        cid, check=False).stdout)
+                    if labels.get(FIXTURE_LABEL) != self.token:
+                        errors.append("undeclared fixture ownership unconfirmed")
+                    elif self.call("container", "rm", "--force", cid,
+                                   check=False).returncode:
+                        errors.append("undeclared fixture cleanup unconfirmed")
+            except Exception:
+                errors.append("undeclared fixture cleanup unconfirmed")
         # qcg removes its own --rm container; this only retires a container
         # left behind by this probe's run, verified by its exact run label.
         if self.qcg_run_id:
