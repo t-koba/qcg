@@ -1193,8 +1193,6 @@ output_file = "three.txt"
             .await
             .expect("start request should respond");
         assert_eq!(response.status(), reqwest::StatusCode::CREATED);
-        server_task.abort();
-        let _ = server_task.await;
 
         let serve_id = std::fs::read_dir(&serve_runs)
             .expect("serve runs directory should exist")
@@ -1204,6 +1202,14 @@ output_file = "three.txt"
             .expect("the listener should have admitted one run");
         let cli_events = wait_for_terminal_events(cli_runs.clone(), cli_id.clone()).await;
         let serve_events = wait_for_terminal_events(serve_runs.clone(), serve_id).await;
+        // Tear the listener down only after both admitted runs have reached a
+        // terminal journal event. Aborting the server drops `ResidentTasks`,
+        // whose Drop aborts in-flight engine tasks; doing that while a run is
+        // still executing strands it mid-step with no `run_finished`. Keep the
+        // listener alive until both runs settle (Windows yields inside the
+        // atomic write, so the window is observable there).
+        server_task.abort();
+        let _ = server_task.await;
 
         let expected_origin = format!(
             "service-ceiling:2 caps contract:{}",
