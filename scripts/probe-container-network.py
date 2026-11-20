@@ -275,7 +275,11 @@ def passed(result):
 class Probe:
     def __init__(self, endpoint, qcg, command_timeout, deadline):
         self.env = command_env(endpoint)
-        self.qcg = qcg
+        # The child runs with cwd=<tempdir>. POSIX resolves an executable
+        # containing a slash against that child cwd, so a relative path such
+        # as the default target/debug/qcg could never launch. Bare names keep
+        # PATH lookup; explicit paths are frozen before the cwd override.
+        self.qcg = qcg if not os.path.dirname(qcg) else os.path.abspath(qcg)
         self.command_timeout = command_timeout
         self.deadline = deadline
         self.token = uuid.uuid4().hex

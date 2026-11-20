@@ -6,6 +6,7 @@ import ipaddress
 import json
 from pathlib import Path
 import subprocess
+import tempfile
 import tomllib
 import unittest
 from unittest.mock import patch
@@ -14,6 +15,31 @@ spec = importlib.util.spec_from_file_location(
     "network_probe", Path(__file__).with_name("probe-container-network.py"))
 probe = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(probe)
+
+
+class ExecutableResolution(unittest.TestCase):
+    def test_relative_qcg_path_is_absolute_before_the_cwd_override(self):
+        import os
+        import stat
+
+        with tempfile.TemporaryDirectory() as root:
+            root_path = Path(root)
+            (root_path / "bin").mkdir()
+            tool = root_path / "bin" / "qcg-stub"
+            tool.write_text("#!/bin/sh\nprintf '%s\\n' QCG_RAN\n", encoding="utf-8")
+            tool.chmod(tool.stat().st_mode | stat.S_IXUSR)
+            elsewhere = root_path / "elsewhere"
+            elsewhere.mkdir()
+            with patch.object(probe.os, "getcwd", return_value=str(root_path)):
+                subject = probe.Probe(
+                    "unix:///var/run/docker.sock", "bin/qcg-stub", 5, probe.Deadline(10))
+            self.assertTrue(os.path.isabs(subject.qcg))
+            completed = subprocess.run(
+                [subject.qcg], cwd=elsewhere, capture_output=True, text=True, check=True)
+            self.assertEqual(completed.stdout.strip(), "QCG_RAN")
+
+        bare = probe.Probe("unix:///var/run/docker.sock", "qcg", 5, probe.Deadline(10))
+        self.assertEqual(bare.qcg, "qcg")
 
 
 class Derivation(unittest.TestCase):
