@@ -602,6 +602,41 @@
         ],
         "type": "string"
       },
+      "ContainerNetwork": {
+        "description": "Network reach declared for a container workload.\n\n`none` (the default) keeps the runner's fully isolated network mode.\n`destination` names exactly one canonical host and selects the runner\nnetwork dedicated to it; the deployment owns that network's egress\nrules. It is validated against the existing `permissions.network`\nallowlist at contract load, and a wildcard entry never qualifies.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "mode": {
+                "const": "none",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "host": {
+                "type": "string"
+              },
+              "mode": {
+                "const": "destination",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "host"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "ContainerPermission": {
         "additionalProperties": false,
         "properties": {
@@ -616,12 +651,29 @@
             },
             "type": "array"
           },
+          "network": {
+            "$ref": "#/components/schemas/ContainerNetwork",
+            "default": {
+              "mode": "none"
+            },
+            "description": "Destination-scoped runner network. Empty means fully isolated."
+          },
           "on_missing": {
             "default": null,
             "type": [
               "string",
               "null"
             ]
+          },
+          "resources": {
+            "$ref": "#/components/schemas/ContainerResources",
+            "default": {
+              "cpu_limit": null,
+              "memory_limit": null,
+              "pids_limit": 256,
+              "tmpfs_size": "64m"
+            },
+            "description": "Resource bounds applied to Docker-family runner invocations."
           },
           "runtime": {
             "anyOf": [
@@ -633,6 +685,41 @@
               }
             ],
             "default": null
+          }
+        },
+        "type": "object"
+      },
+      "ContainerResources": {
+        "additionalProperties": false,
+        "description": "Resource bounds declared for one container workload.\n\nEvery field defaults to the hardened runner values used before bounds\nbecame configurable: 256 pids, a 64 MiB noexec/nosuid `/tmp`, and no\nmemory or CPU limit. The contract owns these values; the container plan\nonly renders a validated declaration into runner argv.",
+        "properties": {
+          "cpu_limit": {
+            "default": null,
+            "description": "CPU ceiling in cores, `<digits>[.<1-3 digits>]`. `None` means no\n`--cpus` flag.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "memory_limit": {
+            "default": null,
+            "description": "Memory ceiling in the same size grammar. `None` means no `--memory`.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "pids_limit": {
+            "default": 256,
+            "description": "Maximum process ids in one container. Must be positive and fit the\nrunner's signed 32-bit `--pids-limit` flag.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "tmpfs_size": {
+            "default": "64m",
+            "description": "`/tmp` tmpfs size in canonical `<digits><b|k|m|g>` form (e.g. `64m`).",
+            "type": "string"
           }
         },
         "type": "object"

@@ -85,8 +85,8 @@ type QcgModel12 = {
     attempt: number;
     confirm: QcgModel22 | null;
     findings: Array<unknown>;
-    question: QcgModel44 | null;
-    reason: QcgModel36 | null;
+    question: QcgModel46 | null;
+    reason: QcgModel38 | null;
     status: QcgModel13;
 };
 
@@ -142,7 +142,7 @@ type QcgModel21 = {
     /**
      * Suspended-step file revisions retained for resume and fork.
      */
-    files: Array<QcgModel37>;
+    files: Array<QcgModel39>;
     parallel: boolean;
 };
 
@@ -168,62 +168,115 @@ type QcgModel22 = {
      * (`node:kind:digest:invocation-hash`), `content` ones 3-part ids
      * (`node:kind:digest`).
      */
-    scope: QcgModel123;
+    scope: QcgModel125;
     target: string;
     title: string;
 };
 
 type QcgModel23 = 'approve' | 'deny';
 
+/**
+ * Network reach declared for a container workload.
+ *
+ * `none` (the default) keeps the runner's fully isolated network mode.
+ * `destination` names exactly one canonical host and selects the runner
+ * network dedicated to it; the deployment owns that network's egress
+ * rules. It is validated against the existing `permissions.network`
+ * allowlist at contract load, and a wildcard entry never qualifies.
+ */
 type QcgModel24 = {
-    enabled: boolean;
-    images: Array<string>;
-    on_missing: string | null;
-    runtime: QcgModel25 | null;
+    mode: 'none';
+} | {
+    host: string;
+    mode: 'destination';
 };
 
-type QcgModel25 = 'docker' | 'podman' | 'docker_runsc' | 'incus' | 'lxd';
+type QcgModel25 = {
+    enabled: boolean;
+    images: Array<string>;
+    /**
+     * Destination-scoped runner network. Empty means fully isolated.
+     */
+    network: QcgModel24;
+    on_missing: string | null;
+    /**
+     * Resource bounds applied to Docker-family runner invocations.
+     */
+    resources: QcgModel26;
+    runtime: QcgModel27 | null;
+};
+
+/**
+ * Resource bounds declared for one container workload.
+ *
+ * Every field defaults to the hardened runner values used before bounds
+ * became configurable: 256 pids, a 64 MiB noexec/nosuid `/tmp`, and no
+ * memory or CPU limit. The contract owns these values; the container plan
+ * only renders a validated declaration into runner argv.
+ */
+type QcgModel26 = {
+    /**
+     * CPU ceiling in cores, `<digits>[.<1-3 digits>]`. `None` means no
+     * `--cpus` flag.
+     */
+    cpu_limit: string | null;
+    /**
+     * Memory ceiling in the same size grammar. `None` means no `--memory`.
+     */
+    memory_limit: string | null;
+    /**
+     * Maximum process ids in one container. Must be positive and fit the
+     * runner's signed 32-bit `--pids-limit` flag.
+     */
+    pids_limit: number;
+    /**
+     * `/tmp` tmpfs size in canonical `<digits><b|k|m|g>` form (e.g. `64m`).
+     */
+    tmpfs_size: string;
+};
+
+type QcgModel27 = 'docker' | 'podman' | 'docker_runsc' | 'incus' | 'lxd';
 
 /**
  * The two payload shapes emitted by context management are deliberately kept
  * as separate closed objects so prompt compaction cannot silently acquire
  * transcript-only fields.
  */
-type QcgModel26 = QcgModel27 | QcgModel28;
+type QcgModel28 = QcgModel29 | QcgModel30;
 
-type QcgModel27 = {
+type QcgModel29 = {
     final_bytes: number;
     limit_bytes: number;
     original_bytes: number;
-    policy: QcgModel29;
+    policy: QcgModel31;
 };
 
-type QcgModel28 = {
+type QcgModel30 = {
     compacted_messages: number;
     compacted_tool_results: number;
     final_bytes: number;
     limit_bytes: number;
     original_bytes: number;
-    policy: QcgModel29;
-    scope: QcgModel30;
+    policy: QcgModel31;
+    scope: QcgModel32;
 };
 
 /**
  * The policy used when a prompt or an agent transcript exceeded its context limit.
  */
-type QcgModel29 = 'error' | 'truncate_head' | 'truncate_tail';
+type QcgModel31 = 'error' | 'truncate_head' | 'truncate_tail';
 
-type QcgModel30 = 'request' | 'agent_transcript';
-
-type QcgModel31 = {
-    message: string;
-    path: string;
-    status: QcgModel32;
-};
-
-type QcgModel32 = 'skipped' | 'failed';
+type QcgModel32 = 'request' | 'agent_transcript';
 
 type QcgModel33 = {
+    message: string;
+    path: string;
+    status: QcgModel34;
+};
+
+type QcgModel34 = 'skipped' | 'failed';
+
+type QcgModel35 = {
     details: unknown;
     kind: string;
     operation_digest: string | null;
@@ -233,16 +286,16 @@ type QcgModel33 = {
 /**
  * Single durable active elapsed ledger, preserving subsecond consumption.
  */
-type QcgModel34 = {
+type QcgModel36 = {
     active_nanoseconds: number;
     active_started_at: string | null;
 };
 
-type QcgModel35 = 'when_false' | 'dependency_unsatisfied' | 'no_dependency_succeeded' | 'check_failed' | 'execution_failed' | 'elapsed_exceeded' | 'repair_exhausted' | 'scheduler_failed' | 'canceled' | 'interrupted' | 'budget_exceeded' | 'provider_context_exhausted' | 'mcp_authorization_required' | 'timed_out' | 'refused';
+type QcgModel37 = 'when_false' | 'dependency_unsatisfied' | 'no_dependency_succeeded' | 'check_failed' | 'execution_failed' | 'elapsed_exceeded' | 'repair_exhausted' | 'scheduler_failed' | 'canceled' | 'interrupted' | 'budget_exceeded' | 'provider_context_exhausted' | 'mcp_authorization_required' | 'timed_out' | 'refused';
 
-type QcgModel36 = {
-    code: QcgModel35;
-    dependencies?: Array<QcgModel31>;
+type QcgModel38 = {
+    code: QcgModel37;
+    dependencies?: Array<QcgModel33>;
     exhaustion?: QcgModel15 | null;
     message: string;
 };
@@ -250,36 +303,36 @@ type QcgModel36 = {
 /**
  * A retained workspace file revision: its path and the digest of its bytes.
  */
-type QcgModel37 = {
+type QcgModel39 = {
     path: string;
     sha256: string;
 };
 
-type QcgModel38 = unknown & {
+type QcgModel40 = unknown & {
     content_base64?: string;
     name: string;
     text?: string;
 };
 
-type QcgModel39 = {
+type QcgModel41 = {
     executed_iterations: number;
     max_iterations: number;
     requested_iterations: number;
 };
 
-type QcgModel40 = {
+type QcgModel42 = {
     index: number;
 };
 
 /**
  * Identical model requests are answered from the source's responses.
  */
-type QcgModel41 = 'matching';
+type QcgModel43 = 'matching';
 
 /**
  * ForkRun
  */
-type QcgModel42 = {
+type QcgModel44 = {
     /**
      * Pre-provisioned answers keyed by question id, consumed without interaction.
      */
@@ -305,14 +358,14 @@ type QcgModel42 = {
      * Continue the source by serving its recorded model responses to
      * identical requests instead of calling the provider again.
      */
-    reuse?: QcgModel41 | null;
-    state_patch?: QcgModel43;
+    reuse?: QcgModel43 | null;
+    state_patch?: QcgModel45;
 };
 
 /**
  * ForkStatePatch
  */
-type QcgModel43 = {
+type QcgModel45 = {
     inputs: {
         [key: string]: unknown;
     };
@@ -324,8 +377,8 @@ type QcgModel43 = {
     };
 };
 
-type QcgModel44 = {
-    fields: Array<QcgModel56>;
+type QcgModel46 = {
+    fields: Array<QcgModel58>;
     id: string;
     title: string;
     title_i18n?: {
@@ -336,18 +389,18 @@ type QcgModel44 = {
 /**
  * GeneratorDetail
  */
-type QcgModel45 = {
+type QcgModel47 = {
     assets: QcgModel11;
-    generator: QcgModel46;
-    inputs: QcgModel57;
+    generator: QcgModel48;
+    inputs: QcgModel59;
     /**
      * SHA-256 identity of the complete generator package tree.
      */
     package_sha256: string;
-    permissions: QcgModel85;
+    permissions: QcgModel87;
 };
 
-type QcgModel46 = {
+type QcgModel48 = {
     authors: Array<string>;
     description: string;
     id: string;
@@ -358,59 +411,59 @@ type QcgModel46 = {
 /**
  * GeneratorSummary
  */
-type QcgModel47 = {
+type QcgModel49 = {
     description: string;
     id: string;
     name: string;
     version: string;
 };
 
-type QcgModel48 = {
+type QcgModel50 = {
     nodes: Array<string>;
 };
 
-type QcgModel49 = {
+type QcgModel51 = {
     code: string;
-    error_kind: QcgModel50;
+    error_kind: QcgModel52;
     guardrail: string;
     kind: string;
     message: string;
-    policy: QcgModel51;
-    stage: QcgModel53;
+    policy: QcgModel53;
+    stage: QcgModel55;
     tool: string | null;
 };
 
-type QcgModel50 = 'invalid_configuration' | 'evaluation';
+type QcgModel52 = 'invalid_configuration' | 'evaluation';
 
-type QcgModel51 = 'fail' | 'block';
-
-type QcgModel52 = {
-    guardrail: string;
-    kind: string;
-    passed: boolean;
-    stage: QcgModel53;
-    tool: string | null;
-    tripwire: boolean;
-    violation: QcgModel55 | null;
-};
-
-type QcgModel53 = 'input' | 'output' | 'tool_input' | 'tool_output';
+type QcgModel53 = 'fail' | 'block';
 
 type QcgModel54 = {
     guardrail: string;
     kind: string;
-    stage: QcgModel53;
+    passed: boolean;
+    stage: QcgModel55;
     tool: string | null;
-    violation: QcgModel55;
+    tripwire: boolean;
+    violation: QcgModel57 | null;
 };
 
-type QcgModel55 = {
+type QcgModel55 = 'input' | 'output' | 'tool_input' | 'tool_output';
+
+type QcgModel56 = {
+    guardrail: string;
+    kind: string;
+    stage: QcgModel55;
+    tool: string | null;
+    violation: QcgModel57;
+};
+
+type QcgModel57 = {
     code: string;
     details: unknown;
     message: string;
 };
 
-type QcgModel56 = {
+type QcgModel58 = {
     default: unknown;
     description?: string | null;
     description_i18n?: {
@@ -456,12 +509,12 @@ type QcgModel56 = {
     };
 };
 
-type QcgModel57 = {
-    stages: Array<QcgModel58>;
+type QcgModel59 = {
+    stages: Array<QcgModel60>;
 };
 
-type QcgModel58 = {
-    fields: Array<QcgModel56>;
+type QcgModel60 = {
+    fields: Array<QcgModel58>;
     id: string;
     when: string | null;
 };
@@ -471,7 +524,7 @@ type QcgModel58 = {
  *
  * Caller-provided audit metadata for an irreversible successful-run invalidation.
  */
-type QcgModel59 = {
+type QcgModel61 = {
     /**
      * Descriptive label, NOT authenticated identity. Nonblank, no controls;
      * at most 128 UTF-8 bytes.
@@ -483,13 +536,13 @@ type QcgModel59 = {
     reason: string;
 };
 
-type QcgModel60 = 'resync_snapshot';
+type QcgModel62 = 'resync_snapshot';
 
-type QcgModel61 = {
-    action: QcgModel60;
+type QcgModel63 = {
+    action: QcgModel62;
 };
 
-type QcgModel62 = {
+type QcgModel64 = {
     agent: string | null;
     attempt: number;
     /**
@@ -513,12 +566,12 @@ type QcgModel62 = {
     model: string;
     parallel_tool_calls: boolean | null;
     provider: string;
-    reasoning_effort: QcgModel92 | null;
+    reasoning_effort: QcgModel94 | null;
     repair: boolean | null;
     /**
      * Failed provider attempts, including retries preceding a successful call.
      */
-    retry_decisions: Array<QcgModel102>;
+    retry_decisions: Array<QcgModel104>;
     seed: number | null;
     /**
      * Normalized terminal reason; absent in older journals and decision calls.
@@ -526,24 +579,24 @@ type QcgModel62 = {
     stop_reason?: string | null;
     stop_sequences: Array<string>;
     stream: boolean;
-    structured_output: QcgModel134;
+    structured_output: QcgModel136;
     temperature: number | null;
-    tokens: QcgModel135;
+    tokens: QcgModel137;
     tokens_total: number | null;
-    tool_choice: QcgModel143 | null;
+    tool_choice: QcgModel145 | null;
     top_p: number | null;
     turn: number | null;
-    verbosity: QcgModel100 | null;
+    verbosity: QcgModel102 | null;
     /**
      * Hosted-search details; null when the request did not enable the tool.
      */
-    web_search: QcgModel150 | null;
+    web_search: QcgModel152 | null;
 };
 
 /**
  * LlmCatalogCapabilities
  */
-type QcgModel63 = {
+type QcgModel65 = {
     audio_input: boolean;
     file_input: boolean;
     image_input: boolean;
@@ -566,7 +619,7 @@ type QcgModel63 = {
  * Effective rates in USD/1M tokens, after catalog inheritance and registry pins.
  * The greatest threshold <= whole prompt input selects a row for the whole request.
  */
-type QcgModel64 = {
+type QcgModel66 = {
     cache_creation_input_cost_per_million_usd?: number | null;
     cache_read_input_cost_per_million_usd?: number | null;
     input_cost_per_million_usd?: number | null;
@@ -577,16 +630,16 @@ type QcgModel64 = {
 /**
  * LlmCatalogModel
  */
-type QcgModel65 = {
+type QcgModel67 = {
     cache_creation_input_cost_per_million_usd?: number | null;
     cache_read_input_cost_per_million_usd?: number | null;
-    capabilities: QcgModel63;
+    capabilities: QcgModel65;
     context_tokens: number | null;
     /**
      * Effective catalog schedule, not a contract-specific final quote. Empty for no tiers.
      * Flat price fields above remain base rates; null tier rates are unresolved, not free.
      */
-    cost_tiers: Array<QcgModel64>;
+    cost_tiers: Array<QcgModel66>;
     enabled: boolean;
     id: string;
     input_cost_per_million_usd: number | null;
@@ -608,7 +661,7 @@ type QcgModel65 = {
 /**
  * LlmCatalogProvider
  */
-type QcgModel66 = {
+type QcgModel68 = {
     /**
      * False when the provider needs a credential that is not configured.
      */
@@ -620,7 +673,7 @@ type QcgModel66 = {
     error: string | null;
     id: string;
     label: string | null;
-    models: Array<QcgModel65>;
+    models: Array<QcgModel67>;
 };
 
 /**
@@ -629,13 +682,13 @@ type QcgModel66 = {
  * Selectable LLM provider/model catalog. Metadata only: the catalog never
  * carries credentials and never grants run permissions.
  */
-type QcgModel67 = {
+type QcgModel69 = {
     /**
      * RFC 3339 timestamp of the last successful external catalog fetch.
      */
     fetched_at: string | null;
-    providers: Array<QcgModel66>;
-    sources: Array<QcgModel68>;
+    providers: Array<QcgModel68>;
+    sources: Array<QcgModel70>;
     /**
      * True while external metadata is missing or stale.
      */
@@ -645,21 +698,21 @@ type QcgModel67 = {
 /**
  * LlmCatalogSource
  */
-type QcgModel68 = {
+type QcgModel70 = {
     error: string | null;
     fetched_at: string | null;
     kind: string;
     location: string;
 };
 
-type QcgModel69 = {
+type QcgModel71 = {
     index: number;
     model: string;
     provider: string;
     text: string;
 };
 
-type QcgModel70 = 'timed_out' | 'network' | 'empty_response' | 'invalid_response' | 'partial_stream' | 'canceled' | 'circuit_open' | 'other' | {
+type QcgModel72 = 'timed_out' | 'network' | 'empty_response' | 'invalid_response' | 'partial_stream' | 'canceled' | 'circuit_open' | 'other' | {
     http_status: number;
 };
 
@@ -667,7 +720,7 @@ type QcgModel70 = 'timed_out' | 'network' | 'empty_response' | 'invalid_response
  * A model response kept beside the journal so a continuation can serve it,
  * or one served from the parent run (`reused_from`) instead of a provider call.
  */
-type QcgModel71 = {
+type QcgModel73 = {
     /**
      * SHA-256 of the stored response; the sidecar is named after it.
      */
@@ -676,18 +729,18 @@ type QcgModel71 = {
      * SHA-256 of the node identity and the full provider request.
      */
     request_digest: string;
-    reused_from?: QcgModel72 | null;
+    reused_from?: QcgModel74 | null;
 };
 
 /**
  * Where a reused response was recorded.
  */
-type QcgModel72 = {
+type QcgModel74 = {
     run_id: string;
     seq: number;
 };
 
-type QcgModel73 = {
+type QcgModel75 = {
     attempt: number;
     /**
      * Zero-based index into the declared route list (0 is the primary route).
@@ -697,10 +750,10 @@ type QcgModel73 = {
      * Whether this invocation advanced to the next declared route.
      */
     fallback_taken: boolean;
-    kind: QcgModel70;
+    kind: QcgModel72;
     model: string;
     provider: string;
-    retry_decisions: Array<QcgModel102>;
+    retry_decisions: Array<QcgModel104>;
     /**
      * Number of declared routes available for this invocation.
      */
@@ -709,10 +762,10 @@ type QcgModel73 = {
      * Unresolved hosted-search liability after publication rejection without completion.
      * Numeric fields are null; no response text, search events, or citations are recorded.
      */
-    web_search?: QcgModel149 | null;
+    web_search?: QcgModel151 | null;
 };
 
-type QcgModel74 = {
+type QcgModel76 = {
     attempt: number;
     message: string;
 };
@@ -720,45 +773,45 @@ type QcgModel74 = {
 /**
  * McpAuthorizationStart
  */
-type QcgModel75 = {
+type QcgModel77 = {
     authorization_url: string;
 };
 
 /**
  * Settlement of a failed direct MCP session cleanup.
  */
-type QcgModel76 = 'preserve_execution' | 'fail_fast';
+type QcgModel78 = 'preserve_execution' | 'fail_fast';
 
-type QcgModel77 = 'default' | 'node_parameter';
+type QcgModel79 = 'default' | 'node_parameter';
 
-type QcgModel78 = {
-    policy: QcgModel76;
-    source: QcgModel77;
+type QcgModel80 = {
+    policy: QcgModel78;
+    source: QcgModel79;
 };
 
 /**
  * McpServerList
  */
-type QcgModel79 = {
-    items: Array<QcgModel80>;
+type QcgModel81 = {
+    items: Array<QcgModel82>;
 };
 
 /**
  * McpServerSummary
  */
-type QcgModel80 = {
+type QcgModel82 = {
     auth: string;
     authorized: boolean;
     id: string;
     transport: string;
 };
 
-type QcgModel81 = {
+type QcgModel83 = {
     policy: string;
     reason: string;
 };
 
-type QcgModel82 = {
+type QcgModel84 = {
     bytes: number;
     description: string;
     label: string;
@@ -772,18 +825,18 @@ type QcgModel82 = {
 /**
  * OutputManifest
  */
-type QcgModel83 = {
-    artifacts: Array<QcgModel82>;
+type QcgModel85 = {
+    artifacts: Array<QcgModel84>;
 };
 
 /**
  * Compatibility preserves existing abort timing and aggregation, not replay authority.
  */
-type QcgModel84 = 'fail_fast';
+type QcgModel86 = 'fail_fast';
 
-type QcgModel85 = {
+type QcgModel87 = {
     commands: Array<QcgModel19>;
-    containers: QcgModel24;
+    containers: QcgModel25;
     fs_read: Array<string>;
     fs_write: Array<string>;
     network: Array<string>;
@@ -795,7 +848,7 @@ type QcgModel85 = {
      * false so existing wildcard deployments keep working.
      */
     network_deny_private_ips: boolean;
-    side_effects: QcgModel124;
+    side_effects: QcgModel126;
     /**
      * How far one approval reaches. `invocation` (default) authorizes a
      * single call; `content` reuses the approval for identical content in
@@ -803,23 +856,23 @@ type QcgModel85 = {
      * manifest-parse-time default: an explicit `[permissions]` block may
      * omit the key and still resolve to `invocation`.
      */
-    side_effects_scope: QcgModel123;
+    side_effects_scope: QcgModel125;
 };
 
 /**
  * ProblemDetails
  */
-type QcgModel86 = {
+type QcgModel88 = {
     code: string;
     detail: string;
-    errors: Array<QcgModel87>;
+    errors: Array<QcgModel89>;
     instance: string;
     status: number;
     title: string;
     type: string;
 };
 
-type QcgModel87 = {
+type QcgModel89 = {
     field: string;
     reason: string;
 };
@@ -827,13 +880,13 @@ type QcgModel87 = {
 /**
  * What one hosted search call did.
  */
-type QcgModel88 = 'search' | 'open_page' | 'find_in_page';
+type QcgModel90 = 'search' | 'open_page' | 'find_in_page';
 
 /**
  * One hosted search call reported by the provider.
  */
-type QcgModel89 = {
-    action: QcgModel88;
+type QcgModel91 = {
+    action: QcgModel90;
     /**
      * The provider's identifier for the call, when it reports one.
      */
@@ -848,63 +901,63 @@ type QcgModel89 = {
     url: string | null;
 };
 
-type QcgModel90 = 'exact' | 'estimated' | 'unavailable';
+type QcgModel92 = 'exact' | 'estimated' | 'unavailable';
 
-type QcgModel91 = {
+type QcgModel93 = {
     /**
      * Accumulated cost metrics, present when the writer attached them.
      */
-    metrics: QcgModel114;
-    reason: QcgModel36;
+    metrics: QcgModel116;
+    reason: QcgModel38;
 };
 
 /**
  * Provider-neutral reasoning effort requested for a model invocation.
  */
-type QcgModel92 = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
+type QcgModel94 = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 
-type QcgModel93 = {
+type QcgModel95 = {
     attempt: number;
     max_attempts: number;
 };
 
-type QcgModel94 = {
+type QcgModel96 = {
     attempt: number;
     max_attempts: number;
     recheck: string;
     repair: string;
 };
 
-type QcgModel95 = 'not_sent' | 'sent' | 'unknown';
+type QcgModel97 = 'not_sent' | 'sent' | 'unknown';
 
-type QcgModel96 = 'not_applicable' | 'local' | 'hit' | 'miss';
+type QcgModel98 = 'not_applicable' | 'local' | 'hit' | 'miss';
 
-type QcgModel97 = {
+type QcgModel99 = {
     bytes: number;
-    cache: QcgModel96;
+    cache: QcgModel98;
     /**
      * Lenient specification violations recorded while inspecting the
      * resource (for example a skill name that differs from its directory).
      */
     diagnostics?: Array<string>;
-    files: Array<QcgModel98>;
+    files: Array<QcgModel100>;
     llm_visible: boolean;
     name: string;
     pin_sha256: string | null;
     sha256: string;
     snapshot: string | null;
-    source: QcgModel99;
+    source: QcgModel101;
     trust: string;
     type: string;
 };
 
-type QcgModel98 = {
+type QcgModel100 = {
     bytes: number;
     path: string;
     sha256: string;
 };
 
-type QcgModel99 = {
+type QcgModel101 = {
     kind: 'path';
     path: string;
 } | {
@@ -923,32 +976,32 @@ type QcgModel99 = {
 /**
  * Provider-neutral control for the detail of a model response.
  */
-type QcgModel100 = 'low' | 'medium' | 'high';
+type QcgModel102 = 'low' | 'medium' | 'high';
 
-type QcgModel101 = 'fail_fast' | 'retry' | 'next_route';
+type QcgModel103 = 'fail_fast' | 'retry' | 'next_route';
 
 /**
  * One failed provider attempt, including the effective bounded decision.
  */
-type QcgModel102 = {
-    action: QcgModel101;
+type QcgModel104 = {
+    action: QcgModel103;
     /**
      * One-based attempt within this route (not the fallback index). Null
      * when gateway cancellation cannot know which router attempt is active.
      */
     attempt?: number | null;
-    facts: QcgModel145;
+    facts: QcgModel147;
     /**
      * A mechanism that overrode policy, if any.
      */
-    guard?: QcgModel103 | null;
-    kind: QcgModel70;
+    guard?: QcgModel105 | null;
+    kind: QcgModel72;
     /**
      * Sanitized provider `error.code`: 1..=64 ASCII `A-Z a-z 0-9 . _ -`.
      * Absent if missing, malformed, oversized, or unreadable; inert unless a rule matches it.
      */
     provider_code?: string | null;
-    requested: QcgModel101;
+    requested: QcgModel103;
     /**
      * Whether this decision uses the policy-bounded candidate as a backoff floor.
      * True only for matching rule opt-in, an observation, and an effective retry;
@@ -972,48 +1025,48 @@ type QcgModel102 = {
     stream: boolean;
 };
 
-type QcgModel103 = 'attempt_limit' | 'stream_emitted' | 'terminal_error' | 'circuit_open';
+type QcgModel105 = 'attempt_limit' | 'stream_emitted' | 'terminal_error' | 'circuit_open';
 
-type QcgModel104 = 'success' | 'failed';
+type QcgModel106 = 'success' | 'failed';
 
 /**
  * RunCostMetrics
  *
  * Per-run cost metrics with a USD estimate for display.
  */
-type QcgModel105 = {
+type QcgModel107 = {
     /**
      * `cost_microusd / 1_000_000`, for display only.
      */
     cost_usd: number;
-    metrics: QcgModel114;
+    metrics: QcgModel116;
     /**
      * False when a billed call lacked contract pricing, search is unmetered,
      * or the pricing contract cannot be resolved; the total may understate.
      */
     priced: boolean;
     run_id: string;
-    state: QcgModel119;
+    state: QcgModel121;
 };
 
-type QcgModel106 = {
+type QcgModel108 = {
     error: string;
     /**
      * Accumulated cost metrics, present when the writer attached them.
      */
-    metrics: QcgModel114;
+    metrics: QcgModel116;
     /**
      * Structured failure detail carrying the dedicated code (for example
      * an elapsed-deadline stop), when the writer attached one.
      */
-    reason: QcgModel36 | null;
+    reason: QcgModel38 | null;
 };
 
 /**
  * RunEvent
  */
-type QcgModel107 = {
-    data: QcgModel108;
+type QcgModel109 = {
+    data: QcgModel110;
     kind: 'agent_checkpoint' | 'agent_completed' | 'agent_delegated' | 'agent_failed' | 'agent_file_changes' | 'agent_handoff' | 'artifact' | 'audit_degraded' | 'budget_charged' | 'confirm_request' | 'context_compacted' | 'dry_run' | 'effect_closed' | 'effect_intent' | 'elapsed_accounted' | 'elapsed_exceeded' | 'foreach_budget_exhausted' | 'foreach_iteration' | 'foreach_iteration_settled' | 'foreach_sibling_drained' | 'foreach_sibling_ignored' | 'graph_resolved' | 'guardrail_error' | 'guardrail_evaluated' | 'guardrail_tripwire' | 'hook_failed' | 'hook_replayed' | 'hook_skipped' | 'lagged' | 'llm_call' | 'llm_cost_unresolved' | 'llm_delta' | 'llm_memo' | 'llm_route_failed' | 'llm_validation_failed' | 'mcp_authorization_required' | 'mcp_cleanup_settled' | 'mcp_continuation_consumed' | 'mcp_continuation_resumed' | 'mcp_destination_decision' | 'mcp_input_pending' | 'operation_finished' | 'operation_repeated' | 'operation_started' | 'out_of_contract' | 'parallel_replay_authorized' | 'parallel_task_joined' | 'regenerate_attempt_finished' | 'regenerate_attempt_started' | 'repair_attempt_finished' | 'repair_attempt_started' | 'resource' | 'run_canceled' | 'run_error' | 'run_finished' | 'run_forked' | 'run_interrupted' | 'run_queued' | 'run_resumed' | 'run_started' | 'run_waiting' | 'run_yielded' | 'shutdown' | 'side_effect' | 'state_patched' | 'step_finished' | 'step_interrupted' | 'step_replayed' | 'step_retry' | 'step_skipped' | 'step_started' | 'step_timeout' | 'stream_error' | 'tool_backend_resolved' | 'tool_call' | 'user_answered' | 'user_cancel_requested' | 'user_confirmed' | 'user_interaction';
     parent_span_id: string | null;
     path: string | null;
@@ -1024,19 +1077,19 @@ type QcgModel107 = {
     ts: string;
 };
 
-type QcgModel108 = QcgModel34 | QcgModel118 | QcgModel116 | QcgModel48 | QcgModel97 | QcgModel130 | QcgModel129 | QcgModel127 | QcgModel128 | QcgModel91 | QcgModel40 | QcgModel39 | QcgModel94 | QcgModel12 | QcgModel93 | QcgModel62 | QcgModel69 | QcgModel71 | QcgModel0 | QcgModel6 | QcgModel2 | QcgModel1 | QcgModel3 | QcgModel7 | QcgModel26 | QcgModel74 | QcgModel73 | QcgModel139 | QcgModel52 | QcgModel49 | QcgModel54 | QcgModel136 | QcgModel148 | QcgModel81 | QcgModel21 | QcgModel122 | QcgModel33 | QcgModel82 | QcgModel120 | QcgModel106 | QcgModel109 | QcgModel61 | unknown;
+type QcgModel110 = QcgModel36 | QcgModel120 | QcgModel118 | QcgModel50 | QcgModel99 | QcgModel132 | QcgModel131 | QcgModel129 | QcgModel130 | QcgModel93 | QcgModel42 | QcgModel41 | QcgModel96 | QcgModel12 | QcgModel95 | QcgModel64 | QcgModel71 | QcgModel73 | QcgModel0 | QcgModel6 | QcgModel2 | QcgModel1 | QcgModel3 | QcgModel7 | QcgModel28 | QcgModel76 | QcgModel75 | QcgModel141 | QcgModel54 | QcgModel51 | QcgModel56 | QcgModel138 | QcgModel150 | QcgModel83 | QcgModel21 | QcgModel124 | QcgModel35 | QcgModel84 | QcgModel122 | QcgModel108 | QcgModel111 | QcgModel63 | unknown;
 
-type QcgModel109 = {
-    failures: Array<QcgModel115>;
-    metrics: QcgModel114;
-    reason: QcgModel36 | null;
-    status: QcgModel104;
+type QcgModel111 = {
+    failures: Array<QcgModel117>;
+    metrics: QcgModel116;
+    reason: QcgModel38 | null;
+    status: QcgModel106;
 };
 
 /**
  * RunInvalidation
  */
-type QcgModel110 = {
+type QcgModel112 = {
     actor_label: string;
     invalidated_at: string;
     reason: string;
@@ -1046,13 +1099,13 @@ type QcgModel110 = {
 /**
  * RunListItem
  */
-type QcgModel111 = {
+type QcgModel113 = {
     generator_id: string;
-    invalidation: QcgModel110 | null;
+    invalidation: QcgModel112 | null;
     run_id: string;
     seq: number;
     started_at: string;
-    state: QcgModel119;
+    state: QcgModel121;
 };
 
 /**
@@ -1062,17 +1115,17 @@ type QcgModel111 = {
  * existing cursor contract; descending serves newest-first views so
  * recent runs never fall out of a capped fetch window (B12).
  */
-type QcgModel112 = 'asc' | 'desc';
+type QcgModel114 = 'asc' | 'desc';
 
 /**
  * RunListResponse
  */
-type QcgModel113 = {
-    items: Array<QcgModel111>;
+type QcgModel115 = {
+    items: Array<QcgModel113>;
     next_cursor: string | null;
 };
 
-type QcgModel114 = {
+type QcgModel116 = {
     /**
      * Durable step-budget consumption (F13): sum of `budget_charged`
      * deltas. `steps_executed` counts `step_started` events (observational,
@@ -1103,23 +1156,23 @@ type QcgModel114 = {
     tokens_total: number;
 };
 
-type QcgModel115 = {
-    failure: QcgModel36;
+type QcgModel117 = {
+    failure: QcgModel38;
     path: string;
 };
 
-type QcgModel116 = {
+type QcgModel118 = {
     /**
      * Absent on historical `run_resumed` records; present on new engine entries.
      */
-    step_budget_baseline?: QcgModel126 | null;
+    step_budget_baseline?: QcgModel128 | null;
 };
 
 /**
  * RunSnapshot
  */
-type QcgModel117 = {
-    artifacts?: QcgModel83 | null;
+type QcgModel119 = {
+    artifacts?: QcgModel85 | null;
     confirm?: QcgModel22 | null;
     contract_sha256: string | null;
     /**
@@ -1128,7 +1181,7 @@ type QcgModel117 = {
      * to guess from the run id.
      */
     generator_id: string;
-    invalidation: QcgModel110 | null;
+    invalidation: QcgModel112 | null;
     /**
      * Run metadata admitted with the run; never authorization.
      */
@@ -1139,7 +1192,7 @@ type QcgModel117 = {
      * Cost totals: exact terminal metrics when finished, otherwise a live
      * synthesis from the folded budget. Absent only before any activity.
      */
-    metrics: QcgModel114 | null;
+    metrics: QcgModel116 | null;
     /**
      * Parent run id for runs created by fork.
      */
@@ -1148,12 +1201,12 @@ type QcgModel117 = {
      * Scheduling priority, higher runs first.
      */
     priority: number;
-    question?: QcgModel44 | null;
+    question?: QcgModel46 | null;
     /**
      * 1-based position among queued runs, present only while `Queued`.
      */
     queue_position: number | null;
-    queue_position_quality: QcgModel90;
+    queue_position_quality: QcgModel92;
     /**
      * RFC 3339 durable FIFO key while queued. Scheduler preemption may
      * preserve the prior key rather than stamp the latest transition time.
@@ -1161,17 +1214,17 @@ type QcgModel117 = {
     queued_at: string | null;
     run_id: string;
     seq: number;
-    state: QcgModel119;
+    state: QcgModel121;
     /**
      * Terminal outcomes folded from journal records, keyed by canonical
      * `NodePath` strings. Live values and outputs are not summarized here.
      */
     step_summaries: {
-        [key: string]: QcgModel132;
+        [key: string]: QcgModel134;
     };
 };
 
-type QcgModel118 = {
+type QcgModel120 = {
     answers: {
         [key: string]: unknown;
     };
@@ -1216,7 +1269,7 @@ type QcgModel118 = {
     /**
      * Deployment-owned parallel compatibility; only fail-fast exists.
      */
-    parallel_compatibility: QcgModel84 | null;
+    parallel_compatibility: QcgModel86 | null;
     parallel_compatibility_origin: string | null;
     /**
      * Parent run id for runs created by fork.
@@ -1232,31 +1285,31 @@ type QcgModel118 = {
      * use the actual event timestamp (C04), which is never backdated.
      */
     queued_at: string | null;
-    resource_hashes: Array<QcgModel97>;
+    resource_hashes: Array<QcgModel99>;
     retention_days: number | null;
     /**
      * Set on a continuation: the parent's recorded model responses serve identical requests.
      */
-    reuse?: QcgModel41 | null;
+    reuse?: QcgModel43 | null;
     schema_version: number;
     /**
      * Versioned step-budget checkpoint emitted by the engine at a durable
      * run-entry boundary. Older identity events omit it.
      */
-    step_budget_baseline?: QcgModel126 | null;
+    step_budget_baseline?: QcgModel128 | null;
 };
 
-type QcgModel119 = 'queued' | 'running' | 'waiting' | 'confirming' | 'succeeded' | 'failed' | 'canceled' | 'interrupted' | 'cancel_requested';
+type QcgModel121 = 'queued' | 'running' | 'waiting' | 'confirming' | 'succeeded' | 'failed' | 'canceled' | 'interrupted' | 'cancel_requested';
 
-type QcgModel120 = {
-    question: QcgModel44;
+type QcgModel122 = {
+    question: QcgModel46;
     question_id: string;
 };
 
-type QcgModel121 = 'denied' | 'allowed' | 'approved_by_user' | 'denied_by_user' | 'confirmation_required';
+type QcgModel123 = 'denied' | 'allowed' | 'approved_by_user' | 'denied_by_user' | 'confirmation_required';
 
-type QcgModel122 = {
-    decision: QcgModel121;
+type QcgModel124 = {
+    decision: QcgModel123;
     details: unknown;
     dry_run: boolean;
     kind: string;
@@ -1268,14 +1321,14 @@ type QcgModel122 = {
     target: string;
 };
 
-type QcgModel123 = 'invocation' | 'content';
+type QcgModel125 = 'invocation' | 'content';
 
-type QcgModel124 = 'none' | 'confirm' | 'dry_run_first' | 'allowed';
+type QcgModel126 = 'none' | 'confirm' | 'dry_run_first' | 'allowed';
 
 /**
  * StartRun
  */
-type QcgModel125 = {
+type QcgModel127 = {
     /**
      * Pre-provisioned answers keyed by question id, consumed without interaction.
      * Same semantics as eval suite answers.
@@ -1314,59 +1367,59 @@ type QcgModel125 = {
 /**
  * Exact cumulative step usage and charge-ledger position at a run-entry boundary.
  */
-type QcgModel126 = {
+type QcgModel128 = {
     charged: number;
     used: number;
     version: number;
 };
 
-type QcgModel127 = {
+type QcgModel129 = {
     answer: unknown;
-    failed_files: Array<QcgModel37>;
+    failed_files: Array<QcgModel39>;
     failed_output: unknown;
     /**
      * File revisions produced by this step, retained across suspension.
      */
-    files: Array<QcgModel37>;
+    files: Array<QcgModel39>;
     findings: Array<unknown>;
     output: unknown;
     output_name: string | null;
     parallel: boolean;
-    question: QcgModel44 | null;
-    reason: QcgModel36 | null;
-    status: QcgModel131;
+    question: QcgModel46 | null;
+    reason: QcgModel38 | null;
+    status: QcgModel133;
     to: string | null;
 };
 
-type QcgModel128 = {
-    status: QcgModel131;
+type QcgModel130 = {
+    status: QcgModel133;
 };
 
-type QcgModel129 = {
+type QcgModel131 = {
     attempt: number;
     error: string;
     max_attempts: number;
 };
 
-type QcgModel130 = {
+type QcgModel132 = {
     attempt: number;
     parallel: boolean;
     type: string;
 };
 
-type QcgModel131 = 'success' | 'repaired' | 'routed' | 'repair_exhausted' | 'answered_on_fail' | 'regenerated' | 'regenerate_exhausted' | 'needs_user' | 'needs_confirm' | 'check_failed' | 'failed';
+type QcgModel133 = 'success' | 'repaired' | 'routed' | 'repair_exhausted' | 'answered_on_fail' | 'regenerated' | 'regenerate_exhausted' | 'needs_user' | 'needs_confirm' | 'check_failed' | 'failed';
 
 /**
  * StepSummary
  *
  * Journal-folded terminal summary for one canonical node path.
  */
-type QcgModel132 = {
+type QcgModel134 = {
     /**
      * Present for failed and skipped steps; success has no reason.
      */
-    reason?: QcgModel36 | null;
-    status: QcgModel133;
+    reason?: QcgModel38 | null;
+    status: QcgModel135;
 };
 
 /**
@@ -1374,11 +1427,11 @@ type QcgModel132 = {
  *
  * Terminal outcome of one step execution, projected from the run journal.
  */
-type QcgModel133 = 'success' | 'failed' | 'skipped';
+type QcgModel135 = 'success' | 'failed' | 'skipped';
 
-type QcgModel134 = 'auto' | 'native_strict' | 'native_compatible' | 'prompt';
+type QcgModel136 = 'auto' | 'native_strict' | 'native_compatible' | 'prompt';
 
-type QcgModel135 = {
+type QcgModel137 = {
     /**
      * Input tokens used to create cache entries, included in total input.
      */
@@ -1395,71 +1448,71 @@ type QcgModel135 = {
     reasoning: number;
 };
 
-type QcgModel136 = {
+type QcgModel138 = {
     argv: Array<string>;
     backend: string;
     tool: string;
 };
 
-type QcgModel137 = {
-    code: QcgModel138;
+type QcgModel139 = {
+    code: QcgModel140;
     message: string;
 };
 
-type QcgModel138 = 'invalid_arguments' | 'guardrail_rejected' | 'execution_failed' | 'output_rejected' | 'cancelled' | 'budget_exceeded' | 'tool_reported_error' | 'timed_out' | 'elapsed_exceeded' | 'cleanup_failed';
+type QcgModel140 = 'invalid_arguments' | 'guardrail_rejected' | 'execution_failed' | 'output_rejected' | 'cancelled' | 'budget_exceeded' | 'tool_reported_error' | 'timed_out' | 'elapsed_exceeded' | 'cleanup_failed';
 
-type QcgModel139 = {
+type QcgModel141 = {
     agent: string | null;
     arguments: unknown;
     /**
      * Cleanup failure retained beside the execution outcome.
      */
-    cleanup_error: QcgModel137 | null;
+    cleanup_error: QcgModel139 | null;
     /**
      * Effective cleanup policy and source; absent when cleanup settlement is not applied.
      */
-    cleanup_settlement: QcgModel78 | null;
+    cleanup_settlement: QcgModel80 | null;
     duration_ms: number;
-    error: QcgModel137 | null;
+    error: QcgModel139 | null;
     id: string;
-    phase: QcgModel140;
+    phase: QcgModel142;
     result: unknown;
     server: string | null;
-    sources: Array<QcgModel141>;
-    status: QcgModel142;
+    sources: Array<QcgModel143>;
+    status: QcgModel144;
     tool: string;
     truncated: boolean;
 };
 
-type QcgModel140 = 'input_validation' | 'input_guardrail' | 'execution' | 'output_guardrail' | 'completed';
+type QcgModel142 = 'input_validation' | 'input_guardrail' | 'execution' | 'output_guardrail' | 'completed';
 
-type QcgModel141 = {
+type QcgModel143 = {
     title: string | null;
     url: string;
 };
 
-type QcgModel142 = 'succeeded' | 'failed' | 'needs_user' | 'needs_confirmation' | 'degraded';
+type QcgModel144 = 'succeeded' | 'failed' | 'needs_user' | 'needs_confirmation' | 'degraded';
 
 /**
  * Provider-neutral policy for whether a model may call an exposed tool.
  */
-type QcgModel143 = QcgModel144 | {
+type QcgModel145 = QcgModel146 | {
     tool: string;
 };
 
-type QcgModel144 = 'none' | 'auto' | 'required';
+type QcgModel146 = 'none' | 'auto' | 'required';
 
-type QcgModel145 = {
-    dispatch: QcgModel95;
-    phase: QcgModel146;
+type QcgModel147 = {
+    dispatch: QcgModel97;
+    phase: QcgModel148;
 };
 
-type QcgModel146 = 'connect' | 'response' | 'unknown';
+type QcgModel148 = 'connect' | 'response' | 'unknown';
 
 /**
  * One citation the provider attached to its answer.
  */
-type QcgModel147 = {
+type QcgModel149 = {
     end_index: number | null;
     /**
      * The cited range inside the answer text, when the provider reports one.
@@ -1469,14 +1522,14 @@ type QcgModel147 = {
     url: string;
 };
 
-type QcgModel148 = {
+type QcgModel150 = {
     source: string | null;
 };
 
 /**
  * Unknown possible hosted-search spend, without fabricated usage or response metadata.
  */
-type QcgModel149 = {
+type QcgModel151 = {
     calls: null;
     cost_microusd: null;
 };
@@ -1484,24 +1537,20 @@ type QcgModel149 = {
 /**
  * What provider-hosted search did for one response and how much was metered.
  */
-type QcgModel150 = {
+type QcgModel152 = {
     /**
      * Provider-billable units under the configured mapping; null is unknown, never zero.
      */
     calls: number | null;
-    citations: Array<QcgModel147>;
+    citations: Array<QcgModel149>;
     /**
      * Hosted search charge in microusd; null means unmetered, never free.
      */
     cost_microusd: number | null;
-    events: Array<QcgModel89>;
+    events: Array<QcgModel91>;
 };
 
-type QcgInline151 = Array<QcgModel47>;
-
-type QcgInline152 = string;
-
-type QcgInline153 = string;
+type QcgInline153 = Array<QcgModel49>;
 
 type QcgInline154 = string;
 
@@ -1513,11 +1562,11 @@ type QcgInline157 = string;
 
 type QcgInline158 = string;
 
-type QcgInline159 = boolean;
+type QcgInline159 = string;
 
 type QcgInline160 = string;
 
-type QcgInline161 = string;
+type QcgInline161 = boolean;
 
 type QcgInline162 = string;
 
@@ -1531,13 +1580,13 @@ type QcgInline166 = string;
 
 type QcgInline167 = string;
 
-type QcgInline168 = unknown;
+type QcgInline168 = string;
 
-type QcgInline169 = number;
+type QcgInline169 = string;
 
-type QcgInline170 = string;
+type QcgInline170 = unknown;
 
-type QcgInline171 = string;
+type QcgInline171 = number;
 
 type QcgInline172 = string;
 
@@ -1643,13 +1692,17 @@ type QcgInline222 = string;
 
 type QcgInline223 = string;
 
-type QcgInline224 = unknown;
+type QcgInline224 = string;
 
 type QcgInline225 = string;
 
-type QcgInline226 = string;
+type QcgInline226 = unknown;
 
 type QcgInline227 = string;
+
+type QcgInline228 = string;
+
+type QcgInline229 = string;
 
 export type paths = {
     "/api/generators": {
@@ -1673,7 +1726,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/json": QcgInline151;
+                        "application/json": QcgInline153;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -1707,10 +1760,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "If-None-Match"?: QcgInline153;
+                    "If-None-Match"?: QcgInline155;
                 };
                 "path": {
-                    "id": QcgInline152;
+                    "id": QcgInline154;
                 };
                 "cookie"?: never;
             };
@@ -1718,7 +1771,7 @@ export type paths = {
             "responses": {
                 "200": {
                     "headers": {
-                        "ETag"?: QcgInline154;
+                        "ETag"?: QcgInline156;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -1727,7 +1780,7 @@ export type paths = {
                 };
                 "304": {
                     "headers": {
-                        "ETag"?: QcgInline155;
+                        "ETag"?: QcgInline157;
                         [name: string]: unknown;
                     };
                     "content"?: never;
@@ -1780,8 +1833,8 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline156;
-                    "path": QcgInline157;
+                    "id": QcgInline158;
+                    "path": QcgInline159;
                 };
                 "cookie"?: never;
             };
@@ -1792,7 +1845,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/octet-stream": QcgInline158;
+                        "application/octet-stream": QcgInline160;
                     };
                 };
                 "400": {
@@ -1841,7 +1894,7 @@ export type paths = {
         "get": {
             "parameters": {
                 "query"?: {
-                    "refresh"?: QcgInline159;
+                    "refresh"?: QcgInline161;
                 };
                 "header"?: never;
                 "path"?: never;
@@ -1887,10 +1940,10 @@ export type paths = {
         "get": {
             "parameters": {
                 "query": {
-                    "code"?: QcgInline160;
-                    "state": QcgInline161;
-                    "iss"?: QcgInline162;
-                    "error"?: QcgInline163;
+                    "code"?: QcgInline162;
+                    "state": QcgInline163;
+                    "iss"?: QcgInline164;
+                    "error"?: QcgInline165;
                 };
                 "header"?: never;
                 "path"?: never;
@@ -1903,7 +1956,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "text/html": QcgInline164;
+                        "text/html": QcgInline166;
                     };
                 };
                 "400": {
@@ -2000,7 +2053,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline165;
+                    "id": QcgInline167;
                 };
                 "cookie"?: never;
             };
@@ -2039,7 +2092,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline166;
+                    "id": QcgInline168;
                 };
                 "cookie"?: never;
             };
@@ -2091,7 +2144,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline167;
+                    "id": QcgInline169;
                 };
                 "cookie"?: never;
             };
@@ -2149,7 +2202,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/json": QcgInline168;
+                        "application/json": QcgInline170;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -2182,11 +2235,11 @@ export type paths = {
         "get": {
             "parameters": {
                 "query"?: {
-                    "limit"?: QcgInline169;
-                    "cursor"?: QcgInline170;
+                    "limit"?: QcgInline171;
+                    "cursor"?: QcgInline172;
                     "state"?: components["schemas"]["RunStatus"];
-                    "generator_id"?: QcgInline171;
-                    "since"?: QcgInline172;
+                    "generator_id"?: QcgInline173;
+                    "since"?: QcgInline174;
                     "order"?: components["schemas"]["RunListOrder"];
                 };
                 "header"?: never;
@@ -2228,8 +2281,8 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header": {
-                    "X-QCG-Package-SHA256": QcgInline173;
-                    "Idempotency-Key"?: QcgInline174;
+                    "X-QCG-Package-SHA256": QcgInline175;
+                    "Idempotency-Key"?: QcgInline176;
                 };
                 "path"?: never;
                 "cookie"?: never;
@@ -2242,7 +2295,7 @@ export type paths = {
             "responses": {
                 "201": {
                     "headers": {
-                        "Location"?: QcgInline175;
+                        "Location"?: QcgInline177;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -2318,10 +2371,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "If-None-Match"?: QcgInline177;
+                    "If-None-Match"?: QcgInline179;
                 };
                 "path": {
-                    "id": QcgInline176;
+                    "id": QcgInline178;
                 };
                 "cookie"?: never;
             };
@@ -2329,7 +2382,7 @@ export type paths = {
             "responses": {
                 "200": {
                     "headers": {
-                        "ETag"?: QcgInline178;
+                        "ETag"?: QcgInline180;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -2338,7 +2391,7 @@ export type paths = {
                 };
                 "304": {
                     "headers": {
-                        "ETag"?: QcgInline179;
+                        "ETag"?: QcgInline181;
                         [name: string]: unknown;
                     };
                     "content"?: never;
@@ -2378,7 +2431,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline180;
+                    "id": QcgInline182;
                 };
                 "cookie"?: never;
             };
@@ -2434,10 +2487,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "If-None-Match"?: QcgInline182;
+                    "If-None-Match"?: QcgInline184;
                 };
                 "path": {
-                    "id": QcgInline181;
+                    "id": QcgInline183;
                 };
                 "cookie"?: never;
             };
@@ -2445,7 +2498,7 @@ export type paths = {
             "responses": {
                 "200": {
                     "headers": {
-                        "ETag"?: QcgInline183;
+                        "ETag"?: QcgInline185;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -2454,7 +2507,7 @@ export type paths = {
                 };
                 "304": {
                     "headers": {
-                        "ETag"?: QcgInline184;
+                        "ETag"?: QcgInline186;
                         [name: string]: unknown;
                     };
                     "content"?: never;
@@ -2507,7 +2560,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline185;
+                    "id": QcgInline187;
                 };
                 "cookie"?: never;
             };
@@ -2518,7 +2571,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/zip": QcgInline186;
+                        "application/zip": QcgInline188;
                     };
                 };
                 "400": {
@@ -2568,13 +2621,13 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "If-None-Match"?: QcgInline189;
-                    "Range"?: QcgInline190;
-                    "If-Range"?: QcgInline191;
+                    "If-None-Match"?: QcgInline191;
+                    "Range"?: QcgInline192;
+                    "If-Range"?: QcgInline193;
                 };
                 "path": {
-                    "id": QcgInline187;
-                    "path": QcgInline188;
+                    "id": QcgInline189;
+                    "path": QcgInline190;
                 };
                 "cookie"?: never;
             };
@@ -2582,29 +2635,29 @@ export type paths = {
             "responses": {
                 "200": {
                     "headers": {
-                        "Accept-Ranges"?: QcgInline192;
-                        "Content-Disposition"?: QcgInline193;
-                        "ETag"?: QcgInline194;
+                        "Accept-Ranges"?: QcgInline194;
+                        "Content-Disposition"?: QcgInline195;
+                        "ETag"?: QcgInline196;
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/octet-stream": QcgInline195;
+                        "application/octet-stream": QcgInline197;
                     };
                 };
                 "206": {
                     "headers": {
-                        "Accept-Ranges"?: QcgInline196;
-                        "Content-Disposition"?: QcgInline197;
-                        "ETag"?: QcgInline198;
+                        "Accept-Ranges"?: QcgInline198;
+                        "Content-Disposition"?: QcgInline199;
+                        "ETag"?: QcgInline200;
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/octet-stream": QcgInline199;
+                        "application/octet-stream": QcgInline201;
                     };
                 };
                 "304": {
                     "headers": {
-                        "ETag"?: QcgInline200;
+                        "ETag"?: QcgInline202;
                         [name: string]: unknown;
                     };
                     "content"?: never;
@@ -2671,7 +2724,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline201;
+                    "id": QcgInline203;
                 };
                 "cookie"?: never;
             };
@@ -2682,7 +2735,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/zip": QcgInline202;
+                        "application/zip": QcgInline204;
                     };
                 };
                 "400": {
@@ -2733,11 +2786,11 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline205;
+                    "Idempotency-Key"?: QcgInline207;
                 };
                 "path": {
-                    "id": QcgInline203;
-                    "cid": QcgInline204;
+                    "id": QcgInline205;
+                    "cid": QcgInline206;
                 };
                 "cookie"?: never;
             };
@@ -2827,10 +2880,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline207;
+                    "Idempotency-Key"?: QcgInline209;
                 };
                 "path": {
-                    "id": QcgInline206;
+                    "id": QcgInline208;
                 };
                 "cookie"?: never;
             };
@@ -2838,7 +2891,7 @@ export type paths = {
             "responses": {
                 "201": {
                     "headers": {
-                        "Location"?: QcgInline208;
+                        "Location"?: QcgInline210;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -2914,10 +2967,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Last-Event-ID"?: QcgInline210;
+                    "Last-Event-ID"?: QcgInline212;
                 };
                 "path": {
-                    "id": QcgInline209;
+                    "id": QcgInline211;
                 };
                 "cookie"?: never;
             };
@@ -2928,7 +2981,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "text/event-stream": QcgInline211;
+                        "text/event-stream": QcgInline213;
                     };
                 };
                 "400": {
@@ -2980,10 +3033,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline213;
+                    "Idempotency-Key"?: QcgInline215;
                 };
                 "path": {
-                    "id": QcgInline212;
+                    "id": QcgInline214;
                 };
                 "cookie"?: never;
             };
@@ -2995,7 +3048,7 @@ export type paths = {
             "responses": {
                 "201": {
                     "headers": {
-                        "Location"?: QcgInline214;
+                        "Location"?: QcgInline216;
                         [name: string]: unknown;
                     };
                     "content": {
@@ -3074,7 +3127,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline215;
+                    "id": QcgInline217;
                 };
                 "cookie"?: never;
             };
@@ -3162,7 +3215,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline216;
+                    "id": QcgInline218;
                 };
                 "cookie"?: never;
             };
@@ -3173,7 +3226,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/x-ndjson": QcgInline217;
+                        "application/x-ndjson": QcgInline219;
                     };
                 };
                 "400": {
@@ -3224,7 +3277,7 @@ export type paths = {
                 "query"?: never;
                 "header"?: never;
                 "path": {
-                    "id": QcgInline218;
+                    "id": QcgInline220;
                 };
                 "cookie"?: never;
             };
@@ -3286,11 +3339,11 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline221;
+                    "Idempotency-Key"?: QcgInline223;
                 };
                 "path": {
-                    "id": QcgInline219;
-                    "qid": QcgInline220;
+                    "id": QcgInline221;
+                    "qid": QcgInline222;
                 };
                 "cookie"?: never;
             };
@@ -3380,10 +3433,10 @@ export type paths = {
             "parameters": {
                 "query"?: never;
                 "header"?: {
-                    "Idempotency-Key"?: QcgInline223;
+                    "Idempotency-Key"?: QcgInline225;
                 };
                 "path": {
-                    "id": QcgInline222;
+                    "id": QcgInline224;
                 };
                 "cookie"?: never;
             };
@@ -3452,7 +3505,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "application/json": QcgInline224;
+                        "application/json": QcgInline226;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -3495,7 +3548,7 @@ export type paths = {
                         [name: string]: unknown;
                     };
                     "content": {
-                        "text/plain; version=0.0.4": QcgInline225;
+                        "text/plain; version=0.0.4": QcgInline227;
                     };
                 };
                 "401": components["responses"]["Unauthorized"];
@@ -3546,138 +3599,140 @@ export type components = {
         "ConfirmRequestEventData": QcgModel21;
         "ConfirmSpec": QcgModel22;
         "ConfirmationDecision": QcgModel23;
-        "ContainerPermission": QcgModel24;
-        "ContainerRuntime": QcgModel25;
-        "ContextCompactedEventData": QcgModel26;
-        "ContextCompactedPromptEventData": QcgModel27;
-        "ContextCompactedRequestEventData": QcgModel28;
-        "ContextCompactionPolicy": QcgModel29;
-        "ContextCompactionScope": QcgModel30;
-        "DependencyFailure": QcgModel31;
-        "DependencyStatus": QcgModel32;
-        "DryRunEventData": QcgModel33;
-        "ElapsedAccountedEventData": QcgModel34;
-        "FailureCode": QcgModel35;
-        "FailureDetail": QcgModel36;
-        "FilePinEventData": QcgModel37;
-        "FileValue": QcgModel38;
-        "ForeachBudgetEventData": QcgModel39;
-        "ForeachIterationEventData": QcgModel40;
-        "ForkReuse": QcgModel41;
-        "ForkRun": QcgModel42;
-        "ForkStatePatch": QcgModel43;
-        "FormSpec": QcgModel44;
-        "GeneratorDetail": QcgModel45;
-        "GeneratorMeta": QcgModel46;
-        "GeneratorSummary": QcgModel47;
-        "GraphResolvedEventData": QcgModel48;
-        "GuardrailErrorEventData": QcgModel49;
-        "GuardrailErrorKind": QcgModel50;
-        "GuardrailErrorPolicy": QcgModel51;
-        "GuardrailEvaluatedEventData": QcgModel52;
-        "GuardrailStage": QcgModel53;
-        "GuardrailTripwireEventData": QcgModel54;
-        "GuardrailViolationEventData": QcgModel55;
-        "InputField": QcgModel56;
-        "InputSpec": QcgModel57;
-        "InputStage": QcgModel58;
-        "InvalidateRun": QcgModel59;
-        "LaggedAction": QcgModel60;
-        "LaggedEventData": QcgModel61;
-        "LlmCallEventData": QcgModel62;
-        "LlmCatalogCapabilities": QcgModel63;
-        "LlmCatalogCostTier": QcgModel64;
-        "LlmCatalogModel": QcgModel65;
-        "LlmCatalogProvider": QcgModel66;
-        "LlmCatalogResponse": QcgModel67;
-        "LlmCatalogSource": QcgModel68;
-        "LlmDeltaEventData": QcgModel69;
-        "LlmErrorKind": QcgModel70;
-        "LlmMemoEventData": QcgModel71;
-        "LlmReusedFrom": QcgModel72;
-        "LlmRouteFailedEventData": QcgModel73;
-        "LlmValidationFailedEventData": QcgModel74;
-        "McpAuthorizationStart": QcgModel75;
-        "McpCleanupPolicy": QcgModel76;
-        "McpCleanupPolicySource": QcgModel77;
-        "McpCleanupSettlement": QcgModel78;
-        "McpServerList": QcgModel79;
-        "McpServerSummary": QcgModel80;
-        "OutOfContractEventData": QcgModel81;
-        "OutputArtifact": QcgModel82;
-        "OutputManifest": QcgModel83;
-        "ParallelCompatibility": QcgModel84;
-        "Permissions": QcgModel85;
-        "ProblemDetails": QcgModel86;
-        "ProblemFieldError": QcgModel87;
-        "ProviderSearchAction": QcgModel88;
-        "ProviderSearchEvent": QcgModel89;
-        "QueuePositionQuality": QcgModel90;
-        "ReasonEventData": QcgModel91;
-        "ReasoningEffort": QcgModel92;
-        "RegenerateAttemptStartedEventData": QcgModel93;
-        "RepairAttemptStartedEventData": QcgModel94;
-        "RequestDispatch": QcgModel95;
-        "ResourceEventCacheStatus": QcgModel96;
-        "ResourceEventData": QcgModel97;
-        "ResourceFileEventData": QcgModel98;
-        "ResourceSource": QcgModel99;
-        "ResponseVerbosity": QcgModel100;
-        "RetryAction": QcgModel101;
-        "RetryDecision": QcgModel102;
-        "RetryGuard": QcgModel103;
-        "RunCompletionStatus": QcgModel104;
-        "RunCostMetrics": QcgModel105;
-        "RunErrorEventData": QcgModel106;
-        "RunEvent": QcgModel107;
-        "RunEventData": QcgModel108;
-        "RunFinishedEventData": QcgModel109;
-        "RunInvalidation": QcgModel110;
-        "RunListItem": QcgModel111;
-        "RunListOrder": QcgModel112;
-        "RunListResponse": QcgModel113;
-        "RunMetrics": QcgModel114;
-        "RunNodeFailureEventData": QcgModel115;
-        "RunResumedEventData": QcgModel116;
-        "RunSnapshot": QcgModel117;
-        "RunStartedEventData": QcgModel118;
-        "RunStatus": QcgModel119;
-        "RunWaitingEventData": QcgModel120;
-        "SideEffectDecision": QcgModel121;
-        "SideEffectEventData": QcgModel122;
-        "SideEffectScope": QcgModel123;
-        "SideEffects": QcgModel124;
-        "StartRun": QcgModel125;
-        "StepBudgetBaseline": QcgModel126;
-        "StepFinishedEventData": QcgModel127;
-        "StepReplayedEventData": QcgModel128;
-        "StepRetryEventData": QcgModel129;
-        "StepStartedEventData": QcgModel130;
-        "StepStatus": QcgModel131;
-        "StepSummary": QcgModel132;
-        "StepSummaryStatus": QcgModel133;
-        "StructuredOutputMode": QcgModel134;
-        "TokenUsageEventData": QcgModel135;
-        "ToolBackendResolvedEventData": QcgModel136;
-        "ToolCallError": QcgModel137;
-        "ToolCallErrorCode": QcgModel138;
-        "ToolCallEventData": QcgModel139;
-        "ToolCallPhase": QcgModel140;
-        "ToolCallSource": QcgModel141;
-        "ToolCallStatus": QcgModel142;
-        "ToolChoice": QcgModel143;
-        "ToolChoiceMode": QcgModel144;
-        "TransportFacts": QcgModel145;
-        "TransportPhase": QcgModel146;
-        "UrlCitation": QcgModel147;
-        "UserInteractionEventData": QcgModel148;
-        "WebSearchLiability": QcgModel149;
-        "WebSearchUsage": QcgModel150;
+        "ContainerNetwork": QcgModel24;
+        "ContainerPermission": QcgModel25;
+        "ContainerResources": QcgModel26;
+        "ContainerRuntime": QcgModel27;
+        "ContextCompactedEventData": QcgModel28;
+        "ContextCompactedPromptEventData": QcgModel29;
+        "ContextCompactedRequestEventData": QcgModel30;
+        "ContextCompactionPolicy": QcgModel31;
+        "ContextCompactionScope": QcgModel32;
+        "DependencyFailure": QcgModel33;
+        "DependencyStatus": QcgModel34;
+        "DryRunEventData": QcgModel35;
+        "ElapsedAccountedEventData": QcgModel36;
+        "FailureCode": QcgModel37;
+        "FailureDetail": QcgModel38;
+        "FilePinEventData": QcgModel39;
+        "FileValue": QcgModel40;
+        "ForeachBudgetEventData": QcgModel41;
+        "ForeachIterationEventData": QcgModel42;
+        "ForkReuse": QcgModel43;
+        "ForkRun": QcgModel44;
+        "ForkStatePatch": QcgModel45;
+        "FormSpec": QcgModel46;
+        "GeneratorDetail": QcgModel47;
+        "GeneratorMeta": QcgModel48;
+        "GeneratorSummary": QcgModel49;
+        "GraphResolvedEventData": QcgModel50;
+        "GuardrailErrorEventData": QcgModel51;
+        "GuardrailErrorKind": QcgModel52;
+        "GuardrailErrorPolicy": QcgModel53;
+        "GuardrailEvaluatedEventData": QcgModel54;
+        "GuardrailStage": QcgModel55;
+        "GuardrailTripwireEventData": QcgModel56;
+        "GuardrailViolationEventData": QcgModel57;
+        "InputField": QcgModel58;
+        "InputSpec": QcgModel59;
+        "InputStage": QcgModel60;
+        "InvalidateRun": QcgModel61;
+        "LaggedAction": QcgModel62;
+        "LaggedEventData": QcgModel63;
+        "LlmCallEventData": QcgModel64;
+        "LlmCatalogCapabilities": QcgModel65;
+        "LlmCatalogCostTier": QcgModel66;
+        "LlmCatalogModel": QcgModel67;
+        "LlmCatalogProvider": QcgModel68;
+        "LlmCatalogResponse": QcgModel69;
+        "LlmCatalogSource": QcgModel70;
+        "LlmDeltaEventData": QcgModel71;
+        "LlmErrorKind": QcgModel72;
+        "LlmMemoEventData": QcgModel73;
+        "LlmReusedFrom": QcgModel74;
+        "LlmRouteFailedEventData": QcgModel75;
+        "LlmValidationFailedEventData": QcgModel76;
+        "McpAuthorizationStart": QcgModel77;
+        "McpCleanupPolicy": QcgModel78;
+        "McpCleanupPolicySource": QcgModel79;
+        "McpCleanupSettlement": QcgModel80;
+        "McpServerList": QcgModel81;
+        "McpServerSummary": QcgModel82;
+        "OutOfContractEventData": QcgModel83;
+        "OutputArtifact": QcgModel84;
+        "OutputManifest": QcgModel85;
+        "ParallelCompatibility": QcgModel86;
+        "Permissions": QcgModel87;
+        "ProblemDetails": QcgModel88;
+        "ProblemFieldError": QcgModel89;
+        "ProviderSearchAction": QcgModel90;
+        "ProviderSearchEvent": QcgModel91;
+        "QueuePositionQuality": QcgModel92;
+        "ReasonEventData": QcgModel93;
+        "ReasoningEffort": QcgModel94;
+        "RegenerateAttemptStartedEventData": QcgModel95;
+        "RepairAttemptStartedEventData": QcgModel96;
+        "RequestDispatch": QcgModel97;
+        "ResourceEventCacheStatus": QcgModel98;
+        "ResourceEventData": QcgModel99;
+        "ResourceFileEventData": QcgModel100;
+        "ResourceSource": QcgModel101;
+        "ResponseVerbosity": QcgModel102;
+        "RetryAction": QcgModel103;
+        "RetryDecision": QcgModel104;
+        "RetryGuard": QcgModel105;
+        "RunCompletionStatus": QcgModel106;
+        "RunCostMetrics": QcgModel107;
+        "RunErrorEventData": QcgModel108;
+        "RunEvent": QcgModel109;
+        "RunEventData": QcgModel110;
+        "RunFinishedEventData": QcgModel111;
+        "RunInvalidation": QcgModel112;
+        "RunListItem": QcgModel113;
+        "RunListOrder": QcgModel114;
+        "RunListResponse": QcgModel115;
+        "RunMetrics": QcgModel116;
+        "RunNodeFailureEventData": QcgModel117;
+        "RunResumedEventData": QcgModel118;
+        "RunSnapshot": QcgModel119;
+        "RunStartedEventData": QcgModel120;
+        "RunStatus": QcgModel121;
+        "RunWaitingEventData": QcgModel122;
+        "SideEffectDecision": QcgModel123;
+        "SideEffectEventData": QcgModel124;
+        "SideEffectScope": QcgModel125;
+        "SideEffects": QcgModel126;
+        "StartRun": QcgModel127;
+        "StepBudgetBaseline": QcgModel128;
+        "StepFinishedEventData": QcgModel129;
+        "StepReplayedEventData": QcgModel130;
+        "StepRetryEventData": QcgModel131;
+        "StepStartedEventData": QcgModel132;
+        "StepStatus": QcgModel133;
+        "StepSummary": QcgModel134;
+        "StepSummaryStatus": QcgModel135;
+        "StructuredOutputMode": QcgModel136;
+        "TokenUsageEventData": QcgModel137;
+        "ToolBackendResolvedEventData": QcgModel138;
+        "ToolCallError": QcgModel139;
+        "ToolCallErrorCode": QcgModel140;
+        "ToolCallEventData": QcgModel141;
+        "ToolCallPhase": QcgModel142;
+        "ToolCallSource": QcgModel143;
+        "ToolCallStatus": QcgModel144;
+        "ToolChoice": QcgModel145;
+        "ToolChoiceMode": QcgModel146;
+        "TransportFacts": QcgModel147;
+        "TransportPhase": QcgModel148;
+        "UrlCitation": QcgModel149;
+        "UserInteractionEventData": QcgModel150;
+        "WebSearchLiability": QcgModel151;
+        "WebSearchUsage": QcgModel152;
     };
     "responses": {
         "TooManyRequests": {
             "headers": {
-                "Retry-After"?: QcgInline226;
+                "Retry-After"?: QcgInline228;
                 [name: string]: unknown;
             };
             "content": {
@@ -3686,7 +3741,7 @@ export type components = {
         };
         "Unauthorized": {
             "headers": {
-                "WWW-Authenticate"?: QcgInline227;
+                "WWW-Authenticate"?: QcgInline229;
                 [name: string]: unknown;
             };
             "content": {
