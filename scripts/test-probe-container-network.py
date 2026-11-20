@@ -261,56 +261,130 @@ class OrchestrationLogic(unittest.TestCase):
 
 
 class QcgDiagnostics(unittest.TestCase):
-    def test_failing_qcg_keeps_a_bounded_sanitized_excerpt(self):
-        stderr = (
-            "\x1b[31mError: run failed: probe: container exit 1\x1b[0m\n"
-            "PASSWORD=hunter2\n"
-            "Authorization: Bearer abc123def456\n"
-            "connect https://user:pass@example.invalid/ failed\x08\n"
-            + "diagnostic noise " * 300
-        )
-        stdout = (
-            "\x1b[33mWARN: retry scheduled\x1b[0m\n"
-            '{"kind":"tool_invoked","data":{"token":"s3cr3t"}}\n'
-            + "event noise " * 300
-        )
+    FIELDS = {
+        "error_class", "stderr_line_count", "stdout_line_count", "json_event_count",
+    }
+    CLOSED_CLASSES = {
+        "runtime_missing", "daemon_unavailable", "network_denied",
+        "invalid_destination", "image_unresolved", "contract_invalid",
+        "check_failed", "timeout", "resource_error", "unclassified",
+    }
+    CREDENTIALS = (
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "curl -u admin:s3cr3t https://host",
+        "Error: rejected token a1b2c3d4e5f6",
+        'PASSWORD="hunter2 secret"',
+    )
+    LEAKS = (
+        "Authorization: Basic dXNlcjpwYXNzd29yZA==",
+        "dXNlcjpwYXNzd29yZA==",
+        "curl -u admin:s3cr3t https://host",
+        "admin:s3cr3t",
+        "s3cr3t",
+        "Error: rejected token a1b2c3d4e5f6",
+        "a1b2c3d4e5f6",
+        'PASSWORD="hunter2 secret"',
+        "hunter2",
+    )
+    SIGNATURES = (
+        ("container runtime unavailable on this host", "runtime_missing"),
+        ("container client `docker` was not found on PATH", "runtime_missing"),
+        ("cannot connect to daemon socket: no such file or directory", "daemon_unavailable"),
+        ("Error response from daemon: No such container", "daemon_unavailable"),
+        ("network policy denied for destination", "network_denied"),
+        ("destination network permission denied", "network_denied"),
+        ("container destination `bad` is invalid", "invalid_destination"),
+        ("INVALID DESTINATION supplied", "invalid_destination"),
+        ("image not found for pinned digest", "image_unresolved"),
+        ("manifest unknown for image", "image_unresolved"),
+        ("Invalid image reference for backend", "image_unresolved"),
+        ("invalid contract: missing flow", "contract_invalid"),
+        ("contract load failed", "contract_invalid"),
+        ("check failed for probe step", "check_failed"),
+        ("probe step timed out after 5s", "timeout"),
+        ("operation timeout reached", "timeout"),
+        ("local resource exhausted", "resource_error"),
+        ("run budget exceeded", "resource_error"),
+    )
+
+    def record(self, stderr, stdout="", returncode=1):
         completed = subprocess.CompletedProcess(
-            ["qcg", "run"], 1, stdout, stderr)
+            ["qcg", "run"], returncode, stdout, stderr)
         result = probe.result_template()
-
         probe.record_qcg_diagnostics(completed, result)
+        return result
 
-        error_excerpt = result["qcg"]["stderr_excerpt"]
-        output_excerpt = result["qcg"]["stdout_excerpt"]
-        self.assertIn("Error: run failed: probe: container exit 1", error_excerpt)
-        self.assertLessEqual(len(error_excerpt), probe.EXCERPT_LIMIT)
-        self.assertLessEqual(len(output_excerpt), probe.EXCERPT_LIMIT)
-        self.assertNotIn("\x1b", error_excerpt + output_excerpt)
-        self.assertNotIn("\x08", error_excerpt)
-        self.assertIn("PASSWORD=<redacted>", error_excerpt)
-        for secret in ("hunter2", "abc123def456", "user:pass", "s3cr3t"):
-            with self.subTest(secret=secret):
-                self.assertNotIn(secret, error_excerpt + output_excerpt)
+    def test_credential_forms_never_reach_the_result(self):
+        stderr = "\n".join(self.CREDENTIALS) + "\n" + "noise\n" * 1200
+        stdout = "\n".join(self.CREDENTIALS) + "\n" + "noise\n" * 1200
 
-    def test_successful_qcg_adds_no_excerpt(self):
+        serialized = json.dumps(self.record(stderr, stdout))
+
+        for leak in self.LEAKS:
+            with self.subTest(leak=leak):
+                self.assertNotIn(leak, serialized)
+        self.assertNotIn("excerpt", serialized)
+
+    def test_only_allowlisted_fields_are_added(self):
+        result = self.record("check failed\n", '{"kind":"run_finished"}\n')
+        self.assertEqual(
+            set(result["qcg"]) - set(probe.result_template()["qcg"]), self.FIELDS)
+
+    def test_error_class_always_uses_the_closed_vocabulary(self):
+        self.assertEqual(probe.ERROR_CLASSES, self.CLOSED_CLASSES)
+        for stderr in ("", "unexpected condition\n", "no known signature\n",
+                       *self.CREDENTIALS):
+            with self.subTest(stderr=stderr):
+                self.assertIn(self.record(stderr)["qcg"]["error_class"],
+                              self.CLOSED_CLASSES)
+        self.assertEqual(
+            self.record("unexpected condition\n")["qcg"]["error_class"],
+            "unclassified",
+        )
+
+    def test_known_signatures_map_to_their_class(self):
+        for stderr, expected in self.SIGNATURES:
+            with self.subTest(stderr=stderr):
+                self.assertEqual(self.record(stderr)["qcg"]["error_class"], expected)
+
+    def test_signature_priority_is_deterministic(self):
+        result = self.record("check failed\nruntime unavailable\n")
+        self.assertEqual(result["qcg"]["error_class"], "runtime_missing")
+
+    def test_counts_are_bounded_integers(self):
+        stdout = '{"kind":"run_started"}\nnot-json\n' + "noise\n" * 1100
+        result = self.record("line\n" * 1200, stdout)
+        qcg = result["qcg"]
+        self.assertEqual(qcg["stderr_line_count"], 1000)
+        self.assertEqual(qcg["stdout_line_count"], 1000)
+        self.assertEqual(qcg["json_event_count"], 1)
+        for field in ("stderr_line_count", "stdout_line_count", "json_event_count"):
+            with self.subTest(field=field):
+                self.assertIs(type(qcg[field]), int)
+                self.assertGreaterEqual(qcg[field], 0)
+                self.assertLessEqual(qcg[field], 1000)
+
+    def test_successful_qcg_adds_no_diagnostic_fields(self):
         event = {"kind": "run_finished", "data": {"status": "success"}}
         completed = subprocess.CompletedProcess(
-            ["qcg", "run"], 0, json.dumps(event) + "\n", "\x1b[31mignored\x1b[0m\n")
+            ["qcg", "run"], 0, json.dumps(event) + "\n",
+            "\n".join(self.CREDENTIALS) + "\n")
         result = probe.result_template()
+        before = dict(result["qcg"])
 
         probe.record_qcg_diagnostics(completed, result)
 
-        self.assertNotIn("stderr_excerpt", result["qcg"])
-        self.assertNotIn("stdout_excerpt", result["qcg"])
+        self.assertEqual(result["qcg"], before)
+        self.assertFalse(self.FIELDS & set(result["qcg"]))
+        for leak in self.LEAKS:
+            self.assertNotIn(leak, json.dumps(result))
 
-    def test_qcg_with_no_parsed_events_is_failure_even_with_zero_exit(self):
-        completed = subprocess.CompletedProcess(
-            ["qcg", "run"], 0, "not-json\n", "Error: no events\n")
-        result = probe.result_template()
-
-        probe.record_qcg_diagnostics(completed, result)
-
-        self.assertIn("Error: no events", result["qcg"]["stderr_excerpt"])
+    def test_zero_events_is_a_failure_even_with_zero_exit(self):
+        result = self.record("no known signature\n", "not-json\n", returncode=0)
+        self.assertEqual(set(result["qcg"]) - set(probe.result_template()["qcg"]),
+                         self.FIELDS)
+        self.assertEqual(result["qcg"]["error_class"], "unclassified")
+        self.assertEqual(result["qcg"]["json_event_count"], 0)
 
 
 class Guards(unittest.TestCase):

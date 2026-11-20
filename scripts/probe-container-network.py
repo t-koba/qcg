@@ -46,20 +46,28 @@ RUN_ID = re.compile(r"[A-Za-z0-9_-]{1,128}\Z")
 TOKEN = re.compile(r"[0-9a-f]{32}\Z")
 SOCKET = re.compile(r"unix:///[-A-Za-z0-9._/]+\Z")
 
-EXCERPT_LIMIT = 2000
-REDACTED = "<redacted>"
-ANSI_ESCAPE = re.compile(
-    r"\x1b(?:\[[0-?]*[ -/]*[@-~]|\][^\x07\x1b]*(?:\x07|\x1b\\)|[@-Z\\-_])"
+DIAGNOSTIC_LINE_CAP = 1000
+# Closed vocabulary: only class names ever enter the result artifact.
+ERROR_CLASSES = frozenset({
+    "runtime_missing", "daemon_unavailable", "network_denied",
+    "invalid_destination", "image_unresolved", "contract_invalid",
+    "check_failed", "timeout", "resource_error", "unclassified",
+})
+# Fixed qcg failure signatures, in priority order. A case-insensitive
+# substring match selects the first class; unclassified is the safe fallback.
+ERROR_SIGNATURES = (
+    ("runtime_missing", ("runtime unavailable", "was not found on path")),
+    ("daemon_unavailable", ("cannot connect to daemon", "error response from daemon")),
+    ("network_denied", ("network policy denied", "permission denied")),
+    ("invalid_destination", ("invalid destination", "container destination")),
+    ("image_unresolved", ("image not found", "manifest unknown", "invalid image",
+                          "is not valid for")),
+    ("contract_invalid", ("invalid contract", "contract load failed")),
+    ("check_failed", ("check failed",)),
+    ("timeout", ("timed out", "timeout")),
+    ("resource_error", ("resource exhausted", "budget exceeded",
+                        "resource declaration is invalid")),
 )
-CONTROL_CHAR = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
-SECRET_ASSIGNMENT = re.compile(
-    r"""(?i)(?P<key>["']?(?:password|passwd|secret|token|api[_-]?key|apikey|"""
-    r"""credential|authorization|access[_-]?key|private[_-]?key)["']?\s*[:=]\s*)"""
-    r"""(?P<quote>["']?)(?P<value>[^\s,;"']+)(?P=quote)"""
-)
-ENV_ASSIGNMENT = re.compile(r"(?m)(?P<key>\b[A-Z][A-Z0-9_]{2,}\s*=\s*)(?P<value>[^\s;]+)")
-BEARER_TOKEN = re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]+")
-URL_CREDENTIALS = re.compile(r"(?i)(?P<scheme>[a-z][a-z0-9+.-]*://)(?P<userinfo>[^/@\s]+:[^/@\s]+@)")
 
 
 def network_name(host):
@@ -247,27 +255,30 @@ def parse_events(stdout):
     return events
 
 
-def _sanitize_excerpt(text):
-    """Neutralize untrusted child output before it enters a result artifact."""
-    text = ANSI_ESCAPE.sub("", text or "")
-    text = CONTROL_CHAR.sub(" ", text)
-    text = BEARER_TOKEN.sub(f"Bearer {REDACTED}", text)
-    text = SECRET_ASSIGNMENT.sub(
-        lambda match: f"{match.group('key')}{match.group('quote')}{REDACTED}{match.group('quote')}",
-        text,
-    )
-    text = ENV_ASSIGNMENT.sub(lambda match: f"{match.group('key')}{REDACTED}", text)
-    text = URL_CREDENTIALS.sub(lambda match: f"{match.group('scheme')}{REDACTED}@", text)
-    return text[:EXCERPT_LIMIT]
+def classify_qcg_error(stderr):
+    """Map untrusted stderr to a fixed class name without retaining its text."""
+    text = (stderr or "").lower()
+    for error_class, signatures in ERROR_SIGNATURES:
+        if any(signature in text for signature in signatures):
+            return error_class
+    return "unclassified"
+
+
+def bounded_line_count(text):
+    return min(len((text or "").splitlines()), DIAGNOSTIC_LINE_CAP)
 
 
 def record_qcg_diagnostics(completed, result):
-    """Keep a bounded qcg stderr/stdout excerpt only for a failed invocation."""
-    if completed.returncode == 0 and parse_events(completed.stdout or ""):
+    """Record allowlisted failure signals only; never copy child output."""
+    events = parse_events(completed.stdout or "")
+    if completed.returncode == 0 and events:
         return result
-    qcg = result["qcg"]
-    qcg["stderr_excerpt"] = _sanitize_excerpt(completed.stderr)
-    qcg["stdout_excerpt"] = _sanitize_excerpt(completed.stdout)
+    result["qcg"].update({
+        "error_class": classify_qcg_error(completed.stderr),
+        "stderr_line_count": bounded_line_count(completed.stderr),
+        "stdout_line_count": bounded_line_count(completed.stdout),
+        "json_event_count": len(events),
+    })
     return result
 
 
