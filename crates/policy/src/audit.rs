@@ -28,7 +28,9 @@ pub enum EventClass {
 /// to the durable path (the hosted-search liability on `llm_route_failed`). Durable
 /// records that carry no state (operator diagnostics such as
 /// `foreach_sibling_ignored`) stay durable on purpose: they are journal
-/// history that an audit policy must not be able to filter away.
+/// history that an audit policy must not be able to filter away. Tool backend
+/// resolution is durable for the same reason: its argv proof must reach
+/// `qcg run --json` stdout independently of audit policy.
 pub const OBSERVATION_EVENT_KINDS: &[&str] = &[
     "graph_resolved",
     "step_retry",
@@ -49,7 +51,6 @@ pub const OBSERVATION_EVENT_KINDS: &[&str] = &[
     "guardrail_evaluated",
     "guardrail_error",
     "guardrail_tripwire",
-    "tool_backend_resolved",
     "user_interaction",
     "out_of_contract",
     "side_effect",
@@ -386,6 +387,15 @@ mod tests {
                 "`{kind}` is listed as observation"
             );
         }
+    }
+
+    #[test]
+    fn tool_backend_resolved_is_durable() {
+        assert_eq!(event_class("tool_backend_resolved"), EventClass::Durable);
+        assert!(
+            !OBSERVATION_EVENT_KINDS.contains(&"tool_backend_resolved"),
+            "backend resolution proof must not be audit-filterable"
+        );
     }
 
     #[test]
