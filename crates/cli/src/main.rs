@@ -958,8 +958,43 @@ mod tests {
             .unwrap_or_else(|| panic!("journal should contain a {kind} event"))
     }
 
+    /// Defensive journal snapshot for a timed-out run. Unlike
+    /// `journal_events`, this must never panic: the file may be missing or
+    /// mid-write at the moment the bound expires.
+    fn journal_timeout_diagnostics(runs: &Utf8PathBuf, run_id: &str) -> String {
+        let journal = runs.join(run_id).join("meta/journal.jsonl");
+        let mut diag = format!("run_id={run_id}; runs={runs}; journal={journal}");
+        match std::fs::read(&journal) {
+            Ok(bytes) => {
+                let text = String::from_utf8_lossy(&bytes);
+                let events: Vec<serde_json::Value> = text
+                    .lines()
+                    .filter_map(|line| serde_json::from_str(line).ok())
+                    .collect();
+                let types: Vec<&str> = events
+                    .iter()
+                    .filter_map(|event| event.get("t").and_then(serde_json::Value::as_str))
+                    .collect();
+                let last_types = types
+                    .iter()
+                    .rev()
+                    .take(20)
+                    .rev()
+                    .copied()
+                    .collect::<Vec<_>>();
+                let tail = String::from_utf8_lossy(&bytes[bytes.len().saturating_sub(4000)..]);
+                let parsed_events = events.len();
+                diag.push_str(&format!(
+                    "; parsed_events={parsed_events}; last_event_types={last_types:?}; journal_tail_last_4000_bytes={tail}"
+                ));
+            }
+            Err(error) => diag.push_str(&format!("; journal_read_error={error}")),
+        }
+        diag
+    }
+
     async fn wait_for_terminal_events(runs: Utf8PathBuf, run_id: String) -> Vec<serde_json::Value> {
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        match tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
                 let events = journal_events(&runs, &run_id);
                 if events.iter().any(|value| {
@@ -971,7 +1006,15 @@ mod tests {
             }
         })
         .await
-        .expect("the run should reach a terminal journal event within the bound")
+        {
+            Ok(events) => events,
+            Err(_) => {
+                let diag = journal_timeout_diagnostics(&runs, &run_id);
+                panic!(
+                    "the run should reach a terminal journal event within the bound; diagnostics: {diag}"
+                )
+            }
+        }
     }
 
     /// Fixed check for the accepted `MAX_TOTAL_STEPS` finding: the CLI's
