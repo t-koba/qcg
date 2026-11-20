@@ -2056,10 +2056,12 @@ impl LocalService {
                     .map(|event| RunEvent::from_flat(&event))
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(api_internal)?;
-                // An empty or lagged tail, or a tail cut short before the
-                // last journal append, is not a divergence: every event is
-                // durable, so the journal is authoritative (E12). A
-                // conflicting event still fails the run.
+                // A tail whose events are all durable in the journal is not
+                // a divergence: the writer appends before broadcasting, and
+                // a resumed run broadcasts only its own appended events, so
+                // offset and order carry no signal (E12). The journal stays
+                // authoritative; a streamed event with no durable counterpart
+                // still fails the run.
                 match accepted_direct_events(collected, journal_events) {
                     Some(events) => events,
                     None => {
