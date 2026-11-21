@@ -294,11 +294,11 @@ pub(crate) fn task_slot_is_live(slot: &Mutex<Option<JoinHandle<()>>>) -> bool {
 /// Both production paths route through here: fresh-run admission via
 /// `LocalService::new_live_event_channel`, and recovery rehydration
 /// (`rehydrate_run`, which runs before any `LocalService` exists) by calling
-/// this function directly. `LocalService::live_event_channel_capacity_probe`
-/// builds its observation channel through the service method, so the probe
-/// guards THIS constructor and those two production callers. A caller that
-/// bypasses this function and constructs a channel with a different capacity
-/// is not detected by that probe.
+/// this function directly. The capacity probe observes this constructor only
+/// through `LocalService::new_live_event_channel`: it exercises the fresh-run
+/// admission route, but not recovery's direct call. A caller that bypasses
+/// this function and constructs a channel with a different capacity is not
+/// detected by that probe.
 pub(crate) fn new_live_event_channel(
     capacity: usize,
 ) -> (broadcast::Sender<RunEvent>, broadcast::Receiver<RunEvent>) {
