@@ -103,12 +103,12 @@ impl LocalService {
         )
     }
 
-    /// Observes the frozen capacity through the shared live-event channel
-    /// constructor via this service's delegating method. This exercises the
-    /// fresh-run admission route only; recovery rehydration calls the shared
-    /// constructor directly before a `LocalService` exists and is not
-    /// exercised by this probe. A caller that bypasses the constructor with a
-    /// different capacity is not detected.
+    /// Observes the frozen capacity by calling the same
+    /// `LocalService::new_live_event_channel` method that fresh-run admission
+    /// uses; the probe itself performs no admission. Recovery rehydration
+    /// calls the shared constructor directly before a `LocalService` exists
+    /// and is not exercised by this probe. A caller that bypasses the
+    /// constructor with a different capacity is not detected.
     ///
     /// More sends than the accepted maximum force the receiver to lag;
     /// `Lagged(n)` reports the overwritten messages, so the remainder is what
