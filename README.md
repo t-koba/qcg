@@ -29,7 +29,51 @@ provider's MCP search tool, and must grant the corresponding hosts in
 
 ## Quick start
 
-When running from the source tree, build the generated SPA assets first:
+### From a release bundle (no build required)
+
+If a tagged release matching your platform is available on the
+[official Releases page](https://github.com/t-koba/qcg/releases), start there:
+each archive already contains the built SPA, so no Rust or frontend toolchain
+is needed. Download the archive for your OS and architecture
+(`qcg-<os>-<arch>.tar.gz`, or `qcg-<os>-<arch>.zip` on Windows) together with
+its matching `SHA256SUMS-<os>-<arch>` file, and check the archive against the
+published hash from the directory holding both:
+
+```bash
+sha256sum -c SHA256SUMS-linux-x86_64
+```
+
+On macOS use `shasum -a 256 -c`; on Windows compare
+`Get-FileHash -Algorithm SHA256 <archive>` with the value in the checksum file.
+The checksum confirms the downloaded bytes match the published hash: it checks
+the file is intact, not who published it. Only a tag's own release workflow
+builds and publishes these archives, so a green result on a development branch
+does not prove a matching release exists.
+
+Extract the archive and keep its layout: the executable is `bin/qcg`
+(`bin\qcg.exe` on Windows), with the bundled demo and documents in the sibling
+`share/qcg` directory. The executable discovers that demo relative to itself,
+so keep `bin` and `share` together. From the extracted directory, start the
+unauthenticated loopback server:
+
+```bash
+./bin/qcg serve --bind 127.0.0.1 --port 8080 --runs-dir /tmp/runs
+```
+
+On Windows use `bin\qcg.exe` instead of `./bin/qcg`. Then open the demo:
+
+```text
+http://127.0.0.1:8080/api/generators/generator/assets/ui/index.html
+```
+
+The `generator` demo is served through its normal `[assets]` contract. This
+startup path is exercised by `scripts/check-dist-bundle.sh`, which runs the
+bundled executable outside the source tree and fetches the URL above.
+
+### From a source checkout (fallback / development)
+
+When no matching bundle is available, or when developing qcg, build the
+generated SPA assets first:
 
 ```bash
 # --ignore-scripts: dependency install scripts never execute (install-time
@@ -50,13 +94,7 @@ cargo run -p cli -- serve --bind 127.0.0.1 --port 8080 \
   --max-active-runs 8
 ```
 
-The `generator` demo is served through its normal `[assets]` contract.
-Distribution archives contain the built SPA; source checkouts require the
-build above. Open this URL after the server starts:
-
-```text
-http://127.0.0.1:8080/api/generators/generator/assets/ui/index.html
-```
+Open the same demo URL shown above after the server starts.
 
 For frontend development, run the source SPA through Vite's API proxy:
 
