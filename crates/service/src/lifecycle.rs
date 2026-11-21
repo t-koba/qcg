@@ -90,19 +90,27 @@ impl LocalService {
         self.inner.deployment_policy.live_event_channel_capacity
     }
 
-    /// The single construction owner for per-run live-event channels: every
-    /// production allocation and the capacity probe build their broadcast
-    /// pair here, from this service's frozen deployment policy.
+    /// Delegates to the shared live-event channel constructor with this
+    /// service's frozen deployment capacity. Fresh-run admission sites and
+    /// the capacity probe use this method; recovery rehydration calls the
+    /// shared constructor directly because it runs before a `LocalService`
+    /// exists.
     pub(crate) fn new_live_event_channel(
         &self,
     ) -> (broadcast::Sender<RunEvent>, broadcast::Receiver<RunEvent>) {
-        broadcast::channel(self.inner.deployment_policy.live_event_channel_capacity)
+        crate::types::new_live_event_channel(
+            self.inner.deployment_policy.live_event_channel_capacity,
+        )
     }
 
-    /// Observes the frozen capacity through the same live-event channel
-    /// constructor real runs use. More sends than the accepted maximum force
-    /// the receiver to lag; `Lagged(n)` reports the overwritten messages, so
-    /// the remainder is what the channel retained.
+    /// Observes the frozen capacity through the shared live-event channel
+    /// constructor (via this service's delegating method). The probe guards
+    /// that constructor and its two production callers; a caller that
+    /// bypasses it with a different capacity is not detected.
+    ///
+    /// More sends than the accepted maximum force the receiver to lag;
+    /// `Lagged(n)` reports the overwritten messages, so the remainder is what
+    /// the channel retained.
     pub fn live_event_channel_capacity_probe(&self) -> usize {
         let (sender, mut receiver) = self.new_live_event_channel();
         let sent = policy::MAX_LIVE_EVENT_CHANNEL_CAPACITY + 1;

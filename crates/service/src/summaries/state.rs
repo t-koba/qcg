@@ -8,7 +8,6 @@ use model::OutputManifest;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use super::reads::read_journal_events;
@@ -336,7 +335,9 @@ fn rehydrate_run(
     // Restore the durable FIFO key, including a scheduler-preserved
     // queued_at override, instead of re-stamping on recovery.
     let queued_at = read_last_queued_at_from_values(&journal_values);
-    let (events, _) = broadcast::channel(live_event_channel_capacity);
+    // Recovery runs before a LocalService exists; the shared constructor is
+    // the one ownership point for this path and fresh-run admission alike.
+    let (events, _) = crate::types::new_live_event_channel(live_event_channel_capacity);
     Ok(Some((
         run_id,
         RunRecord {
