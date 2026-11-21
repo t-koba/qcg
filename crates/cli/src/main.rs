@@ -712,48 +712,18 @@ async fn run_async() -> Result<std::process::ExitCode> {
                 println!("no packages match `{query}`");
             }
         }
-        Command::Serve {
-            bind,
+        ref serve @ Command::Serve {
+            ref bind,
             port,
-            generators_dir,
-            runs_dir,
-            max_active_runs,
-            max_tracked_runs,
-            max_total_steps,
-            run_store,
-            cors_origins,
-            api_token,
-            max_request_bytes,
-            max_artifact_bytes,
-            max_artifact_response_bytes,
-            max_artifact_entries,
-            max_asset_bytes,
+            ref api_token,
+            ..
         } => {
             preload_operational_limits_for_contracts(providers_path.as_deref())?;
             let container_timeouts =
                 policy::ContainerTimeouts::from_env().map_err(anyhow::Error::msg)?;
-            let api_token = resolve_api_token(api_token)?;
-            let config = server::ServerConfig {
-                providers_path,
-                extra_generators_dirs: bundled_generators_root()
-                    .filter(|bundled| bundled != &generators_dir)
-                    .into_iter()
-                    .collect(),
-                generators_dir,
-                runs_dir,
-                max_active_runs,
-                max_tracked_runs,
-                max_total_steps,
-                run_store_mode: run_store.into(),
-                cors_origins,
-                api_token,
-                max_request_bytes,
-                max_artifact_bytes,
-                max_artifact_response_bytes,
-                max_artifact_entries,
-                max_asset_bytes,
-            };
-            serve_with_config(config, &bind, port, container_timeouts).await?;
+            let api_token = resolve_api_token(api_token.clone())?;
+            let config = server_config_from_serve(serve, providers_path, api_token);
+            serve_with_config(config, bind, port, container_timeouts).await?;
         }
         Command::Dev {
             bind,
@@ -806,6 +776,57 @@ async fn run_async() -> Result<std::process::ExitCode> {
 
 fn command_hint(args: &str) -> String {
     policy::binary_stem().map_or_else(|| args.to_owned(), |stem| format!("{stem} {args}"))
+}
+
+/// The single `serve`-args to `ServerConfig` mapping. Both the production
+/// `Command::Serve` arm and the ceiling-parity test build their config here,
+/// so dropping the ceiling at this handoff fails the test rather than leaving
+/// a green served half. `providers_path` and `api_token` are resolved by the
+/// caller (the CLI global and `resolve_api_token` respectively); every other
+/// field comes straight from the parsed `Serve` command.
+fn server_config_from_serve(
+    serve: &Command,
+    providers_path: Option<Utf8PathBuf>,
+    api_token: Option<String>,
+) -> server::ServerConfig {
+    let Command::Serve {
+        generators_dir,
+        runs_dir,
+        max_active_runs,
+        max_tracked_runs,
+        max_total_steps,
+        run_store,
+        cors_origins,
+        max_request_bytes,
+        max_artifact_bytes,
+        max_artifact_response_bytes,
+        max_artifact_entries,
+        max_asset_bytes,
+        ..
+    } = serve
+    else {
+        unreachable!("server_config_from_serve requires a Serve command");
+    };
+    server::ServerConfig {
+        providers_path,
+        extra_generators_dirs: bundled_generators_root()
+            .filter(|bundled| bundled != generators_dir)
+            .into_iter()
+            .collect(),
+        generators_dir: generators_dir.clone(),
+        runs_dir: runs_dir.clone(),
+        max_active_runs: *max_active_runs,
+        max_tracked_runs: *max_tracked_runs,
+        max_total_steps: *max_total_steps,
+        run_store_mode: (*run_store).into(),
+        cors_origins: cors_origins.clone(),
+        api_token,
+        max_request_bytes: *max_request_bytes,
+        max_artifact_bytes: *max_artifact_bytes,
+        max_artifact_response_bytes: *max_artifact_response_bytes,
+        max_artifact_entries: *max_artifact_entries,
+        max_asset_bytes: *max_asset_bytes,
+    }
 }
 
 /// Resolves the instance bearer token: an explicit flag or `API_TOKEN`
@@ -1085,27 +1106,37 @@ output_file = "three.txt"
         .expect("fixture manifest should write");
 
         let variable = "MAX_TOTAL_STEPS";
+        // The served half must travel the same production mapping as the
+        // binary's `Command::Serve` arm. Parse a literal `qcg serve` and build
+        // the config with `server_config_from_serve`; only the test's directory
+        // fixtures are substituted afterwards. Dropping the ceiling at that
+        // handoff, or removing the Serve arg's clap/env binding, fails here.
+        let served_half_config = |expected: Option<usize>| -> server::ServerConfig {
+            let cli = Cli::try_parse_from(["qcg", "serve"])
+                .expect("bare qcg serve should parse for the served half");
+            let Command::Serve {
+                max_total_steps, ..
+            } = &cli.command
+            else {
+                panic!("bare serve should parse as the Serve command");
+            };
+            assert_eq!(max_total_steps, &expected, "Serve clap/env ceiling binding");
+            let mut config = server_config_from_serve(&cli.command, None, None);
+            assert_eq!(
+                config.max_total_steps, expected,
+                "production Serve-to-ServerConfig handoff must carry the ceiling"
+            );
+            config.generators_dir = generators.clone();
+            config.runs_dir = serve_runs.clone();
+            config.max_active_runs = 1;
+            config
+        };
+
         // SAFETY: the isolated child process owns this environment.
         unsafe { std::env::remove_var(variable) };
         let default_cli = CliDeployment::from_env(None).expect("unset ceiling should boot via CLI");
         assert_eq!(default_cli.max_total_steps, None);
-        let mut config = server::ServerConfig {
-            generators_dir: generators.clone(),
-            providers_path: None,
-            extra_generators_dirs: Vec::new(),
-            runs_dir: serve_runs.clone(),
-            max_active_runs: 1,
-            max_tracked_runs: policy::DEFAULT_MAX_TRACKED_RUNS,
-            run_store_mode: service::RunStoreMode::Exclusive,
-            cors_origins: Vec::new(),
-            api_token: None,
-            max_request_bytes: None,
-            max_artifact_bytes: None,
-            max_artifact_response_bytes: None,
-            max_artifact_entries: None,
-            max_asset_bytes: None,
-            max_total_steps: None,
-        };
+        let config = served_half_config(None);
         let default_server = server::resolve_server_policy(&config).expect("unset should resolve");
         assert_eq!(default_server.max_total_steps, None);
 
@@ -1113,20 +1144,7 @@ output_file = "three.txt"
         unsafe { std::env::set_var(variable, "2") };
         let deployment = CliDeployment::from_env(None).expect("valid ceiling should boot via CLI");
         assert_eq!(deployment.max_total_steps, Some(2));
-        // The serve ceiling comes from the real Serve clap/env binding, not
-        // from the CLI resolver: removing `env = "MAX_TOTAL_STEPS"` from the
-        // Serve arg must leave this parse at None and fail the parity check.
-        let Command::Serve {
-            max_total_steps: serve_max_total_steps,
-            ..
-        } = Cli::try_parse_from(["qcg", "serve"])
-            .expect("serve with a valid ceiling should parse")
-            .command
-        else {
-            panic!("bare serve should parse as the Serve command");
-        };
-        assert_eq!(serve_max_total_steps, Some(2));
-        config.max_total_steps = serve_max_total_steps;
+        let config = served_half_config(Some(2));
         let server_policy =
             server::resolve_server_policy(&config).expect("valid ceiling should resolve");
         assert_eq!(server_policy.max_total_steps, Some(2));
@@ -1289,18 +1307,7 @@ output_file = "three.txt"
             Err(error) => error.to_string(),
             Ok(_) => panic!("zero ceiling must refuse CLI startup"),
         };
-        let Command::Serve {
-            max_total_steps: zero_serve_max_total_steps,
-            ..
-        } = Cli::try_parse_from(["qcg", "serve"])
-            .expect("serve with a zero ceiling should parse")
-            .command
-        else {
-            panic!("bare serve should parse as the Serve command");
-        };
-        assert_eq!(zero_serve_max_total_steps, Some(0));
-        let mut zero_config = config.clone();
-        zero_config.max_total_steps = zero_serve_max_total_steps;
+        let zero_config = served_half_config(Some(0));
         let zero_serve = server::resolve_server_policy(&zero_config)
             .expect_err("zero ceiling must refuse serve startup");
         assert!(
