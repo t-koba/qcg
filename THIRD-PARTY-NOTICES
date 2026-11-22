@@ -118,7 +118,7 @@ Rust packages (including build and verification dependencies):
 - flate2@1.1.10 — MIT OR Apache-2.0
 - fluent-uri@0.4.1 — MIT
 - foldhash@0.2.0 — Zlib
-- form_urlencoded@1.2.2 — MIT OR Apache-2.0
+- form_urlencoded@1.2.3 — MIT OR Apache-2.0
 - fraction@0.17.0 — MIT OR Apache-2.0
 - fs_extra@1.3.0 — MIT
 - futures@0.3.34 — MIT OR Apache-2.0
@@ -373,7 +373,7 @@ Rust packages (including build and verification dependencies):
 - unicode-ident@1.0.24 — (MIT OR Apache-2.0) AND Unicode-3.0
 - unicode-normalization@0.1.25 — MIT OR Apache-2.0
 - untrusted@0.9.0 — ISC
-- url@2.5.8 — MIT OR Apache-2.0
+- url@2.5.9 — MIT OR Apache-2.0
 - utf8_iter@1.0.4 — Apache-2.0 OR MIT
 - utf8parse@0.2.2 — Apache-2.0 OR MIT
 - uuid@1.26.0 — Apache-2.0 OR MIT
