@@ -39,7 +39,7 @@ where
 
 async fn open_state(generators: &Utf8PathBuf, runs: &Utf8PathBuf) -> Arc<AppState> {
     // Dropped service workers may briefly retain the exclusive store lock.
-    tokio::time::timeout(Duration::from_secs(5), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             match crate::test_service(generators.clone(), runs.clone(), None) {
                 Ok(service) => {
@@ -422,7 +422,7 @@ impl Mutation {
             .await
             .unwrap();
         let interaction = if route == "confirm" {
-            tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::time::timeout(TEST_LIVENESS_GUARD, async {
                 loop {
                     if let Some(confirm) = state.service.snapshot(id.clone()).await.unwrap().confirm
                     {

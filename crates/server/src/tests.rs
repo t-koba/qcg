@@ -12,6 +12,16 @@ use std::time::{Duration, Instant};
 
 use policy::{IDEMPOTENCY_HEADER, IDEMPOTENCY_MAX_ENTRIES};
 
+/// Wall-clock deadlock guard for tests that poll the service for an async
+/// state transition (store lock, question/confirm interaction, terminal
+/// state). The wrapped work finishes in well under a second; this only fires
+/// for a genuinely wedged service. Deliberately generous so a runner-wide
+/// scheduling stall on a loaded CI worker cannot turn correct behavior into a
+/// false `Elapsed` failure. This is a liveness detector, not a semantic timing
+/// bound: assertions about elapsed time and configured timeouts keep their own
+/// values.
+pub(crate) const TEST_LIVENESS_GUARD: Duration = Duration::from_secs(60);
+
 /// Binds an ephemeral loopback port for a test server, failing the test
 /// on any refusal. `TEST_SKIP_IF_NO_LOOPBACK=1` is the explicit
 /// opt-in for environments that cannot bind loopback at all; it reports
@@ -2422,7 +2432,7 @@ async fn cost_metrics_endpoint_reports_terminal_totals() {
 }
 
 async fn wait_for_terminal(service: &LocalService, run_id: &str) {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             let snapshot = service
                 .snapshot(run_id.to_string())
@@ -2439,7 +2449,7 @@ async fn wait_for_terminal(service: &LocalService, run_id: &str) {
 }
 
 async fn wait_for_question(service: &LocalService, run_id: &str) -> String {
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             let snapshot = service
                 .snapshot(run_id.to_string())
@@ -2846,7 +2856,7 @@ async fn created_snapshot_byte_errors_keep_location_for_start_and_fork() {
     }
     assert_eq!(state.service.list_run_items().await.unwrap().len(), 2);
     let source = locations[0].strip_prefix("/api/runs/").unwrap().to_string();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             if state
                 .service
@@ -2900,7 +2910,7 @@ async fn created_snapshot_byte_errors_keep_location_for_start_and_fork() {
     assert_eq!(state.service.list_run_items().await.unwrap().len(), 4);
     for location in &locations {
         let id = location.strip_prefix("/api/runs/").unwrap();
-        tokio::time::timeout(Duration::from_secs(30), async {
+        tokio::time::timeout(TEST_LIVENESS_GUARD, async {
             loop {
                 if state
                     .service
@@ -2966,7 +2976,7 @@ async fn created_snapshot_entry_errors_keep_location_on_start_and_fork_replay() 
         .strip_prefix("/api/runs/")
         .unwrap()
         .to_string();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             if state
                 .service
@@ -3006,7 +3016,7 @@ async fn created_snapshot_entry_errors_keep_location_on_start_and_fork_replay() 
         .strip_prefix("/api/runs/")
         .unwrap()
         .to_string();
-    tokio::time::timeout(Duration::from_secs(30), async {
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
             if state
                 .service
