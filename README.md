@@ -57,10 +57,17 @@ so keep `bin` and `share` together. From the extracted directory, start the
 unauthenticated loopback server:
 
 ```bash
-./bin/qcg serve --bind 127.0.0.1 --port 8080 --runs-dir /tmp/runs
+./bin/qcg serve --bind 127.0.0.1 --port 8080
 ```
 
-On Windows use `bin\qcg.exe` instead of `./bin/qcg`. Then open the demo:
+On Windows, from PowerShell:
+
+```powershell
+.\bin\qcg.exe serve --bind 127.0.0.1 --port 8080
+```
+
+With no `--runs-dir` override, runs are kept in the relative `.data/runs`
+directory under the writable extracted directory. Then open the demo:
 
 ```text
 http://127.0.0.1:8080/api/generators/generator/assets/ui/index.html
