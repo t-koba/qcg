@@ -4,13 +4,14 @@
 //! reclaim. The fixture only owns its `serve` children: it never signals
 //! saved numeric PIDs or process groups.
 //!
-//! Code inspection for host MCP stdio (no separate runtime change):
-//! `crates/mcp/src/bounded_stdio.rs::spawn` forwards to
-//! `spawn_with_scope(..., None)`, and `crates/mcp/src/mcp/runtime.rs` keeps
-//! that unscoped path when `host_stdio_scope` has no delegated cgroup. MCP
-//! steps use the same `guard_external_operation` fail-closed ledger as the
-//! command step below, so the refusal and evidence assertions here cover
-//! host MCP stdio on the default path too.
+//! Code inspection for host MCP stdio: `crates/mcp/src/bounded_stdio.rs::spawn`
+//! forwards to `spawn_with_scope(..., None)`, and `crates/mcp/src/mcp/runtime.rs`
+//! keeps that unscoped path when `host_stdio_scope` has no delegated cgroup.
+//! A stdio step journals a distinct `mcp.stdio_launch` operation record before
+//! `runtime.connect()` on the same `guard_external_operation` fail-closed
+//! ledger as the command step below, and leaves it `Started` on an
+//! indeterminate connect. The refusal and evidence assertions here cover that
+//! launch identity on the default path too.
 #![cfg(unix)]
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -23,10 +24,12 @@ use std::time::{Duration, Instant};
 /// Liveness detector only: no semantic timing assertion depends on it.
 const TEST_LIVENESS_GUARD: Duration = Duration::from_secs(60);
 const UNRESOLVED_EFFECT: &str = "qcg has not proved that the effect stopped";
-// Fixed, redacted HTTP refusal categories; the detailed unresolved-effect
-// reason is durable in the journal, not in the refusal response.
+// Fixed, redacted HTTP refusal categories. Continue's detail is redacted in
+// the response; delete's Started-gate detail is carried verbatim, so the
+// assertion below names the real unresolved-operation gate, not an
+// idempotency pin that could short-circuit it.
 const CONTINUE_REFUSAL: &str = "source run is executing or has in-flight work";
-const DELETE_REFUSAL: &str = "is retained by idempotency records";
+const DELETE_REFUSAL: &str = "unresolved external operation";
 const GENERATOR_ID: &str = "serve-crash-host-command";
 // The default command and its descendant exit together after 30s, well past
 // this test's normal runtime, so no saved-PID cleanup is needed.
@@ -251,7 +254,6 @@ async fn recover_and_assert_refusals(
     let package_sha256 = detail["package_sha256"].as_str().unwrap();
     let created = client
         .post(format!("{base}/api/runs"))
-        .header(policy::IDEMPOTENCY_HEADER, uuid::Uuid::now_v7().to_string())
         .header("x-qcg-package-sha256", package_sha256)
         .json(&json!({ "generator_id": GENERATOR_ID, "inputs": {} }))
         .send()
@@ -318,7 +320,6 @@ async fn recover_and_assert_refusals(
 
     let replay = client
         .post(format!("{base}/api/runs/{run_id}/continue"))
-        .header(policy::IDEMPOTENCY_HEADER, uuid::Uuid::now_v7().to_string())
         .send()
         .await
         .unwrap();
@@ -341,6 +342,10 @@ async fn recover_and_assert_refusals(
         "{deleted_body}"
     );
     assert!(deleted_body.contains(DELETE_REFUSAL), "{deleted_body}");
+    assert!(
+        deleted_body.contains(UNRESOLVED_EFFECT),
+        "delete must reach the unresolved Started gate: {deleted_body}"
+    );
     assert_unresolved_effect(&fetch_journal(client, base, &run_id).await);
 
     // Every refusal must preserve the run and its unresolved evidence.
