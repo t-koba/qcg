@@ -211,9 +211,15 @@ impl StepExecutor for McpCallStep {
             profile.max_response_bytes(),
         )
         .await;
-        let cleanup_error = session
-            .close()
-            .await
+        #[cfg(any(test, feature = "test-probe"))]
+        let close_result = if close_probe::should_fail_close() {
+            Err(mcp::McpError::TimedOut { seconds: 5 })
+        } else {
+            session.close().await
+        };
+        #[cfg(not(any(test, feature = "test-probe")))]
+        let close_result = session.close().await;
+        let cleanup_error = close_result
             .err()
             .map(|error| StepError::failed(&node.id, error.to_string()));
         let outcome = super::settlement::settle_direct_mcp(
@@ -234,6 +240,46 @@ impl StepExecutor for McpCallStep {
             cleanup_error.as_ref(),
         )?;
         outcome
+    }
+}
+
+/// Test-only seam for the session-close outcome inside `execute()`.
+///
+/// A stdio server's stderr/stdin shutdown path has no deterministic way to
+/// report a close failure to the client without relying on transport timeouts.
+/// Tests still need to prove that `execute()` forwards the close error to
+/// `settle_stdio_launch_after_close`, so they inject the exact `McpError`
+/// variant a genuinely timed-out `McpSession::close()` returns. Everything else in the
+/// call (connect, tools/list, tool call, journaling, settlement) stays real.
+/// The seam is compiled only for unit tests and the existing `test-probe`
+/// feature; default production builds always use the actual close result.
+#[cfg(any(test, feature = "test-probe"))]
+mod close_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Guard that injects a close timeout for the duration of its lifetime.
+    #[cfg(test)]
+    pub(crate) struct FailClose;
+
+    #[cfg(test)]
+    pub(crate) fn fail_close() -> FailClose {
+        FAIL_CLOSE.set(true);
+        FailClose
+    }
+
+    pub(crate) fn should_fail_close() -> bool {
+        FAIL_CLOSE.get()
+    }
+
+    #[cfg(test)]
+    impl Drop for FailClose {
+        fn drop(&mut self) {
+            FAIL_CLOSE.set(false);
+        }
     }
 }
 
@@ -744,27 +790,106 @@ side_effects = false
         );
     }
 
-    #[test]
-    fn unconfirmed_session_close_keeps_the_stdio_launch_started() {
-        let harness = LaunchHarness::new("local", Some("/nonexistent/unused"));
-        let journal = harness.journal();
-        let id = start_launch_operation(&harness, &journal);
-        let close_error = StepError::failed(&harness.node.id, "session close timed out");
-        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
-        let ctx = StepContext {
-            run: &harness.run,
-            journal: &journal,
-            vars: &mut vars,
-            llm: None,
-        };
-        settle_stdio_launch_after_close(&ctx, &harness.node, Some(&id), Some(&close_error))
-            .unwrap();
+    #[cfg(unix)]
+    fn stdio_initialize_step(server: &str, command: &str) -> McpCallStep {
+        let spec = serde_json::from_value(json!({
+            "id": server, "transport": "stdio", "command": [command],
+            "lifecycle": "initialize", "auth": "none", "timeout_seconds": 3,
+        }))
+        .unwrap();
+        McpCallStep {
+            runtime: std::sync::Arc::new(mcp::McpRuntime::from_specs(vec![spec]).unwrap()),
+        }
+    }
 
-        assert!(harness.events("operation_finished").is_empty());
+    /// A newline-delimited stdio MCP server: connect, tools/list and the tool
+    /// call all succeed over a real stdio transport.
+    #[cfg(unix)]
+    fn echo_stdio_server(dir: &camino::Utf8Path) -> camino::Utf8PathBuf {
+        let script = dir.join("echo_server.py");
+        std::fs::write(
+            &script,
+            r#"#!/usr/bin/env python3
+import json, sys, time
+for line in sys.stdin:
+    try:
+        request = json.loads(line)
+    except ValueError:
+        continue
+    if "id" not in request:
+        continue
+    method = request.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": "2025-06-18", "capabilities": {"tools": {}},
+                  "serverInfo": {"name": "echo-fixture", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "echo",
+                             "inputSchema": {"type": "object"}}]}
+    elif method == "tools/call":
+        result = {"content": [{"type": "text", "text": "ok"}],
+                  "structuredContent": {"done": True}}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": request["id"], "result": result}) + "\n")
+    sys.stdout.flush()
+while True:
+    time.sleep(3600)
+"#,
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unconfirmed_session_close_keeps_the_stdio_launch_started() {
+        let script_dir = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mcp-echo-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let server = echo_stdio_server(&script_dir);
+        let harness = LaunchHarness::new("local", Some(server.as_str()));
+        std::fs::create_dir_all(&harness.run.workspace).unwrap();
+        let journal = harness.journal();
+        // The close error is injected at the seam inside execute(); connect,
+        // tools/list, the tool call and settlement all run the real path.
+        let _fail_close = super::close_probe::fail_close();
+        let step = stdio_initialize_step("local", server.as_str());
+        let outcome = execute_launch(&harness, &journal, &step).await.unwrap();
+        assert!(
+            matches!(&outcome, StepOutcome::Success { output: Some(value), .. }
+                if value["server"] == "local" && value["tool"] == "echo" && value["result"]["structuredContent"]["done"] == true),
+            "{outcome:?}"
+        );
+        let starts = harness.events("operation_started");
+        let launches: Vec<_> = starts
+            .iter()
+            .filter(|event| event["kind"] == "mcp.stdio_launch")
+            .collect();
+        assert_eq!(launches.len(), 1, "execute() must journal the launch");
+        let id = launches[0]["operation_id"].as_str().unwrap();
+        let finishes = harness.events("operation_finished");
+        assert!(
+            finishes.iter().all(|event| event["operation_id"] != id),
+            "an unconfirmed close must not finish the launch: {finishes:?}"
+        );
         assert_eq!(
-            journal.state().operation_records[&id].status,
+            journal.state().operation_records[id].status,
             engine::OperationStatus::Started
         );
+        let calls: Vec<_> = std::fs::read_to_string(harness.root.join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["t"] == "tool_call")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["cleanup_error"]["code"], "cleanup_failed");
+        drop(journal);
+        drop(harness);
+        let _ = std::fs::remove_dir_all(&script_dir);
     }
 
     #[tokio::test]
