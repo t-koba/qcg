@@ -177,6 +177,21 @@ fn process_exists(pid: i32) -> bool {
     signalled || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+/// Signal zero still succeeds on an unreaped zombie, which cannot execute.
+/// Treat a zombie as stopped: the retired scope is the primary containment
+/// evidence, and this probe only rules out a live pre-kill descendant.
+fn process_can_run(pid: i32) -> bool {
+    if !process_exists(pid) {
+        return false;
+    }
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The process state is the third whitespace-separated stat field.
+        Ok(stat) => stat.split_whitespace().nth(2) != Some("Z"),
+        // No procfs view of this pid: keep the conservative existence signal.
+        Err(_) => true,
+    }
+}
+
 async fn wait_ready(client: &reqwest::Client, base: &str, child: &mut Child, log: &Utf8Path) {
     tokio::time::timeout(TEST_LIVENESS_GUARD, async {
         loop {
@@ -210,9 +225,12 @@ fn client_and_base() -> (reqwest::Client, String, u16) {
 }
 
 /// The diagnostic alone can persist after a refusal path finished or
-/// discarded the launch evidence. Check the same operation id against the
+/// discarded the launch evidence. Check the operation id against the
 /// authoritative `operation_started`/`operation_finished` journal events too.
-fn assert_unresolved_effect(journal: &str) {
+/// Returns the id named by the original refusal so callers can pin every
+/// later refusal to that same operation; `expected` makes a rewritten
+/// diagnostic fail instead of being silently re-extracted and accepted.
+fn assert_unresolved_effect(journal: &str, expected: Option<&str>) -> String {
     let events: Vec<Value> = journal
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -234,6 +252,12 @@ fn assert_unresolved_effect(journal: &str) {
         .and_then(|(_, rest)| rest.split_once("` remains Started"))
         .map(|(id, _)| id)
         .unwrap_or_else(|| panic!("unresolved diagnostic must name its operation: {refusal}"));
+    if let Some(expected) = expected {
+        assert_eq!(
+            operation_id, expected,
+            "refusal must name the original unresolved operation `{expected}`, not `{operation_id}`: {refusal}"
+        );
+    }
     let has_record = |kind: &str| {
         events
             .iter()
@@ -247,6 +271,7 @@ fn assert_unresolved_effect(journal: &str) {
         !has_record("operation_finished"),
         "operation `{operation_id}` must have no Finished journal record: {journal}"
     );
+    operation_id.to_owned()
 }
 
 async fn fetch_journal(client: &reqwest::Client, base: &str, run_id: &str) -> String {
@@ -366,7 +391,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
     let snapshot_url = format!("{base}/api/runs/{run_id}");
     // Neither path may claim the effect stopped: recovery journals this
     // run_error, and the refusals below must preserve that evidence.
-    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
+    let operation_id = assert_unresolved_effect(&fetch_journal(client, base, run_id).await, None);
 
     let replay = client
         .post(format!("{base}/api/runs/{run_id}/continue"))
@@ -381,7 +406,10 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         "{replay_body}"
     );
     assert!(replay_body.contains(CONTINUE_REFUSAL), "{replay_body}");
-    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
+    assert_unresolved_effect(
+        &fetch_journal(client, base, run_id).await,
+        Some(&operation_id),
+    );
 
     let deleted = client.delete(&snapshot_url).send().await.unwrap();
     let deleted_status = deleted.status();
@@ -396,7 +424,10 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         deleted_body.contains(UNRESOLVED_EFFECT),
         "delete must reach the unresolved Started gate: {deleted_body}"
     );
-    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
+    assert_unresolved_effect(
+        &fetch_journal(client, base, run_id).await,
+        Some(&operation_id),
+    );
 
     // Every refusal must preserve the run and its unresolved evidence.
     let after_refusals: Value = client
@@ -416,42 +447,48 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         ),
         "{after_refusals}"
     );
-    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
+    assert_unresolved_effect(
+        &fetch_journal(client, base, run_id).await,
+        Some(&operation_id),
+    );
 }
 
 /// Read-only proof at the first recovery observation: the persisted run scope
-/// is retired and the original processes are gone. No saved PID/group is
+/// is retired and the original descendant cannot run. No saved PID/group is
 /// signalled, and no `continue`/DELETE has had a chance to reconcile here.
-async fn assert_scope_reclaimed(runs_dir: &Utf8Path, recovered: &RecoveredRun) {
+fn assert_scope_reclaimed(runs_dir: &Utf8Path, recovered: &RecoveredRun) {
     let meta = runs_dir.join(&recovered.run_id).join("meta");
-    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
-        loop {
-            let retired = match engine::host_cgroup::load_host_binding(&meta)
-                .expect("host binding must be readable after restart")
-            {
-                Some(binding) if binding.cleaned && binding.empty_confirmed => {
-                    let events = binding.run_root.join("cgroup.events");
-                    match std::fs::read_to_string(&events) {
-                        Ok(contents) => contents.lines().any(|line| line == "populated 0"),
-                        // Retirement removes the run root once the kernel confirms it empty.
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                        Err(error) => panic!("cannot read {}: {error}", events.display()),
-                    }
-                }
-                // No binding would make this containment claim vacuous; a live
-                // binding is not yet reclaimed.
-                Some(_) | None => false,
-            };
-            if retired && recovered.pids.iter().all(|&pid| !process_exists(pid)) {
-                return;
+    // Single observation at the first recovered snapshot: reconciliation is
+    // synchronous and precedes publication of the failed/interrupted outcome,
+    // so a live binding here is a real regression, never a timing artefact.
+    let retired = match engine::host_cgroup::load_host_binding(&meta)
+        .expect("host binding must be readable after restart")
+    {
+        Some(binding) if binding.cleaned && binding.empty_confirmed => {
+            let events = binding.run_root.join("cgroup.events");
+            match std::fs::read_to_string(&events) {
+                Ok(contents) => contents.lines().any(|line| line == "populated 0"),
+                // Retirement removes the run root once the kernel confirms it empty.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(error) => panic!("cannot read {}: {error}", events.display()),
             }
-            tokio::time::sleep(Duration::from_millis(20)).await;
         }
-    })
-    .await
-    .expect(
-        "startup recovery must retire the bound scope and stop both processes before any reconciling endpoint",
+        // No binding or an unretired binding makes this containment claim
+        // vacuous; it must never accompany a published recovery outcome.
+        other => {
+            panic!("first recovery observation must find a retired bound scope, got {other:?}")
+        }
+    };
+    assert!(
+        retired,
+        "bound scope must be confirmed empty at first recovery observation: no async reconciliation may follow the published outcome"
     );
+    for &pid in &recovered.pids {
+        assert!(
+            !process_can_run(pid),
+            "original descendant {pid} must be unable to run at first recovery observation"
+        );
+    }
 }
 
 #[tokio::test]
@@ -471,6 +508,6 @@ async fn delegated_serve_restart_reclaims_command_and_descendant() {
     let mut fixture = Fixture::new(&DELEGATED_COMMAND, true);
     let (client, base, port) = client_and_base();
     let recovered = crash_and_recover(&mut fixture, &client, &base, port).await;
-    assert_scope_reclaimed(&fixture.runs_dir, &recovered).await;
+    assert_scope_reclaimed(&fixture.runs_dir, &recovered);
     assert_refusals(&client, &base, &recovered).await;
 }
