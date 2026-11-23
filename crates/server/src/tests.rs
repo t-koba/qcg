@@ -2291,13 +2291,39 @@ enabled = false
         IDEMPOTENCY_HEADER,
         HeaderValue::from_static("continue-once"),
     );
-    let response = crate::continue_run(
-        State(Arc::clone(&state)),
-        headers.clone(),
-        Path(source_id.clone()),
-    )
+    // wait_for_terminal observes the journal, where a terminal outcome wins
+    // over memory, so it can return while the in-memory task slot and the
+    // execution lease have not settled yet. During that bounded window the
+    // fork lease is correctly fail-closed with InFlight. Retry only that exact
+    // transient refusal; any other status is returned for the assertions
+    // below to judge, so a real regression still fails the test.
+    let response = tokio::time::timeout(TEST_LIVENESS_GUARD, async {
+        loop {
+            let response = crate::continue_run(
+                State(Arc::clone(&state)),
+                headers.clone(),
+                Path(source_id.clone()),
+            )
+            .await
+            .expect("failed source should continue over HTTP");
+            if response.status() != StatusCode::CONFLICT {
+                return response;
+            }
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("conflict body should be readable");
+            let problem: serde_json::Value =
+                serde_json::from_slice(&body).expect("conflict body should be problem+json");
+            assert_eq!(
+                problem["detail"].as_str(),
+                Some("source run is executing or has in-flight work"),
+                "unexpected conflict while the source settles: {problem}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
     .await
-    .expect("failed source should continue over HTTP");
+    .expect("failed source should become continuable within the liveness guard");
     assert_eq!(response.status(), StatusCode::CREATED);
     let location = response.headers()[header::LOCATION]
         .to_str()
