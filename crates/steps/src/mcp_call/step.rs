@@ -125,6 +125,26 @@ impl StepExecutor for McpCallStep {
                 files: Vec::new(),
             });
         }
+        // A stdio connect can spawn a child before any tool call is guarded.
+        // Journal its own launch identity first: a kill during connect or
+        // discovery must leave an unconfirmed effect that replay/delete refuse.
+        let launch_operation = if profile.command().is_empty() {
+            None
+        } else {
+            let launch_invocation = format!("{confirm_invocation}::stdio_launch");
+            match ctx.run.guard_external_operation(
+                ctx.journal,
+                node,
+                "mcp.stdio_launch",
+                &params.server,
+                &None,
+                &launch_invocation,
+            )? {
+                engine::GuardDecision::Proceed { operation_id } => Some(operation_id),
+                // A prior launch is already settled; nothing left to finish.
+                engine::GuardDecision::Resend { .. } => None,
+            }
+        };
         let runtime = self.runtime.clone();
         let server = params.server.clone();
         let tool_name = params.tool.clone();
@@ -137,6 +157,7 @@ impl StepExecutor for McpCallStep {
         let session = match connect {
             Ok(Ok(session)) => session,
             Ok(Err(mcp::McpError::AuthorizationRequired { server })) => {
+                settle_stdio_launch(ctx, node, launch_operation.as_deref())?;
                 let (action, source) = params.authorization_action();
                 ctx.journal
                     .event(
@@ -162,6 +183,15 @@ impl StepExecutor for McpCallStep {
                 };
             }
             Ok(Err(error)) => {
+                // Configuration and authorization failures prove no process
+                // was launched (or no tool effect happened); transport
+                // failures may have spawned it, so leave those Started.
+                if matches!(
+                    error,
+                    mcp::McpError::Configuration(_) | mcp::McpError::Authorization(_)
+                ) {
+                    settle_stdio_launch(ctx, node, launch_operation.as_deref())?;
+                }
                 let error = StepError::failed(&node.id, error.to_string());
                 return degrade_optional_mcp_call(ctx, node, &params, &arguments, error).await;
             }
@@ -186,7 +216,7 @@ impl StepExecutor for McpCallStep {
             .await
             .err()
             .map(|error| StepError::failed(&node.id, error.to_string()));
-        super::settlement::settle_direct_mcp(
+        let outcome = super::settlement::settle_direct_mcp(
             ctx,
             node,
             &params,
@@ -194,9 +224,30 @@ impl StepExecutor for McpCallStep {
             &arguments,
             cleanup_error.as_ref(),
             started.elapsed().as_millis() as u64,
-        )
+        );
+        // The session is closed, so the launched server is gone.
+        settle_stdio_launch(ctx, node, launch_operation.as_deref())?;
+        outcome
     }
 }
+
+/// Settle a stdio launch only when the exit proves no live server remains.
+fn settle_stdio_launch(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    operation_id: Option<&str>,
+) -> Result<(), StepError> {
+    if let Some(operation_id) = operation_id {
+        ctx.run.finish_external_operation_with(
+            ctx.journal,
+            node,
+            operation_id,
+            engine::OperationOutcome::CleanError,
+        )?;
+    }
+    Ok(())
+}
+
 /// Reclassify before static policy/decider checks; audit hosts only and recheck fresh policy on resume.
 async fn authorize_direct_destinations(
     ctx: &StepContext<'_>,
@@ -455,6 +506,263 @@ tool = "local_only"
                 assert!(!error.to_string().contains("private-unparseable-value"));
             }
         }
+    }
+
+    struct LaunchHarness {
+        root: camino::Utf8PathBuf,
+        run: engine::RunContext,
+        node: NodeDef,
+    }
+
+    impl Drop for LaunchHarness {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl LaunchHarness {
+        fn new(server: &str, command: Option<&str>) -> Self {
+            let root = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                .unwrap()
+                .join(format!("mcp-launch-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&root).unwrap();
+            let commands = command
+                .map(|bin| {
+                    format!(
+                        "[[permissions.commands]]\nbin = \"{bin}\"\nargs = []\npurpose = \"launch fixture\"\nisolation = \"trusted_host\"\n"
+                    )
+                })
+                .unwrap_or_else(|| "commands = []\n".into());
+            std::fs::write(
+                root.join(contract::MANIFEST_FILE),
+                format!(
+                    r#"
+[generator]
+id = "launch-test"
+name = "Launch test"
+version = "0.1.0"
+[permissions]
+network = []
+fs_read = []
+fs_write = ["workspace"]
+side_effects = "none"
+side_effects_scope = "invocation"
+containers = {{ enabled = false }}
+{commands}
+[[flow]]
+id = "call"
+type = "mcp.call"
+[flow.params]
+server = "{server}"
+tool = "echo"
+arguments = {{}}
+side_effects = false
+"#
+                ),
+            )
+            .unwrap();
+            let contract = contract::Contract::load(&root).unwrap();
+            let node = contract.manifest.flow[0].clone();
+            let run = engine::RunContext::for_tests(
+                "launch-test".into(),
+                root.join("workspace"),
+                root.join("meta"),
+                contract,
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            )
+            .unwrap();
+            Self { root, run, node }
+        }
+
+        fn journal(&self) -> engine::JournalWriter {
+            engine::JournalWriter::create(
+                &self.root.join("journal.jsonl"),
+                &self.run.run_id,
+                false,
+                None,
+            )
+            .unwrap()
+        }
+
+        fn events(&self, kind: &str) -> Vec<serde_json::Value> {
+            std::fs::read_to_string(self.root.join("journal.jsonl"))
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .filter(|event| event["t"] == kind)
+                .collect()
+        }
+    }
+
+    fn stdio_step(server: &str, command: &str) -> McpCallStep {
+        let spec = serde_json::from_value(json!({
+            "id": server, "transport": "stdio", "command": [command],
+            "auth": "none", "timeout_seconds": 1,
+        }))
+        .unwrap();
+        McpCallStep {
+            runtime: std::sync::Arc::new(mcp::McpRuntime::from_specs(vec![spec]).unwrap()),
+        }
+    }
+
+    async fn execute_launch(
+        harness: &LaunchHarness,
+        journal: &engine::JournalWriter,
+        step: &McpCallStep,
+    ) -> Result<StepOutcome, StepError> {
+        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
+        let mut ctx = StepContext {
+            run: &harness.run,
+            journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        step.execute(&mut ctx, &harness.node).await
+    }
+
+    fn tool_operation_id(harness: &LaunchHarness, journal: &engine::JournalWriter) -> String {
+        let invocation = engine::RunContext::execution_invocation(journal, &harness.node);
+        engine::operation_id_for(&harness.run.run_id, &harness.node.id, &invocation)
+    }
+
+    #[tokio::test]
+    async fn stdio_launch_is_durable_before_connect_and_distinct_from_the_tool_guard() {
+        let bin = format!("/nonexistent/qcg-mcp-launch-{}", uuid::Uuid::new_v4());
+        let harness = LaunchHarness::new("local", Some(&bin));
+        let journal = harness.journal();
+        let error = execute_launch(&harness, &journal, &stdio_step("local", &bin))
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("MCP transport failed"),
+            "{error}"
+        );
+        let starts = harness.events("operation_started");
+        assert_eq!(starts.len(), 1, "connect alone must have a durable launch");
+        assert_eq!(starts[0]["kind"], "mcp.stdio_launch");
+        assert_ne!(
+            starts[0]["operation_id"],
+            tool_operation_id(&harness, &journal)
+        );
+    }
+
+    #[tokio::test]
+    async fn clean_connect_failure_settles_the_stdio_launch() {
+        // No command permission: access validation fails before any spawn.
+        let harness = LaunchHarness::new("local", None);
+        let journal = harness.journal();
+        let error = execute_launch(
+            &harness,
+            &journal,
+            &stdio_step("local", "/nonexistent/qcg-mcp-clean-launch"),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("not allowed by permissions.commands"),
+            "{error}"
+        );
+        let starts = harness.events("operation_started");
+        assert_eq!(starts.len(), 1);
+        let id = starts[0]["operation_id"].as_str().unwrap();
+        let finishes = harness.events("operation_finished");
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0]["operation_id"], id);
+        assert_eq!(finishes[0]["status"], "clean");
+        assert_eq!(
+            journal.state().operation_records[id].status,
+            engine::OperationStatus::FailedClean
+        );
+    }
+
+    #[tokio::test]
+    async fn indeterminate_connect_failure_leaves_the_stdio_launch_started() {
+        let bin = format!("/nonexistent/qcg-mcp-launch-{}", uuid::Uuid::new_v4());
+        let harness = LaunchHarness::new("local", Some(&bin));
+        let journal = harness.journal();
+        assert!(
+            execute_launch(&harness, &journal, &stdio_step("local", &bin))
+                .await
+                .is_err()
+        );
+        let id = harness.events("operation_started")[0]["operation_id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(harness.events("operation_finished").is_empty());
+        assert_eq!(
+            journal.state().operation_records[&id].status,
+            engine::OperationStatus::Started
+        );
+    }
+
+    #[tokio::test]
+    async fn http_profile_writes_no_stdio_launch_record() {
+        let harness = LaunchHarness::new("exa", None);
+        let journal = harness.journal();
+        let step = McpCallStep {
+            runtime: std::sync::Arc::new(
+                mcp::McpRuntime::from_specs(vec![
+                    serde_json::from_value(json!({
+                        "id": "exa", "transport": "streamable_http",
+                        "url": "https://mcp.example.test/mcp", "auth": "none",
+                        "allowed_hosts": ["mcp.example.test"],
+                    }))
+                    .unwrap(),
+                ])
+                .unwrap(),
+            ),
+        };
+        assert!(execute_launch(&harness, &journal, &step).await.is_err());
+        assert!(harness.events("operation_started").is_empty());
+        assert!(harness.events("operation_finished").is_empty());
+    }
+
+    #[tokio::test]
+    async fn stdio_launch_does_not_change_the_original_invocation_record() {
+        let harness = LaunchHarness::new("local", None);
+        let journal = harness.journal();
+        let invocation = engine::RunContext::execution_invocation(&journal, &harness.node);
+        harness
+            .run
+            .guard_external_operation(
+                &journal,
+                &harness.node,
+                "mcp:local/echo",
+                "local/echo",
+                &Some(json!({})),
+                &invocation,
+            )
+            .unwrap();
+        let tool_id = engine::operation_id_for(&harness.run.run_id, &harness.node.id, &invocation);
+        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
+        let ctx = StepContext {
+            run: &harness.run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        assert!(has_operation_record(&ctx, &harness.node));
+        assert!(
+            execute_launch(
+                &harness,
+                &journal,
+                &stdio_step("local", "/nonexistent/unused")
+            )
+            .await
+            .is_err()
+        );
+        assert!(has_operation_record(&ctx, &harness.node));
+        assert_eq!(
+            journal.state().operation_records[&tool_id].status,
+            engine::OperationStatus::Started
+        );
+        let starts = harness.events("operation_started");
+        assert_eq!(starts.len(), 2);
+        assert_ne!(starts[1]["operation_id"], tool_id);
     }
 
     #[test]
