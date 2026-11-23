@@ -12,6 +12,11 @@
 //! ledger as the command step below, and leaves it `Started` on an
 //! indeterminate connect. The refusal and evidence assertions here cover that
 //! launch identity on the default path too.
+//!
+//! Both paths assert against the journal's authoritative `operation_started`
+//! record, not only the diagnostic text. The delegated path checks scope
+//! reclaim at the first failed/interrupted snapshot, before any endpoint that
+//! could reconcile the cgroup itself is called.
 #![cfg(unix)]
 
 use camino::{Utf8Path, Utf8PathBuf};
@@ -42,10 +47,12 @@ struct Fixture {
     generators_dir: Utf8PathBuf,
     runs_dir: Utf8PathBuf,
     serve: Option<Child>,
+    delegate: bool,
 }
 
 impl Fixture {
-    fn new(command: &[&str]) -> Self {
+    /// Only the delegated path may inherit the test runner's cgroup parent.
+    fn new(command: &[&str], delegate: bool) -> Self {
         let root = Utf8PathBuf::from_path_buf(std::env::temp_dir())
             .unwrap()
             .join(format!("qcg-serve-crash-recovery-{}", uuid::Uuid::now_v7()));
@@ -93,13 +100,15 @@ command = {command:?}
             generators_dir: generators_dir.parent().unwrap().to_owned(),
             runs_dir,
             serve: None,
+            delegate,
         }
     }
 
     fn start_serve(&mut self, port: u16, log_name: &str) {
         assert!(self.serve.is_none(), "previous serve child is still owned");
         let log = File::create(self.root.join(log_name)).unwrap();
-        let child = Command::new(env!("CARGO_BIN_EXE_qcg"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_qcg"));
+        command
             .current_dir(&self.root)
             .args([
                 "serve",
@@ -117,9 +126,13 @@ command = {command:?}
             .env_remove("API_TOKEN_FILE")
             .stdin(Stdio::null())
             .stdout(Stdio::from(log.try_clone().unwrap()))
-            .stderr(Stdio::from(log))
-            .spawn()
-            .unwrap();
+            .stderr(Stdio::from(log));
+        // The delegated script exports the parent for the whole test process;
+        // the default fixture must not silently inherit that configuration.
+        if !self.delegate {
+            command.env_remove(policy::HOST_CGROUP_PARENT_ENV);
+        }
+        let child = command.spawn().unwrap();
         self.serve = Some(child);
     }
 
@@ -196,10 +209,16 @@ fn client_and_base() -> (reqwest::Client, String, u16) {
     )
 }
 
+/// The diagnostic alone can persist after a refusal path finished or
+/// discarded the launch evidence. Check the same operation id against the
+/// authoritative `operation_started`/`operation_finished` journal events too.
 fn assert_unresolved_effect(journal: &str) {
-    let refusal = journal
+    let events: Vec<Value> = journal
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let refusal = events
+        .iter()
         .find(|event| {
             event["t"] == "run_error"
                 && event["error"]
@@ -207,12 +226,26 @@ fn assert_unresolved_effect(journal: &str) {
                     .is_some_and(|error| error.contains(UNRESOLVED_EFFECT))
         })
         .unwrap_or_else(|| panic!("run_error must name the unresolved effect: {journal}"));
+    let detail = refusal["error"].as_str().unwrap();
+    // The single operator-facing diagnostic assertion.
+    assert!(detail.contains("remains Started"), "{refusal}");
+    let operation_id = detail
+        .split_once("unresolved external operation `")
+        .and_then(|(_, rest)| rest.split_once("` remains Started"))
+        .map(|(id, _)| id)
+        .unwrap_or_else(|| panic!("unresolved diagnostic must name its operation: {refusal}"));
+    let has_record = |kind: &str| {
+        events
+            .iter()
+            .any(|event| event["t"] == kind && event["operation_id"].as_str() == Some(operation_id))
+    };
     assert!(
-        refusal["error"]
-            .as_str()
-            .unwrap()
-            .contains("remains Started"),
-        "{refusal}"
+        has_record("operation_started"),
+        "operation `{operation_id}` must still have a Started journal record: {journal}"
+    );
+    assert!(
+        !has_record("operation_finished"),
+        "operation `{operation_id}` must have no Finished journal record: {journal}"
     );
 }
 
@@ -229,14 +262,22 @@ async fn fetch_journal(client: &reqwest::Client, base: &str, run_id: &str) -> St
         .unwrap()
 }
 
-/// Crash, restart and fail-closed checks shared by both containment paths.
-/// Returns the command/descendant PIDs observed before the kill.
-async fn recover_and_assert_refusals(
+/// The first observable recovery result: run id plus the command/descendant
+/// PIDs probed before the kill. No reconciling endpoint has been called yet.
+struct RecoveredRun {
+    run_id: String,
+    pids: Vec<i32>,
+}
+
+/// Crash, restart and wait for the first failed/interrupted snapshot shared by
+/// both containment paths. The delegated test inspects this point before
+/// `assert_refusals` calls any endpoint that can reconcile.
+async fn crash_and_recover(
     fixture: &mut Fixture,
     client: &reqwest::Client,
     base: &str,
     port: u16,
-) -> Vec<i32> {
+) -> RecoveredRun {
     fixture.start_serve(port, "serve-before.log");
     let before_log = fixture.root.join("serve-before.log");
     wait_ready(client, base, fixture.serve.as_mut().unwrap(), &before_log).await;
@@ -314,9 +355,18 @@ async fn recover_and_assert_refusals(
         "{snapshot}"
     );
 
+    RecoveredRun { run_id, pids }
+}
+
+/// Fail-closed checks shared by both containment paths. All endpoints here
+/// run after the first recovery observation (and, for the delegated path,
+/// after its scope-reclaim assertion).
+async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &RecoveredRun) {
+    let run_id = &recovered.run_id;
+    let snapshot_url = format!("{base}/api/runs/{run_id}");
     // Neither path may claim the effect stopped: recovery journals this
     // run_error, and the refusals below must preserve that evidence.
-    assert_unresolved_effect(&fetch_journal(client, base, &run_id).await);
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
 
     let replay = client
         .post(format!("{base}/api/runs/{run_id}/continue"))
@@ -331,7 +381,7 @@ async fn recover_and_assert_refusals(
         "{replay_body}"
     );
     assert!(replay_body.contains(CONTINUE_REFUSAL), "{replay_body}");
-    assert_unresolved_effect(&fetch_journal(client, base, &run_id).await);
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
 
     let deleted = client.delete(&snapshot_url).send().await.unwrap();
     let deleted_status = deleted.status();
@@ -346,7 +396,7 @@ async fn recover_and_assert_refusals(
         deleted_body.contains(UNRESOLVED_EFFECT),
         "delete must reach the unresolved Started gate: {deleted_body}"
     );
-    assert_unresolved_effect(&fetch_journal(client, base, &run_id).await);
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
 
     // Every refusal must preserve the run and its unresolved evidence.
     let after_refusals: Value = client
@@ -366,16 +416,50 @@ async fn recover_and_assert_refusals(
         ),
         "{after_refusals}"
     );
-    assert_unresolved_effect(&fetch_journal(client, base, &run_id).await);
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await);
+}
 
-    pids
+/// Read-only proof at the first recovery observation: the persisted run scope
+/// is retired and the original processes are gone. No saved PID/group is
+/// signalled, and no `continue`/DELETE has had a chance to reconcile here.
+async fn assert_scope_reclaimed(runs_dir: &Utf8Path, recovered: &RecoveredRun) {
+    let meta = runs_dir.join(&recovered.run_id).join("meta");
+    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
+        loop {
+            let retired = match engine::host_cgroup::load_host_binding(&meta)
+                .expect("host binding must be readable after restart")
+            {
+                Some(binding) if binding.cleaned && binding.empty_confirmed => {
+                    let events = binding.run_root.join("cgroup.events");
+                    match std::fs::read_to_string(&events) {
+                        Ok(contents) => contents.lines().any(|line| line == "populated 0"),
+                        // Retirement removes the run root once the kernel confirms it empty.
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                        Err(error) => panic!("cannot read {}: {error}", events.display()),
+                    }
+                }
+                // No binding would make this containment claim vacuous; a live
+                // binding is not yet reclaimed.
+                Some(_) | None => false,
+            };
+            if retired && recovered.pids.iter().all(|&pid| !process_exists(pid)) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect(
+        "startup recovery must retire the bound scope and stop both processes before any reconciling endpoint",
+    );
 }
 
 #[tokio::test]
 async fn killed_serve_restart_reports_unresolved_effect_and_refuses_replay_and_delete() {
-    let mut fixture = Fixture::new(&DEFAULT_COMMAND);
+    let mut fixture = Fixture::new(&DEFAULT_COMMAND, false);
     let (client, base, port) = client_and_base();
-    recover_and_assert_refusals(&mut fixture, &client, &base, port).await;
+    let recovered = crash_and_recover(&mut fixture, &client, &base, port).await;
+    assert_refusals(&client, &base, &recovered).await;
     // The bounded command exits by itself; Drop only reaps the serve child.
 }
 
@@ -384,17 +468,9 @@ async fn delegated_serve_restart_reclaims_command_and_descendant() {
     if !engine::host_cgroup::host_cgroup_tests_enabled() {
         return;
     }
-    let mut fixture = Fixture::new(&DELEGATED_COMMAND);
+    let mut fixture = Fixture::new(&DELEGATED_COMMAND, true);
     let (client, base, port) = client_and_base();
-    let pids = recover_and_assert_refusals(&mut fixture, &client, &base, port).await;
-    tokio::time::timeout(TEST_LIVENESS_GUARD, async {
-        loop {
-            if pids.iter().all(|&pid| !process_exists(pid)) {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("delegated cgroup reclaim should stop command and descendant");
+    let recovered = crash_and_recover(&mut fixture, &client, &base, port).await;
+    assert_scope_reclaimed(&fixture.runs_dir, &recovered).await;
+    assert_refusals(&client, &base, &recovered).await;
 }
