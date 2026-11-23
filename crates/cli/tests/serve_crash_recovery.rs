@@ -227,10 +227,10 @@ fn client_and_base() -> (reqwest::Client, String, u16) {
 /// The diagnostic alone can persist after a refusal path finished or
 /// discarded the launch evidence. Check the operation id against the
 /// authoritative `operation_started`/`operation_finished` journal events too.
-/// Returns the id named by the original refusal so callers can pin every
-/// later refusal to that same operation; `expected` makes a rewritten
-/// diagnostic fail instead of being silently re-extracted and accepted.
-fn assert_unresolved_effect(journal: &str, expected: Option<&str>) -> String {
+/// `expected` is the operation id captured from the live journal before the
+/// crash: the recovery diagnostic must name that same original operation, so
+/// a rewrite to a different Started operation cannot silently pass.
+fn assert_unresolved_effect(journal: &str, expected: &str) {
     let events: Vec<Value> = journal
         .lines()
         .filter_map(|line| serde_json::from_str::<Value>(line).ok())
@@ -252,12 +252,10 @@ fn assert_unresolved_effect(journal: &str, expected: Option<&str>) -> String {
         .and_then(|(_, rest)| rest.split_once("` remains Started"))
         .map(|(id, _)| id)
         .unwrap_or_else(|| panic!("unresolved diagnostic must name its operation: {refusal}"));
-    if let Some(expected) = expected {
-        assert_eq!(
-            operation_id, expected,
-            "refusal must name the original unresolved operation `{expected}`, not `{operation_id}`: {refusal}"
-        );
-    }
+    assert_eq!(
+        operation_id, expected,
+        "refusal must name the original pre-kill operation `{expected}`, not `{operation_id}`: {refusal}"
+    );
     let has_record = |kind: &str| {
         events
             .iter()
@@ -271,7 +269,37 @@ fn assert_unresolved_effect(journal: &str, expected: Option<&str>) -> String {
         !has_record("operation_finished"),
         "operation `{operation_id}` must have no Finished journal record: {journal}"
     );
-    operation_id.to_owned()
+}
+
+/// The single external operation durably Started (with no matching Finished)
+/// while the command and its descendant are still live, before the crash.
+/// This is the original launch identity that recovery must name and preserve;
+/// it is captured before SIGKILL so a recovery-side rewrite to a different
+/// Started operation cannot substitute the id the assertions pin to.
+fn live_operation_id(journal: &str) -> String {
+    let events: Vec<Value> = journal
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .collect();
+    let finished: Vec<&str> = events
+        .iter()
+        .filter(|event| event["t"] == "operation_finished")
+        .filter_map(|event| event["operation_id"].as_str())
+        .collect();
+    let mut live: Vec<&str> = events
+        .iter()
+        .filter(|event| event["t"] == "operation_started")
+        .filter_map(|event| event["operation_id"].as_str())
+        .filter(|id| !finished.contains(id))
+        .collect();
+    live.sort_unstable();
+    live.dedup();
+    assert_eq!(
+        live.len(),
+        1,
+        "exactly one external operation must be live before the kill: {journal}"
+    );
+    live[0].to_owned()
 }
 
 async fn fetch_journal(client: &reqwest::Client, base: &str, run_id: &str) -> String {
@@ -287,11 +315,14 @@ async fn fetch_journal(client: &reqwest::Client, base: &str, run_id: &str) -> St
         .unwrap()
 }
 
-/// The first observable recovery result: run id plus the command/descendant
-/// PIDs probed before the kill. No reconciling endpoint has been called yet.
+/// The first observable recovery result: run id, the command/descendant PIDs
+/// probed before the kill, and the original external operation id captured
+/// from the live journal before SIGKILL. No reconciling endpoint has been
+/// called yet.
 struct RecoveredRun {
     run_id: String,
     pids: Vec<i32>,
+    operation_id: String,
 }
 
 /// Crash, restart and wait for the first failed/interrupted snapshot shared by
@@ -354,6 +385,10 @@ async fn crash_and_recover(
     .await
     .expect("command and descendant should start before the liveness guard");
 
+    // Capture the original external operation while the command is still
+    // live, before any crash/recovery can rewrite the record or diagnostic.
+    let operation_id = live_operation_id(&fetch_journal(client, base, &run_id).await);
+
     fixture.kill_serve();
 
     fixture.start_serve(port, "serve-after.log");
@@ -380,7 +415,11 @@ async fn crash_and_recover(
         "{snapshot}"
     );
 
-    RecoveredRun { run_id, pids }
+    RecoveredRun {
+        run_id,
+        pids,
+        operation_id,
+    }
 }
 
 /// Fail-closed checks shared by both containment paths. All endpoints here
@@ -389,9 +428,12 @@ async fn crash_and_recover(
 async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &RecoveredRun) {
     let run_id = &recovered.run_id;
     let snapshot_url = format!("{base}/api/runs/{run_id}");
+    let operation_id = &recovered.operation_id;
     // Neither path may claim the effect stopped: recovery journals this
-    // run_error, and the refusals below must preserve that evidence.
-    let operation_id = assert_unresolved_effect(&fetch_journal(client, base, run_id).await, None);
+    // run_error, and the refusals below must preserve that evidence. Match it
+    // to the operation id captured live before the crash, never one derived
+    // only from the restarted service's diagnostic.
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await, operation_id);
 
     let replay = client
         .post(format!("{base}/api/runs/{run_id}/continue"))
@@ -406,10 +448,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         "{replay_body}"
     );
     assert!(replay_body.contains(CONTINUE_REFUSAL), "{replay_body}");
-    assert_unresolved_effect(
-        &fetch_journal(client, base, run_id).await,
-        Some(&operation_id),
-    );
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await, operation_id);
 
     let deleted = client.delete(&snapshot_url).send().await.unwrap();
     let deleted_status = deleted.status();
@@ -424,10 +463,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         deleted_body.contains(UNRESOLVED_EFFECT),
         "delete must reach the unresolved Started gate: {deleted_body}"
     );
-    assert_unresolved_effect(
-        &fetch_journal(client, base, run_id).await,
-        Some(&operation_id),
-    );
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await, operation_id);
 
     // Every refusal must preserve the run and its unresolved evidence.
     let after_refusals: Value = client
@@ -447,10 +483,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
         ),
         "{after_refusals}"
     );
-    assert_unresolved_effect(
-        &fetch_journal(client, base, run_id).await,
-        Some(&operation_id),
-    );
+    assert_unresolved_effect(&fetch_journal(client, base, run_id).await, operation_id);
 }
 
 /// Read-only proof at the first recovery observation: the persisted run scope
