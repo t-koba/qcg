@@ -67,11 +67,16 @@ Explicit deletion and retention GC refuse every `Started` operation,
 including repeat-policy operations. These checks preserve evidence; they do
 not stop a process or establish its outcome.
 
-The operation gate is not a complete inventory of host processes. In
-particular, MCP can start its stdio server while connecting and discovering
-tools, before the tool call's `operation_started` record exists. Absence of a
-`Started` record therefore does not establish that no MCP process survives.
-Run deletion, a missing process lookup, and a changed PID/PGID are not cleanup
+A host-mode MCP stdio launch records its own durable `mcp.stdio_launch`
+operation before connecting and discovering tools, separate from the later
+tool-call operation. A launch that is neither cleanly settled nor interrupted
+by a crash therefore leaves a `Started` record, and the fail-closed refusals
+above retain it. What that record proves is launch identity, not cleanup: it
+does not confirm the server stopped, and the operation gate is still not a
+complete inventory of host processes. Container daemon effects have their own
+best-effort teardown (see [container crash-recovery limits](container-crash-recovery.md)),
+and a trusted descendant can leave its process group with `setsid`. Run
+deletion, a missing process lookup, and a changed PID/PGID are not cleanup
 acknowledgements. There is no automatic host-process reconciliation command.
 Keep the journal and reconcile the external effect before removing its
 evidence. Even confirmed process termination would not prove that a tool's
