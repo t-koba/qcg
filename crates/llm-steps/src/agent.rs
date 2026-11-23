@@ -590,7 +590,12 @@ impl StepExecutor for LlmAgentStep {
             .unwrap_or_else(|| {
                 build_user_message(ctx, node, prompt).map(|message| vec![message])
             })?;
-        let mcp_tools = McpAgentTools::prepare(ctx, node, &self.runtime, &params.tools).await?;
+        let mut mcp_tools = McpAgentTools::prepare(ctx, node, &self.runtime, &params.tools).await?;
+        // Keep discovery sessions owned outside the body: every exit,
+        // including interaction pauses and early errors, drains and settles
+        // them exactly once below. Partial prepare failures clean up their
+        // own already-acquired sessions before returning.
+        let outcome: Result<StepOutcome, StepError> = async {
         if !mcp_tools.authorization_required.is_empty() {
             let (action, source) = params
                 .on_authorization_required
@@ -1683,6 +1688,17 @@ impl StepExecutor for LlmAgentStep {
         let (code, action) = (agent_failure_code(&error), AgentFailureAction::Fail);
         record_agent_failure_event(ctx, node, &node.id, None, code, action, &error)?;
         Err(error)
+    }.await;
+        // The primary outcome wins; a cleanup error is surfaced only when
+        // there is no earlier failure to preserve.
+        let cleanup_error = mcp_tools.close_and_settle(ctx, node).await.err();
+        match outcome {
+            Ok(outcome) => match cleanup_error {
+                Some(error) => Err(error),
+                None => Ok(outcome),
+            },
+            Err(error) => Err(error),
+        }
     }
 }
 

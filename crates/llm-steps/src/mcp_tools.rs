@@ -38,7 +38,7 @@ pub(crate) struct McpResolvedTool {
 
 #[derive(Default)]
 pub(crate) struct McpAgentTools {
-    sessions: BTreeMap<String, McpSession>,
+    sessions: BTreeMap<String, AgentSession>,
     tools: BTreeMap<String, McpResolvedTool>,
     /// Operator `allowed_destinations` ceiling per resolved server id.
     /// Missing entries fail closed (deny everything extracted).
@@ -55,6 +55,96 @@ pub(crate) struct McpAgentTools {
     /// widen a static miss at execution time, never a narrowing denial.
     deciders: BTreeMap<String, (Vec<String>, u64)>,
     pub(crate) authorization_required: Vec<String>,
+}
+
+/// One live discovery session with the launch record that authorizes it.
+/// HTTP sessions carry no launch id; stdio sessions carry the operation that
+/// must be settled only after a confirmed close.
+struct AgentSession {
+    session: McpSession,
+    launch: Option<String>,
+}
+
+struct DiscoveryFailure {
+    server: String,
+    error: McpError,
+    launch: Option<String>,
+}
+
+/// Only errors that prove no child could have been spawned may settle a
+/// launch clean. Transport, timeout, and interruption failures stay Started.
+fn discovery_failure_is_clean(error: &McpError) -> bool {
+    matches!(
+        error,
+        McpError::Configuration(_) | McpError::Authorization(_)
+    )
+}
+
+fn settle_discovery_launch(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    operation_id: Option<&str>,
+) -> Result<(), StepError> {
+    if let Some(operation_id) = operation_id {
+        ctx.run.finish_external_operation_with(
+            ctx.journal,
+            node,
+            operation_id,
+            engine::OperationOutcome::CleanError,
+        )?;
+    }
+    Ok(())
+}
+
+/// A launch is settled only when that exact session's close was confirmed.
+fn settle_after_close(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    server: &str,
+    operation_id: Option<&str>,
+    close: Result<(), McpError>,
+) -> Result<(), StepError> {
+    match close {
+        Ok(()) => settle_discovery_launch(ctx, node, operation_id),
+        Err(error) => Err(StepError::failed(
+            &node.id,
+            format!("MCP server `{server}` discovery session close failed: {error}"),
+        )),
+    }
+}
+
+/// Drain every owned session. A confirmed close settles that server's
+/// launch; an unconfirmed close leaves its launch Started. Cleanup failures
+/// are journaled for audit and reported by the caller when no primary error
+/// exists, so a sibling's success never proves anything about another server.
+async fn close_and_settle_sessions(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    sessions: &mut BTreeMap<String, AgentSession>,
+) -> Result<(), StepError> {
+    let mut first_error = None;
+    for (server, entry) in std::mem::take(sessions) {
+        let result = settle_after_close(
+            ctx,
+            node,
+            &server,
+            entry.launch.as_deref(),
+            entry.session.close().await,
+        );
+        if let Err(error) = result {
+            let _ = ctx.journal.event(
+                "mcp_discovery_cleanup_failed",
+                serde_json::json!({ "node": node.id, "server": server }),
+            );
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
+    }
 }
 
 impl McpAgentTools {
@@ -163,6 +253,18 @@ impl McpAgentTools {
         Ok(extracted)
     }
 
+    /// Closes every owned session and settles only the launches whose close
+    /// was confirmed. All closes are attempted even if one fails; the first
+    /// cleanup error is returned after the drain, so one server's failure is
+    /// never treated as proof about another server.
+    pub(crate) async fn close_and_settle(
+        &mut self,
+        ctx: &StepContext<'_>,
+        node: &NodeDef,
+    ) -> Result<(), StepError> {
+        close_and_settle_sessions(ctx, node, &mut self.sessions).await
+    }
+
     pub(crate) async fn prepare(
         ctx: &StepContext<'_>,
         node: &NodeDef,
@@ -197,57 +299,108 @@ impl McpAgentTools {
         let mut destinations = BTreeMap::new();
         let mut non_network_tools = BTreeMap::new();
         let mut deciders = BTreeMap::new();
-        for server in requested.keys() {
-            let profile = runtime
-                .mcp
-                .resolve(server)
-                .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
-            destinations.insert(server.clone(), profile.allowed_destinations().to_vec());
-            non_network_tools.insert(
-                server.clone(),
-                profile.non_network_tools().iter().cloned().collect(),
-            );
-            if let Some(argv) = profile.destination_decider() {
-                deciders.insert(
+        let mut stdio_launches = BTreeMap::new();
+        let setup = (|| -> Result<(), StepError> {
+            for server in requested.keys() {
+                let profile = runtime
+                    .mcp
+                    .resolve(server)
+                    .map_err(|error| StepError::failed(&node.id, error.to_string()))?;
+                destinations.insert(server.clone(), profile.allowed_destinations().to_vec());
+                non_network_tools.insert(
                     server.clone(),
-                    (argv.to_vec(), profile.destination_decider_timeout_seconds()),
+                    profile.non_network_tools().iter().cloned().collect(),
                 );
+                if let Some(argv) = profile.destination_decider() {
+                    deciders.insert(
+                        server.clone(),
+                        (argv.to_vec(), profile.destination_decider_timeout_seconds()),
+                    );
+                }
+                if profile.transport() == mcp::McpTransport::Stdio {
+                    let invocation = format!(
+                        "{}::agent_discovery::{}",
+                        engine::RunContext::execution_invocation(ctx.journal, node),
+                        profile.id()
+                    );
+                    match ctx.run.guard_external_operation(
+                        ctx.journal,
+                        node,
+                        "mcp.stdio_launch",
+                        profile.id(),
+                        &None,
+                        &invocation,
+                    )? {
+                        // The task owns the id so a session is never stored
+                        // without the launch record that authorizes it.
+                        engine::GuardDecision::Proceed { operation_id } => {
+                            stdio_launches.insert(server.clone(), operation_id);
+                        }
+                        engine::GuardDecision::Resend { .. } => {
+                            return Err(StepError::failed(
+                                &node.id,
+                                format!(
+                                    "MCP server `{}` discovery launch has a cached result; refusing to reuse it",
+                                    profile.id()
+                                ),
+                            ));
+                        }
+                    }
+                }
+                if profile.transport() == mcp::McpTransport::Stdio
+                    && let Some(permission) = agent_command_permission(
+                        &ctx.run.contract.manifest.permissions.commands,
+                        profile.command(),
+                    )
+                    && let Some(isolation) = permission.isolation.as_ref()
+                {
+                    permitted_commands.push(McpCommandAccess {
+                        argv: profile.command().to_vec(),
+                        isolation: match isolation {
+                            CommandIsolation::Container => McpCommandIsolation::Container,
+                            CommandIsolation::TrustedHost => McpCommandIsolation::TrustedHost,
+                        },
+                        image: permission.image.clone(),
+                        runtime: match isolation {
+                            CommandIsolation::TrustedHost => None,
+                            CommandIsolation::Container => ctx
+                                .run
+                                .contract
+                                .manifest
+                                .permissions
+                                .containers
+                                .runtime
+                                .map(|runtime| match runtime {
+                                    contract::ContainerRuntime::Docker => {
+                                        McpContainerRuntime::Docker
+                                    }
+                                    contract::ContainerRuntime::Podman => {
+                                        McpContainerRuntime::Podman
+                                    }
+                                    contract::ContainerRuntime::DockerRunsc => {
+                                        McpContainerRuntime::DockerRunsc
+                                    }
+                                    contract::ContainerRuntime::Incus => McpContainerRuntime::Incus,
+                                    contract::ContainerRuntime::Lxd => McpContainerRuntime::Lxd,
+                                }),
+                        },
+                    });
+                }
             }
-            if profile.transport() == mcp::McpTransport::Stdio
-                && let Some(permission) = agent_command_permission(
-                    &ctx.run.contract.manifest.permissions.commands,
-                    profile.command(),
-                )
-                && let Some(isolation) = permission.isolation.as_ref()
-            {
-                permitted_commands.push(McpCommandAccess {
-                    argv: profile.command().to_vec(),
-                    isolation: match isolation {
-                        CommandIsolation::Container => McpCommandIsolation::Container,
-                        CommandIsolation::TrustedHost => McpCommandIsolation::TrustedHost,
-                    },
-                    image: permission.image.clone(),
-                    runtime: match isolation {
-                        CommandIsolation::TrustedHost => None,
-                        CommandIsolation::Container => ctx
-                            .run
-                            .contract
-                            .manifest
-                            .permissions
-                            .containers
-                            .runtime
-                            .map(|runtime| match runtime {
-                                contract::ContainerRuntime::Docker => McpContainerRuntime::Docker,
-                                contract::ContainerRuntime::Podman => McpContainerRuntime::Podman,
-                                contract::ContainerRuntime::DockerRunsc => {
-                                    McpContainerRuntime::DockerRunsc
-                                }
-                                contract::ContainerRuntime::Incus => McpContainerRuntime::Incus,
-                                contract::ContainerRuntime::Lxd => McpContainerRuntime::Lxd,
-                            }),
-                    },
-                });
+            Ok(())
+        })();
+        if let Err(error) = setup {
+            // Nothing has been spawned yet: admitted launches were never
+            // used, so close their accounting without waiting for a child.
+            for operation_id in stdio_launches.values() {
+                if settle_discovery_launch(ctx, node, Some(operation_id)).is_err() {
+                    let _ = ctx.journal.event(
+                        "mcp_discovery_cleanup_failed",
+                        serde_json::json!({ "node": node.id, "operation_id": operation_id }),
+                    );
+                }
             }
+            return Err(error);
         }
         let access = McpAccess {
             network_hosts: ctx
@@ -270,98 +423,157 @@ impl McpAgentTools {
             let mcp = runtime.mcp.clone();
             let access = access.clone();
             let cancellation = ctx.run.cancellation.clone();
+            let launch = stdio_launches.get(&server).cloned();
             joins.spawn(async move {
-                let session = mcp.connect(&server, &access, cancellation).await?;
-                let tools = session.list_tools().await?;
-                Ok::<_, mcp::McpError>((server, session, tools))
+                let session =
+                    mcp.connect(&server, &access, cancellation)
+                        .await
+                        .map_err(|error| DiscoveryFailure {
+                            server: server.clone(),
+                            error,
+                            launch: launch.clone(),
+                        })?;
+                let tools = session
+                    .list_tools()
+                    .await
+                    .map_err(|error| DiscoveryFailure {
+                        server: server.clone(),
+                        error,
+                        launch: launch.clone(),
+                    })?;
+                Ok::<_, DiscoveryFailure>((server, session, tools, launch))
             });
         }
 
         let mut sessions = BTreeMap::new();
         let mut discovered = BTreeMap::new();
         let mut authorization_required = Vec::new();
+        let mut discovery_error = None;
+        // Drain every task before cleanup: a sibling that has already
+        // established a session must be closed explicitly, not dropped with
+        // the JoinSet. Its own launch cannot be settled otherwise.
         while let Some(result) = joins.join_next().await {
-            match result.map_err(|error| StepError::failed(&node.id, error.to_string()))? {
-                Ok((server, session, tools)) => {
+            let result = match result {
+                Ok(result) => result,
+                Err(error) => {
+                    if discovery_error.is_none() {
+                        discovery_error = Some(StepError::failed(&node.id, error.to_string()));
+                    }
+                    continue;
+                }
+            };
+            match result {
+                Ok((server, session, tools, launch)) => {
                     discovered.insert(server.clone(), tools);
-                    sessions.insert(server, session);
+                    sessions.insert(server, AgentSession { session, launch });
                 }
-                Err(McpError::AuthorizationRequired { server }) => {
-                    authorization_required.push(server);
+                Err(failure) => {
+                    if matches!(failure.error, McpError::AuthorizationRequired { .. }) {
+                        authorization_required.push(failure.server);
+                        continue;
+                    }
+                    if discovery_failure_is_clean(&failure.error)
+                        && discovery_error.is_none()
+                        && let Err(error) =
+                            settle_discovery_launch(ctx, node, failure.launch.as_deref())
+                    {
+                        discovery_error = Some(error);
+                    }
+                    if discovery_error.is_none() {
+                        discovery_error =
+                            Some(StepError::failed(&node.id, failure.error.to_string()));
+                    }
                 }
-                Err(error) => return Err(StepError::failed(&node.id, error.to_string())),
             }
+        }
+        if let Some(error) = discovery_error {
+            let _ = close_and_settle_sessions(ctx, node, &mut sessions).await;
+            return Err(error);
         }
         authorization_required.sort();
 
-        let mut resolved = BTreeMap::new();
-        for (server, bindings) in requested {
-            let Some(tools) = discovered.get(&server) else {
-                if authorization_required.contains(&server) {
-                    continue;
-                }
-                return Err(StepError::failed(
-                    &node.id,
-                    format!("MCP server `{server}` discovery result is missing"),
-                ));
-            };
-            for (alias, remote_name, override_description) in bindings {
-                let tool = tools
-                    .iter()
-                    .find(|tool| tool.name == remote_name)
-                    .ok_or_else(|| {
-                        StepError::failed(
-                            &node.id,
-                            format!("MCP server `{server}` does not expose tool `{remote_name}`"),
-                        )
-                    })?;
-                if !tool.input_schema.is_object() {
+        let resolved = (|| -> Result<BTreeMap<String, McpResolvedTool>, StepError> {
+            let mut resolved = BTreeMap::new();
+            for (server, bindings) in &requested {
+                let Some(tools) = discovered.get(server) else {
+                    if authorization_required.contains(server) {
+                        continue;
+                    }
                     return Err(StepError::failed(
                         &node.id,
-                        format!(
-                            "MCP server `{server}` tool `{remote_name}` returned a non-object input schema"
-                        ),
+                        format!("MCP server `{server}` discovery result is missing"),
                     ));
-                }
-                let input_validator = policy::compile_bounded_validator(&tool.input_schema).map_err(|message| {
-                    StepError::failed(
-                        &node.id,
-                        format!(
-                            "MCP server `{server}` tool `{remote_name}` input schema is invalid or unsafe: {message}"
-                        ),
-                    )
-                })?;
-                let output_validator = tool
-                    .output_schema
-                    .as_ref()
-                    .map(|schema| {
-                        policy::compile_bounded_validator(schema).map_err(|message| {
+                };
+                for (alias, remote_name, override_description) in bindings {
+                    let tool = tools
+                        .iter()
+                        .find(|tool| tool.name == *remote_name)
+                        .ok_or_else(|| {
                             StepError::failed(
                                 &node.id,
                                 format!(
-                                    "MCP server `{server}` tool `{remote_name}` output schema is invalid or unsafe: {message}"
+                                    "MCP server `{server}` does not expose tool `{remote_name}`"
                                 ),
                             )
+                        })?;
+                    if !tool.input_schema.is_object() {
+                        return Err(StepError::failed(
+                            &node.id,
+                            format!(
+                                "MCP server `{server}` tool `{remote_name}` returned a non-object input schema"
+                            ),
+                        ));
+                    }
+                    let input_validator =
+                        policy::compile_bounded_validator(&tool.input_schema).map_err(|message| {
+                            StepError::failed(
+                                &node.id,
+                                format!(
+                                    "MCP server `{server}` tool `{remote_name}` input schema is invalid or unsafe: {message}"
+                                ),
+                            )
+                        })?;
+                    let output_validator = tool
+                        .output_schema
+                        .as_ref()
+                        .map(|schema| {
+                            policy::compile_bounded_validator(schema).map_err(|message| {
+                                StepError::failed(
+                                    &node.id,
+                                    format!(
+                                        "MCP server `{server}` tool `{remote_name}` output schema is invalid or unsafe: {message}"
+                                    ),
+                                )
+                            })
                         })
-                    })
-                    .transpose()?;
-                resolved.insert(
-                    alias,
-                    McpResolvedTool {
-                        server: server.clone(),
-                        remote_name,
-                        description: override_description
-                            .unwrap_or_else(|| format!("MCP tool `{server}/{}`", tool.name)),
-                        model_input_schema: sanitize_untrusted_schema(&tool.input_schema),
-                        input_validator,
-                        output_validator,
-                    },
-                );
+                        .transpose()?;
+                    resolved.insert(
+                        alias.clone(),
+                        McpResolvedTool {
+                            server: server.clone(),
+                            remote_name: remote_name.clone(),
+                            description: override_description
+                                .clone()
+                                .unwrap_or_else(|| format!("MCP tool `{server}/{}`", tool.name)),
+                            model_input_schema: sanitize_untrusted_schema(&tool.input_schema),
+                            input_validator,
+                            output_validator,
+                        },
+                    );
+                }
             }
-        }
+            Ok(resolved)
+        })();
+        let tools = match resolved {
+            Ok(tools) => tools,
+            Err(error) => {
+                let _ = close_and_settle_sessions(ctx, node, &mut sessions).await;
+                return Err(error);
+            }
+        };
         Ok(Self {
             sessions,
-            tools: resolved,
+            tools,
             destinations,
             non_network_tools,
             declared,
@@ -499,7 +711,7 @@ impl McpAgentTools {
                 format!("MCP tool alias `{alias}` was not resolved"),
             )
         })?;
-        let session = self.sessions.get(&tool.server).ok_or_else(|| {
+        let entry = self.sessions.get(&tool.server).ok_or_else(|| {
             StepError::failed(
                 &node.id,
                 format!("MCP server `{}` has no active session", tool.server),
@@ -513,7 +725,7 @@ impl McpAgentTools {
             _ = cancellation.cancelled() => {
                 return Err(StepError::Cancelled);
             }
-            result = session.call_tool_with_input(
+            result = entry.session.call_tool_with_input(
                 &tool.remote_name,
                 args,
                 input_responses,
@@ -926,5 +1138,592 @@ mod tests {
         tools
             .validate_args(&node, "fetch", &json!({"query": "rust"}))
             .expect("empty narrowing must pass query-only");
+    }
+
+    /// Durable launch accounting for agent discovery. The fixture is a local
+    /// newline-delimited JSON-RPC stdio server; no provider, sleep, or external
+    /// process beyond the test's own child is involved.
+    #[cfg(unix)]
+    mod launch_tests {
+        use super::*;
+        use contract::MANIFEST_FILE;
+        use engine::OperationStatus;
+
+        static DISCOVERY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        const HEALTHY_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}]}
+    elif "id" in msg:
+        result = {}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+"#;
+
+        fn marker_server(marker: &str) -> String {
+            format!(
+                r#"#!/usr/bin/env python3
+from pathlib import Path
+Path({marker:?}).write_text("started")
+raise SystemExit(1)
+"#
+            )
+        }
+
+        struct Fixture {
+            root: camino::Utf8PathBuf,
+            run: engine::RunContext,
+            node: NodeDef,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.root);
+            }
+        }
+
+        impl Fixture {
+            fn root() -> camino::Utf8PathBuf {
+                camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+                    .unwrap()
+                    .join(format!(
+                        "agent-discovery-{}-{}",
+                        std::process::id(),
+                        DISCOVERY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    ))
+            }
+
+            fn new(root: camino::Utf8PathBuf, scripts: &[(&str, &str)]) -> Self {
+                std::fs::create_dir_all(&root).unwrap();
+                std::fs::create_dir_all(root.join("workspace")).unwrap();
+                let commands = scripts
+                .iter()
+                .map(|(name, body)| {
+                    let path = root.join(name);
+                    std::fs::write(&path, body).unwrap();
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+                    permissions.set_mode(0o755);
+                    std::fs::set_permissions(&path, permissions).unwrap();
+                    format!(
+                        "[[permissions.commands]]\nbin = {:?}\nargs = []\npurpose = \"discovery fixture\"\nisolation = \"trusted_host\"\n",
+                        path.as_str()
+                    )
+                })
+                .collect::<String>();
+                let command_table = if scripts.is_empty() {
+                    "commands = []\n".to_owned()
+                } else {
+                    String::new()
+                };
+                std::fs::write(
+                    root.join(MANIFEST_FILE),
+                    format!(
+                        r#"
+[generator]
+id = "agent-discovery-test"
+name = "Agent discovery test"
+version = "0.1.0"
+[llm]
+models = []
+max_tokens = 100
+[permissions]
+network = []
+fs_read = []
+fs_write = ["workspace"]
+{command_table}side_effects = "none"
+side_effects_scope = "invocation"
+containers = {{ enabled = false }}
+{commands}
+[[flow]]
+id = "agent"
+type = "llm.agent"
+[flow.params]
+max_iterations = 1
+max_tokens_total = 100
+"#
+                    ),
+                )
+                .unwrap();
+                let contract = contract::Contract::load(&root).unwrap();
+                let node = contract.manifest.flow[0].clone();
+                let run = engine::RunContext::for_tests(
+                    "agent-discovery-test".into(),
+                    root.join("workspace"),
+                    root.join("meta"),
+                    contract,
+                    BTreeMap::new(),
+                    BTreeMap::new(),
+                )
+                .unwrap();
+                Self { root, run, node }
+            }
+
+            fn command(&self, name: &str) -> Vec<String> {
+                vec![self.root.join(name).to_string()]
+            }
+
+            fn journal(&self) -> engine::JournalWriter {
+                engine::JournalWriter::create(&self.journal_path(), &self.run.run_id, false, None)
+                    .unwrap()
+            }
+
+            fn journal_path(&self) -> camino::Utf8PathBuf {
+                self.root.join("journal.jsonl")
+            }
+
+            fn disk_state(&self) -> engine::RunState {
+                engine::RunState::fold_journal(&self.journal_path()).unwrap()
+            }
+
+            fn events(&self, kind: &str) -> Vec<serde_json::Value> {
+                std::fs::read_to_string(self.journal_path())
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .filter(|event| event["t"] == kind)
+                    .collect()
+            }
+
+            fn launches(&self) -> Vec<serde_json::Value> {
+                self.events("operation_started")
+                    .into_iter()
+                    .filter(|event| event["kind"] == "mcp.stdio_launch")
+                    .collect()
+            }
+
+            fn finishes(&self) -> Vec<serde_json::Value> {
+                self.events("operation_finished")
+            }
+
+            fn context<'a>(
+                &'a self,
+                journal: &'a engine::JournalWriter,
+                vars: &'a mut contract::ValueBag,
+            ) -> StepContext<'a> {
+                StepContext {
+                    run: &self.run,
+                    journal,
+                    vars,
+                    llm: None,
+                }
+            }
+        }
+
+        fn runtime(specs: Vec<serde_json::Value>) -> llm::LlmRuntime {
+            let mut runtime = llm::LlmRuntime::builtins();
+            runtime.mcp = mcp::McpRuntime::from_specs(
+                specs
+                    .into_iter()
+                    .map(|spec| serde_json::from_value(spec).unwrap())
+                    .collect(),
+            )
+            .unwrap();
+            runtime
+        }
+
+        fn stdio_spec(id: &str, command: Vec<String>) -> serde_json::Value {
+            serde_json::json!({
+                "id": id, "transport": "stdio", "lifecycle": "initialize",
+                "command": command, "auth": "none", "timeout_seconds": 3,
+            })
+        }
+
+        fn declaration(server: &str, alias: &str) -> ToolDecl {
+            serde_json::from_value(serde_json::json!({
+                "kind": "mcp", "name": alias, "server": server, "tool": "echo",
+            }))
+            .unwrap()
+        }
+
+        fn launch_invocation(fixture: &Fixture, journal: &engine::JournalWriter) -> String {
+            format!(
+                "{}::agent_discovery",
+                engine::RunContext::execution_invocation(journal, &fixture.node)
+            )
+        }
+
+        fn start_launch(
+            fixture: &Fixture,
+            journal: &engine::JournalWriter,
+            target: &str,
+        ) -> String {
+            let invocation = format!("{}::{target}", launch_invocation(fixture, journal));
+            match fixture
+                .run
+                .guard_external_operation(
+                    journal,
+                    &fixture.node,
+                    "mcp.stdio_launch",
+                    target,
+                    &None,
+                    &invocation,
+                )
+                .unwrap()
+            {
+                engine::GuardDecision::Proceed { operation_id } => operation_id,
+                engine::GuardDecision::Resend { .. } => panic!("fresh launch must start"),
+            }
+        }
+
+        #[tokio::test]
+        async fn child_startup_is_journaled_before_connect_and_failed_admission_spawns_no_child() {
+            let root = Fixture::root();
+            let marker = root.join("child-started");
+            let script = marker_server(marker.as_str());
+            let fixture = Fixture::new(root, &[("fail.py", &script)]);
+            let runtime = runtime(vec![stdio_spec("local", fixture.command("fail.py"))]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[declaration("local", "echo")]
+                )
+                .await
+                .is_err(),
+                "a child that speaks no MCP must fail discovery"
+            );
+            assert!(marker.exists(), "the child was started");
+
+            let launches = fixture.launches();
+            assert_eq!(launches.len(), 1, "the launch is journaled before connect");
+            assert_eq!(launches[0]["kind"], "mcp.stdio_launch");
+            assert_eq!(launches[0]["target"], "local");
+            assert!(
+                fixture
+                    .events("operation_started")
+                    .iter()
+                    .all(|event| event["kind"] == "mcp.stdio_launch"),
+                "no tool call is journaled by discovery"
+            );
+            let id = launches[0]["operation_id"].as_str().unwrap();
+            assert!(fixture.finishes().is_empty());
+            assert_eq!(
+                fixture.disk_state().operation_records[id].status,
+                OperationStatus::Started
+            );
+            let state = fixture.disk_state();
+            assert!(state.ensure_no_fail_closed_inflight_operations().is_err());
+            assert!(state.ensure_no_inflight_operations().is_err());
+
+            // Replay of the same interrupted launch is refused before any new
+            // child can be spawned: the marker records whether spawn happened.
+            std::fs::remove_file(&marker).unwrap();
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[declaration("local", "echo")]
+                )
+                .await
+                .is_err(),
+                "an unconfirmed launch must refuse replay"
+            );
+            assert!(!marker.exists(), "refused admission must not spawn a child");
+            assert_eq!(fixture.launches().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn confirmed_close_settles_the_launch_and_resume_reuses_the_invocation() {
+            let root = Fixture::root();
+            let fixture = Fixture::new(root, &[("healthy.py", HEALTHY_SERVER)]);
+            let runtime = runtime(vec![stdio_spec("local", fixture.command("healthy.py"))]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            let mut tools = McpAgentTools::prepare(
+                &ctx,
+                &fixture.node,
+                &runtime,
+                &[declaration("local", "echo")],
+            )
+            .await
+            .expect("healthy discovery must succeed");
+            let launches = fixture.launches();
+            assert_eq!(launches.len(), 1);
+            let id = launches[0]["operation_id"].as_str().unwrap().to_owned();
+            assert_eq!(
+                fixture.disk_state().operation_records[&id].status,
+                OperationStatus::Started,
+                "the launch stays open while the child lives"
+            );
+            assert!(
+                fixture
+                    .disk_state()
+                    .ensure_no_inflight_operations()
+                    .is_err()
+            );
+            assert!(
+                launch_invocation(&fixture, &journal).ends_with("::agent_discovery"),
+                "agent discovery uses its own invocation namespace"
+            );
+
+            tools
+                .close_and_settle(&ctx, &fixture.node)
+                .await
+                .expect("confirmed close settles cleanly");
+            let finishes = fixture.finishes();
+            assert_eq!(finishes.len(), 1);
+            assert_eq!(finishes[0]["operation_id"], id);
+            assert_eq!(finishes[0]["status"], "clean");
+            assert_eq!(
+                fixture.disk_state().operation_records[&id].status,
+                OperationStatus::FailedClean
+            );
+            assert!(fixture.disk_state().ensure_no_inflight_operations().is_ok());
+
+            let resumed = fixture.journal();
+            let invocation = format!("{}::local", launch_invocation(&fixture, &resumed));
+            match fixture
+                .run
+                .guard_external_operation(
+                    &resumed,
+                    &fixture.node,
+                    "mcp.stdio_launch",
+                    "local",
+                    &None,
+                    &invocation,
+                )
+                .unwrap()
+            {
+                engine::GuardDecision::Proceed { operation_id } => {
+                    assert_eq!(operation_id, id, "resume reuses the same invocation id");
+                }
+                engine::GuardDecision::Resend { .. } => panic!("a clean launch is retried"),
+            }
+        }
+
+        #[tokio::test]
+        async fn one_failed_discovery_leaves_only_its_launch_started() {
+            let root = Fixture::root();
+            let marker = root.join("broken-started");
+            let script = marker_server(marker.as_str());
+            let fixture = Fixture::new(
+                root,
+                &[("healthy.py", HEALTHY_SERVER), ("broken.py", &script)],
+            );
+            let runtime = runtime(vec![
+                stdio_spec("healthy", fixture.command("healthy.py")),
+                stdio_spec("broken", fixture.command("broken.py")),
+            ]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[
+                        declaration("healthy", "first"),
+                        declaration("healthy", "second"),
+                        declaration("broken", "broken-tool"),
+                    ],
+                )
+                .await
+                .is_err(),
+                "one broken server fails discovery"
+            );
+
+            let launches = fixture.launches();
+            assert_eq!(launches.len(), 2, "aliases of one server share one launch");
+            let mut targets = launches
+                .iter()
+                .map(|event| event["target"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            targets.sort();
+            assert_eq!(targets, vec!["broken".to_owned(), "healthy".to_owned()]);
+            let ids = launches
+                .iter()
+                .map(|event| event["operation_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_ne!(ids[0], ids[1], "distinct servers get distinct operations");
+            let broken = launches
+                .iter()
+                .find(|event| event["target"] == "broken")
+                .unwrap()["operation_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let healthy = launches
+                .iter()
+                .find(|event| event["target"] == "healthy")
+                .unwrap()["operation_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let finishes = fixture.finishes();
+            assert_eq!(finishes.len(), 1, "only the confirmed sibling settles");
+            assert_eq!(finishes[0]["operation_id"], healthy);
+            let state = fixture.disk_state();
+            assert_eq!(
+                state.operation_records[&healthy].status,
+                OperationStatus::FailedClean
+            );
+            assert_eq!(
+                state.operation_records[&broken].status,
+                OperationStatus::Started
+            );
+            assert!(state.ensure_no_inflight_operations().is_err());
+        }
+
+        #[tokio::test]
+        async fn unconfirmed_close_leaves_that_launch_started_and_blocks_deletion() {
+            let root = Fixture::root();
+            let fixture = Fixture::new(root, &[]);
+            let journal = fixture.journal();
+            let confirmed = start_launch(&fixture, &journal, "confirmed");
+            let unconfirmed = start_launch(&fixture, &journal, "unconfirmed");
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            settle_after_close(&ctx, &fixture.node, "confirmed", Some(&confirmed), Ok(()))
+                .expect("confirmed close settles");
+            settle_after_close(
+                &ctx,
+                &fixture.node,
+                "unconfirmed",
+                Some(&unconfirmed),
+                Err(McpError::TimedOut { seconds: 5 }),
+            )
+            .expect_err("unconfirmed close is surfaced");
+
+            let finishes = fixture.finishes();
+            assert_eq!(finishes.len(), 1);
+            assert_eq!(finishes[0]["operation_id"], confirmed);
+            let state = fixture.disk_state();
+            assert_eq!(
+                state.operation_records[&confirmed].status,
+                OperationStatus::FailedClean
+            );
+            assert_eq!(
+                state.operation_records[&unconfirmed].status,
+                OperationStatus::Started
+            );
+            assert!(state.ensure_no_inflight_operations().is_err());
+        }
+
+        /// A refused admission for one server must not leave a freshly admitted
+        /// sibling launch open: nothing has spawned yet, so that launch settles.
+        #[tokio::test]
+        async fn refused_peer_admission_settles_unused_launch_without_spawning() {
+            let root = Fixture::root();
+            let marker = root.join("must-not-start");
+            let script = marker_server(marker.as_str());
+            let fixture = Fixture::new(
+                root,
+                &[("a-healthy.py", &script), ("z-blocked.py", HEALTHY_SERVER)],
+            );
+            let runtime = runtime(vec![
+                stdio_spec("a-healthy", fixture.command("a-healthy.py")),
+                stdio_spec("z-blocked", fixture.command("z-blocked.py")),
+            ]);
+            let journal = fixture.journal();
+            let blocked = format!("{}::z-blocked", launch_invocation(&fixture, &journal));
+            match fixture
+                .run
+                .guard_external_operation(
+                    &journal,
+                    &fixture.node,
+                    "mcp.stdio_launch",
+                    "z-blocked",
+                    &None,
+                    &blocked,
+                )
+                .unwrap()
+            {
+                engine::GuardDecision::Proceed { .. } => {}
+                engine::GuardDecision::Resend { .. } => panic!("fresh crash record must start"),
+            }
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[
+                        declaration("a-healthy", "first"),
+                        declaration("z-blocked", "second"),
+                    ],
+                )
+                .await
+                .is_err(),
+                "the unconfirmed launch must refuse admission"
+            );
+            assert!(
+                !marker.exists(),
+                "no child is spawned after a refused guard"
+            );
+            let launches = fixture.launches();
+            assert_eq!(launches.len(), 2);
+            let finishes = fixture.finishes();
+            assert_eq!(finishes.len(), 1, "only the unused launch is settled clean");
+            let healthy = launches
+                .iter()
+                .find(|event| event["target"] == "a-healthy")
+                .unwrap()["operation_id"]
+                .as_str()
+                .unwrap();
+            let blocked = launches
+                .iter()
+                .find(|event| event["target"] == "z-blocked")
+                .unwrap()["operation_id"]
+                .as_str()
+                .unwrap();
+            assert_eq!(finishes[0]["operation_id"], healthy);
+            let state = fixture.disk_state();
+            assert_eq!(
+                state.operation_records[healthy].status,
+                OperationStatus::FailedClean
+            );
+            assert_eq!(
+                state.operation_records[blocked].status,
+                OperationStatus::Started
+            );
+            assert!(state.ensure_no_inflight_operations().is_err());
+        }
+
+        #[tokio::test]
+        async fn plain_http_discovery_writes_no_launch_record() {
+            let root = Fixture::root();
+            let fixture = Fixture::new(root, &[]);
+            let runtime = runtime(vec![serde_json::json!({
+                "id": "remote", "transport": "streamable_http", "lifecycle": "discover",
+                "url": "http://127.0.0.1:1/mcp", "auth": "none", "timeout_seconds": 1,
+                "allowed_hosts": ["127.0.0.1"],
+            })]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[declaration("remote", "echo")]
+                )
+                .await
+                .is_err(),
+                "the unreachable HTTP server fails discovery"
+            );
+            assert!(fixture.launches().is_empty());
+            assert!(fixture.finishes().is_empty());
+        }
     }
 }

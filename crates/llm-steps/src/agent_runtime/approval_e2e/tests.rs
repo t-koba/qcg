@@ -1209,3 +1209,209 @@ async fn mcp_execution_checks_schemeless_policy_and_never_delegates_ambiguity() 
         );
     }
 }
+
+/// Agent-body cleanup coverage: a discovery-only stdio server is closed and
+/// its launch settled on every exit path, including an interaction pause.
+#[cfg(unix)]
+mod discovery_launch {
+    use super::*;
+    use engine::OperationStatus;
+
+    const HEALTHY_SERVER: &str = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
+    elif method == "tools/list":
+        result = {"tools": [{"name": "echo", "description": "echo", "inputSchema": {"type": "object"}}]}
+    elif "id" in msg:
+        result = {}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+"#;
+
+    fn stdio_runtime(command: Vec<String>) -> llm::LlmRuntime {
+        let mut runtime = test_runtime();
+        runtime.mcp = mcp::McpRuntime::from_specs(vec![
+            serde_json::from_value(json!({
+                "id": "local", "transport": "stdio", "lifecycle": "initialize",
+                "command": command, "auth": "none", "timeout_seconds": 3,
+            }))
+            .unwrap(),
+        ])
+        .unwrap();
+        runtime
+    }
+
+    fn agent_node(include_ask: bool) -> NodeDef {
+        let mut tools = vec![json!({
+            "kind": "mcp", "name": "remote", "server": "local", "tool": "echo",
+            "side_effects": false, "max_calls": 10
+        })];
+        if include_ask {
+            tools.push(json!({"kind": "ask_user", "name": "ask"}));
+        }
+        let mut node = ApprovalHarness::node();
+        node.params = serde_json::from_value(json!({
+            "prompt": "prompt.md", "max_iterations": 1, "max_tokens_total": 1000,
+            "tools": tools,
+        }))
+        .unwrap();
+        node
+    }
+
+    fn run_with_command(harness: &ApprovalHarness, command: &str) -> RunContext {
+        std::fs::write(harness.root.join("prompt.md"), "Discovery only.").unwrap();
+        let mut contract = harness.contract();
+        contract.manifest.permissions.side_effects = SideEffects::Allowed;
+        contract.manifest.llm = Some(
+            serde_json::from_value(json!({
+                "model": {"provider": "fake", "model": "test"}, "max_tokens": 1000,
+            }))
+            .unwrap(),
+        );
+        contract.manifest.permissions.commands = vec![
+            serde_json::from_value(json!({
+                "bin": command, "args": [], "purpose": "discovery fixture",
+                "isolation": "trusted_host",
+            }))
+            .unwrap(),
+        ];
+        RunContext::for_tests(
+            harness.run_id.clone(),
+            harness.root.join("workspace"),
+            harness.root.join("meta"),
+            contract,
+            BTreeMap::new(),
+            BTreeMap::new(),
+        )
+        .unwrap()
+    }
+
+    fn events(harness: &ApprovalHarness, kind: &str) -> Vec<Value> {
+        harness
+            .journal_text()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|event| event["t"] == kind)
+            .collect()
+    }
+
+    #[derive(Clone)]
+    struct AskProvider;
+
+    #[async_trait::async_trait]
+    impl llm::LlmProvider for AskProvider {
+        fn id(&self) -> &str {
+            "fake"
+        }
+
+        fn capabilities(&self) -> llm::Capabilities {
+            llm::Capabilities {
+                tool_use: true,
+                ..Default::default()
+            }
+        }
+
+        async fn complete(
+            &self,
+            _request: llm::ChatRequest,
+        ) -> Result<llm::ChatResponse, llm::LlmError> {
+            Ok(llm::ChatResponse {
+                content: vec![llm::ChatContent::ToolCall {
+                    id: "ask-1".into(),
+                    name: "ask".into(),
+                    args: json!({"question": "proceed?"}),
+                }],
+                usage: llm::TokenUsage::default(),
+                stop: llm::StopReason::ToolUse,
+                provider_state: None,
+                web_search: None,
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_without_a_tool_call_settles_once_on_success() {
+        let harness = ApprovalHarness::setup("mcp-discovery-launch-success");
+        let path = harness.root.join("server.py");
+        std::fs::write(&path, HEALTHY_SERVER).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let command = vec![path.to_string()];
+        let mut runtime = stdio_runtime(command);
+        runtime.provider = Arc::new(CapturedFinalProvider(Arc::new(Mutex::new(Vec::new()))));
+        let runtime = Arc::new(runtime);
+        let run = run_with_command(&harness, path.as_str());
+        let journal = journal(&harness);
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = context(&run, &journal, &mut vars, &runtime);
+        let result = LlmAgentStep {
+            runtime: runtime.clone(),
+        }
+        .execute(&mut ctx, &agent_node(false))
+        .await;
+        assert!(
+            matches!(result, Ok(StepOutcome::Success { .. })),
+            "unexpected result: {result:?}"
+        );
+        let launches = events(&harness, "operation_started")
+            .into_iter()
+            .filter(|event| event["kind"] == "mcp.stdio_launch")
+            .collect::<Vec<_>>();
+        assert_eq!(launches.len(), 1);
+        let finishes = events(&harness, "operation_finished");
+        assert_eq!(finishes.len(), 1, "cleanup runs exactly once");
+        assert_eq!(finishes[0]["operation_id"], launches[0]["operation_id"]);
+        assert_eq!(
+            journal.state().operation_records[finishes[0]["operation_id"].as_str().unwrap()].status,
+            OperationStatus::FailedClean
+        );
+        assert!(journal.state().ensure_no_inflight_operations().is_ok());
+    }
+
+    #[tokio::test]
+    async fn discovery_without_a_tool_call_settles_once_on_interaction_pause() {
+        let harness = ApprovalHarness::setup("mcp-discovery-launch-pause");
+        let path = harness.root.join("server.py");
+        std::fs::write(&path, HEALTHY_SERVER).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions).unwrap();
+        let mut runtime = stdio_runtime(vec![path.to_string()]);
+        runtime.provider = Arc::new(AskProvider);
+        let runtime = Arc::new(runtime);
+        let run = run_with_command(&harness, path.as_str());
+        let journal = journal(&harness);
+        let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+        let mut ctx = context(&run, &journal, &mut vars, &runtime);
+        let result = LlmAgentStep {
+            runtime: runtime.clone(),
+        }
+        .execute(&mut ctx, &agent_node(true))
+        .await;
+        assert!(
+            matches!(result, Ok(StepOutcome::NeedsUser { .. })),
+            "unexpected result: {result:?}"
+        );
+        let launches = events(&harness, "operation_started")
+            .into_iter()
+            .filter(|event| event["kind"] == "mcp.stdio_launch")
+            .collect::<Vec<_>>();
+        assert_eq!(launches.len(), 1);
+        let finishes = events(&harness, "operation_finished");
+        assert_eq!(finishes.len(), 1, "a pause still closes and settles once");
+        assert_eq!(finishes[0]["operation_id"], launches[0]["operation_id"]);
+        assert!(journal.state().ensure_no_inflight_operations().is_ok());
+    }
+}

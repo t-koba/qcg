@@ -67,13 +67,16 @@ Explicit deletion and retention GC refuse every `Started` operation,
 including repeat-policy operations. These checks preserve evidence; they do
 not stop a process or establish its outcome.
 
-A host-mode MCP stdio launch records its own durable `mcp.stdio_launch`
-operation before connecting and discovering tools, separate from the later
-tool-call operation. A launch that is neither cleanly settled nor interrupted
-by a crash therefore leaves a `Started` record, and the fail-closed refusals
-above retain it. What that record proves is launch identity, not cleanup: it
-does not confirm the server stopped, and the operation gate is still not a
-complete inventory of host processes. Container daemon effects have their own
+Both host-mode MCP stdio paths — the direct `mcp.call` step and MCP tool
+discovery in `llm.agent` — journal a distinct durable `mcp.stdio_launch`
+operation before `connect` and `tools/list`, under separate invocation
+namespaces. Direct calls also keep a later tool-call operation. Each launch
+is settled clean only after its session close is confirmed; a transport
+failure, timeout, interruption, or unconfirmed close leaves a `Started`
+record, and the fail-closed refusals above retain it. What that record proves
+is launch identity, not cleanup: it does not confirm the server stopped, and
+the operation gate is still not a complete inventory of host processes.
+Container daemon effects have their own
 best-effort teardown (see [container crash-recovery limits](container-crash-recovery.md)),
 and a trusted descendant can leave its process group with `setsid`. Run
 deletion, a missing process lookup, and a changed PID/PGID are not cleanup
