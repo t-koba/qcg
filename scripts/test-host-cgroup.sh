@@ -19,3 +19,4 @@ cargo test --offline --locked -p engine --test host_cgroup_crash -- --nocapture
 cargo test --offline --locked -p mcp --lib host_cgroup -- --nocapture
 cargo test --offline --locked -p service --lib host_cgroup -- --nocapture
 cargo test --offline --locked -p cli --test direct_run_recovery sigkill_retains_started_operation_before_restart_or_delete -- --nocapture
+cargo test --offline --locked -p cli --test serve_crash_recovery -- --nocapture
