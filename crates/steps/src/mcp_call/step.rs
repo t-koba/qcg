@@ -262,10 +262,12 @@ mod close_probe {
     }
 
     /// Guard that injects a close timeout for the duration of its lifetime.
-    #[cfg(test)]
+    /// The only test that uses it drives a real stdio fixture and is Unix-only,
+    /// so keep the guard under the same cfg to avoid dead code on Windows.
+    #[cfg(all(test, unix))]
     pub(crate) struct FailClose;
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn fail_close() -> FailClose {
         FAIL_CLOSE.set(true);
         FailClose
@@ -275,7 +277,7 @@ mod close_probe {
         FAIL_CLOSE.get()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     impl Drop for FailClose {
         fn drop(&mut self) {
             FAIL_CLOSE.set(false);
