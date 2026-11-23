@@ -69,6 +69,9 @@ struct DiscoveryFailure {
     server: String,
     error: McpError,
     launch: Option<String>,
+    /// A list_tools failure happens after connect, so the owner must close
+    /// this session and settle its launch. Pre-connect failures have none.
+    session: Option<McpSession>,
 }
 
 /// Only errors that prove no child could have been spawned may settle a
@@ -432,15 +435,21 @@ impl McpAgentTools {
                             server: server.clone(),
                             error,
                             launch: launch.clone(),
+                            session: None,
                         })?;
-                let tools = session
-                    .list_tools()
-                    .await
-                    .map_err(|error| DiscoveryFailure {
-                        server: server.clone(),
-                        error,
-                        launch: launch.clone(),
-                    })?;
+                let tools = match session.list_tools().await {
+                    Ok(tools) => tools,
+                    Err(error) => {
+                        // The connect succeeded: hand the live session to the
+                        // owner so it can be closed and its launch settled.
+                        return Err(DiscoveryFailure {
+                            server: server.clone(),
+                            error,
+                            launch: launch.clone(),
+                            session: Some(session),
+                        });
+                    }
+                };
                 Ok::<_, DiscoveryFailure>((server, session, tools, launch))
             });
         }
@@ -488,6 +497,26 @@ impl McpAgentTools {
                     if discovery_error.is_none() {
                         discovery_error =
                             Some(StepError::failed(&node.id, failure.error.to_string()));
+                    }
+                    // A post-connect failure owns a live session that would
+                    // otherwise be dropped with the JoinSet. Close it so its
+                    // launch can settle; an unconfirmed close leaves the launch
+                    // Started. Cleanup is journaled but never displaces the
+                    // discovery error already chosen as primary.
+                    if let Some(session) = failure.session
+                        && settle_after_close(
+                            ctx,
+                            node,
+                            &failure.server,
+                            failure.launch.as_deref(),
+                            session.close().await,
+                        )
+                        .is_err()
+                    {
+                        let _ = ctx.journal.event(
+                            "mcp_discovery_cleanup_failed",
+                            serde_json::json!({ "node": node.id, "server": failure.server }),
+                        );
                     }
                 }
             }
@@ -1587,6 +1616,73 @@ max_tokens_total = 100
                 OperationStatus::Started
             );
             assert!(state.ensure_no_inflight_operations().is_err());
+        }
+
+        /// A tools/list failure after a successful connect still owns a live
+        /// session. Dropping it leaves its launch Started and blocks the next
+        /// owner's continuation/deletion, so the failure's owner must close
+        /// and settle it even though discovery still reports the first error.
+        #[tokio::test]
+        async fn list_tools_failure_closes_session_and_settles_launch() {
+            let script = r#"#!/usr/bin/env python3
+import json, sys
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    if method == "initialize":
+        result = {"protocolVersion": msg.get("params", {}).get("protocolVersion", "2025-06-18"),
+                  "capabilities": {"tools": {}}, "serverInfo": {"name": "fixture", "version": "1"}}
+    elif method == "tools/list":
+        print(json.dumps({"jsonrpc": "2.0", "id": msg["id"],
+                          "error": {"code": -32000, "message": "tools unavailable"}}), flush=True)
+        continue
+    elif "id" in msg:
+        result = {}
+    else:
+        continue
+    print(json.dumps({"jsonrpc": "2.0", "id": msg["id"], "result": result}), flush=True)
+"#;
+            let root = Fixture::root();
+            let fixture = Fixture::new(root, &[("no-tools.py", script)]);
+            let runtime = runtime(vec![stdio_spec("local", fixture.command("no-tools.py"))]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[declaration("local", "echo")],
+                )
+                .await
+                .is_err(),
+                "a failed tools/list must fail discovery"
+            );
+
+            let launches = fixture.launches();
+            assert_eq!(launches.len(), 1, "the stdio launch was admitted");
+            let id = launches[0]["operation_id"].as_str().unwrap();
+            let finishes = fixture.finishes();
+            assert_eq!(finishes.len(), 1, "the live session was explicitly closed");
+            assert_eq!(finishes[0]["operation_id"], id);
+            assert_eq!(finishes[0]["status"], "clean");
+            let state = fixture.disk_state();
+            assert_eq!(
+                state.operation_records[id].status,
+                OperationStatus::FailedClean
+            );
+            assert!(
+                state.ensure_no_inflight_operations().is_ok(),
+                "a post-connect discovery error must not block recovery"
+            );
+            assert!(
+                fixture.events("mcp_discovery_cleanup_failed").is_empty(),
+                "a confirmed close is not a cleanup failure"
+            );
         }
 
         /// Two profiles admitted to the launch journal but both refused before
