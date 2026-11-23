@@ -154,10 +154,7 @@ async fn continuation_creates_linked_child_preserving_successful_outcomes() {
     let source_dir = service.run_dir_for(&source_id).await.expect("source dir");
     let source_before = std::fs::read(source_dir.join("meta/journal.jsonl")).expect("journal");
 
-    let child_id = service
-        .continue_run(&source_id)
-        .await
-        .expect("service-owned failed run continues");
+    let child_id = continue_after_source_settlement(&service, &source_id).await;
     assert_ne!(child_id, source_id);
 
     let child_dir = service.run_dir_for(&child_id).await.expect("child dir");
@@ -288,10 +285,7 @@ async fn continuation_creates_child_from_default_wallclock_source() {
         .expect("source queue")["ts"]
         .clone();
 
-    let child_id = service
-        .continue_run(&source_id)
-        .await
-        .expect("default WallClock source continues");
+    let child_id = continue_after_source_settlement(&service, &source_id).await;
     let child_dir = service.run_dir_for(&child_id).await.expect("child dir");
     let journal = std::fs::read_to_string(child_dir.join("meta/journal.jsonl")).expect("journal");
     let events = journal

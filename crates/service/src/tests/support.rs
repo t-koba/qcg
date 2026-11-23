@@ -347,6 +347,37 @@ fn agent_process_exists(pid: u32) -> bool {
         .success()
 }
 
+/// Continues a terminally failed source after its journal-terminal state has
+/// been observed. A terminal journal entry can be visible before the in-memory
+/// task slot and execution lease settle; in that bounded window the source fork
+/// lease is correctly fail-closed with the typed `InFlight` refusal (reason
+/// "source run is executing or has in-flight work"). Retry only that exact
+/// category and surface every other refusal immediately, so a real regression
+/// still fails the test rather than being hidden by the retry.
+#[cfg(unix)]
+pub(crate) async fn continue_after_source_settlement(
+    service: &LocalService,
+    source_id: &str,
+) -> String {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match service.continue_run(source_id).await {
+                Ok(child_id) => return child_id,
+                Err(ContinuationRefusal::InFlight) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(other) => panic!(
+                    "source continuation refused with `{reason}` ({other:?}) while settling; \
+                     only InFlight is the transient settlement refusal",
+                    reason = other.reason()
+                ),
+            }
+        }
+    })
+    .await
+    .expect("failed source should become continuable within the liveness guard")
+}
+
 pub(crate) async fn wait_for_snapshot(
     service: &LocalService,
     id: &str,
