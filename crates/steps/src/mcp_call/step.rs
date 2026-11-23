@@ -225,10 +225,30 @@ impl StepExecutor for McpCallStep {
             cleanup_error.as_ref(),
             started.elapsed().as_millis() as u64,
         );
-        // The session is closed, so the launched server is gone.
-        settle_stdio_launch(ctx, node, launch_operation.as_deref())?;
+        // Only a confirmed close proves the launched server is gone. An
+        // unconfirmed close leaves the launch Started so replay/delete refuse.
+        settle_stdio_launch_after_close(
+            ctx,
+            node,
+            launch_operation.as_deref(),
+            cleanup_error.as_ref(),
+        )?;
         outcome
     }
+}
+
+/// Settle the launch after a tool call only when its close was confirmed:
+/// otherwise the stdio server may still be alive, so keep the launch Started.
+fn settle_stdio_launch_after_close(
+    ctx: &StepContext<'_>,
+    node: &NodeDef,
+    operation_id: Option<&str>,
+    close_error: Option<&StepError>,
+) -> Result<(), StepError> {
+    if close_error.is_none() {
+        settle_stdio_launch(ctx, node, operation_id)?;
+    }
+    Ok(())
 }
 
 /// Settle a stdio launch only when the exit proves no live server remains.
@@ -675,6 +695,75 @@ side_effects = false
         assert_eq!(
             journal.state().operation_records[id].status,
             engine::OperationStatus::FailedClean
+        );
+    }
+
+    fn start_launch_operation(harness: &LaunchHarness, journal: &engine::JournalWriter) -> String {
+        let invocation = format!(
+            "{}::stdio_launch",
+            engine::RunContext::execution_invocation(journal, &harness.node)
+        );
+        match harness
+            .run
+            .guard_external_operation(
+                journal,
+                &harness.node,
+                "mcp.stdio_launch",
+                "local",
+                &None,
+                &invocation,
+            )
+            .unwrap()
+        {
+            engine::GuardDecision::Proceed { operation_id } => operation_id,
+            engine::GuardDecision::Resend { .. } => panic!("fresh launch must start"),
+        }
+    }
+
+    #[test]
+    fn confirmed_session_close_settles_the_stdio_launch() {
+        let harness = LaunchHarness::new("local", Some("/nonexistent/unused"));
+        let journal = harness.journal();
+        let id = start_launch_operation(&harness, &journal);
+        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
+        let ctx = StepContext {
+            run: &harness.run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        settle_stdio_launch_after_close(&ctx, &harness.node, Some(&id), None).unwrap();
+
+        let finishes = harness.events("operation_finished");
+        assert_eq!(finishes.len(), 1);
+        assert_eq!(finishes[0]["operation_id"], id);
+        assert_eq!(finishes[0]["status"], "clean");
+        assert_eq!(
+            journal.state().operation_records[&id].status,
+            engine::OperationStatus::FailedClean
+        );
+    }
+
+    #[test]
+    fn unconfirmed_session_close_keeps_the_stdio_launch_started() {
+        let harness = LaunchHarness::new("local", Some("/nonexistent/unused"));
+        let journal = harness.journal();
+        let id = start_launch_operation(&harness, &journal);
+        let close_error = StepError::failed(&harness.node.id, "session close timed out");
+        let mut vars = contract::ValueBag::with_inputs(std::collections::BTreeMap::new());
+        let ctx = StepContext {
+            run: &harness.run,
+            journal: &journal,
+            vars: &mut vars,
+            llm: None,
+        };
+        settle_stdio_launch_after_close(&ctx, &harness.node, Some(&id), Some(&close_error))
+            .unwrap();
+
+        assert!(harness.events("operation_finished").is_empty());
+        assert_eq!(
+            journal.state().operation_records[&id].status,
+            engine::OperationStatus::Started
         );
     }
 
