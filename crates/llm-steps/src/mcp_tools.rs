@@ -472,10 +472,16 @@ impl McpAgentTools {
                         authorization_required.push(failure.server);
                         continue;
                     }
+                    // Every proven clean pre-launch failure must settle its own
+                    // launch, independent of which failure is selected as the
+                    // primary error. Deferring settlement behind
+                    // `discovery_error.is_none()` would leave a sibling's launch
+                    // Started and block the next owner's recovery. Only the
+                    // choice of which error to report is first-wins.
                     if discovery_failure_is_clean(&failure.error)
-                        && discovery_error.is_none()
                         && let Err(error) =
                             settle_discovery_launch(ctx, node, failure.launch.as_deref())
+                        && discovery_error.is_none()
                     {
                         discovery_error = Some(error);
                     }
@@ -1581,6 +1587,69 @@ max_tokens_total = 100
                 OperationStatus::Started
             );
             assert!(state.ensure_no_inflight_operations().is_err());
+        }
+
+        /// Two profiles admitted to the launch journal but both refused before
+        /// any child spawns must BOTH settle. A sibling's primary error must
+        /// never leave another launch Started, which would block the next
+        /// owner's continuation/deletion with a fictitious unresolved launch.
+        #[tokio::test]
+        async fn two_clean_prelaunch_refusals_settle_both_launches() {
+            let root = Fixture::root();
+            // No permitted commands: both stdio profiles are refused before
+            // spawn, but each still gets a launch journaled in prepare's setup.
+            let fixture = Fixture::new(root, &[]);
+            let runtime = runtime(vec![
+                stdio_spec("alpha", vec!["/unpermitted/alpha".to_owned()]),
+                stdio_spec("beta", vec!["/unpermitted/beta".to_owned()]),
+            ]);
+            let journal = fixture.journal();
+            let mut vars = contract::ValueBag::with_inputs(BTreeMap::new());
+            let ctx = fixture.context(&journal, &mut vars);
+            assert!(
+                McpAgentTools::prepare(
+                    &ctx,
+                    &fixture.node,
+                    &runtime,
+                    &[
+                        declaration("alpha", "a-tool"),
+                        declaration("beta", "b-tool")
+                    ],
+                )
+                .await
+                .is_err(),
+                "unpermitted stdio commands must fail discovery"
+            );
+
+            let launches = fixture.launches();
+            assert_eq!(
+                launches.len(),
+                2,
+                "both profiles were admitted with a launch before connect"
+            );
+            let ids = launches
+                .iter()
+                .map(|event| event["operation_id"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            assert_ne!(ids[0], ids[1], "distinct profiles get distinct launches");
+            let finishes = fixture.finishes();
+            assert_eq!(
+                finishes.len(),
+                2,
+                "each clean pre-launch refusal settles its own launch"
+            );
+            let state = fixture.disk_state();
+            for id in &ids {
+                assert_eq!(
+                    state.operation_records[id].status,
+                    OperationStatus::FailedClean,
+                    "launch {id} must be settled clean"
+                );
+            }
+            assert!(
+                state.ensure_no_inflight_operations().is_ok(),
+                "no fictitious unresolved launch may block recovery"
+            );
         }
 
         #[tokio::test]
