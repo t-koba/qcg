@@ -62,11 +62,14 @@ pub(crate) struct BoundedChildTransport {
     inject_close_failure: bool,
     #[cfg(all(unix, feature = "test-probe"))]
     inject_group_signal_failure: bool,
-    /// Simulates XNU's ambiguous `killpg` EPERM with a controlled answer to
-    /// "is there a live member in the owned group?". `Some(true)` must keep the
-    /// close unconfirmed; `Some(false)` is the benign zombie-only case.
+    /// Overrides the errno observed from the owned group's `killpg`, so the
+    /// real failure classifier runs deterministically on every host.
     #[cfg(all(unix, feature = "test-probe"))]
-    inject_group_signal_eperm_live: Option<bool>,
+    inject_group_signal_errno: Option<i32>,
+    /// Overrides the owned-group liveness answer used by the classifier:
+    /// `Ok(true)` live member, `Ok(false)` zombie-only, `Err` unreadable.
+    #[cfg(all(unix, feature = "test-probe"))]
+    inject_group_live_member: Option<std::io::Result<bool>>,
 }
 
 impl BoundedChildTransport {
@@ -94,7 +97,9 @@ impl BoundedChildTransport {
         let inject_group_signal_failure =
             crate::mcp::session::close_probe::should_fail_group_signal();
         #[cfg(all(unix, feature = "test-probe"))]
-        let inject_group_signal_eperm_live = None;
+        let inject_group_signal_errno = None;
+        #[cfg(all(unix, feature = "test-probe"))]
+        let inject_group_live_member = None;
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -144,7 +149,9 @@ impl BoundedChildTransport {
             #[cfg(all(unix, feature = "test-probe"))]
             inject_group_signal_failure,
             #[cfg(all(unix, feature = "test-probe"))]
-            inject_group_signal_eperm_live,
+            inject_group_signal_errno,
+            #[cfg(all(unix, feature = "test-probe"))]
+            inject_group_live_member,
         })
     }
 
@@ -268,33 +275,34 @@ impl BoundedChildTransport {
                     "injected MCP stdio process-group signal failure",
                 ));
             }
+            // Test probes override the errno and the group-state answer that
+            // feed the classifier below, so the real decision runs unchanged on
+            // any host; production reads both from the live system.
             #[cfg(feature = "test-probe")]
-            if let Some(live_member) = self.inject_group_signal_eperm_live {
-                // Model XNU's ambiguous EPERM with a controlled liveness
-                // answer so both branches are exercised on every platform.
-                return if live_member {
-                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
-                } else {
-                    Ok(())
+            let injected_errno = self.inject_group_signal_errno;
+            #[cfg(not(feature = "test-probe"))]
+            let injected_errno: Option<i32> = None;
+            #[cfg(feature = "test-probe")]
+            let injected_live_member = self.inject_group_live_member.take();
+            #[cfg(not(feature = "test-probe"))]
+            let injected_live_member: Option<std::io::Result<bool>> = None;
+
+            if result == -1 || injected_errno.is_some() {
+                let error = match injected_errno {
+                    Some(errno) => std::io::Error::from_raw_os_error(errno),
+                    None => std::io::Error::last_os_error(),
                 };
-            }
-            if result == -1 {
-                let error = std::io::Error::last_os_error();
-                // A vanished group is always benign: nothing is left to signal.
-                if error.raw_os_error() == Some(libc::ESRCH) {
-                    return Ok(());
-                }
-                // XNU reports EPERM both for a zombie-only group (benign) and
-                // for a live setuid/setgid member that refused SIGKILL (a real
-                // containment failure). Errno alone cannot tell them apart, so
-                // suppress EPERM only after proving the owned group has no live
-                // member. Every other outcome keeps the close unconfirmed.
                 // The PGID equals the leader PID (spawned with process_group(0)).
-                // That leader is our known-exited WNOWAIT zombie, not a live
-                // member, so it is excluded from the liveness check below.
-                if error.raw_os_error() == Some(libc::EPERM)
-                    && !owned_group_has_live_member(process_group_id).unwrap_or(true)
-                {
+                // That leader is a known-exited WNOWAIT zombie, not a live
+                // member, so owned_group_has_live_member excludes it.
+                let benign = is_benign_group_signal_failure(
+                    error.raw_os_error().unwrap_or_default(),
+                    || match injected_live_member {
+                        Some(answer) => answer,
+                        None => owned_group_has_live_member(process_group_id),
+                    },
+                );
+                if benign {
                     return Ok(());
                 }
                 return Err(error);
@@ -345,6 +353,24 @@ impl Drop for BoundedChildTransport {
     }
 }
 
+/// Decide whether a failed owned-group signal is benign and may confirm close.
+///
+/// `live_member` is evaluated lazily and only for XNU's ambiguous EPERM. A
+/// vanished group (`ESRCH`) holds no effect; EPERM is benign only for a proven
+/// zombie-only group (`Ok(false)`). A live member (`Ok(true)`), unreadable group
+/// state (`Err`), and every other errno keep the close unconfirmed.
+#[cfg(unix)]
+fn is_benign_group_signal_failure(
+    errno: i32,
+    live_member: impl FnOnce() -> std::io::Result<bool>,
+) -> bool {
+    match errno {
+        libc::ESRCH => true,
+        libc::EPERM => matches!(live_member(), Ok(false)),
+        _ => false,
+    }
+}
+
 /// Whether the owned process group still contains a live (non-zombie) member.
 ///
 /// Used only to disambiguate XNU's `killpg` EPERM. The group leader's PID equals
@@ -370,8 +396,10 @@ fn owned_group_has_live_member(process_group_id: i32) -> std::io::Result<bool> {
         )
     };
     if needed <= 0 {
-        // No members reported: the group has no live member.
-        return Ok(false);
+        // libproc collapses a __proc_info failure to 0, and a successful
+        // sizing query is always strictly positive. An error must fail closed:
+        // callers treat Err as "live" and keep the close unconfirmed.
+        return Err(std::io::Error::other("proc_listpids sizing failed"));
     }
     let needed = usize::try_from(needed)
         .map_err(|_| std::io::Error::other("process group size overflow"))?;
@@ -392,7 +420,9 @@ fn owned_group_has_live_member(process_group_id: i32) -> std::io::Result<bool> {
         )
     };
     if filled <= 0 {
-        return Ok(false);
+        // Either a listing failure or the group vanished; both are ambiguous
+        // here, so fail closed rather than confirming an unproven cleanup.
+        return Err(std::io::Error::other("proc_listpids listing failed"));
     }
     let filled = usize::try_from(filled)
         .map_err(|_| std::io::Error::other("process group count overflow"))?
@@ -590,13 +620,34 @@ mod tests {
         assert_eq!(output, input);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn group_signal_failure_classification_is_state_aware_and_fails_closed() {
+        // A vanished group is benign: there is nothing left to signal.
+        assert!(is_benign_group_signal_failure(libc::ESRCH, || panic!(
+            "ESRCH must not consult group state"
+        )));
+        // XNU's ambiguous EPERM is benign only for a proven zombie-only group.
+        assert!(is_benign_group_signal_failure(libc::EPERM, || Ok(false)));
+        // A live unsignaled member keeps the close unconfirmed.
+        assert!(!is_benign_group_signal_failure(libc::EPERM, || Ok(true)));
+        // Unreadable group state must fail closed, never confirm cleanup.
+        assert!(!is_benign_group_signal_failure(libc::EPERM, || {
+            Err(std::io::Error::other("unreadable"))
+        }));
+        // Every other signal failure stays fatal.
+        assert!(!is_benign_group_signal_failure(libc::EINVAL, || Ok(false)));
+    }
+
     #[cfg(all(unix, feature = "test-probe"))]
     #[tokio::test]
     async fn live_member_group_signal_eperm_keeps_the_close_unconfirmed() {
         // XNU's EPERM is ambiguous: a live setuid/setgid member that refused
-        // SIGKILL must never be mistaken for a benign zombie-only group.
+        // SIGKILL must never be mistaken for a benign zombie-only group. The
+        // injected errno and answer flow through the real classifier.
         let mut transport = shell_transport("cat >/dev/null; exit 0");
-        transport.inject_group_signal_eperm_live = Some(true);
+        transport.inject_group_signal_errno = Some(libc::EPERM);
+        transport.inject_group_live_member = Some(Ok(true));
         let error = transport
             .close()
             .await
@@ -614,10 +665,26 @@ mod tests {
 
     #[cfg(all(unix, feature = "test-probe"))]
     #[tokio::test]
+    async fn unreadable_group_state_eperm_keeps_the_close_unconfirmed() {
+        // If group membership cannot be read, the EPERM cannot be proven benign.
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_errno = Some(libc::EPERM);
+        transport.inject_group_live_member = Some(Err(std::io::Error::other("unreadable")));
+        let error = transport
+            .close()
+            .await
+            .expect_err("unreadable group state must fail the owned close");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+        assert!(!transport.close_receipt().confirmed());
+    }
+
+    #[cfg(all(unix, feature = "test-probe"))]
+    #[tokio::test]
     async fn zombie_only_group_signal_eperm_confirms_the_close() {
         // A zombie-only group holds no protected effect, so its EPERM is benign.
         let mut transport = shell_transport("cat >/dev/null; exit 0");
-        transport.inject_group_signal_eperm_live = Some(false);
+        transport.inject_group_signal_errno = Some(libc::EPERM);
+        transport.inject_group_live_member = Some(Ok(false));
         transport
             .close()
             .await
