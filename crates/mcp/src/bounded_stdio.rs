@@ -261,8 +261,16 @@ impl BoundedChildTransport {
             }
             if result == -1 {
                 let error = std::io::Error::last_os_error();
-                // The group is already gone, so there is nothing to signal.
-                if error.raw_os_error() != Some(libc::ESRCH) {
+                // "No live member left in the owned group" is a successful
+                // cleanup, not a failure. Linux reports ESRCH; XNU (macOS)
+                // skips exited, unreaped zombie members and reports EPERM for
+                // a zombie-only group, which is our WNOWAIT leader after a
+                // clean exit. Any other errno is a genuine signal failure and
+                // must leave the owned close unconfirmed.
+                if !error
+                    .raw_os_error()
+                    .is_some_and(is_benign_group_signal_errno)
+                {
                     return Err(error);
                 }
             }
@@ -310,6 +318,18 @@ impl Drop for BoundedChildTransport {
         let _ = self.terminate_process_group();
         self.kill_container_blocking();
     }
+}
+
+/// Errnos that mean the owned process group has no live member left to signal.
+///
+/// Linux reports `ESRCH` once the group is gone. XNU (macOS) excludes exited,
+/// unreaped zombie members from group signaling and reports `EPERM` when the
+/// group is zombie-only; with `WNOWAIT` the exited leader is exactly such a
+/// member. Neither errno proves a cleanup failure. Every other errno is a
+/// genuine signal failure that keeps the owned close unconfirmed.
+#[cfg(unix)]
+fn is_benign_group_signal_errno(errno: i32) -> bool {
+    errno == libc::ESRCH || errno == libc::EPERM
 }
 
 #[cfg(unix)]
@@ -444,6 +464,15 @@ mod tests {
             .await
             .expect("individually bounded lines should pass");
         assert_eq!(output, input);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn benign_group_signal_errnos_cover_linux_and_xnu_zombie_groups() {
+        assert!(is_benign_group_signal_errno(libc::ESRCH));
+        assert!(is_benign_group_signal_errno(libc::EPERM));
+        assert!(!is_benign_group_signal_errno(libc::EINVAL));
+        assert!(!is_benign_group_signal_errno(libc::ECHILD));
     }
 
     #[cfg(unix)]
