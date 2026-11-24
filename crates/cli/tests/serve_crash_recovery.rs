@@ -38,7 +38,7 @@ const DELETE_REFUSAL: &str = "unresolved external operation";
 // Transient, fail-closed lease refusal. Recovery/replay can briefly hold the
 // source execution lease after restart; this precedes, and is distinct from,
 // the unresolved Started gate the DELETE assertions below must reach.
-const EXECUTING_ELSEWHERE: &str = "is executing elsewhere";
+const EXECUTING_ELSEWHERE: &str = "is executing elsewhere; wait for its owner to exit or cancel and wait for settlement before deletion";
 const GENERATOR_ID: &str = "serve-crash-host-command";
 // The default command and its descendant exit together after 30s, well past
 // this test's normal runtime, so no saved-PID cleanup is needed.
@@ -426,13 +426,27 @@ async fn crash_and_recover(
     }
 }
 
+/// The exact `problem+json` detail emitted by the execution-lease gate for
+/// `run_id` (see `crates/service/src/runs_api/query.rs`). Only this
+/// run-specific detail counts as the transient lease.
+fn execution_lease_detail(run_id: &str) -> String {
+    format!("run `{run_id}` {EXECUTING_ELSEWHERE}")
+}
+
 /// A DELETE is retried only for the specific fail-closed condition this
-/// liveness wait exists to outlast: a 409 Conflict whose problem detail names
-/// the transient execution lease. Every other response — including an
-/// unexpected status or an unrelated body that happens to contain the phrase —
-/// is returned immediately so the Started-gate assertions below evaluate it.
-fn is_transient_execution_lease(status: reqwest::StatusCode, body: &str) -> bool {
-    status == reqwest::StatusCode::CONFLICT && body.contains(EXECUTING_ELSEWHERE)
+/// liveness wait exists to outlast: an RFC 7807 Conflict whose parsed `detail`
+/// is exactly this run's transient execution-lease detail. Every other
+/// response — including an unexpected status, an unrelated body, a same-status
+/// problem whose phrase lives outside `detail`, or another run's lease — is
+/// returned immediately so the Started-gate assertions below evaluate it.
+fn is_transient_execution_lease(status: reqwest::StatusCode, body: &str, run_id: &str) -> bool {
+    if status != reqwest::StatusCode::CONFLICT {
+        return false;
+    }
+    let Ok(problem) = serde_json::from_str::<Value>(body) else {
+        return false;
+    };
+    problem["detail"].as_str() == Some(execution_lease_detail(run_id).as_str())
 }
 
 /// Fail-closed checks shared by both containment paths. All endpoints here
@@ -474,7 +488,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
             let deleted = client.delete(&snapshot_url).send().await.unwrap();
             let status = deleted.status();
             let body = deleted.text().await.unwrap();
-            if !is_transient_execution_lease(status, &body) {
+            if !is_transient_execution_lease(status, &body, run_id) {
                 return (status, body);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -575,28 +589,85 @@ async fn delegated_serve_restart_reclaims_command_and_descendant() {
 }
 
 #[test]
-fn transient_lease_retry_requires_conflict_status_and_lease_detail() {
+fn transient_lease_retry_requires_conflict_status_and_run_specific_detail() {
     use reqwest::StatusCode;
-    let lease_detail = "run `r` is executing elsewhere; wait for its owner to exit";
+    let run = "run-with-lease";
+    let lease_body = json!({
+        "type": "https://example.invalid/problems/conflict",
+        "title": "Resource conflict",
+        "status": 409,
+        "detail": execution_lease_detail(run),
+        "instance": "",
+        "code": "conflict",
+        "errors": [],
+    })
+    .to_string();
     // The only condition allowed to be retried.
     assert!(is_transient_execution_lease(
         StatusCode::CONFLICT,
-        lease_detail
+        &lease_body,
+        run
     ));
-    // An unexpected status carrying the same phrase must NOT be discarded.
-    assert!(!is_transient_execution_lease(
+
+    // An unexpected status carrying the exact lease detail must NOT be discarded.
+    for status in [
         StatusCode::INTERNAL_SERVER_ERROR,
-        lease_detail
-    ));
-    assert!(!is_transient_execution_lease(StatusCode::OK, lease_detail));
-    assert!(!is_transient_execution_lease(
+        StatusCode::OK,
         StatusCode::BAD_REQUEST,
-        lease_detail
-    ));
-    // A conflict without the lease detail is the real Started gate; it must
-    // be returned to the assertions below, never retried away.
+    ] {
+        assert!(!is_transient_execution_lease(status, &lease_body, run));
+    }
+
+    // A 409 that is the real Started gate: return it to the assertions below,
+    // never retry it away.
+    let started_gate = json!({
+        "status": 409,
+        "code": "conflict",
+        "detail": "unresolved external operation: qcg has not proved that the effect stopped",
+    })
+    .to_string();
     assert!(!is_transient_execution_lease(
         StatusCode::CONFLICT,
-        "unresolved external operation: qcg has not proved that the effect stopped"
+        &started_gate,
+        run
+    ));
+
+    // Same status, lease phrase outside the problem detail: not a lease.
+    let phrase_outside = json!({
+        "status": 409,
+        "detail": "unresolved external operation",
+        "note": format!("run `{run}` {EXECUTING_ELSEWHERE}"),
+    })
+    .to_string();
+    assert!(!is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        &phrase_outside,
+        run
+    ));
+
+    // Same status, a different detail that merely quotes the phrase: not a lease.
+    let quoted = json!({
+        "status": 409,
+        "detail": format!("some other conflict; see run `{run}` {EXECUTING_ELSEWHERE}"),
+    })
+    .to_string();
+    assert!(!is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        &quoted,
+        run
+    ));
+
+    // Another run's lease detail must not be retried as this run's lease.
+    assert!(!is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        &lease_body,
+        "another-run"
+    ));
+
+    // A malformed body is not a problem document and cannot be a lease.
+    assert!(!is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        "not json",
+        run
     ));
 }
