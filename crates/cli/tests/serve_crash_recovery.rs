@@ -426,6 +426,15 @@ async fn crash_and_recover(
     }
 }
 
+/// A DELETE is retried only for the specific fail-closed condition this
+/// liveness wait exists to outlast: a 409 Conflict whose problem detail names
+/// the transient execution lease. Every other response — including an
+/// unexpected status or an unrelated body that happens to contain the phrase —
+/// is returned immediately so the Started-gate assertions below evaluate it.
+fn is_transient_execution_lease(status: reqwest::StatusCode, body: &str) -> bool {
+    status == reqwest::StatusCode::CONFLICT && body.contains(EXECUTING_ELSEWHERE)
+}
+
 /// Fail-closed checks shared by both containment paths. All endpoints here
 /// run after the first recovery observation (and, for the delegated path,
 /// after its scope-reclaim assertion).
@@ -465,7 +474,7 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
             let deleted = client.delete(&snapshot_url).send().await.unwrap();
             let status = deleted.status();
             let body = deleted.text().await.unwrap();
-            if !body.contains(EXECUTING_ELSEWHERE) {
+            if !is_transient_execution_lease(status, &body) {
                 return (status, body);
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
@@ -563,4 +572,31 @@ async fn delegated_serve_restart_reclaims_command_and_descendant() {
     let recovered = crash_and_recover(&mut fixture, &client, &base, port).await;
     assert_scope_reclaimed(&fixture.runs_dir, &recovered);
     assert_refusals(&client, &base, &recovered).await;
+}
+
+#[test]
+fn transient_lease_retry_requires_conflict_status_and_lease_detail() {
+    use reqwest::StatusCode;
+    let lease_detail = "run `r` is executing elsewhere; wait for its owner to exit";
+    // The only condition allowed to be retried.
+    assert!(is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        lease_detail
+    ));
+    // An unexpected status carrying the same phrase must NOT be discarded.
+    assert!(!is_transient_execution_lease(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        lease_detail
+    ));
+    assert!(!is_transient_execution_lease(StatusCode::OK, lease_detail));
+    assert!(!is_transient_execution_lease(
+        StatusCode::BAD_REQUEST,
+        lease_detail
+    ));
+    // A conflict without the lease detail is the real Started gate; it must
+    // be returned to the assertions below, never retried away.
+    assert!(!is_transient_execution_lease(
+        StatusCode::CONFLICT,
+        "unresolved external operation: qcg has not proved that the effect stopped"
+    ));
 }
