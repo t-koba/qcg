@@ -31,6 +31,11 @@ pub(crate) mod close_probe {
         static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
     }
 
+    #[cfg(unix)]
+    thread_local! {
+        static FAIL_GROUP_SIGNAL: Cell<bool> = const { Cell::new(false) };
+    }
+
     /// Makes an owned stdio transport's close fail for as long as this guard
     /// is alive, so the session cannot confirm that its child was cleaned up.
     pub struct FailClose;
@@ -49,10 +54,35 @@ pub(crate) mod close_probe {
             FAIL_CLOSE.set(false);
         }
     }
+
+    /// Makes a stdio transport's process-group signal fail for as long as this
+    /// guard is alive, so the close cannot be confirmed.
+    #[cfg(unix)]
+    pub struct FailGroupSignal;
+
+    #[cfg(unix)]
+    pub fn fail_group_signal() -> FailGroupSignal {
+        FAIL_GROUP_SIGNAL.set(true);
+        FailGroupSignal
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn should_fail_group_signal() -> bool {
+        FAIL_GROUP_SIGNAL.get()
+    }
+
+    #[cfg(unix)]
+    impl Drop for FailGroupSignal {
+        fn drop(&mut self) {
+            FAIL_GROUP_SIGNAL.set(false);
+        }
+    }
 }
 
 #[cfg(feature = "test-probe")]
 pub use close_probe::fail_close;
+#[cfg(all(unix, feature = "test-probe"))]
+pub use close_probe::fail_group_signal;
 
 pub struct McpSession {
     pub(crate) profile: McpProfile,

@@ -60,6 +60,8 @@ pub(crate) struct BoundedChildTransport {
     close_receipt: CloseReceipt,
     #[cfg(feature = "test-probe")]
     inject_close_failure: bool,
+    #[cfg(all(unix, feature = "test-probe"))]
+    inject_group_signal_failure: bool,
 }
 
 impl BoundedChildTransport {
@@ -83,6 +85,9 @@ impl BoundedChildTransport {
         // flag can only be read here, on the constructing (test) thread.
         #[cfg(feature = "test-probe")]
         let inject_close_failure = crate::mcp::session::close_probe::should_fail_close();
+        #[cfg(all(unix, feature = "test-probe"))]
+        let inject_group_signal_failure =
+            crate::mcp::session::close_probe::should_fail_group_signal();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -129,6 +134,8 @@ impl BoundedChildTransport {
             close_receipt: CloseReceipt::new(),
             #[cfg(feature = "test-probe")]
             inject_close_failure,
+            #[cfg(all(unix, feature = "test-probe"))]
+            inject_group_signal_failure,
         })
     }
 
@@ -174,9 +181,10 @@ impl BoundedChildTransport {
         match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, self.transport.close()).await {
             Ok(result) => result?,
             Err(_) => {
-                self.terminate_process_group();
+                let group_result = self.terminate_process_group();
                 self.terminate_child().await?;
                 self.kill_container_blocking();
+                group_result?;
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "MCP stdio transport close timed out",
@@ -188,9 +196,10 @@ impl BoundedChildTransport {
                 result?;
             }
             Err(_) => {
-                self.terminate_process_group();
+                let group_result = self.terminate_process_group();
                 self.terminate_child().await?;
                 self.kill_container_blocking();
+                group_result?;
             }
         }
         self.kill_container_blocking();
@@ -212,7 +221,7 @@ impl BoundedChildTransport {
             loop {
                 match child_exit_is_waitable(pid) {
                     Ok(true) => {
-                        self.terminate_process_group();
+                        self.terminate_process_group()?;
                         break;
                     }
                     Ok(false) => {}
@@ -234,16 +243,31 @@ impl BoundedChildTransport {
         self.child.wait().await.map(|_| ())
     }
 
-    fn terminate_process_group(&mut self) {
+    fn terminate_process_group(&mut self) -> std::io::Result<()> {
         #[cfg(unix)]
-        if let Some(process_group_id) = self.process_group_id.take() {
+        {
+            let Some(process_group_id) = self.process_group_id.take() else {
+                return Ok(());
+            };
             // SAFETY: the child is spawned into a dedicated process group with
             // this id and has not been reaped. Only descendants still in this
             // group are covered; processes that leave it are outside our scope.
-            unsafe {
-                libc::killpg(process_group_id, libc::SIGKILL);
+            let result = unsafe { libc::killpg(process_group_id, libc::SIGKILL) };
+            #[cfg(feature = "test-probe")]
+            if self.inject_group_signal_failure {
+                return Err(std::io::Error::other(
+                    "injected MCP stdio process-group signal failure",
+                ));
+            }
+            if result == -1 {
+                let error = std::io::Error::last_os_error();
+                // The group is already gone, so there is nothing to signal.
+                if error.raw_os_error() != Some(libc::ESRCH) {
+                    return Err(error);
+                }
             }
         }
+        Ok(())
     }
 
     async fn terminate_child(&mut self) -> std::io::Result<()> {
@@ -282,7 +306,8 @@ fn apply_host_scope(
 
 impl Drop for BoundedChildTransport {
     fn drop(&mut self) {
-        self.terminate_process_group();
+        // Drop stays best effort: no receipt can be settled here.
+        let _ = self.terminate_process_group();
         self.kill_container_blocking();
     }
 }
@@ -426,6 +451,31 @@ mod tests {
         let mut command = tokio::process::Command::new("/bin/sh");
         command.args(["-c", script]);
         BoundedChildTransport::spawn(command, 1024).expect("shell transport should spawn")
+    }
+
+    #[cfg(all(unix, feature = "test-probe"))]
+    #[tokio::test]
+    async fn injected_group_signal_failure_leaves_the_close_unconfirmed() {
+        let _fail_group_signal = crate::mcp::session::close_probe::fail_group_signal();
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        let error = transport
+            .close()
+            .await
+            .expect_err("a failed group signal must fail the owned close");
+        assert!(
+            error
+                .to_string()
+                .contains("injected MCP stdio process-group signal failure"),
+            "{error}"
+        );
+        assert!(
+            !transport.close_receipt().confirmed(),
+            "an unconfirmed close must not settle the launch"
+        );
+        assert!(
+            transport.process_group_id.is_none(),
+            "the PGID was consumed before signalling, so Drop cannot re-signal"
+        );
     }
 
     // Unix-only: process-group child reaping has no Windows counterpart, so
