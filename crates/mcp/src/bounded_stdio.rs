@@ -62,6 +62,11 @@ pub(crate) struct BoundedChildTransport {
     inject_close_failure: bool,
     #[cfg(all(unix, feature = "test-probe"))]
     inject_group_signal_failure: bool,
+    /// Simulates XNU's ambiguous `killpg` EPERM with a controlled answer to
+    /// "is there a live member in the owned group?". `Some(true)` must keep the
+    /// close unconfirmed; `Some(false)` is the benign zombie-only case.
+    #[cfg(all(unix, feature = "test-probe"))]
+    inject_group_signal_eperm_live: Option<bool>,
 }
 
 impl BoundedChildTransport {
@@ -88,6 +93,8 @@ impl BoundedChildTransport {
         #[cfg(all(unix, feature = "test-probe"))]
         let inject_group_signal_failure =
             crate::mcp::session::close_probe::should_fail_group_signal();
+        #[cfg(all(unix, feature = "test-probe"))]
+        let inject_group_signal_eperm_live = None;
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -136,6 +143,8 @@ impl BoundedChildTransport {
             inject_close_failure,
             #[cfg(all(unix, feature = "test-probe"))]
             inject_group_signal_failure,
+            #[cfg(all(unix, feature = "test-probe"))]
+            inject_group_signal_eperm_live,
         })
     }
 
@@ -259,20 +268,36 @@ impl BoundedChildTransport {
                     "injected MCP stdio process-group signal failure",
                 ));
             }
+            #[cfg(feature = "test-probe")]
+            if let Some(live_member) = self.inject_group_signal_eperm_live {
+                // Model XNU's ambiguous EPERM with a controlled liveness
+                // answer so both branches are exercised on every platform.
+                return if live_member {
+                    Err(std::io::Error::from_raw_os_error(libc::EPERM))
+                } else {
+                    Ok(())
+                };
+            }
             if result == -1 {
                 let error = std::io::Error::last_os_error();
-                // "No live member left in the owned group" is a successful
-                // cleanup, not a failure. Linux reports ESRCH; XNU (macOS)
-                // skips exited, unreaped zombie members and reports EPERM for
-                // a zombie-only group, which is our WNOWAIT leader after a
-                // clean exit. Any other errno is a genuine signal failure and
-                // must leave the owned close unconfirmed.
-                if !error
-                    .raw_os_error()
-                    .is_some_and(is_benign_group_signal_errno)
-                {
-                    return Err(error);
+                // A vanished group is always benign: nothing is left to signal.
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    return Ok(());
                 }
+                // XNU reports EPERM both for a zombie-only group (benign) and
+                // for a live setuid/setgid member that refused SIGKILL (a real
+                // containment failure). Errno alone cannot tell them apart, so
+                // suppress EPERM only after proving the owned group has no live
+                // member. Every other outcome keeps the close unconfirmed.
+                // The PGID equals the leader PID (spawned with process_group(0)).
+                // That leader is our known-exited WNOWAIT zombie, not a live
+                // member, so it is excluded from the liveness check below.
+                if error.raw_os_error() == Some(libc::EPERM)
+                    && !owned_group_has_live_member(process_group_id).unwrap_or(true)
+                {
+                    return Ok(());
+                }
+                return Err(error);
             }
         }
         Ok(())
@@ -320,16 +345,115 @@ impl Drop for BoundedChildTransport {
     }
 }
 
-/// Errnos that mean the owned process group has no live member left to signal.
+/// Whether the owned process group still contains a live (non-zombie) member.
 ///
-/// Linux reports `ESRCH` once the group is gone. XNU (macOS) excludes exited,
-/// unreaped zombie members from group signaling and reports `EPERM` when the
-/// group is zombie-only; with `WNOWAIT` the exited leader is exactly such a
-/// member. Neither errno proves a cleanup failure. Every other errno is a
-/// genuine signal failure that keeps the owned close unconfirmed.
-#[cfg(unix)]
-fn is_benign_group_signal_errno(errno: i32) -> bool {
-    errno == libc::ESRCH || errno == libc::EPERM
+/// Used only to disambiguate XNU's `killpg` EPERM. The group leader's PID equals
+/// the PGID and is the known-exited WNOWAIT zombie, so it is excluded. An error
+/// reading group state is treated as "live" by callers so cleanup fails closed.
+#[cfg(target_os = "macos")]
+fn owned_group_has_live_member(process_group_id: i32) -> std::io::Result<bool> {
+    if process_group_id <= 0 {
+        return Err(std::io::Error::other("invalid process group id"));
+    }
+    // libproc's PROC_PGRP_ONLY lists the pids in a process group. `proc_listpids`
+    // is used directly because proc_listpgrppids is unreliable for live groups.
+    const PROC_PGRP_ONLY: u32 = 2;
+    const MAX_GROUP_PIDS: usize = 1 << 16;
+
+    // SAFETY: a null buffer with size zero only queries the required byte count.
+    let needed = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            process_group_id as u32,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if needed <= 0 {
+        // No members reported: the group has no live member.
+        return Ok(false);
+    }
+    let needed = usize::try_from(needed)
+        .map_err(|_| std::io::Error::other("process group size overflow"))?;
+    let count = needed / std::mem::size_of::<libc::pid_t>();
+    if count == 0 || count > MAX_GROUP_PIDS {
+        return Err(std::io::Error::other("unreasonable process group size"));
+    }
+    let mut pids = vec![0 as libc::pid_t; count];
+    let buffer_bytes = libc::c_int::try_from(std::mem::size_of_val(pids.as_slice()))
+        .map_err(|_| std::io::Error::other("process group buffer too large"))?;
+    // SAFETY: `pids` is a writable buffer of exactly `buffer_bytes` bytes.
+    let filled = unsafe {
+        libc::proc_listpids(
+            PROC_PGRP_ONLY,
+            process_group_id as u32,
+            pids.as_mut_ptr().cast(),
+            buffer_bytes,
+        )
+    };
+    if filled <= 0 {
+        return Ok(false);
+    }
+    let filled = usize::try_from(filled)
+        .map_err(|_| std::io::Error::other("process group count overflow"))?
+        .min(pids.len());
+    for &pid in pids.iter().take(filled) {
+        // The group leader (PGID) is a known-exited zombie; it cannot hold a
+        // protected effect. Only other members can be unsignaled live processes.
+        if pid <= 0 || pid == process_group_id {
+            continue;
+        }
+        if macos_process_is_live(pid, process_group_id)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_process_is_live(pid: libc::pid_t, process_group_id: i32) -> std::io::Result<bool> {
+    // SAFETY: zeroed storage is valid for proc_bsdinfo; the query does not
+    // retain the pointer after returning.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>();
+    let size_i32 = libc::c_int::try_from(size)
+        .map_err(|_| std::io::Error::other("process information size exceeds i32"))?;
+    let written = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            std::ptr::addr_of_mut!(info).cast(),
+            size_i32,
+        )
+    };
+    if written < size_i32 {
+        // State is unreadable (e.g. a live setuid/setgid member owned by another
+        // user). A zero-signal existence probe distinguishes a survivor from a
+        // gone process; an unexpected error fails closed.
+        // SAFETY: signal 0 only probes the numeric PID and changes no state.
+        let probe = unsafe { libc::kill(pid, 0) };
+        if probe == 0 {
+            return Ok(true);
+        }
+        let error = std::io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ESRCH) => Ok(false),
+            Some(libc::EPERM) => Ok(true),
+            _ => Err(error),
+        };
+    }
+    // Guard against PID reuse (a member that now belongs to a different group)
+    // and treat only genuinely running members as live blockers; exited zombies
+    // hold no protected effect.
+    Ok(info.pbi_pgid == process_group_id as u32 && info.pbi_status != libc::SZOMB)
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn owned_group_has_live_member(_process_group_id: i32) -> std::io::Result<bool> {
+    // Outside XNU a gone group reports ESRCH and zombies accept SIGKILL, so
+    // EPERM has no benign reading: treat it as a live member and fail closed.
+    Ok(true)
 }
 
 #[cfg(unix)]
@@ -466,13 +590,39 @@ mod tests {
         assert_eq!(output, input);
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn benign_group_signal_errnos_cover_linux_and_xnu_zombie_groups() {
-        assert!(is_benign_group_signal_errno(libc::ESRCH));
-        assert!(is_benign_group_signal_errno(libc::EPERM));
-        assert!(!is_benign_group_signal_errno(libc::EINVAL));
-        assert!(!is_benign_group_signal_errno(libc::ECHILD));
+    #[cfg(all(unix, feature = "test-probe"))]
+    #[tokio::test]
+    async fn live_member_group_signal_eperm_keeps_the_close_unconfirmed() {
+        // XNU's EPERM is ambiguous: a live setuid/setgid member that refused
+        // SIGKILL must never be mistaken for a benign zombie-only group.
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_eperm_live = Some(true);
+        let error = transport
+            .close()
+            .await
+            .expect_err("a live unsignaled member must fail the owned close");
+        assert_eq!(error.raw_os_error(), Some(libc::EPERM), "{error}");
+        assert!(
+            !transport.close_receipt().confirmed(),
+            "an unconfirmed close must not settle the launch"
+        );
+        assert!(
+            transport.process_group_id.is_none(),
+            "the PGID was consumed before signalling, so Drop cannot re-signal"
+        );
+    }
+
+    #[cfg(all(unix, feature = "test-probe"))]
+    #[tokio::test]
+    async fn zombie_only_group_signal_eperm_confirms_the_close() {
+        // A zombie-only group holds no protected effect, so its EPERM is benign.
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_eperm_live = Some(false);
+        transport
+            .close()
+            .await
+            .expect("a zombie-only group must confirm the owned close");
+        assert!(transport.close_receipt().confirmed());
     }
 
     #[cfg(unix)]
