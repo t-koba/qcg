@@ -211,13 +211,6 @@ impl StepExecutor for McpCallStep {
             profile.max_response_bytes(),
         )
         .await;
-        #[cfg(any(test, feature = "test-probe"))]
-        let close_result = if close_probe::should_fail_close() {
-            Err(mcp::McpError::TimedOut { seconds: 5 })
-        } else {
-            session.close().await
-        };
-        #[cfg(not(any(test, feature = "test-probe")))]
         let close_result = session.close().await;
         let cleanup_error = close_result
             .err()
@@ -240,48 +233,6 @@ impl StepExecutor for McpCallStep {
             cleanup_error.as_ref(),
         )?;
         outcome
-    }
-}
-
-/// Test-only seam for the session-close outcome inside `execute()`.
-///
-/// A stdio server's stderr/stdin shutdown path has no deterministic way to
-/// report a close failure to the client without relying on transport timeouts.
-/// Tests still need to prove that `execute()` forwards the close error to
-/// `settle_stdio_launch_after_close`, so they inject the exact `McpError`
-/// variant a genuinely timed-out `McpSession::close()` returns. Everything else in the
-/// call (connect, tools/list, tool call, journaling, settlement) stays real.
-/// The seam is compiled only for unit tests and the existing `test-probe`
-/// feature; default production builds always use the actual close result.
-#[cfg(any(test, feature = "test-probe"))]
-mod close_probe {
-    use std::cell::Cell;
-
-    thread_local! {
-        static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
-    }
-
-    /// Guard that injects a close timeout for the duration of its lifetime.
-    /// The only test that uses it drives a real stdio fixture and is Unix-only,
-    /// so keep the guard under the same cfg to avoid dead code on Windows.
-    #[cfg(all(test, unix))]
-    pub(crate) struct FailClose;
-
-    #[cfg(all(test, unix))]
-    pub(crate) fn fail_close() -> FailClose {
-        FAIL_CLOSE.set(true);
-        FailClose
-    }
-
-    pub(crate) fn should_fail_close() -> bool {
-        FAIL_CLOSE.get()
-    }
-
-    #[cfg(all(test, unix))]
-    impl Drop for FailClose {
-        fn drop(&mut self) {
-            FAIL_CLOSE.set(false);
-        }
     }
 }
 
@@ -855,9 +806,10 @@ while True:
         let harness = LaunchHarness::new("local", Some(server.as_str()));
         std::fs::create_dir_all(&harness.run.workspace).unwrap();
         let journal = harness.journal();
-        // The close error is injected at the seam inside execute(); connect,
-        // tools/list, the tool call and settlement all run the real path.
-        let _fail_close = super::close_probe::fail_close();
+        // The owned session's close returns a real timeout variant through
+        // session.close().await; connect, tools/list, the tool call and
+        // settlement all run the real path.
+        let _fail_close = mcp::fail_close();
         let step = stdio_initialize_step("local", server.as_str());
         let outcome = execute_launch(&harness, &journal, &step).await.unwrap();
         assert!(

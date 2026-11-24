@@ -19,6 +19,40 @@ use super::spec::{TASK_POLL_INTERVAL_MS_MAX, TASK_POLL_INTERVAL_MS_MIN};
 use super::transport::McpLifecycle;
 use super::validate::{guarded_transport_error, reject_credential_reflection};
 
+/// Deterministic failure in the owned session close path, for tests only.
+/// Compiled solely with the `test-probe` feature; production builds never
+/// consult it and keep the real transport close result.
+#[cfg(feature = "test-probe")]
+mod close_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Makes `McpSession::close()` return the real transport timeout error
+    /// for as long as this guard is alive.
+    pub struct FailClose;
+
+    pub fn fail_close() -> FailClose {
+        FAIL_CLOSE.set(true);
+        FailClose
+    }
+
+    pub(crate) fn should_fail_close() -> bool {
+        FAIL_CLOSE.get()
+    }
+
+    impl Drop for FailClose {
+        fn drop(&mut self) {
+            FAIL_CLOSE.set(false);
+        }
+    }
+}
+
+#[cfg(feature = "test-probe")]
+pub use close_probe::fail_close;
+
 pub struct McpSession {
     pub(crate) profile: McpProfile,
     pub(crate) client: Option<RunningService<RoleClient, McpClient>>,
@@ -380,6 +414,10 @@ impl McpSession {
     }
 
     pub async fn close(mut self) -> Result<(), McpError> {
+        #[cfg(feature = "test-probe")]
+        if close_probe::should_fail_close() {
+            return Err(McpError::TimedOut { seconds: 5 });
+        }
         let sensitive_values = self.sensitive_values_for_close().await?;
         let result = self
             .client

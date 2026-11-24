@@ -40,5 +40,7 @@ windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 engine = { path = "../engine", features = ["test-support"] }
+# Unit tests arm the owned-session close seam inside mcp; production builds do not.
+mcp = { path = "../mcp", features = ["test-probe"] }
 axum.workspace = true
 rmcp = { workspace = true, features = ["server", "transport-streamable-http-server"] }
