@@ -41,8 +41,24 @@ Unix API. No instance is started and no image is fetched. The
 `container-identity-incus` artifact contains only sanitized observations, always
 `crash_cleanup_certified:false` and `qcg_crash_recovery_test:false`.
 
-This is a diagnostic to run, not an Incus result already established here, and
-it provides no LXD evidence. Setup assumes Ubuntu's Incus packages, local socket,
+A real-daemon observation has since been established on an ephemeral Ubuntu
+24.04 runner with Incus 6.0.0: the stale name resolved to the replacement
+instance and removal through that stale name deleted the replacement
+(`outcome: observed_name_keyed_replacement_deletion`,
+`stale_name_resolved_to_replacement: true`,
+`stale_name_delete_removed_replacement: true`), while the artifact still
+records `crash_cleanup_certified:false` and `qcg_crash_recovery_test:false`.
+The observation is recorded in the `container-identity-incus/incus-identity.json`
+artifact (digest
+`6e10c6c8092a361348161585f517f570b6d13fe12651150124133033793d6a21`) from the
+`Container identity diagnostic` workflow run `45300052460`
+(https://github.com/t-koba/qcg/actions/runs/45300052460), check `Identity probe
+(Incus, not cleanup certification)`, on published revision
+`d76d469c579f51986ba6b60d01eae78d0e3991bb`. This is diagnostic evidence of the
+same name-keyed hazard seen with Docker and Podman, not a cleanup guarantee,
+and it provides no LXD evidence.
+
+Setup assumes Ubuntu's Incus packages, local socket,
 the initialized `default` storage pool, and API/`volatile.uuid` support. The
 project shares the default project's profiles (`features.profiles=false`);
 explicit storage selection supplies the root disk without relying on an
