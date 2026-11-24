@@ -35,6 +35,10 @@ const UNRESOLVED_EFFECT: &str = "qcg has not proved that the effect stopped";
 // idempotency pin that could short-circuit it.
 const CONTINUE_REFUSAL: &str = "source run is executing or has in-flight work";
 const DELETE_REFUSAL: &str = "unresolved external operation";
+// Transient, fail-closed lease refusal. Recovery/replay can briefly hold the
+// source execution lease after restart; this precedes, and is distinct from,
+// the unresolved Started gate the DELETE assertions below must reach.
+const EXECUTING_ELSEWHERE: &str = "is executing elsewhere";
 const GENERATOR_ID: &str = "serve-crash-host-command";
 // The default command and its descendant exit together after 30s, well past
 // this test's normal runtime, so no saved-PID cleanup is needed.
@@ -450,9 +454,25 @@ async fn assert_refusals(client: &reqwest::Client, base: &str, recovered: &Recov
     assert!(replay_body.contains(CONTINUE_REFUSAL), "{replay_body}");
     assert_unresolved_effect(&fetch_journal(client, base, run_id).await, operation_id);
 
-    let deleted = client.delete(&snapshot_url).send().await.unwrap();
-    let deleted_status = deleted.status();
-    let deleted_body = deleted.text().await.unwrap();
+    // The replay above and recovered-run reconciliation can briefly hold the
+    // source execution lease after the restart. While that lease is held,
+    // DELETE is refused at the earlier "executing elsewhere" gate rather than
+    // the unresolved Started gate this test exists to prove. Wait out only
+    // that transient, fail-closed lease conflict; every assertion below is
+    // unchanged, so the real Started-gate refusal is still required.
+    let (deleted_status, deleted_body) = tokio::time::timeout(TEST_LIVENESS_GUARD, async {
+        loop {
+            let deleted = client.delete(&snapshot_url).send().await.unwrap();
+            let status = deleted.status();
+            let body = deleted.text().await.unwrap();
+            if !body.contains(EXECUTING_ELSEWHERE) {
+                return (status, body);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("DELETE should reach the unresolved Started gate within the liveness guard");
     assert_eq!(
         deleted_status,
         reqwest::StatusCode::CONFLICT,
