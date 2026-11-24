@@ -1,4 +1,5 @@
 use crate::bounded_http::BoundedHttpClient;
+use crate::bounded_stdio::CloseReceipt;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, CancelTaskParams, GetTaskParams,
     InputResponses, PaginatedRequestParams, ProtocolVersion, TaskPayload, Tool,
@@ -23,15 +24,15 @@ use super::validate::{guarded_transport_error, reject_credential_reflection};
 /// Compiled solely with the `test-probe` feature; production builds never
 /// consult it and keep the real transport close result.
 #[cfg(feature = "test-probe")]
-mod close_probe {
+pub(crate) mod close_probe {
     use std::cell::Cell;
 
     thread_local! {
         static FAIL_CLOSE: Cell<bool> = const { Cell::new(false) };
     }
 
-    /// Makes `McpSession::close()` return the real transport timeout error
-    /// for as long as this guard is alive.
+    /// Makes an owned stdio transport's close fail for as long as this guard
+    /// is alive, so the session cannot confirm that its child was cleaned up.
     pub struct FailClose;
 
     pub fn fail_close() -> FailClose {
@@ -59,6 +60,7 @@ pub struct McpSession {
     pub(crate) cancellation: CancellationToken,
     pub(crate) credential_guard: CredentialGuard,
     pub(crate) active_sessions: Option<Arc<AtomicUsize>>,
+    owned_close_receipt: Option<CloseReceipt>,
 }
 
 impl McpSession {
@@ -95,7 +97,15 @@ impl McpSession {
             cancellation,
             credential_guard,
             active_sessions: None,
+            owned_close_receipt: None,
         })
+    }
+
+    /// Attaches the owned stdio transport's close outcome. HTTP sessions keep
+    /// the default `None` and their existing close semantics.
+    pub fn with_owned_close_receipt(mut self, receipt: CloseReceipt) -> Self {
+        self.owned_close_receipt = Some(receipt);
+        self
     }
 
     async fn sensitive_values(&self) -> Result<Vec<String>, McpError> {
@@ -414,10 +424,6 @@ impl McpSession {
     }
 
     pub async fn close(mut self) -> Result<(), McpError> {
-        #[cfg(feature = "test-probe")]
-        if close_probe::should_fail_close() {
-            return Err(McpError::TimedOut { seconds: 5 });
-        }
         let sensitive_values = self.sensitive_values_for_close().await?;
         let result = self
             .client
@@ -428,6 +434,16 @@ impl McpSession {
             .map_err(|error| guarded_transport_error(error, &sensitive_values))?;
         if result.is_none() {
             return Err(McpError::TimedOut { seconds: 5 });
+        }
+        // The SDK service loop logs a failed transport close but still
+        // reports a completed close. Only a confirmed owned close may settle
+        // the launch; without a receipt (HTTP) the SDK result stands alone.
+        if let Some(receipt) = &self.owned_close_receipt
+            && !receipt.confirmed()
+        {
+            return Err(McpError::Transport(
+                "owned MCP stdio transport close was not confirmed".into(),
+            ));
         }
         Ok(())
     }

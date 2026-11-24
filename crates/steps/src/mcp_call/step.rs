@@ -806,9 +806,9 @@ while True:
         let harness = LaunchHarness::new("local", Some(server.as_str()));
         std::fs::create_dir_all(&harness.run.workspace).unwrap();
         let journal = harness.journal();
-        // The owned session's close returns a real timeout variant through
-        // session.close().await; connect, tools/list, the tool call and
-        // settlement all run the real path.
+        // The probe now fails the owned transport's close, which the SDK
+        // service loop logs and swallows; connect, tools/list, the tool call
+        // and settlement all run the real path.
         let _fail_close = mcp::fail_close();
         let step = stdio_initialize_step("local", server.as_str());
         let outcome = execute_launch(&harness, &journal, &step).await.unwrap();
@@ -841,6 +841,66 @@ while True:
             .collect();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["cleanup_error"]["code"], "cleanup_failed");
+        drop(journal);
+        drop(harness);
+        let _ = std::fs::remove_dir_all(&script_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confirmed_stdio_close_settles_the_launch() {
+        let script_dir = camino::Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("mcp-echo-fixture-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&script_dir).unwrap();
+        let server = echo_stdio_server(&script_dir);
+        let harness = LaunchHarness::new("local", Some(server.as_str()));
+        std::fs::create_dir_all(&harness.run.workspace).unwrap();
+        let journal = harness.journal();
+        let step = stdio_initialize_step("local", server.as_str());
+        let outcome = execute_launch(&harness, &journal, &step).await.unwrap();
+        assert!(
+            matches!(&outcome, StepOutcome::Success { output: Some(value), .. }
+                if value["server"] == "local" && value["tool"] == "echo"),
+            "{outcome:?}"
+        );
+        let starts = harness.events("operation_started");
+        let launches: Vec<_> = starts
+            .iter()
+            .filter(|event| event["kind"] == "mcp.stdio_launch")
+            .collect();
+        assert_eq!(launches.len(), 1);
+        let id = launches[0]["operation_id"].as_str().unwrap();
+        let finishes: Vec<_> = harness
+            .events("operation_finished")
+            .into_iter()
+            .filter(|event| event["operation_id"] == id)
+            .collect();
+        assert_eq!(
+            finishes.len(),
+            1,
+            "a confirmed close must finish the launch"
+        );
+        assert_eq!(finishes[0]["status"], "clean");
+        assert_eq!(
+            journal.state().operation_records[id].status,
+            engine::OperationStatus::FailedClean
+        );
+        assert!(
+            journal
+                .state()
+                .ensure_no_fail_closed_inflight_operations()
+                .is_ok(),
+            "a confirmed close must unblock replay/delete"
+        );
+        let calls: Vec<_> = std::fs::read_to_string(harness.root.join("audit.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|event| event["t"] == "tool_call")
+            .collect();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0]["cleanup_error"].is_null());
         drop(journal);
         drop(harness);
         let _ = std::fs::remove_dir_all(&script_dir);

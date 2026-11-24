@@ -934,6 +934,10 @@ impl McpRuntime {
         if let Some(session) = container_cleanup {
             transport = transport.with_container_cleanup(session);
         }
+        // The transport is consumed by serve(); keep a clone of its close
+        // receipt so the session can tell a confirmed cleanup from one the
+        // SDK service loop merely logged and swallowed.
+        let close_receipt = transport.close_receipt();
         McpSession::serve(
             profile,
             transport,
@@ -941,6 +945,7 @@ impl McpRuntime {
             CredentialGuard::Static(sensitive_values),
         )
         .await
+        .map(|session| session.with_owned_close_receipt(close_receipt))
     }
 }
 

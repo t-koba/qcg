@@ -5,6 +5,7 @@ use rmcp::transport::async_rw::AsyncRwTransport;
 use std::future::Future;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -13,6 +14,38 @@ const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Outcome of an owned stdio transport close, shared with the session that
+/// settles the launch. The SDK service loop logs a failed transport close but
+/// still reports a completed close, so the real outcome must be observed here.
+#[derive(Clone)]
+pub struct CloseReceipt {
+    state: Arc<Mutex<Option<Result<(), String>>>>,
+}
+
+impl CloseReceipt {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub(crate) fn record(&self, result: &std::io::Result<()>) {
+        let recorded = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|error| error.to_string());
+        *self.state.lock().unwrap_or_else(|error| error.into_inner()) = Some(recorded);
+    }
+
+    pub(crate) fn confirmed(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .is_some_and(Result::is_ok)
+    }
+}
 
 pub(crate) struct BoundedChildTransport {
     child: tokio::process::Child,
@@ -24,6 +57,9 @@ pub(crate) struct BoundedChildTransport {
         tokio::process::ChildStdin,
     >,
     container_cleanup: Option<container::Session>,
+    close_receipt: CloseReceipt,
+    #[cfg(feature = "test-probe")]
+    inject_close_failure: bool,
 }
 
 impl BoundedChildTransport {
@@ -43,6 +79,10 @@ impl BoundedChildTransport {
         max_message_bytes: usize,
         scope: Option<&policy::HostCgroupScope>,
     ) -> std::io::Result<Self> {
+        // The SDK service task runs via tokio::spawn, so a thread-local probe
+        // flag can only be read here, on the constructing (test) thread.
+        #[cfg(feature = "test-probe")]
+        let inject_close_failure = crate::mcp::session::close_probe::should_fail_close();
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt as _;
@@ -86,12 +126,19 @@ impl BoundedChildTransport {
                 stdin,
             ),
             container_cleanup: None,
+            close_receipt: CloseReceipt::new(),
+            #[cfg(feature = "test-probe")]
+            inject_close_failure,
         })
     }
 
     pub(crate) fn with_container_cleanup(mut self, session: container::Session) -> Self {
         self.container_cleanup = Some(session);
         self
+    }
+
+    pub(crate) fn close_receipt(&self) -> CloseReceipt {
+        self.close_receipt.clone()
     }
 }
 
@@ -110,6 +157,20 @@ impl Transport<RoleClient> for BoundedChildTransport {
     }
 
     async fn close(&mut self) -> Result<(), Self::Error> {
+        let result = self.close_inner().await;
+        self.close_receipt.record(&result);
+        result
+    }
+}
+
+impl BoundedChildTransport {
+    async fn close_inner(&mut self) -> std::io::Result<()> {
+        #[cfg(feature = "test-probe")]
+        if self.inject_close_failure {
+            return Err(std::io::Error::other(
+                "injected MCP stdio transport close failure",
+            ));
+        }
         match tokio::time::timeout(CHILD_SHUTDOWN_TIMEOUT, self.transport.close()).await {
             Ok(result) => result?,
             Err(_) => {
@@ -322,6 +383,19 @@ mod tests {
     use super::*;
     use tokio::io::AsyncReadExt as _;
 
+    #[test]
+    fn close_receipt_is_confirmed_only_by_a_recorded_success() {
+        let receipt = CloseReceipt::new();
+        assert!(!receipt.confirmed(), "a missing outcome is unconfirmed");
+        let clone = receipt.clone();
+        receipt.record(&Ok(()));
+        assert!(receipt.confirmed());
+        assert!(clone.confirmed(), "cloned handles share the close outcome");
+        receipt.record(&Err(std::io::Error::other("close failed")));
+        assert!(!receipt.confirmed(), "a failed close is unconfirmed");
+        assert!(!clone.confirmed());
+    }
+
     #[tokio::test]
     async fn line_reader_rejects_oversized_messages_before_forwarding_the_chunk() {
         let input = b"123456789\n".as_slice();
@@ -361,6 +435,7 @@ mod tests {
     async fn close_reaps_a_gracefully_exited_child_without_descendants() {
         let mut transport = shell_transport("cat >/dev/null; exit 0");
         transport.close().await.expect("close should succeed");
+        assert!(transport.close_receipt().confirmed());
         assert!(transport.child.id().is_none());
         assert!(transport.child.wait().await.unwrap().success());
         assert!(transport.process_group_id.is_none());
@@ -417,6 +492,7 @@ mod tests {
         // Deliberately violate the ownership invariant to exercise ECHILD.
         transport.child.wait().await.unwrap();
         let error = transport.close().await.expect_err("the PID anchor is gone");
+        assert!(!transport.close_receipt().confirmed());
         assert_eq!(error.raw_os_error(), Some(libc::ECHILD));
         assert!(
             transport.process_group_id.is_none(),
