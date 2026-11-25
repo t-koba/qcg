@@ -1238,17 +1238,20 @@ output_file = "three.txt"
             .json()
             .await
             .expect("generator detail should deserialize");
-        // A freshly booted in-process server can transiently answer a start
-        // with 503 while its idempotency claim gate settles (observed on
-        // Windows CI, where filesystem timing makes the cold-start race
-        // visible). A 503 is retryable: reusing the SAME key and body converges
-        // onto the one reserved run and, if the first attempt committed before
-        // its response was lost, replays the original 201. Bound the retries
-        // and keep the final status so a persistent 503 still fails the test
-        // rather than being hidden behind a loop.
+        // On Windows CI a freshly booted in-process server was observed
+        // answering a start with 503 where 201 was expected. The original job
+        // did not capture the response body or error code, so the cause
+        // (readiness/maintenance, capacity, or idempotency-claim) is not
+        // established. A 503 is retryable by idempotency design: reusing the
+        // SAME key and body converges onto the one reserved run and, if the
+        // first attempt committed before its response was lost, replays the
+        // original 201. Keep the first refusal's status and a bounded body so
+        // a later occurrence can distinguish those causes even when a retry
+        // converges; a persistent 503 still fails the test.
         let idempotency_key = uuid::Uuid::now_v7().to_string();
         let mut last_status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
         let mut last_body = String::new();
+        let mut first_refusal: Option<(reqwest::StatusCode, String)> = None;
         for attempt in 0..6 {
             let current = client
                 .post(format!("http://{addr}/api/runs"))
@@ -1266,9 +1269,18 @@ output_file = "three.txt"
                 break;
             }
             last_body = current.text().await.unwrap_or_default();
+            if first_refusal.is_none() {
+                first_refusal = Some((
+                    last_status,
+                    last_body.chars().take(2048).collect::<String>(),
+                ));
+            }
             if attempt < 5 {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
+        }
+        if let Some((status, detail)) = &first_refusal {
+            eprintln!("start request first 503 refusal: status={status} detail={detail}");
         }
         assert_eq!(
             last_status,
