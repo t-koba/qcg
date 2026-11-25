@@ -1,10 +1,12 @@
-//! Reclaiming orphaned container effects by journaled name.
+//! Fail-closed recovery of name-keyed container effects. A name-keyed
+//! observation cannot prove ownership, so recovery retains the intent and
+//! surfaces a durable refusal rather than deleting by name.
 
 use crate::effects::reconcile_run_effects;
-use crate::summaries::{fold_run_state, run_meta_dir};
+use crate::summaries::{fold_run_state, read_journal_events, run_meta_dir};
 use api::{RunStatus, StartRun};
 use camino::Utf8PathBuf;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::time::Duration;
 
 use super::support::{TempGuard, temp_run_dir, wait_for_snapshot};
@@ -12,6 +14,7 @@ use super::support::{TempGuard, temp_run_dir, wait_for_snapshot};
 use super::execution::daemon_policy_test_support::Daemon;
 
 const T: &str = "tests::container_effects::";
+const MARKER: &str = "qcg has not proved that the effect stopped";
 
 fn timeouts() -> policy::ContainerTimeouts {
     policy::ContainerTimeouts::from_seconds([1; 5]).unwrap()
@@ -50,14 +53,42 @@ fn run_with_intents(daemon: &Daemon, names: &[&str]) -> Utf8PathBuf {
     dir
 }
 
-fn outcomes(dir: &Utf8PathBuf) -> Vec<String> {
-    std::fs::read_to_string(run_meta_dir(dir).join("journal.jsonl"))
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-        .filter(|event| event["t"] == "effect_closed")
-        .map(|event| event["outcome"].as_str().unwrap().to_string())
-        .collect()
+fn events(dir: &Utf8PathBuf) -> Vec<Value> {
+    read_journal_events(dir).unwrap()
+}
+
+fn refusal(dir: &Utf8PathBuf) -> String {
+    events(dir)
+        .iter()
+        .find(|event| {
+            event["t"] == "run_finished"
+                && event["status"] == "failed"
+                && event["reason"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains(MARKER))
+        })
+        .expect("the refusal must be a durable terminal failure detail")
+        .to_string()
+}
+
+fn assert_no_effect_closure(dir: &Utf8PathBuf) {
+    assert!(
+        events(dir)
+            .iter()
+            .all(|event| event["t"] != "effect_closed"),
+        "recovery must never journal effect_closed"
+    );
+}
+
+fn assert_no_deletion(daemon: &Daemon) {
+    let log = daemon.log();
+    assert!(
+        !log.contains(" kill ")
+            && !log.contains(" stop ")
+            && !log.contains(" rm ")
+            && !log.contains(" delete "),
+        "a name match cannot prove ownership: {log}"
+    );
 }
 
 async fn join_run_task(service: &crate::LocalService, id: &str) {
@@ -87,9 +118,9 @@ fn svc(runs: Utf8PathBuf) -> crate::LocalService {
 }
 
 #[tokio::test]
-async fn crash_after_create_removes_only_the_journaled_instance_and_is_idempotent() {
+async fn crash_after_create_never_deletes_by_name_and_refuses_replay_and_deletion() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}crash_after_create_removes_only_the_journaled_instance_and_is_idempotent"
+        "{T}crash_after_create_never_deletes_by_name_and_refuses_replay_and_deletion"
     )) else {
         return;
     };
@@ -97,52 +128,98 @@ async fn crash_after_create_removes_only_the_journaled_instance_and_is_idempoten
     let dir = run_with_intents(&daemon, &[&ours]);
     let similar = format!("{ours}-sidecar");
     daemon.set_instances(&[&ours, &foreign, &similar]);
-    assert!(
-        fold_run_state(&dir)
-            .unwrap()
-            .ensure_no_inflight_operations()
-            .is_err()
-    );
-    reconcile_run_effects(&dir, "run-x", timeouts())
+
+    let state = fold_run_state(&dir).unwrap();
+    assert!(state.operation_records.is_empty());
+    let replay = state
+        .ensure_no_fail_closed_inflight_operations()
+        .expect_err("an open effect blocks re-entry");
+    let deletion = state
+        .ensure_no_inflight_operations()
+        .expect_err("an open effect blocks deletion");
+    for detail in [&replay, &deletion] {
+        assert!(detail.contains("container effect"), "{detail}");
+        assert!(detail.contains(MARKER), "{detail}");
+    }
+
+    let error = reconcile_run_effects(&dir, "run-x", timeouts())
         .await
-        .unwrap();
-    assert_eq!(daemon.instances(), [foreign.as_str(), similar.as_str()]);
-    assert_eq!(outcomes(&dir), ["removed"]);
+        .expect_err("a name-keyed observation is never a settlement");
+    assert!(error.to_string().contains(MARKER), "{error}");
     assert!(
-        fold_run_state(&dir)
-            .unwrap()
-            .ensure_no_inflight_operations()
-            .is_ok()
+        error.to_string().contains("was observed"),
+        "the observation must be recorded for diagnostics: {error}"
     );
-    let calls = daemon.log().lines().count();
-    reconcile_run_effects(&dir, "run-x", timeouts())
-        .await
-        .unwrap();
     assert_eq!(
-        daemon.log().lines().count(),
-        calls,
-        "a closed intent is never revisited"
+        daemon.instances(),
+        [ours.as_str(), foreign.as_str(), similar.as_str()]
     );
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
+    let state = fold_run_state(&dir).unwrap();
+    assert!(state.effects.contains_key(&ours));
+    assert!(state.ensure_no_fail_closed_inflight_operations().is_err());
+    assert!(state.ensure_no_inflight_operations().is_err());
+
+    // The refusal itself is persisted only by the callers under the lease;
+    // when it is, the durable detail carries the same marker and is not
+    // overwritten by a second settlement.
+    crate::run_dirs::settle_unresolved_effect(&dir, &error.to_string()).unwrap();
+    crate::run_dirs::settle_unresolved_effect(&dir, "must not overwrite").unwrap();
+    let detail = refusal(&dir);
+    assert!(detail.contains(MARKER), "{detail}");
+    assert!(!detail.contains("must not overwrite"), "{detail}");
+    assert_eq!(
+        events(&dir)
+            .iter()
+            .filter(|event| event["t"] == "run_finished")
+            .count(),
+        1
+    );
+
+    let again = reconcile_run_effects(&dir, "run-x", timeouts())
+        .await
+        .expect_err("the intent is still open");
+    assert!(again.to_string().contains(MARKER), "{again}");
+    assert!(fold_run_state(&dir).unwrap().effects.contains_key(&ours));
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
 }
 
 #[tokio::test]
-async fn crash_before_create_is_confirmed_absent_and_closed() {
-    let Some(daemon) = Daemon::isolated(&format!(
-        "{T}crash_before_create_is_confirmed_absent_and_closed"
-    )) else {
+async fn crash_before_create_never_certifies_absence() {
+    let Some(daemon) = Daemon::isolated(&format!("{T}crash_before_create_never_certifies_absence"))
+    else {
         return;
     };
-    let dir = run_with_intents(&daemon, &[&name()]);
-    reconcile_run_effects(&dir, "run-x", timeouts())
+    let name = name();
+    let dir = run_with_intents(&daemon, &[&name]);
+    let error = reconcile_run_effects(&dir, "run-x", timeouts())
         .await
-        .unwrap();
-    assert_eq!(outcomes(&dir), ["absent"]);
+        .expect_err("a missing entry does not settle the intent");
+    assert!(
+        error
+            .to_string()
+            .contains("no instance with the journaled name was observed"),
+        "{error}"
+    );
+    assert!(error.to_string().contains(MARKER), "{error}");
+    assert!(fold_run_state(&dir).unwrap().effects.contains_key(&name));
+    assert_no_effect_closure(&dir);
+    assert!(daemon.instances().is_empty());
+    let probes = daemon
+        .log()
+        .lines()
+        .filter(|line| line.contains(" ps "))
+        .count();
+    assert_eq!(probes, 1, "one bounded probe, never an absence certificate");
+    assert_no_deletion(&daemon);
 }
 
 #[tokio::test]
-async fn a_create_completing_after_the_first_check_is_reclaimed() {
+async fn a_create_completing_after_the_probe_is_not_claimed() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}a_create_completing_after_the_first_check_is_reclaimed"
+        "{T}a_create_completing_after_the_probe_is_not_claimed"
     )) else {
         return;
     };
@@ -150,17 +227,19 @@ async fn a_create_completing_after_the_first_check_is_reclaimed() {
     let dir = run_with_intents(&daemon, &[&ours]);
     daemon.mode("late");
     daemon.create_late(&ours);
-    reconcile_run_effects(&dir, "run-x", timeouts())
+    let error = reconcile_run_effects(&dir, "run-x", timeouts())
         .await
-        .unwrap();
-    assert!(daemon.instances().is_empty());
-    assert_eq!(outcomes(&dir), ["removed"]);
+        .expect_err("a late create is not a settled effect");
+    assert!(error.to_string().contains(MARKER), "{error}");
+    assert_eq!(daemon.instances(), [ours.as_str()]);
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
 }
 
 #[tokio::test]
-async fn an_unreachable_backend_keeps_the_intent_open_for_the_next_recovery() {
+async fn an_unreachable_backend_and_a_healthy_backend_both_remain_refused() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}an_unreachable_backend_keeps_the_intent_open_for_the_next_recovery"
+        "{T}an_unreachable_backend_and_a_healthy_backend_both_remain_refused"
     )) else {
         return;
     };
@@ -170,21 +249,24 @@ async fn an_unreachable_backend_keeps_the_intent_open_for_the_next_recovery() {
     daemon.mode("broken");
     let error = reconcile_run_effects(&dir, "run-x", timeouts())
         .await
-        .unwrap_err();
-    assert!(error.to_string().contains("not yet reclaimed"), "{error}");
+        .expect_err("an unreadable backend is retained");
+    assert!(error.to_string().contains(MARKER), "{error}");
     assert_eq!(fold_run_state(&dir).unwrap().effects.len(), 2);
     daemon.mode("ok");
-    reconcile_run_effects(&dir, "run-x", timeouts())
+    let error = reconcile_run_effects(&dir, "run-x", timeouts())
         .await
-        .unwrap();
-    assert!(fold_run_state(&dir).unwrap().effects.is_empty());
-    assert!(daemon.instances().is_empty());
+        .expect_err("a healthy probe is still not a name-keyed settlement");
+    assert!(error.to_string().contains(MARKER), "{error}");
+    assert_eq!(fold_run_state(&dir).unwrap().effects.len(), 2);
+    assert_eq!(daemon.instances(), [first.as_str()]);
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
 }
 
 #[tokio::test]
-async fn queued_resumer_retries_failed_suspended_reconciliation_only() {
+async fn refusal_is_durable_and_observable_and_stops_retry() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}queued_resumer_retries_failed_suspended_reconciliation_only"
+        "{T}refusal_is_durable_and_observable_and_stops_retry"
     )) else {
         return;
     };
@@ -192,7 +274,7 @@ async fn queued_resumer_retries_failed_suspended_reconciliation_only() {
         crate::RunStoreMode::Exclusive,
         crate::RunStoreMode::SharedFilesystem,
     ] {
-        let root = temp_run_dir("effect-reconciliation-retry");
+        let root = temp_run_dir("effect-reconciliation-refusal");
         let _guard = TempGuard(root.clone());
         let generators =
             Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
@@ -240,21 +322,22 @@ async fn queued_resumer_retries_failed_suspended_reconciliation_only() {
         )
         .unwrap();
         daemon.set_instances(&[&effect]);
-        daemon.mode("broken");
 
         service.resume_recovered_runs().await;
         join_run_task(&service, &id).await;
-        assert_eq!(
-            service.snapshot(id.clone()).await.unwrap().state,
-            RunStatus::Waiting,
-            "an unresolved cleanup must not fabricate terminal Failed state"
-        );
+        let failed = wait_for_snapshot(&service, &id, RunStatus::Failed).await;
+        assert_eq!(failed.state, RunStatus::Failed);
+        let detail = refusal(&dir);
+        assert!(detail.contains(MARKER), "{detail}");
+        assert!(detail.contains(&effect), "{detail}");
         assert!(fold_run_state(&dir).unwrap().effects.contains_key(&effect));
         assert!(daemon.instances().contains(&effect));
-        assert!(retries.lock().unwrap().contains(&id));
+        assert_no_effect_closure(&dir);
+        assert_no_deletion(&daemon);
+        assert!(retries.lock().unwrap().is_empty());
 
-        // Healthy suspended work is deliberately absent from the retry set. Taking
-        // its finished handle lets us detect even a replay that writes no events.
+        // A healthy suspended run stays intact and the permanent refusal is
+        // never revisited by the production resumer.
         let healthy = service
             .start_run(StartRun {
                 generator_id: "ask-user".into(),
@@ -264,96 +347,35 @@ async fn queued_resumer_retries_failed_suspended_reconciliation_only() {
             .unwrap();
         wait_for_snapshot(&service, &healthy, RunStatus::Waiting).await;
         join_run_task(&service, &healthy).await;
-        let healthy_task = service.inner.runs.read().await[&healthy].task.clone();
+        let calls = daemon.log();
         let shutdown = tokio_util::sync::CancellationToken::new();
-        {
-            let mut runs = service.inner.runs.write().await;
-            runs.get_mut(&id).unwrap().preempted = true;
-        }
-        let failed_calls = daemon.log();
         let resumer = service.start_queued_resumer(shutdown.clone());
         tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(retries.lock().unwrap().contains(&id));
+        assert!(retries.lock().unwrap().is_empty());
         assert_eq!(
             daemon.log(),
-            failed_calls,
-            "busy runs must not be reconciled"
+            calls,
+            "a permanent refusal must not be retried"
         );
-        let task = {
-            let mut runs = service.inner.runs.write().await;
-            let record = runs.get_mut(&id).unwrap();
-            record.preempted = false;
-            record.task.clone()
-        };
-        // A live slot also defers, rather than consumes, the pending retry.
-        *task.lock().unwrap() = Some(tokio::spawn(std::future::pending()));
-        tokio::time::sleep(Duration::from_millis(1100)).await;
-        assert!(retries.lock().unwrap().contains(&id));
-        assert_eq!(
-            daemon.log(),
-            failed_calls,
-            "busy runs must not be reconciled"
-        );
-        let blocker = task.lock().unwrap().take().unwrap();
-        blocker.abort();
-        assert!(blocker.await.unwrap_err().is_cancelled());
-        daemon.mode("ok");
-        let recovered = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                let pending = retries.lock().unwrap().contains(&id);
-                let live =
-                    crate::types::task_slot_is_live(&service.inner.runs.read().await[&id].task);
-                if !pending && !live && fold_run_state(&dir).unwrap().effects.is_empty() {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        })
-        .await;
-        // Leave the timer running past successful reconciliation as well: a
-        // recovered Waiting run must leave the retry set, not become periodic work.
-        if recovered.is_ok() {
-            join_run_task(&service, &id).await;
-            tokio::time::sleep(Duration::from_secs(2)).await;
-        }
         shutdown.cancel();
         resumer.await.unwrap().unwrap();
-        recovered.expect("the production resumer must retry cleanup without manual recovery");
-        assert_eq!(
-            service.snapshot(id.clone()).await.unwrap().state,
-            RunStatus::Waiting
-        );
-        assert!(fold_run_state(&dir).unwrap().effects.is_empty());
-        assert!(daemon.instances().is_empty());
-        assert!(retries.lock().unwrap().is_empty());
-        assert!(
-            service.inner.runs.read().await[&id]
-                .task
-                .lock()
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            healthy_task.lock().unwrap().is_none(),
-            "healthy suspended work was replayed"
-        );
         assert_eq!(
             service.snapshot(healthy).await.unwrap().state,
             RunStatus::Waiting
         );
+        assert_no_effect_closure(&dir);
     }
 }
 
 #[tokio::test]
-async fn startup_recovery_reconciles_dead_runs_and_skips_leased_ones() {
+async fn startup_recovery_of_a_terminal_run_preserves_terminal_and_never_settles_by_name() {
     let Some(daemon) = Daemon::isolated(&format!(
-        "{T}startup_recovery_reconciles_dead_runs_and_skips_leased_ones"
+        "{T}startup_recovery_of_a_terminal_run_preserves_terminal_and_never_settles_by_name"
     )) else {
         return;
     };
     let ours = name();
     let dir = run_with_intents(&daemon, &[&ours]);
-    // Terminal run: construction still reports its open effect.
     let meta = run_meta_dir(&dir);
     engine::JournalWriter::append_single_event(
         &meta.join("journal.jsonl"),
@@ -378,8 +400,35 @@ async fn startup_recovery_reconciles_dead_runs_and_skips_leased_ones() {
     );
     drop(lease);
     drop(service);
+    let before = events(&dir);
     let service = svc(runs);
     service.resume_recovered_runs().await;
-    assert!(daemon.instances().is_empty());
-    assert_eq!(outcomes(&dir), ["removed"]);
+    assert_eq!(
+        events(&dir),
+        before,
+        "a prior terminal event is never overwritten"
+    );
+    assert_eq!(daemon.instances(), [ours.as_str()]);
+    assert!(fold_run_state(&dir).unwrap().effects.contains_key(&ours));
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
+}
+
+#[tokio::test]
+async fn open_effect_blocks_direct_replay_gate_without_a_fail_closed_started_operation() {
+    let Some(daemon) = Daemon::isolated(&format!(
+        "{T}open_effect_blocks_direct_replay_gate_without_a_fail_closed_started_operation"
+    )) else {
+        return;
+    };
+    let ours = name();
+    let dir = run_with_intents(&daemon, &[&ours]);
+    let state = fold_run_state(&dir).unwrap();
+    assert!(state.operation_records.is_empty());
+    let detail = state
+        .ensure_no_fail_closed_inflight_operations()
+        .expect_err("direct qcg run re-entry must refuse");
+    assert!(detail.contains("container effect"), "{detail}");
+    assert!(detail.contains(MARKER), "{detail}");
+    assert!(detail.contains("before replay"), "{detail}");
 }

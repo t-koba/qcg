@@ -1435,11 +1435,12 @@ impl LocalService {
                     }
                     return;
                 }
-                // Container effects of the dead previous owner are reclaimed
-                // by journaled name under the same lease, before any replay.
-                // A failure remains retryable; it is not a terminal run result.
+                // Container effects of the dead previous owner are only
+                // observed under the same lease, before any replay. A name
+                // match cannot prove ownership and a missing entry does not
+                // fence a late create, so the refusal is permanent: settle it
+                // as durable failure detail instead of retrying cleanup.
                 let state = match crate::effects::reconcile_run_effects_from_state(
-                    &run_dir,
                     &run_id,
                     service.inner.deployment_policy.container_timeouts,
                     state,
@@ -1450,9 +1451,15 @@ impl LocalService {
                     Err(error) => {
                         tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
                         if nonterminal {
-                            service
-                                .retry_suspended_reconciliation(&run_id, &reconciliation_task)
-                                .await;
+                            if let Err(append_error) = crate::run_dirs::settle_unresolved_effect(
+                                &run_dir,
+                                &error.to_string(),
+                            ) {
+                                tracing::error!(run_id = %run_id, %append_error, "unresolved-effect refusal record failed; retaining run");
+                                return;
+                            }
+                            service.mark_spawn_failed(&run_id).await;
+                            service.inner.queue_notify.notify_waiters();
                         }
                         return;
                     }

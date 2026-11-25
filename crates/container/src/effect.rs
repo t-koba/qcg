@@ -1,15 +1,17 @@
-//! Ownership of container effects by unique identity. Before any create call
-//! the intent (backend plus a fresh unguessable name) is journaled through an
-//! [`EffectLedger`]; the effect is created with exactly that name. Because
-//! the name is unique, an instance carrying it is ours, so a later pass can
-//! find and remove it by name alone, whether or not the creator survived.
+//! Container effect intent is journaled through an [`EffectLedger`] before
+//! any create call, using a fresh unguessable name. A name match cannot prove
+//! ownership: the name may have been reused, and a missing entry does not
+//! fence a create still completing after the creator died. Recovery therefore
+//! never deletes or settles an effect by name; it can only observe whether an
+//! instance currently carries the name. Live teardown of an owned session is
+//! unchanged.
 
 use std::sync::Arc;
 
 use super::backend::Backend;
 use super::error::ContainerError;
 use super::plans;
-use super::session::{Session, run_admin, teardown};
+use super::session::{Session, run_admin};
 
 /// Durable record of effect intent and closure, backed by the run journal.
 pub trait EffectLedger: std::fmt::Debug + Send + Sync {
@@ -21,13 +23,15 @@ pub trait EffectLedger: std::fmt::Debug + Send + Sync {
     fn close(&self, name: &str, outcome: &str) -> std::io::Result<()>;
 }
 
-/// What reclaiming one journaled name found.
+/// What one bounded presence probe observed for a journaled name. Neither
+/// observation settles the intent: a name match cannot prove ownership, and a
+/// missing entry does not fence a late create.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Reclaimed {
-    /// The instance existed and was stopped and deleted.
-    Removed,
-    /// No instance carried the name, now and after the settle interval.
-    Absent,
+    /// An instance carrying the journaled name was observed.
+    NamePresent,
+    /// No instance with that name was observed in this probe.
+    NameNotObserved,
 }
 
 /// Journals the intent and returns the session that owns the new name.
@@ -48,10 +52,10 @@ pub fn begin(
     })
 }
 
-/// Removes the instance journaled under `name`, if any. Only the exact name
-/// is ever addressed, never a prefix or label. Absence is re-checked once
-/// after the policy settle interval, because a create submitted before a
-/// crash may still be completing in the daemon.
+/// Probes whether an instance currently carries the journaled name. Only
+/// the exact name is ever addressed, never a prefix or label. This is an
+/// observation, not cleanup: it never tears down by name and never certifies
+/// that the external effect stopped, so neither result settles the intent.
 pub async fn reclaim(
     backend: &Backend,
     name: &str,
@@ -64,30 +68,19 @@ pub async fn reclaim(
             detail: "journaled effect is not a qcg-created instance; refusing".into(),
         });
     }
-    let session = Session {
-        timeouts,
-        backend: backend.clone(),
-        name: name.to_string(),
-        ledger: None,
-    };
-    for attempt in 0..2 {
-        if attempt > 0 {
-            tokio::time::sleep(timeouts.settle()).await;
-        }
-        let listing = run_admin(
-            &plans::presence_argv(backend, name),
-            timeouts.admin(),
-            &tokio_util::sync::CancellationToken::new(),
-            name,
-            "inspect",
-        )
-        .await?;
-        if listing.stdout.lines().any(|line| line.trim() == name) {
-            teardown(&session).await?;
-            return Ok(Reclaimed::Removed);
-        }
-    }
-    Ok(Reclaimed::Absent)
+    let listing = run_admin(
+        &plans::presence_argv(backend, name),
+        timeouts.admin(),
+        &tokio_util::sync::CancellationToken::new(),
+        name,
+        "inspect",
+    )
+    .await?;
+    Ok(if listing.stdout.lines().any(|line| line.trim() == name) {
+        Reclaimed::NamePresent
+    } else {
+        Reclaimed::NameNotObserved
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -135,9 +128,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reclaim_removes_only_the_exact_journaled_name() {
+    async fn reclaim_observes_the_exact_journaled_name_without_deleting_anything() {
         let Some(daemon) = Daemon::isolated(&format!(
-            "{TEST}reclaim_removes_only_the_exact_journaled_name"
+            "{TEST}reclaim_observes_the_exact_journaled_name_without_deleting_anything"
         )) else {
             return;
         };
@@ -148,62 +141,69 @@ mod tests {
             daemon.set_instances(&[&ours, &other, &similar, "prod-db"]);
             assert_eq!(
                 reclaim(&backend, &ours, timeouts()).await.unwrap(),
-                Reclaimed::Removed
+                Reclaimed::NamePresent
+            );
+            assert_eq!(
+                reclaim(&backend, &ours, timeouts()).await.unwrap(),
+                Reclaimed::NamePresent
             );
             assert_eq!(
                 daemon.instances(),
-                [other.as_str(), similar.as_str(), "prod-db"]
+                [ours.as_str(), other.as_str(), similar.as_str(), "prod-db"]
             );
-            // Idempotent: a second pass finds nothing and touches nothing.
-            assert_eq!(
-                reclaim(&backend, &ours, timeouts()).await.unwrap(),
-                Reclaimed::Absent
-            );
-            assert_eq!(daemon.instances().len(), 3);
         }
-        let touched: Vec<String> = daemon
-            .log()
+        let log = daemon.log();
+        let probes = log
             .lines()
-            .filter(|line| {
-                line.contains(" kill ")
-                    || line.contains(" stop ")
-                    || line.contains(" rm ")
-                    || line.contains(" delete ")
-            })
-            .map(String::from)
-            .collect();
+            .filter(|line| line.contains(" list ") || line.contains(" ps "))
+            .count();
+        assert_eq!(probes, 4, "one probe per backend pass: {log}");
         assert!(
-            touched.iter().all(|line| line.ends_with(&ours)),
-            "{touched:?}"
+            !log.contains(" kill ")
+                && !log.contains(" stop ")
+                && !log.contains(" rm ")
+                && !log.contains(" delete "),
+            "a name match cannot prove ownership: {log}"
         );
     }
 
     #[tokio::test]
-    async fn reclaim_rechecks_an_absent_name_once_for_a_late_create() {
+    async fn reclaim_never_certifies_absence_or_fences_a_late_create() {
         let Some(daemon) = Daemon::isolated(&format!(
-            "{TEST}reclaim_rechecks_an_absent_name_once_for_a_late_create"
+            "{TEST}reclaim_never_certifies_absence_or_fences_a_late_create"
         )) else {
             return;
         };
-        let name = plans::effect_name().unwrap();
         let backend = &backends()[1];
+        let late = plans::effect_name().unwrap();
+        // A create completing around the probe is merely observed; the
+        // intent it belongs to is still not settled by this observation.
+        daemon.create_late(&late);
+        daemon.set_instances(&[&late]);
         assert_eq!(
-            reclaim(backend, &name, timeouts()).await.unwrap(),
-            Reclaimed::Absent
+            reclaim(backend, &late, timeouts()).await.unwrap(),
+            Reclaimed::NamePresent
+        );
+        assert_eq!(daemon.instances(), [late.as_str()]);
+
+        let absent = plans::effect_name().unwrap();
+        daemon.mode("ok");
+        assert_eq!(
+            reclaim(backend, &absent, timeouts()).await.unwrap(),
+            Reclaimed::NameNotObserved
         );
         let probes = daemon
             .log()
             .lines()
-            .filter(|line| line.contains(" list "))
+            .filter(|line| line.contains(" list ") || line.contains(" ps "))
             .count();
-        assert_eq!(probes, 2, "absence is confirmed by exactly one re-check");
-        daemon.mode("late");
-        daemon.create_late(&name);
+        assert_eq!(probes, 1, "one bounded probe; absence is never certified");
         assert_eq!(
-            reclaim(backend, &name, timeouts()).await.unwrap(),
-            Reclaimed::Removed
+            daemon.instances(),
+            [late.as_str()],
+            "a missing entry does not fence or remove a late create"
         );
-        assert!(daemon.instances().is_empty());
+        assert!(!daemon.log().contains(" delete "));
     }
 
     #[tokio::test]

@@ -193,6 +193,39 @@ pub(crate) fn try_interrupt_admission(
     Ok(true)
 }
 
+/// Record a permanent fail-closed refusal for an unresolved container effect.
+/// The caller holds the execution lease. Only a nonterminal run is settled,
+/// and the durable detail is written under the journal lock so a prior
+/// terminal outcome is never overwritten.
+pub(crate) fn settle_unresolved_effect(
+    run_dir: &Utf8Path,
+    message: &str,
+) -> Result<(), ServiceError> {
+    let run_id = run_dir
+        .file_name()
+        .ok_or_else(|| ServiceError::invalid("run directory has no file name"))?;
+    let journal = run_meta_dir(run_dir).join("journal.jsonl");
+    JournalWriter::append_events_with(&journal, run_id, JournalLimits::default(), None, |state| {
+        Ok(if state.terminal.is_none() {
+            vec![(
+                "run_finished",
+                json!({
+                    "status": "failed",
+                    "metrics": {},
+                    "reason": model::FailureDetail::new(
+                        model::FailureCode::ExecutionFailed,
+                        message,
+                    ),
+                }),
+            )]
+        } else {
+            Vec::new()
+        })
+    })
+    .map_err(ServiceError::invalid)?;
+    Ok(())
+}
+
 /// Complete only an unambiguous accepted denial. Selection and both appends
 /// share the journal lock; every surviving prefix is retryable. This is process
 /// crash reconciliation, not a power-loss transaction.

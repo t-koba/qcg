@@ -255,8 +255,9 @@ pub struct RunState {
     /// duplicate execution. Successful hooks replay via node outcomes.
     pub hooks_settled: BTreeSet<String>,
     /// Container effects whose `effect_intent` has no `effect_closed` yet,
-    /// keyed by unique instance name with the journaled backend. Each is
-    /// reclaimed by name before the run's journal may be deleted.
+    /// keyed by unique instance name with the journaled backend. A name match
+    /// cannot prove ownership, so every open intent is retained until its
+    /// external outcome is reconciled; recovery never reclaims by name.
     #[serde(default)]
     pub effects: BTreeMap<String, Value>,
 }
@@ -385,7 +386,7 @@ impl RunState {
     pub fn ensure_no_inflight_operations(&self) -> Result<(), String> {
         if let Some(name) = self.effects.keys().next() {
             return Err(format!(
-                "container effect `{name}` is not yet confirmed removed; recovery reclaims it by name before the run may be deleted"
+                "container effect `{name}` is unresolved; qcg has not proved that the effect stopped; manually reconcile the external outcome before the run may be deleted"
             ));
         }
         if let Some((id, _)) = self
@@ -400,12 +401,18 @@ impl RunState {
         Ok(())
     }
 
-    /// Re-entry and replay gate: refuses a `Started` operation only when
+    /// Re-entry and replay gate: refuses an open container effect even with
+    /// no `Started` operation, and refuses a `Started` operation only when
     /// its durable `on_indeterminate` policy is fail-closed (the default
     /// for pre-policy journals). A `Started` record with `repeat` is
     /// allowed through so the existing operation guard can re-execute it
     /// with the acknowledged double-apply risk.
     pub fn ensure_no_fail_closed_inflight_operations(&self) -> Result<(), String> {
+        if let Some(name) = self.effects.keys().next() {
+            return Err(format!(
+                "container effect `{name}` is unresolved; qcg has not proved that the effect stopped; reconcile the external outcome before replay"
+            ));
+        }
         if let Some((id, _)) = self.operation_records.iter().find(|(_, record)| {
             record.status == OperationStatus::Started
                 && record.on_indeterminate == contract::RetryOnIndeterminate::Fail
@@ -2717,5 +2724,46 @@ mod tests {
         );
         let legacy_bytes = serde_json::to_vec(&legacy).expect("state should serialize");
         assert!(String::from_utf8_lossy(&legacy_bytes).contains("fail"));
+    }
+
+    #[test]
+    fn open_container_effect_refuses_direct_reentry_without_a_started_operation() {
+        let mut state = RunState::default();
+        state
+            .effects
+            .insert("qcg-effect".into(), json!({"docker": {}}));
+        assert!(state.operation_records.is_empty());
+        let detail = state
+            .ensure_no_fail_closed_inflight_operations()
+            .expect_err("an open effect must block direct re-entry/replay");
+        assert!(detail.contains("container effect `qcg-effect`"), "{detail}");
+        assert!(
+            detail.contains("qcg has not proved that the effect stopped"),
+            "{detail}"
+        );
+        assert!(
+            detail.contains("reconcile the external outcome before replay"),
+            "{detail}"
+        );
+        assert!(state.ensure_no_inflight_operations().is_err());
+    }
+
+    #[test]
+    fn fail_closed_started_operation_still_refuses_reentry_without_effects() {
+        let mut state = RunState::default();
+        state
+            .apply(&operation_event(1, "operation_started", "op-legacy", None))
+            .expect("legacy start should fold");
+        assert!(state.effects.is_empty());
+        assert!(state.ensure_no_fail_closed_inflight_operations().is_err());
+        assert!(state.ensure_no_inflight_operations().is_err());
+    }
+
+    #[test]
+    fn empty_effects_and_no_started_operations_pass_both_gates() {
+        let state = RunState::default();
+        assert!(state.effects.is_empty());
+        assert!(state.ensure_no_fail_closed_inflight_operations().is_ok());
+        assert!(state.ensure_no_inflight_operations().is_ok());
     }
 }

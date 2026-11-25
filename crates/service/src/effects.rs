@@ -1,7 +1,9 @@
-//! Reclaims container effects orphaned by a dead run, by journaled name.
+//! Fail-closed observation of container effects orphaned by a dead run.
 
 use camino::{Utf8Path, Utf8PathBuf};
-use engine::{JournalLimits, JournalWriter};
+#[cfg(test)]
+use engine::JournalWriter;
+#[cfg(test)]
 use serde_json::json;
 use std::collections::BTreeMap;
 
@@ -21,11 +23,10 @@ pub(crate) enum EffectProvenance {
 
 pub(crate) type EffectCandidates = BTreeMap<Utf8PathBuf, EffectProvenance>;
 
-/// Settles every open `effect_intent` of one run: the exact journaled name is
-/// looked up in its backend; a present instance is removed, an absent one is
-/// confirmed absent, and either way `effect_closed` is journaled. A backend
-/// failure leaves that intent open for the next recovery and is reported
-/// after the remaining intents were attempted. The caller must hold the run's
+/// Observes every open `effect_intent` of one run. A name-keyed observation
+/// cannot prove ownership, and a missing entry does not fence a late create,
+/// so no outcome settles an intent: every one is retained, nothing is deleted,
+/// and no `effect_closed` is journaled. The caller must hold the run's
 /// execution lease, so no live process can be creating under these names.
 #[cfg(test)]
 pub(crate) async fn reconcile_run_effects(
@@ -34,71 +35,60 @@ pub(crate) async fn reconcile_run_effects(
     timeouts: policy::ContainerTimeouts,
 ) -> Result<(), ServiceError> {
     let state = crate::summaries::fold_run_state(run_dir)?;
-    reconcile_effects(run_dir, run_id, timeouts, state)
-        .await
-        .map(drop)
+    reconcile_effects(run_id, timeouts, &state).await
 }
 
-/// Reconciles effects from the caller's already-validated journal fold and
-/// returns that state with successfully closed effects removed. Recovery uses
-/// this to make journal-observation failure retryable before cleanup begins,
-/// without folding the same journal twice.
+/// Observes effects from the caller's already-validated journal fold and
+/// returns that state unchanged when it has no open intents. An open intent
+/// always produces a refusal; recovery uses this without folding the same
+/// journal twice.
 pub(crate) async fn reconcile_run_effects_from_state(
-    run_dir: &Utf8Path,
     run_id: &str,
     timeouts: policy::ContainerTimeouts,
     state: engine::RunState,
 ) -> Result<engine::RunState, ServiceError> {
-    reconcile_effects(run_dir, run_id, timeouts, state).await
+    reconcile_effects(run_id, timeouts, &state).await?;
+    Ok(state)
 }
 
 async fn reconcile_effects(
-    run_dir: &Utf8Path,
     run_id: &str,
     timeouts: policy::ContainerTimeouts,
-    mut state: engine::RunState,
-) -> Result<engine::RunState, ServiceError> {
-    let journal = run_meta_dir(run_dir).join("journal.jsonl");
+    state: &engine::RunState,
+) -> Result<(), ServiceError> {
     let mut unresolved = Vec::new();
-    for (name, backend) in std::mem::take(&mut state.effects) {
-        let reclaimed = match serde_json::from_value::<container::Backend>(backend.clone()) {
-            Ok(backend) => container::reclaim(&backend, &name, timeouts)
+    for (name, backend) in &state.effects {
+        let observation = match serde_json::from_value::<container::Backend>(backend.clone()) {
+            Ok(backend) => container::reclaim(&backend, name, timeouts)
                 .await
                 .map_err(|error| error.to_string()),
             Err(error) => Err(format!("unreadable backend: {error}")),
         };
-        let outcome = match reclaimed {
-            Ok(container::Reclaimed::Removed) => "removed",
-            Ok(container::Reclaimed::Absent) => "absent",
-            Err(error) => {
-                unresolved.push(format!("{name}: {error}"));
-                state.effects.insert(name, backend);
-                continue;
+        let detail = match observation {
+            Ok(container::Reclaimed::NamePresent) => {
+                "an instance carrying the journaled name was observed".to_string()
             }
+            Ok(container::Reclaimed::NameNotObserved) => {
+                "no instance with the journaled name was observed in a bounded probe".to_string()
+            }
+            Err(error) => format!("the backend could not be probed: {error}"),
         };
-        if let Err(error) = JournalWriter::append_single_event(
-            &journal,
-            run_id,
-            "effect_closed",
-            json!({"effect": &name, "outcome": outcome}),
-            JournalLimits::default(),
-            None,
-        ) {
-            unresolved.push(format!("{name}: closure not journaled: {error}"));
-            state.effects.insert(name, backend);
-        }
+        unresolved.push(format!(
+            "container effect `{name}`: {detail}; qcg has not proved that the effect stopped; reconcile the external outcome manually"
+        ));
     }
     if unresolved.is_empty() {
-        return Ok(state);
+        return Ok(());
     }
     Err(ServiceError::invalid(format!(
-        "container effects of run `{run_id}` are not yet reclaimed and stay journaled for the next recovery: {}",
+        "container effects of run `{run_id}` are unresolved and stay journaled: {}",
         unresolved.join("; ")
     )))
 }
 
 /// Returns true only when a candidate can leave the retry queue. Paths are
-/// untrusted scan hints, not authority to reclaim the effects of a copied fork.
+/// untrusted scan hints, never authority to settle the effects of a copied fork;
+/// a fail-closed refusal is durable and needs no retry.
 async fn reconcile_effect_candidate(
     run_dir: &Utf8Path,
     timeouts: policy::ContainerTimeouts,
@@ -123,10 +113,18 @@ async fn reconcile_effect_candidate(
     let Some(state) = recovery_state_for_effect_candidate(run_dir, run_id, provenance)? else {
         return Ok(true);
     };
-    // Execution ownership protects the validated run through external cleanup
-    // and journal closure; unrelated IDs need not wait on this shard.
+    // Execution ownership protects the validated run through the bounded
+    // presence probe; unrelated IDs need not wait on this shard.
     drop(admission);
-    reconcile_effects(run_dir, run_id, timeouts, state).await?;
+    if let Err(error) = reconcile_effects(run_id, timeouts, &state).await {
+        // A name-keyed refusal is permanent, not a transient probe failure:
+        // record it durably when the run has not already settled, and stop
+        // retrying a candidate whose journal now carries the failure detail.
+        if state.terminal.is_none() {
+            crate::run_dirs::settle_unresolved_effect(run_dir, &error.to_string())?;
+        }
+        return Ok(true);
+    }
     Ok(true)
 }
 
@@ -321,16 +319,45 @@ mod tests {
             .unwrap();
     }
 
-    fn close_effect(dir: &Utf8Path) {
-        JournalWriter::append_single_event(
-            &run_meta_dir(dir).join("journal.jsonl"),
+    /// Same unreadable effect intent, but without a terminal event: the
+    /// refusal must be recorded durably instead of being silently retried.
+    fn open_effect(dir: &Utf8Path) {
+        let meta = run_meta_dir(dir);
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal = JournalWriter::create(
+            &meta.join("journal.jsonl"),
             dir.file_name().unwrap(),
-            "effect_closed",
-            json!({"effect": "fixture-effect", "outcome": "absent"}),
-            JournalLimits::default(),
+            false,
             None,
         )
         .unwrap();
+        journal.event("run_queued", json!({
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+        })).unwrap();
+        journal
+            .event(
+                "effect_intent",
+                json!({"effect": "fixture-effect", "backend": {"unknown": true}}),
+            )
+            .unwrap();
+    }
+
+    fn assert_no_effect_closure(dir: &Utf8Path) {
+        let journal = run_meta_dir(dir).join("journal.jsonl");
+        let events = crate::summaries::read_journal_events(dir).unwrap();
+        assert!(
+            events.iter().all(|event| event["t"] != "effect_closed"),
+            "recovery never settles a name-keyed effect: {journal}"
+        );
+        assert!(
+            crate::summaries::fold_run_state(dir)
+                .unwrap()
+                .effects
+                .contains_key("fixture-effect"),
+            "the unreadable intent must stay journaled"
+        );
     }
 
     #[tokio::test]
@@ -439,7 +466,8 @@ mod tests {
             );
             assert!(!missing.exists(), "missing evidence must not be recreated");
         }
-        // Only a valid journal proving settlement clears the confirmed candidate.
+        // An empty journal is not proof of settlement, and only a ScanHint
+        // (never confirmed/preserved evidence) clears when evidence disappears.
         std::fs::create_dir_all(run_meta_dir(&dir)).unwrap();
         std::fs::write(&journal, b"").unwrap();
         service.reconcile_startup_effects().await;
@@ -448,20 +476,26 @@ mod tests {
             std::slice::from_ref(&dir),
             "empty is not proof of settlement"
         );
-        std::fs::write(&journal, original).unwrap();
-        close_effect(&dir);
+        std::fs::write(&journal, &original).unwrap();
+        service.merge_effect_candidates([(dir.clone(), EffectProvenance::ScanHint)]);
         service.reconcile_startup_effects().await;
-        assert!(pending(&service).is_empty());
+        assert!(
+            pending(&service).is_empty(),
+            "a durable refusal needs no retry"
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), original);
+        assert_no_effect_closure(&dir);
     }
 
     #[tokio::test]
-    async fn colliding_admission_retains_terminal_effect_for_startup_and_shared_retry() {
+    async fn colliding_admission_retains_unreadable_effect_until_the_lease_is_released() {
         let root = temp_run_dir("effect-discovery-collision");
         let _guard = TempGuard(root.clone());
         let runs = root.join("runs");
         let peer = service(&runs); // Exists before the peer's terminal journal.
         let dir = runs.join("run-37");
         terminal_effect(&dir);
+        let journal = run_meta_dir(&dir).join("journal.jsonl");
         // These distinct IDs share the FNV admission shard. A need not even
         // have a journal: only its unrelated preparation lease blocks B.
         let admission = try_lock_run_admission(&runs.join("run-0"))
@@ -486,23 +520,100 @@ mod tests {
                 "busy hints stay deduplicated"
             );
         }
+        let original = std::fs::read(&journal).unwrap();
         drop(admission);
-        let error = reconcile_effect_candidate(
-            &dir,
-            peer.inner.deployment_policy.container_timeouts,
-            &mut EffectProvenance::ScanHint,
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("unreadable backend"), "{error}");
-        // A failed cleanup remains queued, not just its durable effect.
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                peer.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap(),
+            "a permanent refusal resolves the candidate without cleanup"
+        );
+        assert_eq!(std::fs::read(&journal).unwrap(), original);
         startup.reconcile_startup_effects().await;
-        assert_eq!(pending(&startup), std::slice::from_ref(&dir));
-        close_effect(&dir);
-        peer.resume_recovered_runs().await;
-        startup.reconcile_startup_effects().await;
-        assert!(pending(&peer).is_empty());
         assert!(pending(&startup).is_empty());
+        // A later scan legitimately rediscovers the still-open intent, but
+        // its pass resolves it without deleting anything or journaling closure.
+        let (_, rescanned) =
+            rehydrate_runs_with_effects(&runs, 8, 8, policy::LIVE_EVENT_CHANNEL_CAPACITY).unwrap();
+        assert_eq!(
+            rescanned,
+            BTreeMap::from([(dir.clone(), EffectProvenance::ConfirmedEffects)])
+        );
+        peer.inner.unreconciled_effects.lock().unwrap().clear();
+        peer.merge_effect_candidates(rescanned);
+        peer.reconcile_startup_effects().await;
+        assert!(pending(&peer).is_empty());
+        assert_no_effect_closure(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_effect_refusal_is_durable_for_a_nonterminal_run() {
+        let root = temp_run_dir("effect-refusal-detail");
+        let _guard = TempGuard(root.clone());
+        let runs = root.join("runs");
+        let service = service(&runs);
+        let dir = runs.join("run-88");
+        open_effect(&dir);
+        let journal = run_meta_dir(&dir).join("journal.jsonl");
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                service.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap()
+        );
+        let events = crate::summaries::read_journal_events(&dir).unwrap();
+        let terminal = events
+            .iter()
+            .find(|event| event["t"] == "run_finished")
+            .expect("the refusal must be durable");
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["metrics"], json!({}));
+        assert_eq!(terminal["reason"]["code"], "execution_failed");
+        assert!(
+            terminal["reason"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("qcg has not proved that the effect stopped"),
+            "{terminal}"
+        );
+        assert!(
+            terminal["reason"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("unreadable backend")
+        );
+        assert_no_effect_closure(&dir);
+        assert!(pending(&service).is_empty());
+        let settled = std::fs::read(&journal).unwrap();
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                service.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(&journal).unwrap(),
+            settled,
+            "no second terminal event"
+        );
+        assert_eq!(
+            crate::summaries::read_journal_events(&dir)
+                .unwrap()
+                .iter()
+                .filter(|event| event["t"] == "run_finished")
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -574,9 +685,31 @@ mod tests {
         assert_eq!(pending(&service), std::slice::from_ref(&dir));
         assert_eq!(std::fs::read(&journal).unwrap(), b"not json\n");
         std::fs::write(&journal, &original).unwrap();
-        close_effect(&dir);
+        let error = reconcile_run_effects(
+            &dir,
+            "terminal",
+            service.inner.deployment_policy.container_timeouts,
+        )
+        .await
+        .expect_err("an open intent must be refused");
+        assert!(
+            error
+                .to_string()
+                .contains("qcg has not proved that the effect stopped"),
+            "{error}"
+        );
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                service.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap()
+        );
         service.reconcile_startup_effects().await;
         assert!(pending(&service).is_empty());
+        assert_no_effect_closure(&dir);
         // A fresh hint that encounters malformed evidence is no longer allowed
         // to clear merely because that uncertain evidence later disappears.
         std::fs::write(&journal, b"not json\n").unwrap();
@@ -590,9 +723,18 @@ mod tests {
         service.reconcile_startup_effects().await;
         assert_eq!(pending(&service), std::slice::from_ref(&dir));
         std::fs::write(&journal, &original).unwrap();
-        close_effect(&dir);
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                service.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap()
+        );
         service.reconcile_startup_effects().await;
         assert!(pending(&service).is_empty());
+        assert_no_effect_closure(&dir);
         service.merge_effect_candidates([(dir.clone(), EffectProvenance::ScanHint)]);
         std::fs::remove_dir_all(&dir).unwrap();
         service.reconcile_startup_effects().await;

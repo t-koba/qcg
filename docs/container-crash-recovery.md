@@ -3,24 +3,34 @@
 qcg records container effect intent in the run journal before provisioning.
 The record currently contains the backend descriptor and a random
 `qcg-<32 hex>` name. The client creates the instance with that name and
-attaches diagnostic ownership labels. Normal teardown and recovery list by
-name, then stop and delete by that same name. A successful command is recorded
-as `effect_closed`; backend errors leave the intent open and block run re-entry
-or deletion.
+attaches diagnostic ownership labels. Live teardown of an owned session still
+stops and deletes that session and journals `effect_closed`.
+
+After the creator dies, qcg does **not** reclaim name-keyed effects: it does
+not delete by name and does not certify absence. Recovery makes one bounded
+presence probe, records what was observed in the refusal detail, and retains
+the intent whichever way the probe went: qcg has not proved that the effect
+stopped. The refusal is written as a durable failed run result, so run failure
+detail surfaces it rather than leaving it only in server logs. Replay,
+including a direct `qcg run`, is refused while any intent is open, as are run
+deletion and retention GC; the external outcome must be reconciled manually.
 
 Recovery runs at startup and again under the run execution lease before a
 recovered run resumes. This prevents concurrent qcg execution from creating an
 effect while recovery is acting, but it does not fence a daemon-side create
-that is still completing after the process dies.
+that is still completing after the process dies. The refusal is permanent, not
+a transient reconciliation failure, so it is not retried; a later scan may
+rediscover the retained intent and record the same refusal again.
 
 ## Limits
 
 This is not a proven identity-safe crash-cleanup protocol. The journal stores
 no immutable backend instance ID, and the implementation has no atomic
-compare-and-delete operation. A matching name is treated as ownership. If a
-name is reused between lookup and removal, current name-targeted commands
-cannot prove that the instance being removed is the one qcg created. Labels
-are diagnostic, not an atomic ownership check.
+compare-and-delete operation. A matching name cannot prove ownership: if a name
+is reused, name-targeted commands cannot prove that the instance is the one
+qcg created, and a missing entry does not fence a create that finishes later.
+Labels are diagnostic, not an atomic ownership check. Recovery therefore
+neither removes nor settles effects by name.
 
 A bounded real-daemon diagnostic on Docker and rootless Podman found that an
 absent full container ID can resolve to a different container deliberately
@@ -76,15 +86,14 @@ fallback cleanup; any remaining resources expire with the runner. On success
 the probe verifies instance absence and retires its empty project. This does
 not exercise qcg process death, late creates, continuation, or reset.
 
-The settle check is finite. A create that completes after the last absence
-check can be left behind after the intent is closed. A successful name-based
-removal likewise proves only that the backend accepted the request, not that
-it removed the originally journaled instance. Backend errors leave the intent
-open, but the current code cannot recognize a successful name-reuse race as
-ambiguous and may record the intent closed after removing a replacement.
-Therefore no Docker, Podman, runsc, Incus, or LXD crash-cleanup guarantee is
-claimed, and `effect_closed` alone is not evidence that an effect is safe to
-replay.
+Recovery's single presence probe is finite: a create that completes after it
+is simply observed later, and neither observation settles the intent. An
+unreachable backend leaves the intent open and produces the same fail-closed
+refusal. Recovery never journals `effect_closed` and never deletes by name, so
+it cannot mistake a replacement for the original instance. Therefore no
+Docker, Podman, runsc, Incus, or LXD crash-cleanup guarantee is claimed, and
+`effect_closed` from live teardown alone is not evidence that an effect is safe
+to replay.
 
 ## Requirements for a cleanup guarantee
 
