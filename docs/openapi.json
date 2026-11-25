@@ -3201,6 +3201,7 @@
               "dry_run",
               "effect_closed",
               "effect_intent",
+              "effect_unresolved",
               "elapsed_accounted",
               "elapsed_exceeded",
               "foreach_budget_exhausted",

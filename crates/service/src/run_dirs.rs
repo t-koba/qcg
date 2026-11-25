@@ -194,9 +194,11 @@ pub(crate) fn try_interrupt_admission(
 }
 
 /// Record a permanent fail-closed refusal for an unresolved container effect.
-/// The caller holds the execution lease. Only a nonterminal run is settled,
-/// and the durable detail is written under the journal lock so a prior
-/// terminal outcome is never overwritten.
+/// The caller holds the execution lease. A nonterminal run is settled with a
+/// failed `run_finished`; a run that already has a terminal outcome keeps that
+/// result byte-for-byte and gets a state-free `effect_unresolved` diagnostic.
+/// The batch is selected under the journal lock so a terminal event is never
+/// overwritten or duplicated.
 pub(crate) fn settle_unresolved_effect(
     run_dir: &Utf8Path,
     message: &str,
@@ -219,7 +221,9 @@ pub(crate) fn settle_unresolved_effect(
                 }),
             )]
         } else {
-            Vec::new()
+            // The existing terminal result stays authoritative: this is a
+            // diagnostic only, with the same detail the failed result carries.
+            vec![("effect_unresolved", json!({ "detail": message }))]
         })
     })
     .map_err(ServiceError::invalid)?;
@@ -3758,6 +3762,128 @@ mod tests {
         assert_eq!(
             pending[0].0, id,
             "resurrect preserves the operation id for journal dedup"
+        );
+    }
+
+    fn effect_run_journal(root: &Utf8Path, terminal: bool) -> Utf8PathBuf {
+        let run_dir = root.join("run-1");
+        let meta = run_meta_dir(&run_dir);
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal =
+            JournalWriter::create(&meta.join("journal.jsonl"), "run-1", false, None).unwrap();
+        journal.event("run_queued", json!({
+            "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+        })).unwrap();
+        journal
+            .event(
+                "effect_intent",
+                json!({
+                    "effect": "fixture-effect", "backend": {"unknown": true},
+                }),
+            )
+            .unwrap();
+        if terminal {
+            journal
+                .event(
+                    "run_canceled",
+                    json!({
+                        "reason": {"code": "canceled", "message": "original outcome"},
+                    }),
+                )
+                .unwrap();
+        }
+        run_dir
+    }
+
+    #[test]
+    fn unresolved_effect_settles_a_nonterminal_run_once() {
+        let root = temp_root("unresolved-effect-nonterminal");
+        let _guard = TempGuard(root.clone());
+        let run_dir = effect_run_journal(&root, false);
+        settle_unresolved_effect(&run_dir, "effect detail").unwrap();
+        let events = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        assert_eq!(events.len(), 3);
+        let terminal = &events[2];
+        assert_eq!(terminal["t"], "run_finished");
+        assert_eq!(terminal["status"], "failed");
+        assert_eq!(terminal["metrics"], json!({}));
+        assert_eq!(terminal["reason"]["code"], "execution_failed");
+        assert_eq!(terminal["reason"]["message"], "effect detail");
+        // A retry observes the new terminal state: it appends a state-free
+        // diagnostic but must never rewrite or duplicate the terminal result.
+        settle_unresolved_effect(&run_dir, "later detail").unwrap();
+        let after = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        assert_eq!(&after[..events.len()], events, "no terminal rewrite");
+        assert_eq!(after.len(), events.len() + 1, "one diagnostic");
+        assert_eq!(after.last().unwrap()["t"], "effect_unresolved");
+        assert_eq!(after.last().unwrap()["detail"], "later detail");
+        assert_eq!(
+            after
+                .iter()
+                .filter(|event| event["t"] == "run_finished")
+                .count(),
+            1,
+            "no second terminal event"
+        );
+    }
+
+    #[test]
+    fn unresolved_effect_on_a_terminal_run_is_a_state_free_diagnostic() {
+        let root = temp_root("unresolved-effect-terminal");
+        let _guard = TempGuard(root.clone());
+        let run_dir = effect_run_journal(&root, true);
+        let journal = run_meta_dir(&run_dir).join("journal.jsonl");
+        let original_bytes = std::fs::read(&journal).unwrap();
+        let original = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        settle_unresolved_effect(&run_dir, "effect detail").unwrap();
+        let events = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        assert!(
+            std::fs::read(&journal)
+                .unwrap()
+                .starts_with(&original_bytes)
+        );
+        assert_eq!(&events[..original.len()], original);
+        assert_eq!(events.len(), original.len() + 1);
+        let diagnostic = events.last().unwrap();
+        assert_eq!(diagnostic["t"], "effect_unresolved");
+        assert_eq!(diagnostic["detail"], "effect detail");
+        assert_eq!(diagnostic["reason"], Value::Null);
+        // Another call appends another diagnostic but leaves the terminal
+        // event, its reason, and the open intent untouched.
+        settle_unresolved_effect(&run_dir, "later detail").unwrap();
+        let after_retry = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
+        assert_eq!(&after_retry[..events.len()], events);
+        assert_eq!(after_retry.len(), events.len() + 1);
+        assert_eq!(after_retry.last().unwrap()["t"], "effect_unresolved");
+        assert_eq!(after_retry.last().unwrap()["detail"], "later detail");
+        assert_eq!(
+            after_retry
+                .iter()
+                .filter(|event| event["t"] == "run_canceled")
+                .count(),
+            1
+        );
+        assert_eq!(
+            after_retry
+                .iter()
+                .filter(|event| event["t"] == "run_finished")
+                .count(),
+            0
+        );
+        assert_eq!(
+            RunState::fold_journal(&journal)
+                .unwrap()
+                .terminal
+                .map(|terminal| serde_json::to_value(terminal).unwrap()),
+            Some(json!("canceled"))
+        );
+        assert!(
+            RunState::fold_journal(&journal)
+                .unwrap()
+                .effects
+                .contains_key("fixture-effect")
         );
     }
 }

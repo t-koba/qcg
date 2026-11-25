@@ -118,11 +118,11 @@ async fn reconcile_effect_candidate(
     drop(admission);
     if let Err(error) = reconcile_effects(run_id, timeouts, &state).await {
         // A name-keyed refusal is permanent, not a transient probe failure:
-        // record it durably when the run has not already settled, and stop
-        // retrying a candidate whose journal now carries the failure detail.
-        if state.terminal.is_none() {
-            crate::run_dirs::settle_unresolved_effect(run_dir, &error.to_string())?;
-        }
+        // record it durably for every run and stop retrying the candidate.
+        // The settlement helper writes a failed terminal result only when the
+        // run has none yet; an already-terminal run keeps its outcome and gets
+        // a state-free `effect_unresolved` detail instead.
+        crate::run_dirs::settle_unresolved_effect(run_dir, &error.to_string())?;
         return Ok(true);
     }
     Ok(true)
@@ -294,6 +294,8 @@ mod tests {
     use crate::summaries::{refresh_runs_with_effects, rehydrate_runs_with_effects};
     use crate::tests::support::{TempGuard, temp_run_dir};
 
+    const MARKER: &str = "qcg has not proved that the effect stopped";
+
     fn service(runs: &Utf8Path) -> LocalService {
         LocalService::with_generator_roots_policy_and_store_mode(
             vec![],
@@ -388,6 +390,36 @@ mod tests {
                 .contains_key("fixture-effect"),
             "the unreadable intent must stay journaled"
         );
+    }
+
+    /// A terminal run keeps its original journal prefix byte-for-byte and
+    /// receives exactly one state-free diagnostic carrying the same marker.
+    fn assert_terminal_effect_diagnostic(dir: &Utf8Path, original: &[u8]) {
+        let journal = run_meta_dir(dir).join("journal.jsonl");
+        assert!(
+            std::fs::read(&journal).unwrap().starts_with(original),
+            "the original terminal journal must stay byte-for-byte unchanged"
+        );
+        let events = crate::summaries::read_journal_events(dir).unwrap();
+        let original_count = original.iter().filter(|byte| **byte == b'\n').count();
+        assert_eq!(events.len(), original_count + 1, "exactly one diagnostic");
+        assert_eq!(events[original_count - 1]["t"], "run_canceled");
+        let diagnostic = &events[original_count];
+        assert_eq!(diagnostic["t"], "effect_unresolved");
+        assert!(
+            diagnostic["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(MARKER)),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["t"] == "run_canceled")
+                .count(),
+            1
+        );
+        assert_no_effect_closure(dir);
     }
 
     #[tokio::test]
@@ -513,8 +545,7 @@ mod tests {
             pending(&service).is_empty(),
             "a durable refusal needs no retry"
         );
-        assert_eq!(std::fs::read(&journal).unwrap(), original);
-        assert_no_effect_closure(&dir);
+        assert_terminal_effect_diagnostic(&dir, &original);
     }
 
     #[tokio::test]
@@ -562,7 +593,7 @@ mod tests {
             .unwrap(),
             "a permanent refusal resolves the candidate without cleanup"
         );
-        assert_eq!(std::fs::read(&journal).unwrap(), original);
+        assert_terminal_effect_diagnostic(&dir, &original);
         startup.reconcile_startup_effects().await;
         assert!(pending(&startup).is_empty());
         // A later scan legitimately rediscovers the still-open intent, but
@@ -588,7 +619,6 @@ mod tests {
         let service = service(&runs);
         let dir = runs.join("run-88");
         open_effect(&dir);
-        let journal = run_meta_dir(&dir).join("journal.jsonl");
         assert!(
             reconcile_effect_candidate(
                 &dir,
@@ -621,7 +651,7 @@ mod tests {
         );
         assert_no_effect_closure(&dir);
         assert!(pending(&service).is_empty());
-        let settled = std::fs::read(&journal).unwrap();
+        let settled = crate::summaries::read_journal_events(&dir).unwrap();
         assert!(
             reconcile_effect_candidate(
                 &dir,
@@ -631,18 +661,27 @@ mod tests {
             .await
             .unwrap()
         );
+        let after_retry = crate::summaries::read_journal_events(&dir).unwrap();
         assert_eq!(
-            std::fs::read(&journal).unwrap(),
+            &after_retry[..settled.len()],
             settled,
-            "no second terminal event"
+            "the terminal result must never be rewritten"
+        );
+        assert_eq!(after_retry.len(), settled.len() + 1, "one diagnostic");
+        assert_eq!(after_retry.last().unwrap()["t"], "effect_unresolved");
+        assert!(
+            after_retry.last().unwrap()["detail"]
+                .as_str()
+                .is_some_and(|detail| detail.contains(MARKER)),
+            "{after_retry:?}"
         );
         assert_eq!(
-            crate::summaries::read_journal_events(&dir)
-                .unwrap()
+            after_retry
                 .iter()
                 .filter(|event| event["t"] == "run_finished")
                 .count(),
-            1
+            1,
+            "no second terminal event"
         );
     }
 

@@ -706,7 +706,9 @@ impl RunState {
         crate::journal::traces::overlay::validate(self, event)?;
         // Final runs accept only explicit lifecycle restarts. `run_interrupted` is
         // nonterminal and HITL resume appends after it; any other post-final event is invalid,
-        // except `effect_closed`: a late cleanup or recovery may still confirm an instance gone.
+        // except `effect_closed`: a late cleanup or recovery may still confirm an instance gone,
+        // and `effect_unresolved`: a state-free diagnostic that reports an effect recovery could
+        // not confirm stopped without changing the preserved terminal outcome.
         if self.terminal.as_ref().is_some_and(|terminal| {
             matches!(
                 terminal,
@@ -714,7 +716,7 @@ impl RunState {
             )
         }) && !matches!(
             kind,
-            "run_queued" | "run_started" | "run_resumed" | "effect_closed"
+            "run_queued" | "run_started" | "run_resumed" | "effect_closed" | "effect_unresolved"
         ) {
             return Err(crate::JournalError::InvalidEvent(format!(
                 "final run cannot accept `{kind}`"
@@ -1753,6 +1755,7 @@ mod tests {
     /// State-free diagnostics; fold tests ensure API internal-event registration.
     const STATE_FREE_JOURNAL_EVENT_KINDS: &[&str] = &[
         "audit_degraded",
+        "effect_unresolved",
         "elapsed_exceeded",
         "foreach_sibling_ignored",
         "hook_replayed",
@@ -1774,6 +1777,40 @@ mod tests {
                 .expect("known state-free kind");
             assert_eq!(serde_json::to_value(state).unwrap(), before, "{kind}");
         }
+    }
+
+    #[test]
+    fn unresolved_effect_diagnostic_is_accepted_after_terminal_without_folding() {
+        let mut state = RunState::default();
+        state
+            .apply(&json!({"t": "run_canceled", "seq": 1}))
+            .expect("terminal event folds");
+        state
+            .apply(&json!({
+                "t": "effect_unresolved", "seq": 2,
+                "detail": "qcg has not proved that the effect stopped",
+            }))
+            .expect("a state-free diagnostic is accepted after a terminal event");
+        assert_eq!(
+            state
+                .terminal
+                .as_ref()
+                .map(|terminal| serde_json::to_value(terminal).unwrap()),
+            Some(json!("canceled")),
+            "the diagnostic must not replace the preserved terminal outcome"
+        );
+        assert!(
+            state.effects.is_empty(),
+            "the diagnostic must not open or close an effect"
+        );
+        assert_eq!(state.last_seq, 2, "the journal sequence still advances");
+        let error = state
+            .apply(&json!({"t": "audit_degraded", "seq": 3}))
+            .expect_err("final runs still reject unrelated events");
+        assert!(
+            error.to_string().contains("final run cannot accept"),
+            "{error}"
+        );
     }
 
     fn operation_event(seq: u64, kind: &str, id: &str, status: Option<&str>) -> Value {

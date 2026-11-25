@@ -475,10 +475,28 @@ async fn startup_recovery_of_a_terminal_run_preserves_terminal_and_never_settles
     let before = events(&dir);
     let service = svc(runs);
     service.resume_recovered_runs().await;
+    let after = events(&dir);
     assert_eq!(
-        events(&dir),
+        &after[..before.len()],
         before,
         "a prior terminal event is never overwritten"
+    );
+    assert_eq!(after.len(), before.len() + 1, "one state-free diagnostic");
+    assert_eq!(after.last().unwrap()["t"], "effect_unresolved");
+    assert!(
+        after.last().unwrap()["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(MARKER)),
+        "{:?}",
+        after.last().unwrap()
+    );
+    assert_eq!(
+        after
+            .iter()
+            .filter(|event| event["t"] == "run_canceled")
+            .count(),
+        1,
+        "the terminal outcome stays singular"
     );
     assert_eq!(daemon.instances(), [ours.as_str()]);
     assert!(fold_run_state(&dir).unwrap().effects.contains_key(&ours));

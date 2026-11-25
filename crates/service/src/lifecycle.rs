@@ -1450,14 +1450,18 @@ impl LocalService {
                     Ok(state) => state,
                     Err(error) => {
                         tracing::error!(run_id = %run_id, %error, "container effect reconciliation refused re-entry; journal retained");
+                        // Journal the refusal for terminal runs too: the
+                        // settlement helper preserves the existing outcome and
+                        // appends a state-free diagnostic. In-memory failure and
+                        // wake-up stay limited to nonterminal runs, so startup
+                        // convergence of a terminal run is untouched.
+                        if let Err(append_error) =
+                            crate::run_dirs::settle_unresolved_effect(&run_dir, &error.to_string())
+                        {
+                            tracing::error!(run_id = %run_id, %append_error, "unresolved-effect refusal record failed; retaining run");
+                            return;
+                        }
                         if nonterminal {
-                            if let Err(append_error) = crate::run_dirs::settle_unresolved_effect(
-                                &run_dir,
-                                &error.to_string(),
-                            ) {
-                                tracing::error!(run_id = %run_id, %append_error, "unresolved-effect refusal record failed; retaining run");
-                                return;
-                            }
                             service.mark_spawn_failed(&run_id).await;
                             service.inner.queue_notify.notify_waiters();
                         }

@@ -27,6 +27,7 @@ pub const INTERNAL_RUN_EVENT_KINDS: &[&str] = &[
     "budget_charged",
     "effect_closed",
     "effect_intent",
+    "effect_unresolved",
     "elapsed_exceeded",
     "foreach_sibling_drained",
     "foreach_iteration_settled",

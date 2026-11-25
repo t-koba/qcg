@@ -15,6 +15,18 @@ detail surfaces it rather than leaving it only in server logs. Replay,
 including a direct `qcg run`, is refused while any intent is open, as are run
 deletion and retention GC; the external outcome must be reconciled manually.
 
+Decision: operator end state's "stops, or reports" has two realizations. For
+name-keyed container effects there is no safe stop under the current backend
+contracts (see [Limits](#limits)): a journaled name cannot prove ownership, so
+qcg refuses replay and deletion, reports the effect, and retains its intent
+instead of stopping or deleting anything. Delegated cgroup host effects are
+different: recovery actually stops them by writing `cgroup.kill` and confirming
+`populated 0` (see [host process recovery](host-process-crash-recovery.md)).
+When a run already has a terminal outcome, that event and its reason are
+preserved unchanged; the unresolved container effect is surfaced as a
+state-free `effect_unresolved` journal event whose `detail` carries the exact
+marker `qcg has not proved that the effect stopped`.
+
 Recovery runs at startup and again under the run execution lease before a
 recovered run resumes. This prevents concurrent qcg execution from creating an
 effect while recovery is acting, but it does not fence a daemon-side create
