@@ -502,6 +502,31 @@ async fn startup_recovery_of_a_terminal_run_preserves_terminal_and_never_settles
     assert!(fold_run_state(&dir).unwrap().effects.contains_key(&ours));
     assert_no_effect_closure(&dir);
     assert_no_deletion(&daemon);
+
+    // The operator-facing events stream must actually deliver the diagnostic,
+    // not merely carry it in the journal: a client that reopened the stream at
+    // the original terminal seq sees exactly one effect_unresolved with the
+    // marker, and settled history replays past the terminal event to EOF.
+    let run_id = dir.file_name().unwrap().to_owned();
+    let terminal_seq = before
+        .iter()
+        .find(|event| event["t"] == "run_canceled")
+        .unwrap()["seq"]
+        .as_u64()
+        .unwrap();
+    let (history, settled, _) = service.history_events(&run_id, terminal_seq).await.unwrap();
+    assert!(settled, "the run is already terminal");
+    use futures_util::StreamExt;
+    let visible = history.collect::<Vec<_>>().await;
+    assert_eq!(visible.len(), 1, "one diagnostic after the terminal event");
+    assert_eq!(visible[0].kind, "effect_unresolved");
+    assert!(
+        serde_json::to_value(&visible[0].data).unwrap()["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(MARKER)),
+        "{:?}",
+        visible[0]
+    );
 }
 
 #[tokio::test]
