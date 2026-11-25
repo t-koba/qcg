@@ -46,6 +46,7 @@ class RunSnapshot(_RunSnapshotRequired, total=False):
     queue_position_quality: QueuePositionQuality
     queued_at: str | None
     seq: int
+    unresolved_effect: bool
 
 
 class QcgError(Exception):

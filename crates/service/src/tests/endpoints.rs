@@ -302,6 +302,101 @@ async fn snapshot_exposes_generator_id_without_parsing_run_id() {
     let _ = std::fs::remove_dir_all(&runs);
 }
 
+/// The operator-facing HTTP snapshot folds the same state-free diagnostic
+/// as `qcg runs show`: an open effect plus `effect_unresolved`, without
+/// changing the already-journaled terminal result.
+#[tokio::test]
+async fn snapshot_surfaces_unresolved_effect_diagnostic_from_journal() {
+    const MARKER: &str = "qcg has not proved that the effect stopped";
+
+    fn write_terminal_run(runs: &Utf8PathBuf, id: &str, diagnostic: bool) {
+        let meta = runs.join(id).join("meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        let journal =
+            engine::JournalWriter::create(&meta.join("journal.jsonl"), id, false, None).unwrap();
+        journal
+            .event(
+                "run_started",
+                json!({
+                    "generator": "demo@1.0.0", "generator_path": "demo", "contract_sha256": "test",
+                    "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+                    "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+                }),
+            )
+            .unwrap();
+        journal
+            .event(
+                "effect_intent",
+                json!({"effect": "orphan-instance", "backend": {"unknown": true}}),
+            )
+            .unwrap();
+        journal
+            .event("run_finished", json!({"status": "success"}))
+            .unwrap();
+        if diagnostic {
+            journal
+                .event(
+                    "effect_unresolved",
+                    json!({"detail": format!("container effect `orphan-instance`: reconcile failed; {MARKER}; reconcile the external outcome manually")}),
+                )
+                .unwrap();
+        }
+        drop(journal);
+    }
+
+    let runs = temp_run_dir("snapshot-unresolved-effect");
+    let _ = std::fs::remove_dir_all(&runs);
+    write_terminal_run(&runs, "unresolved", true);
+    write_terminal_run(&runs, "clean", false);
+    let service = test_service(vec![], runs.clone());
+
+    let snapshot = service
+        .snapshot("unresolved".into())
+        .await
+        .expect("disk-only terminal snapshot should load");
+    assert!(snapshot.unresolved_effect, "{snapshot:?}");
+    assert_eq!(snapshot.state, RunStatus::Succeeded);
+    // The HTTP detail path uses the same assembly with artifact limits.
+    let limited = service
+        .snapshot_with_limits(
+            "unresolved".into(),
+            &crate::package::ArtifactZipLimits::default(),
+        )
+        .await
+        .expect("limited snapshot should load");
+    assert!(limited.unresolved_effect, "{limited:?}");
+
+    let clean = service
+        .snapshot("clean".into())
+        .await
+        .expect("clean terminal snapshot should load");
+    assert!(!clean.unresolved_effect, "{clean:?}");
+    assert_eq!(clean.state, RunStatus::Succeeded);
+
+    // The diagnostic is appended, not substituted: the terminal event and
+    // its reason stay authoritative and the exact marker stays durable.
+    let events = crate::summaries::read_journal_events(&runs.join("unresolved")).unwrap();
+    let finished: Vec<_> = events
+        .iter()
+        .filter(|event| event["t"] == "run_finished")
+        .collect();
+    assert_eq!(finished.len(), 1);
+    assert_eq!(finished[0]["status"], "success");
+    assert_eq!(finished[0]["reason"], serde_json::Value::Null);
+    let diagnostics: Vec<_> = events
+        .iter()
+        .filter(|event| event["t"] == "effect_unresolved")
+        .collect();
+    assert_eq!(diagnostics.len(), 1);
+    assert!(
+        diagnostics[0]["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains(MARKER)),
+        "{diagnostics:?}"
+    );
+    let _ = std::fs::remove_dir_all(&runs);
+}
+
 #[tokio::test]
 async fn cost_metrics_treat_unmetered_search_as_unpriced() {
     let root = temp_run_dir("search-priced");

@@ -1222,6 +1222,12 @@ type QcgModel119 = {
     step_summaries: {
         [key: string]: QcgModel134;
     };
+    /**
+     * State-free diagnostic folded from the journal at read time: an open
+     * container effect alongside an `effect_unresolved` event. Not a stored
+     * run-level reason; it never replaces the terminal outcome.
+     */
+    unresolved_effect: boolean;
 };
 
 type QcgModel120 = {

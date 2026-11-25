@@ -28,8 +28,10 @@ state-free `effect_unresolved` journal event whose `detail` carries the exact
 marker `qcg has not proved that the effect stopped`. Operators discover this on
 an already-terminal run through `qcg runs show` (a short warning in text output,
 `unresolved_effect: true` in show JSON) and through `--diagnose`, which lists the
-`effect_unresolved` event as a cause; both are folded from the journal at read
-time rather than stored as a second message or a run-level reason.
+`effect_unresolved` event as a cause; the HTTP run detail (`GET /api/runs/{id}`)
+exposes the same `unresolved_effect: true` on `RunSnapshot`. All are folded from
+the journal at read time rather than stored as a second message or a run-level
+reason.
 
 Recovery runs at startup and again under the run execution lease before a
 recovered run resumes. This prevents concurrent qcg execution from creating an

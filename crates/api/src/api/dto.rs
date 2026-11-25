@@ -261,6 +261,11 @@ pub struct RunSnapshot {
     /// Terminal outcomes folded from journal records, keyed by canonical
     /// `NodePath` strings. Live values and outputs are not summarized here.
     pub step_summaries: BTreeMap<String, StepSummary>,
+    /// State-free diagnostic folded from the journal at read time: an open
+    /// container effect alongside an `effect_unresolved` event. Not a stored
+    /// run-level reason; it never replaces the terminal outcome.
+    #[serde(default)]
+    pub unresolved_effect: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

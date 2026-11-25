@@ -3861,6 +3861,11 @@
             },
             "description": "Terminal outcomes folded from journal records, keyed by canonical\n`NodePath` strings. Live values and outputs are not summarized here.",
             "type": "object"
+          },
+          "unresolved_effect": {
+            "default": false,
+            "description": "State-free diagnostic folded from the journal at read time: an open\ncontainer effect alongside an `effect_unresolved` event. Not a stored\nrun-level reason; it never replaces the terminal outcome.",
+            "type": "boolean"
           }
         },
         "required": [

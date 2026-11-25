@@ -542,6 +542,10 @@ impl LocalService {
                 .map_err(api_internal)?,
             labels: disk_state.labels.clone(),
             step_summaries: step_summaries_from_nodes(&disk_state.nodes),
+            // Same state-free fold as the CLI summary: the diagnostic is
+            // derived from this single journal read, never a stored reason.
+            unresolved_effect: disk_state.has_unresolved_effect_diagnostic()
+                && !disk_state.effects.is_empty(),
         })
     }
 

@@ -200,6 +200,7 @@ fn conditional_json_star_matches_any_existing_snapshot() {
         metrics: None,
         labels: BTreeMap::new(),
         step_summaries: BTreeMap::new(),
+        unresolved_effect: false,
     };
     let body = serde_json::to_vec(&snapshot).expect("snapshot should serialize");
     let mut star = axum::http::HeaderMap::new();

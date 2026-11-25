@@ -1254,6 +1254,7 @@ mod tests {
             metrics: None,
             labels: std::collections::BTreeMap::new(),
             step_summaries: std::collections::BTreeMap::new(),
+            unresolved_effect: false,
         }
     }
 
