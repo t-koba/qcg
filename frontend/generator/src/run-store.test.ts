@@ -16,6 +16,7 @@ const snapshot = (seq: number, state: RunSnapshot["state"]): RunSnapshot => ({
   parent_run_id: null,
   queued_at: null,
   step_summaries: {},
+  unresolved_effect: false,
 });
 afterEach(() => vi.useRealTimers());
 it("snapshot requests coalesce and concurrent updates add one followup", async () => {

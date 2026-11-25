@@ -30,6 +30,7 @@ vi.mock("./run-store.svelte", async (importOriginal) => {
         parent_run_id: null,
         queued_at: null,
         step_summaries: {},
+        unresolved_effect: false,
       };
       this.currentRun = "test";
       this.applySnapshot(snapshot);
