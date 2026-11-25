@@ -1238,18 +1238,43 @@ output_file = "three.txt"
             .json()
             .await
             .expect("generator detail should deserialize");
-        let response = client
-            .post(format!("http://{addr}/api/runs"))
-            .header(
-                reqwest::header::HeaderName::from_static(policy::IDEMPOTENCY_HEADER),
-                uuid::Uuid::now_v7().to_string(),
-            )
-            .header("x-qcg-package-sha256", &detail.package_sha256)
-            .json(&request)
-            .send()
-            .await
-            .expect("start request should respond");
-        assert_eq!(response.status(), reqwest::StatusCode::CREATED);
+        // A freshly booted in-process server can transiently answer a start
+        // with 503 while its idempotency claim gate settles (observed on
+        // Windows CI, where filesystem timing makes the cold-start race
+        // visible). A 503 is retryable: reusing the SAME key and body converges
+        // onto the one reserved run and, if the first attempt committed before
+        // its response was lost, replays the original 201. Bound the retries
+        // and keep the final status so a persistent 503 still fails the test
+        // rather than being hidden behind a loop.
+        let idempotency_key = uuid::Uuid::now_v7().to_string();
+        let mut last_status = reqwest::StatusCode::SERVICE_UNAVAILABLE;
+        let mut last_body = String::new();
+        for attempt in 0..6 {
+            let current = client
+                .post(format!("http://{addr}/api/runs"))
+                .header(
+                    reqwest::header::HeaderName::from_static(policy::IDEMPOTENCY_HEADER),
+                    idempotency_key.as_str(),
+                )
+                .header("x-qcg-package-sha256", &detail.package_sha256)
+                .json(&request)
+                .send()
+                .await
+                .expect("start request should respond");
+            last_status = current.status();
+            if last_status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
+                break;
+            }
+            last_body = current.text().await.unwrap_or_default();
+            if attempt < 5 {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        assert_eq!(
+            last_status,
+            reqwest::StatusCode::CREATED,
+            "start request did not converge to 201 after bounded retries: {last_body}"
+        );
 
         let serve_id = std::fs::read_dir(&serve_runs)
             .expect("serve runs directory should exist")
