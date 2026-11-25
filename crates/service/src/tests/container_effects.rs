@@ -9,7 +9,7 @@ use camino::Utf8PathBuf;
 use serde_json::{Value, json};
 use std::time::Duration;
 
-use super::support::{TempGuard, temp_run_dir, wait_for_snapshot};
+use super::support::{TempGuard, pin_test_package, temp_run_dir, wait_for_snapshot};
 
 use super::execution::daemon_policy_test_support::Daemon;
 
@@ -365,6 +365,78 @@ async fn refusal_is_durable_and_observable_and_stops_retry() {
         );
         assert_no_effect_closure(&dir);
     }
+}
+
+#[tokio::test]
+async fn startup_reconciliation_converges_memory_and_stops_retry() {
+    let Some(daemon) = Daemon::isolated(&format!(
+        "{T}startup_reconciliation_converges_memory_and_stops_retry"
+    )) else {
+        return;
+    };
+    let ours = name();
+    let dir = run_with_intents(&daemon, &[&ours]);
+    // Rehydration of a nonterminal run requires a pinned package; the
+    // shared helper's journal only carries the effect intent.
+    let generators =
+        Utf8PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/generators");
+    let contract = contract::Contract::load(generators.join("ask-user")).unwrap();
+    let package_sha256 = pin_test_package(&contract.root, &dir);
+    engine::JournalWriter::append_single_event(
+        &run_meta_dir(&dir).join("journal.jsonl"),
+        "run-x",
+        "run_started",
+        json!({
+            "generator": "demo@1.0.0", "generator_path": "demo",
+            "contract_sha256": contract.sha256, "package_sha256": package_sha256,
+            "inputs": {}, "resource_hashes": [], "schema_version": api::JOURNAL_SCHEMA_VERSION,
+            "elapsed_budget_mode": policy::ElapsedBudgetMode::WallClock,
+        }),
+        engine::JournalLimits::default(),
+        None,
+    )
+    .unwrap();
+    daemon.set_instances(&[&ours]);
+    let service = crate::LocalService::with_generator_roots_policy_and_store_mode(
+        vec![],
+        dir.parent().unwrap().to_owned(),
+        None,
+        1,
+        8,
+        crate::RunStoreMode::Exclusive,
+        crate::ServiceDeploymentPolicy {
+            queued_resumer_secs: 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert!(
+        !service.inner.runs.read().await["run-x"].state.is_terminal(),
+        "construction must rehydrate the unresolved run"
+    );
+
+    service.resume_recovered_runs().await;
+    assert_eq!(
+        service.inner.runs.read().await["run-x"].state,
+        RunStatus::Failed,
+        "a durable refusal must converge memory"
+    );
+    let detail = refusal(&dir);
+    assert!(detail.contains(MARKER), "{detail}");
+    assert_no_effect_closure(&dir);
+    assert_no_deletion(&daemon);
+
+    let calls = daemon.log();
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let resumer = service.start_queued_resumer(shutdown.clone());
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert_eq!(
+        daemon.log(),
+        calls,
+        "a permanent refusal must not be retried"
+    );
+    shutdown.cancel();
+    resumer.await.unwrap().unwrap();
 }
 
 #[tokio::test]

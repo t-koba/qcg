@@ -225,6 +225,36 @@ impl LocalService {
         }
     }
 
+    /// Converge a nonterminal record when this process settled a durable
+    /// refusal. The spawn path's terminal precheck skips memory convergence,
+    /// so an unconverged record would be retried by the queued resumer forever
+    /// in Exclusive mode, where no shared refresh repairs memory.
+    async fn converge_settled_effect_run(&self, run_dir: &Utf8Path) {
+        let Some(run_id) = run_dir.file_name() else {
+            return;
+        };
+        let Ok(state) = crate::summaries::fold_run_state(run_dir) else {
+            // Leave memory untouched: the queued resumer can re-read it.
+            return;
+        };
+        let Some(terminal) = state.terminal.clone() else {
+            return;
+        };
+        {
+            let mut runs = self.inner.runs.write().await;
+            if let Some(record) = runs.get_mut(run_id)
+                && !record.state.is_terminal()
+                && !crate::types::task_slot_is_live(&record.task)
+            {
+                // A live owner's own finalizer must not be disturbed.
+                record.state = crate::lifecycle::terminal_status(&terminal);
+                record.preempted = false;
+                record.clear_prompt();
+            }
+        }
+        self.inner.queue_notify.notify_waiters();
+    }
+
     /// Retry discovery and reconciliation from bounded startup/shared scans.
     /// Busy leases and failed evidence/cleanup remain candidates, deduplicated
     /// with discoveries made while this pass was awaiting a backend.
@@ -245,7 +275,7 @@ impl LocalService {
             )
             .await
             {
-                Ok(true) => {}
+                Ok(true) => self.converge_settled_effect_run(&run_dir).await,
                 Ok(false) => retry.push((run_dir, provenance)),
                 Err(error) => {
                     tracing::error!(%run_dir, %error, "container effect discovery/reconciliation incomplete");
