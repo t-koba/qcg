@@ -17,6 +17,9 @@ pub struct RunSummary {
     pub finished_at: Option<String>,
     pub artifacts: Vec<OutputArtifact>,
     pub retention_days: Option<u32>,
+    /// A terminal run whose external effect recovery could not confirm stopped.
+    /// Derived from folded state at read time; never stored, never a reason.
+    pub unresolved_effect: bool,
 }
 
 impl RunSummary {
@@ -42,6 +45,7 @@ impl RunSummary {
             "finished_at": self.finished_at,
             "artifacts": self.artifacts,
             "retention_days": self.retention_days,
+            "unresolved_effect": self.unresolved_effect,
         })
     }
 }

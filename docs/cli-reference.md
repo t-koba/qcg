@@ -163,12 +163,16 @@ JSON event output go to stdout.
   dead owner's journal can still say `running`. It is not a service queue entry.
 - `qcg runs show <id> [--runs-dir dir] [--json] [--diagnose]` prints status, inputs,
   artifacts, and cost metrics (tokens in/out/cached, LLM calls, microUSD with
-  a USD estimate, duration). `--diagnose` bundles journal failure signals
-  (`step_failed`, `step_skipped`, `tool_failed`, `llm_route_failed`,
-  `llm_validation_failed`, `step_retry`, `context_compacted`, guardrail and
-  run errors) into one ordered screen plus read-only per-node LLM cost facts
-  (`node_costs` folded from `llm_call` events: calls, tokens, microUSD);
-  `--json --diagnose` returns
+  a USD estimate, duration). A terminal run whose external effect recovery could
+  not confirm stopped prints a short warning carrying the exact marker
+  `qcg has not proved that the effect stopped`, and show JSON carries
+  `unresolved_effect: true`; both are derived from already-folded state, not a
+  second journal scan, and never change the recorded terminal outcome. `--diagnose`
+  bundles journal failure signals (`step_failed`, `step_skipped`, `tool_failed`,
+  `effect_unresolved`, `llm_route_failed`, `llm_validation_failed`, `step_retry`,
+  `context_compacted`, guardrail and run errors) into one ordered screen plus
+  read-only per-node LLM cost facts (`node_costs` folded from `llm_call` events:
+  calls, tokens, microUSD); `--json --diagnose` returns
   `{summary, diagnosis}` with no threshold judgement.
 - `qcg runs costs [--runs-dir dir] [--state <s>] [--generator <id>]
   [--by-model] [--json]` prints per-run cost totals plus a grand total.

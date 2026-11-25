@@ -73,6 +73,11 @@ pub(crate) fn show_run(
     }
     println!("run: {id}");
     println!("status: {}", summary.status);
+    if summary.unresolved_effect {
+        println!(
+            "warning: an external effect remains unresolved; qcg has not proved that the effect stopped; reconcile it manually before treating this run as complete"
+        );
+    }
     if let Some(hint) = summary.direct_run_hint() {
         println!("{hint}");
     }
@@ -189,6 +194,12 @@ fn diagnose_run(run_dir: &Utf8Path) -> Result<Value> {
                     None
                 }
             }
+            "effect_unresolved" => Some(json!({
+                "seq": event.seq,
+                "kind": "effect_unresolved",
+                "node": node,
+                "message": data.get("detail").and_then(Value::as_str).unwrap_or(""),
+            })),
             "llm_route_failed"
             | "llm_validation_failed"
             | "step_retry"

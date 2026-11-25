@@ -161,6 +161,7 @@ pub(crate) fn run_summary_from_state(
         finished_at: state.finished_at.clone(),
         artifacts,
         retention_days,
+        unresolved_effect: state.has_unresolved_effect_diagnostic() && !state.effects.is_empty(),
     })
 }
 
