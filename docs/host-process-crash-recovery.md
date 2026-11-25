@@ -58,6 +58,28 @@ that group. A descendant can call `setsid` to leave it. Tokio's child
 guards do not run after qcg receives SIGKILL. A numeric PID/PGID after
 restart cannot prove that the same process group still exists.
 
+A non-delegated payload is not given a death-time teardown through
+`PR_SET_PDEATHSIG`. That signal is delivered to the direct child when its
+creating *thread* ends, not when the qcg process dies: a threaded `qcg serve`
+can deliver it on an unrelated worker-thread exit while qcg is still alive,
+and it never reaches descendants that could leave the group with `setsid`.
+The kernel also clears it across `fork` and on any credential change, so it
+cannot be a durable ownership proof. The delegated Linux launch therefore arms
+it only across the fork-to-placement window, verifies the original parent is
+still alive, and clears it once the child is inside its per-run cgroup — from
+then on the cgroup, not a thread lifetime, owns cleanup. Arming it on a
+non-delegated payload would signal only the direct child and imply a
+crash-cleanup guarantee the product does not make.
+
+So, from qcg's death until a later owner arrives, the guarantee for a
+non-delegated host effect is exactly this: the journaled `Started` operation is
+retained and identifies the possible effect; no guard runs and qcg stops no
+process; and a later owner refuses automatic replay and never treats a
+surviving PID/PGID as ownership or cleanup proof. The process tree keeps
+running until an external owner establishes and stops it. Deployments that
+need the whole tree stopped at qcg's death must use delegated Linux cgroup-v2
+recovery.
+
 ## Recovery safety and its limits
 
 A durable external operation still marked `Started` is retained. Under
