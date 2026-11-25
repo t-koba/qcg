@@ -76,9 +76,13 @@ non-delegated host effect is exactly this: the journaled `Started` operation is
 retained and identifies the possible effect; no guard runs and qcg stops no
 process; and a later owner refuses automatic replay and never treats a
 surviving PID/PGID as ownership or cleanup proof. The process tree keeps
-running until an external owner establishes and stops it. Deployments that
-need the whole tree stopped at qcg's death must use delegated Linux cgroup-v2
-recovery.
+running until an external owner establishes and stops it. Delegated Linux
+cgroup-v2 recovery changes this boundary: the persisted binding keeps the tree
+identifiable and contained after qcg dies, but qcg stops and confirms it
+(`cgroup.kill`, `populated 0`) only when a later owner reconciles under
+exclusive ownership — not at qcg's death. A deployment that needs the whole
+tree shut down before the next owner reconciles needs a separate supervisor or
+lifecycle guarantee; delegation alone does not provide one.
 
 ## Recovery safety and its limits
 
