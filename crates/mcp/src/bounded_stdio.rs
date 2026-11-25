@@ -8,12 +8,19 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 
 const READ_CHUNK_BYTES: usize = 8 * 1024;
 const CHILD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(3);
 #[cfg(unix)]
 const CHILD_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
+const GROUP_STOP_SETTLE: Duration = Duration::from_millis(500);
+#[cfg(target_os = "linux")]
+const LIVE_GROUP_MEMBER_ERROR: &str =
+    "owned MCP stdio process group still has a live member after the group signal";
 
 /// Outcome of an owned stdio transport close, shared with the session that
 /// settles the launch. The SDK service loop logs a failed transport close but
@@ -188,6 +195,12 @@ impl Transport<RoleClient> for BoundedChildTransport {
 
 impl BoundedChildTransport {
     async fn close_inner(&mut self) -> std::io::Result<()> {
+        // Captured before terminate consumes the field: confirmation must use
+        // the owned PGID only, never a reaped PID or a saved signal anchor.
+        #[cfg(target_os = "linux")]
+        let group_to_verify: Option<i32> = self.process_group_id;
+        #[cfg(not(target_os = "linux"))]
+        let group_to_verify: Option<i32> = None;
         #[cfg(feature = "test-probe")]
         if self.inject_close_failure {
             return Err(std::io::Error::other(
@@ -218,8 +231,68 @@ impl BoundedChildTransport {
                 group_result?;
             }
         }
+        self.confirm_group_stopped(group_to_verify).await?;
         self.kill_container_blocking();
         Ok(())
+    }
+
+    /// Confirms the owned group has stopped after a successful group signal.
+    ///
+    /// Only Linux needs this: POSIX `killpg` returns 0 when *at least one*
+    /// member was signalled, so a member with different credentials can
+    /// survive. BSD/macOS instead reports EPERM when any member cannot be
+    /// signalled, so success there already proves the whole group was
+    /// signalled; a post-reap libproc re-query cannot distinguish an emptied
+    /// group from a failed lookup and would reject a clean close. Everywhere
+    /// but Linux this is therefore a no-op and pre-existing behaviour stands.
+    ///
+    /// A kernel null probe proves a truly empty group (ESRCH) without trusting
+    /// procfs. While the group is still occupied, a null signal counts dead
+    /// zombies as members, so a per-thread `/proc` scan distinguishes a live
+    /// survivor (fail closed) from a zombie-only group that holds no effect
+    /// (confirm). The scan first verifies procfs is in this PID namespace and
+    /// not `hidepid`-mounted; otherwise the view is incomplete and the close
+    /// fails closed rather than certifying an unproven cessation.
+    async fn confirm_group_stopped(&mut self, pgid: Option<i32>) -> std::io::Result<()> {
+        #[cfg(target_os = "linux")]
+        {
+            let Some(pgid) = pgid else {
+                // No owned group was established; nothing to verify.
+                return Ok(());
+            };
+            #[cfg(feature = "test-probe")]
+            if let Some(answer) = self.inject_group_live_member.take() {
+                // An injected answer is the settled liveness state: no polling.
+                return match answer {
+                    Ok(false) => Ok(()),
+                    Ok(true) => Err(std::io::Error::other(LIVE_GROUP_MEMBER_ERROR)),
+                    Err(error) => Err(error),
+                };
+            }
+            let deadline = Instant::now() + GROUP_STOP_SETTLE;
+            loop {
+                // Kernel-scoped proof of an empty group needs no procfs trust.
+                if owned_group_is_empty(pgid)? {
+                    return Ok(());
+                }
+                // Still occupied: a null signal also counts unreaped zombies,
+                // so inspect per-thread states. An untrusted/incomplete procfs
+                // view fails closed instead of confirming an unproven stop.
+                match owned_group_has_live_member(pgid) {
+                    Ok(false) => return Ok(()),
+                    Ok(true) if Instant::now() >= deadline => {
+                        return Err(std::io::Error::other(LIVE_GROUP_MEMBER_ERROR));
+                    }
+                    Ok(true) => tokio::time::sleep(CHILD_EXIT_POLL_INTERVAL).await,
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (self, pgid);
+            Ok(())
+        }
     }
 }
 
@@ -282,24 +355,24 @@ impl BoundedChildTransport {
             let injected_errno = self.inject_group_signal_errno;
             #[cfg(not(feature = "test-probe"))]
             let injected_errno: Option<i32> = None;
-            #[cfg(feature = "test-probe")]
-            let injected_live_member = self.inject_group_live_member.take();
-            #[cfg(not(feature = "test-probe"))]
-            let injected_live_member: Option<std::io::Result<bool>> = None;
-
             if result == -1 || injected_errno.is_some() {
                 let error = match injected_errno {
                     Some(errno) => std::io::Error::from_raw_os_error(errno),
                     None => std::io::Error::last_os_error(),
                 };
-                // The PGID equals the leader PID (spawned with process_group(0)).
-                // That leader is a known-exited WNOWAIT zombie, not a live
-                // member, so owned_group_has_live_member excludes it.
+                // Only consume the classifier probe when it is actually used;
+                // a successful signal leaves it for close confirmation.
+                #[cfg(feature = "test-probe")]
+                let injected_live_member = self.inject_group_live_member.take();
+                #[cfg(not(feature = "test-probe"))]
+                let injected_live_member: Option<std::io::Result<bool>> = None;
+                // The injected answer drives the real classifier when set;
+                // otherwise the platform default decides benign EPERM.
                 let benign = is_benign_group_signal_failure(
                     error.raw_os_error().unwrap_or_default(),
                     || match injected_live_member {
                         Some(answer) => answer,
-                        None => owned_group_has_live_member(process_group_id),
+                        None => platform_group_live_answer(process_group_id),
                     },
                 );
                 if benign {
@@ -371,11 +444,11 @@ fn is_benign_group_signal_failure(
     }
 }
 
-/// Whether the owned process group still contains a live (non-zombie) member.
-///
-/// Used only to disambiguate XNU's `killpg` EPERM. The group leader's PID equals
-/// the PGID and is the known-exited WNOWAIT zombie, so it is excluded. An error
-/// reading group state is treated as "live" by callers so cleanup fails closed.
+/// Whether the macOS owned process group still contains a live (non-zombie)
+/// member. Used only to disambiguate XNU's ambiguous `killpg` EPERM while the
+/// leader is still a waitable anchor. The group leader's PID equals the PGID
+/// and is a known-exited zombie, so it is excluded. An error reading group
+/// state is an `Err` so callers fail closed.
 #[cfg(target_os = "macos")]
 fn owned_group_has_live_member(process_group_id: i32) -> std::io::Result<bool> {
     if process_group_id <= 0 {
@@ -479,10 +552,172 @@ fn macos_process_is_live(pid: libc::pid_t, process_group_id: i32) -> std::io::Re
     Ok(info.pbi_pgid == process_group_id as u32 && info.pbi_status != libc::SZOMB)
 }
 
+/// Kernel-scoped proof that the owned process group is empty. `kill(-pgid, 0)`
+/// consults the kernel's own group table, so ESRCH proves no process (live or
+/// zombie) remains. This is only the empty fast path: a null signal also
+/// succeeds for unreaped zombies, so an occupied answer says nothing about
+/// liveness and must be resolved by `owned_group_has_live_member`.
+#[cfg(target_os = "linux")]
+fn owned_group_is_empty(process_group_id: i32) -> std::io::Result<bool> {
+    if process_group_id <= 0 {
+        return Err(std::io::Error::other("invalid process group id"));
+    }
+    // SAFETY: signal 0 probes the numeric group and changes no process state.
+    let result = unsafe { libc::kill(-process_group_id, 0) };
+    if result == 0 {
+        return Ok(false);
+    }
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        // ESRCH is the kernel's statement that no process remains in the group.
+        Some(libc::ESRCH) => Ok(true),
+        // A member exists that we cannot signal; still occupied.
+        Some(libc::EPERM) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+/// Whether a member of the owned process group is still live.
+///
+/// Uses per-thread states, not the process-entry state: a `pthread_exit` leader
+/// leaves a `Z` process entry while a sibling thread is still runnable, so a
+/// process-level `Z` check would confirm while a member is alive. Genuine
+/// SIGKILL zombies have every task in `Z`/`X`/`x` and hold no effect.
+///
+/// Before trusting an empty scan, this verifies procfs is mounted in our PID
+/// namespace (otherwise numeric PGIDs are meaningless) and without `hidepid`
+/// (otherwise a foreign-UID survivor is invisible). If either check fails, an
+/// error fails closed rather than certifying an unproven cessation.
+#[cfg(target_os = "linux")]
+fn owned_group_has_live_member(process_group_id: i32) -> std::io::Result<bool> {
+    validate_procfs_coverage()?;
+    for entry in std::fs::read_dir("/proc")? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        let Ok(pid) = name.parse::<i32>() else {
+            continue;
+        };
+        if pid == process_group_id {
+            // The leader is the known-exited, reaped child; its old PGID can be
+            // reused by an unrelated process that must never keep our close open
+            // forever. Its own (empty or Z) task list holds no live effect.
+            continue;
+        }
+        let stat = match std::fs::read_to_string(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if proc_entry_vanished(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        if process_stat_group(&stat)? != process_group_id {
+            continue;
+        }
+        // Inspect every thread: a Z process entry can hide a live sibling.
+        for task in std::fs::read_dir(entry.path().join("task"))? {
+            let task = match task {
+                Ok(task) => task,
+                Err(error) if proc_entry_vanished(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let stat = match std::fs::read_to_string(task.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if proc_entry_vanished(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            if !matches!(process_stat_state(&stat)?, "Z" | "X" | "x") {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Verifies that a `/proc` scan can see exactly the processes in our PID
+/// namespace without `hidepid` filtering. `/proc/self/stat` reports the reader
+/// in the mounted namespace, so its PGID must equal our own `getpgrp()`. A
+/// `hidepid` mount can hide a foreign-UID survivor that survived group
+/// delivery; a mismatched namespace makes numeric PGIDs from the scan unsafe.
+#[cfg(target_os = "linux")]
+fn validate_procfs_coverage() -> std::io::Result<()> {
+    let self_stat = std::fs::read_to_string("/proc/self/stat")?;
+    if process_stat_group(&self_stat)? != unsafe { libc::getpgrp() } {
+        return Err(std::io::Error::other(
+            "/proc is not mounted in this PID namespace",
+        ));
+    }
+    let mounts = std::fs::read_to_string("/proc/self/mountinfo")?;
+    for line in mounts.lines() {
+        // mountinfo: ... mount_point ... - fstype source super_options
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let Some(sep) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        if fields.get(4) != Some(&"/proc") || fields.get(sep + 1) != Some(&"proc") {
+            continue;
+        }
+        let options = fields.get(sep + 3).copied().unwrap_or("");
+        if options.split(',').any(|option| {
+            option
+                .strip_prefix("hidepid=")
+                .is_some_and(|value| value != "0" && !value.is_empty())
+        }) {
+            return Err(std::io::Error::other(
+                "/proc is mounted with hidepid; group membership is not observable",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Parses the process-group field (fifth field, index 2 after `comm`) from a
+/// Linux `/proc/<pid>/stat` or `/proc/<pid>/task/<tid>/stat` record.
+#[cfg(target_os = "linux")]
+fn process_stat_group(stat: &str) -> std::io::Result<i32> {
+    let fields = stat
+        .rsplit_once(')')
+        .ok_or_else(|| std::io::Error::other("malformed process stat"))?
+        .1;
+    let mut fields = fields.split_whitespace();
+    let _state = fields.next();
+    let _ppid = fields.next();
+    let group = fields
+        .next()
+        .ok_or_else(|| std::io::Error::other("incomplete process stat"))?;
+    group
+        .parse::<i32>()
+        .map_err(|_| std::io::Error::other("invalid process group in stat"))
+}
+
+/// Parses the single-character process state from a Linux procfs stat record.
+#[cfg(target_os = "linux")]
+fn process_stat_state(stat: &str) -> std::io::Result<&str> {
+    stat.rsplit_once(')')
+        .and_then(|(_, fields)| fields.split_whitespace().next())
+        .ok_or_else(|| std::io::Error::other("incomplete process stat"))
+}
+
+#[cfg(target_os = "linux")]
+fn proc_entry_vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Default group-liveness answer for the ambiguous EPERM classifier when no
+/// test probe supplies one. macOS libproc can prove a zombie-only group;
+/// elsewhere (Linux included) EPERM has no benign reading — a gone group
+/// reports ESRCH and zombies accept the signal — so it stays fatal.
+#[cfg(target_os = "macos")]
+fn platform_group_live_answer(process_group_id: i32) -> std::io::Result<bool> {
+    owned_group_has_live_member(process_group_id)
+}
+
 #[cfg(all(unix, not(target_os = "macos")))]
-fn owned_group_has_live_member(_process_group_id: i32) -> std::io::Result<bool> {
-    // Outside XNU a gone group reports ESRCH and zombies accept SIGKILL, so
-    // EPERM has no benign reading: treat it as a live member and fail closed.
+fn platform_group_live_answer(_process_group_id: i32) -> std::io::Result<bool> {
     Ok(true)
 }
 
@@ -581,6 +816,153 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLineReader<R> {
 mod tests {
     use super::*;
     use tokio::io::AsyncReadExt as _;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_group_probe_distinguishes_a_live_group_from_an_emptied_one() {
+        // A real leader and same-group worker: the kernel probe must report
+        // the group as occupied while they live, and as empty only after the
+        // whole group is killed and the leader reaped. This exercises the
+        // mechanism that establishes whole-group cessation without trusting
+        // procfs visibility (hidepid, PID namespaces, zombie/thread entries).
+        use std::os::unix::process::CommandExt as _;
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30 & wait"])
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("child should spawn");
+        let pgid = i32::try_from(child.id()).expect("pid fits i32");
+        assert!(
+            !owned_group_is_empty(pgid).expect("probe should read the live group"),
+            "a live owned group must be reported as occupied"
+        );
+        // SAFETY: this process group was created solely for this test by the
+        // child spawned above with process_group(0).
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        let _ = child.wait();
+        let deadline = Instant::now() + GROUP_STOP_SETTLE;
+        while Instant::now() < deadline {
+            if matches!(owned_group_is_empty(pgid), Ok(true)) {
+                return;
+            }
+            std::thread::sleep(CHILD_EXIT_POLL_INTERVAL);
+        }
+        panic!("kernel probe never observed the emptied group");
+    }
+
+    /// Spawns `/bin/sleep` as the group leader and a second `/bin/sleep` joined
+    /// into the same group via a pre-exec `setpgid`; returns (leader, worker).
+    #[cfg(target_os = "linux")]
+    fn spawn_group_with_worker(worker_seconds: &str) -> (std::process::Child, std::process::Child) {
+        use std::os::unix::process::CommandExt as _;
+        let leader = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .process_group(0)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("leader should spawn");
+        let pgid = i32::try_from(leader.id()).expect("pid fits i32");
+        // Let the leader establish the group before the worker joins it.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        // SAFETY: the pre-exec hook calls only async-signal-safe setpgid to
+        // join the leader's group before the child execs the shell.
+        let worker = unsafe {
+            std::process::Command::new("/bin/sleep")
+                .arg(worker_seconds)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .pre_exec(move || {
+                    if libc::setpgid(0, pgid) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                })
+                .spawn()
+        }
+        .expect("worker should spawn");
+        // Ensure the worker actually joined before any liveness observation.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let stat = std::fs::read_to_string(format!("/proc/{}/stat", worker.id())).unwrap();
+        assert_eq!(
+            process_stat_group(&stat).expect("group should parse"),
+            pgid,
+            "worker should be in the owned group"
+        );
+        (leader, worker)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn live_non_leader_member_is_reported_live() {
+        let (mut leader, mut worker) = spawn_group_with_worker("30");
+        let pgid = i32::try_from(leader.id()).expect("pid fits i32");
+        let worker_pid = i32::try_from(worker.id()).expect("pid fits i32");
+        assert_eq!(
+            process_stat_state(
+                &std::fs::read_to_string(format!("/proc/{worker_pid}/stat")).unwrap()
+            )
+            .expect("state should parse"),
+            "S"
+        );
+        assert!(
+            owned_group_has_live_member(pgid).expect("coverage should be established"),
+            "a live same-group worker must keep the close unconfirmed"
+        );
+        // SAFETY: this group was created solely for this test.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        let _ = leader.wait();
+        let _ = worker.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn zombie_only_non_leader_member_is_not_reported_live() {
+        // Reproduces the non-reaping-supervisor case: a same-group worker that
+        // died but stays an unreaped zombie (held as an unreaped direct child).
+        // A null signal counts it as an occupied group, but the per-thread scan
+        // must see every task dead so a clean close is confirmed, not rejected.
+        let (mut leader, mut worker) = spawn_group_with_worker("0.1");
+        let pgid = i32::try_from(leader.id()).expect("pid fits i32");
+        let worker_pid = i32::try_from(worker.id()).expect("pid fits i32");
+        // Do not reap the worker: it becomes a zombie held by this test.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert_eq!(
+            process_stat_state(
+                &std::fs::read_to_string(format!("/proc/{worker_pid}/stat")).unwrap()
+            )
+            .expect("state should parse"),
+            "Z",
+            "the worker should be an unreaped zombie"
+        );
+        assert!(
+            !owned_group_is_empty(pgid).expect("probe should read the group"),
+            "an unreaped zombie keeps the group occupied"
+        );
+        assert!(
+            !owned_group_has_live_member(pgid).expect("coverage should be established"),
+            "a zombie-only member must not keep the close unconfirmed"
+        );
+        // SAFETY: this group was created solely for this test.
+        unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        let _ = leader.wait();
+        let _ = worker.wait();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn procfs_coverage_is_established_in_this_namespace() {
+        // The real coverage gate must accept a procfs mounted in our own PID
+        // namespace without hidepid, and stat parsing must agree with getpgrp.
+        validate_procfs_coverage().expect("ordinary procfs coverage should be established");
+        let self_stat = std::fs::read_to_string("/proc/self/stat").expect("self stat readable");
+        assert_eq!(
+            process_stat_group(&self_stat).expect("group should parse"),
+            unsafe { libc::getpgrp() }
+        );
+    }
 
     #[test]
     fn close_receipt_is_confirmed_only_by_a_recorded_success() {
@@ -690,6 +1072,50 @@ mod tests {
             .await
             .expect("a zombie-only group must confirm the owned close");
         assert!(transport.close_receipt().confirmed());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-probe"))]
+    #[tokio::test]
+    async fn successful_group_signal_with_live_member_leaves_close_unconfirmed() {
+        // Linux kill(2) can return 0 after signalling only part of a group
+        // whose members have different credentials. A survivor must keep the
+        // close unconfirmed even though the group signal itself succeeded.
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_errno = None;
+        transport.inject_group_live_member = Some(Ok(true));
+        let error = transport
+            .close()
+            .await
+            .expect_err("a live group member must fail the owned close");
+        assert!(error.to_string().contains("live member"), "{error}");
+        assert!(!transport.close_receipt().confirmed());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-probe"))]
+    #[tokio::test]
+    async fn successful_group_signal_with_no_live_member_confirms_close() {
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_errno = None;
+        transport.inject_group_live_member = Some(Ok(false));
+        transport
+            .close()
+            .await
+            .expect("a stopped group must confirm the owned close");
+        assert!(transport.close_receipt().confirmed());
+    }
+
+    #[cfg(all(target_os = "linux", feature = "test-probe"))]
+    #[tokio::test]
+    async fn unreadable_liveness_after_signal_fails_closed() {
+        let mut transport = shell_transport("cat >/dev/null; exit 0");
+        transport.inject_group_signal_errno = None;
+        transport.inject_group_live_member = Some(Err(std::io::Error::other("unreadable")));
+        let error = transport
+            .close()
+            .await
+            .expect_err("unreadable group state must fail the owned close");
+        assert!(error.to_string().contains("unreadable"), "{error}");
+        assert!(!transport.close_receipt().confirmed());
     }
 
     #[cfg(unix)]
