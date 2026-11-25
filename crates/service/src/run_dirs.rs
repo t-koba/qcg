@@ -220,6 +220,12 @@ pub(crate) fn settle_unresolved_effect(
                     ),
                 }),
             )]
+        } else if state.has_unresolved_effect_diagnostic() {
+            // An unresolved name-keyed effect is never closed, so every rescan
+            // rediscovers this run. One durable diagnostic is enough; an empty
+            // batch is a true no-op under the journal lock and stops unbounded
+            // growth and repeated O(n) refolds.
+            Vec::new()
         } else {
             // The existing terminal result stays authoritative: this is a
             // diagnostic only, with the same detail the failed result carries.
@@ -3850,14 +3856,14 @@ mod tests {
         assert_eq!(diagnostic["t"], "effect_unresolved");
         assert_eq!(diagnostic["detail"], "effect detail");
         assert_eq!(diagnostic["reason"], Value::Null);
-        // Another call appends another diagnostic but leaves the terminal
-        // event, its reason, and the open intent untouched.
+        // Repeated rescorings of the still-open intent are no-ops: one durable
+        // diagnostic is enough, and the terminal event, its reason, and the
+        // open intent stay untouched. Without the fold-only marker a 5s rescan
+        // would append another event forever.
         settle_unresolved_effect(&run_dir, "later detail").unwrap();
+        settle_unresolved_effect(&run_dir, "third detail").unwrap();
         let after_retry = read_events_from_meta(&run_meta_dir(&run_dir)).unwrap();
-        assert_eq!(&after_retry[..events.len()], events);
-        assert_eq!(after_retry.len(), events.len() + 1);
-        assert_eq!(after_retry.last().unwrap()["t"], "effect_unresolved");
-        assert_eq!(after_retry.last().unwrap()["detail"], "later detail");
+        assert_eq!(after_retry, events, "no second diagnostic on any rescan");
         assert_eq!(
             after_retry
                 .iter()

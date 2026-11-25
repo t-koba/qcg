@@ -260,6 +260,11 @@ pub struct RunState {
     /// external outcome is reconciled; recovery never reclaims by name.
     #[serde(default)]
     pub effects: BTreeMap<String, Value>,
+    /// Whether a state-free `effect_unresolved` diagnostic is already
+    /// journaled. Fold-only (never cached): repeated effect rescans must not
+    /// append one diagnostic per pass, and this never changes the outcome.
+    #[serde(skip)]
+    pub(crate) effect_unresolved_diagnosed: bool,
 }
 
 impl Default for RunState {
@@ -312,6 +317,7 @@ impl Default for RunState {
             mcp_resumed: BTreeMap::new(),
             hooks_settled: BTreeSet::new(),
             effects: BTreeMap::new(),
+            effect_unresolved_diagnosed: false,
         }
     }
 }
@@ -379,6 +385,13 @@ pub fn operation_id_for(run_id: &str, node_id: &str, invocation_id: &str) -> Str
 }
 
 impl RunState {
+    /// Whether this run's journal already carries the state-free
+    /// `effect_unresolved` diagnostic, so repeated effect reconciliations can
+    /// avoid appending one event per rescan.
+    pub fn has_unresolved_effect_diagnostic(&self) -> bool {
+        self.effect_unresolved_diagnosed
+    }
+
     /// Deletion and retention-GC gate: retains every `Started` operation
     /// regardless of its durable `on_indeterminate` policy. Neither
     /// deletion nor GC is cleanup; they must not erase evidence while the
@@ -1517,6 +1530,9 @@ impl RunState {
                     self.effects.remove(name);
                 }
             }
+            "effect_unresolved" => {
+                self.effect_unresolved_diagnosed = true;
+            }
             kind if api::INTERNAL_RUN_EVENT_KINDS.contains(&kind) => {
                 // Internal diagnostics have no folded state unless an earlier arm consumes them.
             }
@@ -1802,6 +1818,10 @@ mod tests {
         assert!(
             state.effects.is_empty(),
             "the diagnostic must not open or close an effect"
+        );
+        assert!(
+            state.effect_unresolved_diagnosed,
+            "the fold-only marker must record the durable diagnostic"
         );
         assert_eq!(state.last_seq, 2, "the journal sequence still advances");
         let error = state

@@ -683,6 +683,19 @@ mod tests {
             1,
             "no second terminal event"
         );
+        // A third scan must not grow the journal: repeated discovery of the
+        // still-open intent is the steady state under the 5s rescan worker.
+        assert!(
+            reconcile_effect_candidate(
+                &dir,
+                service.inner.deployment_policy.container_timeouts,
+                &mut EffectProvenance::ScanHint,
+            )
+            .await
+            .unwrap()
+        );
+        let after_third = crate::summaries::read_journal_events(&dir).unwrap();
+        assert_eq!(after_third, after_retry, "no diagnostic growth on rescan");
     }
 
     #[tokio::test]

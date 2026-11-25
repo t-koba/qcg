@@ -32,7 +32,9 @@ recovered run resumes. This prevents concurrent qcg execution from creating an
 effect while recovery is acting, but it does not fence a daemon-side create
 that is still completing after the process dies. The refusal is permanent, not
 a transient reconciliation failure, so it is not retried; a later scan may
-rediscover the retained intent and record the same refusal again.
+rediscover the retained intent, but the `effect_unresolved` diagnostic is
+journaled once — repeated scans no-op under the journal lock rather than
+appending another event on every pass.
 
 ## Limits
 
