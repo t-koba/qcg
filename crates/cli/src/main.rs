@@ -1280,7 +1280,16 @@ output_file = "three.txt"
             }
         }
         if let Some((status, detail)) = &first_refusal {
-            eprintln!("start request first 503 refusal: status={status} detail={detail}");
+            // libtest captures `eprintln!` from a passing test, which would hide
+            // the first refusal on the very retry path this diagnostic exists
+            // for. Write straight to the locked stderr handle so the runner
+            // still records it when a later attempt converges to 201.
+            use std::io::Write as _;
+            let mut stderr = std::io::stderr().lock();
+            let _ = writeln!(
+                stderr,
+                "start request first 503 refusal: status={status} detail={detail}"
+            );
         }
         assert_eq!(
             last_status,
