@@ -195,8 +195,9 @@ without blocking: an unsuccessful contender closes its key handle before
 releasing the registry and polling. There are no retained open waiters.
 Final gate release explicitly unlocks and closes its handle, then tries the
 registry and rechecks the key file's lock before closing/unlinking it. A busy
-registry is retried briefly at final release; a replacement holder, or a
-registry still busy after that bounded retry, defers reclamation. This
+registry is retried briefly on a non-request worker at final release; a
+replacement holder, or a registry still busy after that bounded retry, defers
+reclamation. This
 ordering prevents an open racing cleanup from later locking a retired inode.
 Do not open, unlink, replace or rotate these coordination files outside this
 protocol while peers are running; the registry itself is never reclaimed.

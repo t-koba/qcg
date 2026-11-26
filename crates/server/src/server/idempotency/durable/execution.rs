@@ -72,17 +72,33 @@ enum ReclaimOutcome {
 }
 
 /// The last owner may drop while another gate briefly holds the registry.
-/// Retry that narrow window so completed work never leaves a stale path.
+/// Try once inline so an uncontended close stays prompt; hand a busy registry
+/// to a non-async worker rather than sleeping on an executor thread.
 fn reclaim_after_drop(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(), String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        if reclaim_outcome(runs, path)? != ReclaimOutcome::RegistryBusy
-            || std::time::Instant::now() >= deadline
-        {
-            return Ok(());
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
+    if reclaim_outcome(runs, path)? != ReclaimOutcome::RegistryBusy {
+        return Ok(());
     }
+    let runs = runs.clone();
+    let path = path.to_owned();
+    if std::thread::Builder::new()
+        .name("qcg-gate-reclaim".into())
+        .spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            while std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                match reclaim_outcome(&runs, &path) {
+                    Ok(ReclaimOutcome::RegistryBusy) => continue,
+                    Ok(_) | Err(_) => return,
+                }
+            }
+        })
+        .is_err()
+    {
+        // The resident sweep still reclaims deferred leftovers; do not block
+        // the owner's thread just because a retry worker could not start.
+        tracing::warn!("idempotency execution gate retry worker unavailable");
+    }
+    Ok(())
 }
 
 pub(super) fn reclaim(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(), String> {
@@ -131,7 +147,68 @@ mod tests {
         acquired_rx.recv().unwrap();
         drop(gate);
         holder.join().unwrap();
-        assert!(!path.exists(), "the final drop must reclaim its lock file");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the final drop must reclaim its lock file"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        std::fs::remove_dir_all(runs).unwrap();
+    }
+
+    #[tokio::test]
+    async fn final_drop_retry_does_not_stall_an_async_worker() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("gate-retry-async-{}", uuid::Uuid::now_v7()));
+        let gate = ExecutionGate::try_acquire(&runs, "key").unwrap().unwrap();
+        let path = gate.path.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let holder_runs = runs.clone();
+        let holder = std::thread::spawn(move || {
+            let registry = registry(&holder_runs).unwrap().unwrap();
+            acquired_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            drop(registry);
+        });
+        acquired_rx.recv().unwrap();
+
+        let ticks = Arc::new(AtomicUsize::new(0));
+        let ticker = {
+            let ticks = Arc::clone(&ticks);
+            tokio::spawn(async move {
+                for _ in 0..100 {
+                    tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+                    ticks.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        drop(gate);
+        // The registry is still held: read progress before releasing it, so a
+        // regression to inline sleeping on this worker cannot pass by awaiting
+        // a ticker that eventually finishes.
+        tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        assert!(
+            ticks.load(Ordering::SeqCst) > 0,
+            "final reclamation must not occupy the async worker while retrying"
+        );
+        release_tx.send(()).unwrap();
+        ticker.await.unwrap();
+        holder.join().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while path.exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "reclamation must complete after the registry releases"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
         std::fs::remove_dir_all(runs).unwrap();
     }
 
