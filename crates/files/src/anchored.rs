@@ -299,7 +299,9 @@ pub fn apply_anchored_patch(
     }
     let mut lines: Vec<String> = snapshot.into_iter().map(|line| line.text).collect();
     // Bottom-up application keeps earlier line numbers stable.
-    // Same-line order is deterministic: prepend, replace, append.
+    // Same-line order is append, replace, prepend: Append inserts after the
+    // anchored line, Replace still targets that line, and Prepend then
+    // inserts before the replaced line.
     let mut ordered: Vec<&PatchEdit> = edits.iter().collect();
     ordered.sort_by(|left, right| {
         right
@@ -539,6 +541,47 @@ mod tests {
         )
         .expect_err("overlap must fail");
         assert!(matches!(error, AnchoredPatchError::OverlappingEdits { .. }));
+    }
+
+    #[test]
+    fn same_line_append_replace_prepend_keep_their_anchor() {
+        let base = "a\nb\nc";
+        let edits = vec![
+            PatchEdit {
+                op: PatchOp::Append,
+                anchor_line: 2,
+                anchor_hash: line_hash(2, "b"),
+                lines: vec!["after1".into(), "after2".into()],
+            },
+            PatchEdit {
+                op: PatchOp::Replace,
+                anchor_line: 2,
+                anchor_hash: line_hash(2, "b"),
+                lines: vec!["B".into()],
+            },
+            PatchEdit {
+                op: PatchOp::Prepend,
+                anchor_line: 2,
+                anchor_hash: line_hash(2, "b"),
+                lines: vec!["before1".into(), "before2".into()],
+            },
+        ];
+        let outcome = apply_anchored_patch(
+            base,
+            Some(&base_sha256(base)),
+            &edits,
+            PatchLimits {
+                max_edits: 8,
+                max_patch_bytes: 1024,
+                max_result_bytes: 1024,
+            },
+        )
+        .expect("same-line ops should apply");
+        assert_eq!(
+            outcome.new_text,
+            "a\nbefore1\nbefore2\nB\nafter1\nafter2\nc"
+        );
+        assert_eq!(outcome.applied, 3);
     }
 
     #[test]
