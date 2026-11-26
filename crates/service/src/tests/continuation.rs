@@ -126,6 +126,9 @@ async fn continuation_refuses_non_failed_and_unsealed_sources_with_fixed_reasons
 
     let source_id = failed_source(&service, &root).await;
     let source_dir = service.run_dir_for(&source_id).await.expect("source dir");
+    // The Failed snapshot can precede journal finalization and seal writing;
+    // wait for the source execution lease before reading or editing its files.
+    wait_for_run_execution_lease(&source_dir).await;
     let before = std::fs::read(source_dir.join("meta/journal.jsonl")).expect("journal");
     std::fs::remove_file(source_dir.join("meta/.clean_shutdown")).expect("marker");
     // The Failed snapshot can precede lease settlement; wait out only the
