@@ -128,7 +128,11 @@ async fn continuation_refuses_non_failed_and_unsealed_sources_with_fixed_reasons
     let source_dir = service.run_dir_for(&source_id).await.expect("source dir");
     let before = std::fs::read(source_dir.join("meta/journal.jsonl")).expect("journal");
     std::fs::remove_file(source_dir.join("meta/.clean_shutdown")).expect("marker");
-    let refusal = service.continue_run(&source_id).await.unwrap_err();
+    // The Failed snapshot can precede lease settlement; wait out only the
+    // documented transient InFlight so the fixed refusal stays under test.
+    let refusal = continue_after_source_settlement_result(&service, &source_id)
+        .await
+        .unwrap_err();
     assert_eq!(
         refusal,
         ContinuationRefusal::Planning(engine::ContinuationRefusal::Unsealed)

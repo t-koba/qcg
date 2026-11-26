@@ -352,30 +352,41 @@ fn agent_process_exists(pid: u32) -> bool {
 /// task slot and execution lease settle; in that bounded window the source fork
 /// lease is correctly fail-closed with the typed `InFlight` refusal (reason
 /// "source run is executing or has in-flight work"). Retry only that exact
-/// category and surface every other refusal immediately, so a real regression
-/// still fails the test rather than being hidden by the retry.
+/// category and return every other refusal to the caller, so a real regression
+/// stays visible while tests that expect a different refusal can assert it.
+#[cfg(unix)]
+pub(crate) async fn continue_after_source_settlement_result(
+    service: &LocalService,
+    source_id: &str,
+) -> Result<String, ContinuationRefusal> {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            match service.continue_run(source_id).await {
+                Ok(child_id) => return Ok(child_id),
+                Err(ContinuationRefusal::InFlight) => {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(other) => return Err(other),
+            }
+        }
+    })
+    .await
+    .expect("failed source should settle within the liveness guard")
+}
+
 #[cfg(unix)]
 pub(crate) async fn continue_after_source_settlement(
     service: &LocalService,
     source_id: &str,
 ) -> String {
-    tokio::time::timeout(Duration::from_secs(60), async {
-        loop {
-            match service.continue_run(source_id).await {
-                Ok(child_id) => return child_id,
-                Err(ContinuationRefusal::InFlight) => {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-                Err(other) => panic!(
-                    "source continuation refused with `{reason}` ({other:?}) while settling; \
-                     only InFlight is the transient settlement refusal",
-                    reason = other.reason()
-                ),
-            }
-        }
-    })
-    .await
-    .expect("failed source should become continuable within the liveness guard")
+    match continue_after_source_settlement_result(service, source_id).await {
+        Ok(child_id) => child_id,
+        Err(other) => panic!(
+            "source continuation refused with `{reason}` ({other:?}) while settling; \
+             only InFlight is the transient settlement refusal",
+            reason = other.reason()
+        ),
+    }
 }
 
 pub(crate) async fn wait_for_snapshot(
