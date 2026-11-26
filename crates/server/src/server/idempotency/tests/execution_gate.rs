@@ -60,6 +60,18 @@ async fn barrier(runs: &Utf8PathBuf, name: &str) {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
+fn wait_no_execution_locks(runs: &Utf8PathBuf) {
+    let directory = runs.join("idempotency/.execution");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fs::read_dir(&directory).unwrap().count() != 0 {
+        assert!(
+            Instant::now() < deadline,
+            "execution gates were not reclaimed"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn pending_for(runs: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
     runs.join("idempotency").join(format!(
         "{}.pending.json",
@@ -564,13 +576,9 @@ fn expired_owner_is_fenced_before_and_after_service_acceptance() {
         fs::read_to_string(runs.join("accepted-run")).unwrap()
     );
     assert!(!pending(runs).exists());
-    // Successful completion leaves no per-key coordination state.
-    assert_eq!(
-        fs::read_dir(runs.join("idempotency/.execution"))
-            .unwrap()
-            .count(),
-        0
-    );
+    // Successful completion leaves no per-key coordination state. A final
+    // owner may be retained by a detached writer until its process tears down.
+    wait_no_execution_locks(runs);
     let gate = ExecutionGate::try_acquire(runs, KEY).unwrap().unwrap();
     assert!(ExecutionGate::try_acquire(runs, KEY).unwrap().is_none());
     drop(gate);

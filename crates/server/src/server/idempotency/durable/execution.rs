@@ -32,7 +32,7 @@ impl ExecutionGate {
 impl Drop for ExecutionGate {
     fn drop(&mut self) {
         drop(self.file.take()); // Unlock and close before registry reclamation.
-        if let Err(error) = reclaim(&self.runs_dir, &self.path) {
+        if let Err(error) = reclaim_after_drop(&self.runs_dir, &self.path) {
             tracing::warn!(%error, "idempotency execution gate cleanup deferred");
         }
     }
@@ -61,13 +61,41 @@ fn registry(runs: &Utf8PathBuf) -> Result<Option<Lock>, String> {
 pub(super) fn directory(runs: &Utf8PathBuf) -> Utf8PathBuf {
     idempotency_dir(runs).join(".execution")
 }
+/// Reclamation outcome: only registry contention is worth retrying at the
+/// final drop. A live owner must keep its path until that owner's own drop.
+#[derive(PartialEq, Eq)]
+enum ReclaimOutcome {
+    Removed,
+    Absent,
+    Held,
+    RegistryBusy,
+}
+
+/// The last owner may drop while another gate briefly holds the registry.
+/// Retry that narrow window so completed work never leaves a stale path.
+fn reclaim_after_drop(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        if reclaim_outcome(runs, path)? != ReclaimOutcome::RegistryBusy
+            || std::time::Instant::now() >= deadline
+        {
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 pub(super) fn reclaim(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(), String> {
+    reclaim_outcome(runs, path).map(|_| ())
+}
+
+fn reclaim_outcome(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<ReclaimOutcome, String> {
     let Some(_registry) = registry(runs)? else {
-        return Ok(());
+        return Ok(ReclaimOutcome::RegistryBusy);
     };
     let file = match open_no_follow(path, true, true, false, false) {
         Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(ReclaimOutcome::Absent),
         Err(e) => return Err(e.to_string()),
     };
     if let Some(file) = try_lock(file)? {
@@ -75,13 +103,38 @@ pub(super) fn reclaim(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(),
         // a live owner would have made try_lock fail. Pollers retain no file.
         drop(file);
         std::fs::remove_file(path).map_err(|e| e.to_string())?;
+        return Ok(ReclaimOutcome::Removed);
     }
-    Ok(())
+    Ok(ReclaimOutcome::Held)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn final_drop_reclaims_when_registry_is_briefly_contended() {
+        let runs = Utf8PathBuf::from_path_buf(std::env::temp_dir())
+            .unwrap()
+            .join(format!("gate-registry-contention-{}", uuid::Uuid::now_v7()));
+        let gate = ExecutionGate::try_acquire(&runs, "key").unwrap().unwrap();
+        let path = gate.path.clone();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let holder = {
+            let runs = runs.clone();
+            std::thread::spawn(move || {
+                let registry = registry(&runs).unwrap().unwrap();
+                acquired_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                drop(registry);
+            })
+        };
+        acquired_rx.recv().unwrap();
+        drop(gate);
+        holder.join().unwrap();
+        assert!(!path.exists(), "the final drop must reclaim its lock file");
+        std::fs::remove_dir_all(runs).unwrap();
+    }
+
     #[cfg(unix)]
     #[test]
     fn execution_gate_unlocks_on_final_arc_even_with_inherited_descriptor() {
