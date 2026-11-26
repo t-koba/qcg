@@ -126,13 +126,16 @@ name, prefix, label, finite settle interval, or successful CLI exit is not by
 itself that proof.
 
 Backend lifecycle configuration does not supply that guarantee either. Docker's
-`--rm` removes a container when it *exits*; it does not stop a still-running
-container whose client dies. Restart policies restart an exited container and
-never observe client liveness. Incus instances are daemon-owned persistent
-objects: a client disconnect leaves them running, and the daemon restarts an
-instance whose recorded power state says it should be running. None of these
-runtimes offers a daemon-side primitive that stops a container when its
-launching client goes away — a Docker feature request for exactly that
+`--rm` removes a container when it *exits*, not when its client dies: the
+[`docker container run` reference](https://docs.docker.com/reference/cli/docker/container/run/#rm)
+documents that `--rm` removes the container "when it exits" and that detached
+containers exit when their root process exits — neither observes client
+liveness. Restart policies restart an exited container and never observe client
+liveness either. Incus instances are daemon-owned persistent objects: a client
+disconnect leaves them running, and on daemon startup
+[Incus restarts an instance whose recorded power state says it should be running](https://linuxcontainers.org/incus/docs/main/daemon-behavior/).
+None of these runtimes offers a daemon-side primitive that stops a container
+when its launching client goes away — a Docker feature request for exactly that
 behavior ([moby/moby#48566](https://github.com/moby/moby/issues/48566)) remains
 open and triaged as a new feature. Enabling a restart policy or `--rm`, or
 sending a client-side stop after qcg dies, therefore cannot substitute for the
