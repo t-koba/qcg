@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -34,19 +35,51 @@ function run(command, args, env) {
   if (result.status !== 0) process.exit(result.status ?? 1);
 }
 
-run(
-  "cargo",
-  [
-    "build",
-    "-p",
-    "expr-wasm",
-    "--release",
-    "--target",
-    "wasm32-unknown-unknown",
-    "--locked",
-  ],
-  { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags, RUSTFLAGS: "" },
-);
+const cargoEnv = { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags, RUSTFLAGS: "" };
+const wasmMagic = Buffer.from([0x00, 0x61, 0x73, 0x6d]);
+
+function buildWasm() {
+  run(
+    "cargo",
+    [
+      "build",
+      "-p",
+      "expr-wasm",
+      "--release",
+      "--target",
+      "wasm32-unknown-unknown",
+      "--locked",
+    ],
+    cargoEnv,
+  );
+}
+
+function hasWasmMagic() {
+  try {
+    return readFileSync(wasmFile).subarray(0, 4).equals(wasmMagic);
+  } catch {
+    return false;
+  }
+}
+
+buildWasm();
+if (!hasWasmMagic()) {
+  // A cached or partially written artifact can look up to date to Cargo while
+  // wasm-bindgen cannot parse it. Remove this package's outputs for that target
+  // so the same build reproduces the module from source, then fail with a clear
+  // error if it still is not valid.
+  console.error("invalid Wasm artifact after build; cleaning and rebuilding");
+  run(
+    "cargo",
+    ["clean", "-p", "expr-wasm", "--target", "wasm32-unknown-unknown", "--release"],
+    cargoEnv,
+  );
+  buildWasm();
+  if (!hasWasmMagic()) {
+    console.error(`cargo did not produce a valid Wasm module: ${wasmFile}`);
+    process.exit(1);
+  }
+}
 
 run(
   "wasm-bindgen",
