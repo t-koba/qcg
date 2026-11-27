@@ -546,12 +546,14 @@ mod tests {
     #[test]
     fn same_line_append_replace_prepend_keep_their_anchor() {
         let base = "a\nb\nc";
+        // Deliberately supplied out of application order: the sort must still
+        // apply append, then replace, then prepend for a shared anchor.
         let edits = vec![
             PatchEdit {
-                op: PatchOp::Append,
+                op: PatchOp::Prepend,
                 anchor_line: 2,
                 anchor_hash: line_hash(2, "b"),
-                lines: vec!["after1".into(), "after2".into()],
+                lines: vec!["before1".into(), "before2".into()],
             },
             PatchEdit {
                 op: PatchOp::Replace,
@@ -560,10 +562,10 @@ mod tests {
                 lines: vec!["B".into()],
             },
             PatchEdit {
-                op: PatchOp::Prepend,
+                op: PatchOp::Append,
                 anchor_line: 2,
                 anchor_hash: line_hash(2, "b"),
-                lines: vec!["before1".into(), "before2".into()],
+                lines: vec!["after1".into(), "after2".into()],
             },
         ];
         let outcome = apply_anchored_patch(
