@@ -647,6 +647,13 @@ mod tests {
         drop(held);
         assert!(path.exists());
         drop(registry);
+        // The deferred final-drop worker and the sweep compete for the same
+        // registry and lock file. Let the worker finish first, then give the
+        // sweep an idle gate with no Drop owner so this assertion measures
+        // maintenance reclamation rather than whichever actor wins the race.
+        super::execution::wait_for_retry_workers();
+        assert!(!path.exists());
+        fs::write(&path, b"").unwrap();
         for _ in 0..3 {
             pass();
         }
