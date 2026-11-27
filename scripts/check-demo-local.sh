@@ -7,7 +7,7 @@ run_step() {
 }
 
 case "${1:-}" in
-  "") run_step npm --prefix frontend/generator ci ;;
+  "") run_step npm --prefix frontend/generator ci --ignore-scripts ;;
   --dependencies-installed) ;;
   *) echo "unknown argument: $1" >&2; exit 2 ;;
 esac

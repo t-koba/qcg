@@ -85,7 +85,7 @@ fi
 # Standalone packaging and releases always build unless explicitly requested.
 if [ "$frontend_built" != "true" ]; then
   if [ "$dependencies_installed" != "true" ]; then
-    npm --prefix frontend/generator ci
+    npm --prefix frontend/generator ci --ignore-scripts
   fi
   npm --prefix frontend/generator run generate:api
   npm --prefix frontend/generator run generate:wasm
