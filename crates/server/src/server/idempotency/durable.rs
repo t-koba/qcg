@@ -57,6 +57,8 @@ fn pending_path(runs_dir: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
 }
 mod execution;
 pub(crate) use execution::ExecutionGate;
+#[cfg(test)]
+pub(crate) use execution::key_lock_is_held;
 // Test callers exercise individual metadata operations, not request lifetimes.
 #[cfg(test)]
 fn test_gate(runs_dir: &Utf8PathBuf, key: &str) -> Result<ExecutionGate, String> {

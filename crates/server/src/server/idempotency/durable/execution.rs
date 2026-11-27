@@ -79,6 +79,18 @@ fn registry(runs: &Utf8PathBuf) -> Result<Option<Lock>, String> {
     let path = idempotency_dir(runs).join(".execution-registry.lock");
     try_lock(open_no_follow(&path, true, true, true, false).map_err(|e| e.to_string())?)
 }
+
+/// Test-only observation of one key's lock, independent of the shared registry.
+/// `try_acquire` can return `None` on transient registry contention before it
+/// opens the key file, so it cannot distinguish "this key is held" from "the
+/// registry is briefly busy". Opening the key's lock directly makes the result
+/// definitive: `true` means another owner really holds this key.
+#[cfg(test)]
+pub(crate) fn key_lock_is_held(runs: &Utf8PathBuf, key: &str) -> Result<bool, String> {
+    let path = directory(runs).join(format!("{}.lock", hex::encode(Sha256::digest(key))));
+    let file = open_no_follow(&path, true, true, true, false).map_err(|e| e.to_string())?;
+    Ok(try_lock(file).map_err(|e| e.to_string())?.is_none())
+}
 pub(super) fn directory(runs: &Utf8PathBuf) -> Utf8PathBuf {
     idempotency_dir(runs).join(".execution")
 }

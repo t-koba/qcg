@@ -186,11 +186,14 @@ async fn gate_process() {
         // claim: it cannot obtain the capability required by those APIs.
         let before = fs::read(pending(&runs)).unwrap();
         let other = format!("other-key-{phase}");
-        // Acquire the distinct key first: succeeding here proves the shared
-        // registry is available while the same-key owner still holds its gate,
-        // so the same-key refusal below is exclusion, not registry contention.
+        // Acquire a distinct key first as a bounded positive control: it can
+        // claim and release while the same-key owner holds its gate.
         let gate = acquire_gate_within(&runs, &other);
-        assert!(ExecutionGate::try_acquire(&runs, KEY).unwrap().is_none());
+        // A same-key try_acquire can report None on transient registry
+        // contention before it opens the key file, so it cannot prove exclusion
+        // while the retry polls. Inspect the known owner's key lock directly;
+        // the shared registry is not involved in that observation.
+        assert!(durable::key_lock_is_held(&runs, KEY).unwrap());
         // A distinct key can both claim and release: no metadata lock was
         // held while the same-key process was waiting at a barrier.
         let (owner, generation) = match durable::claim_durable_pending_gated(
