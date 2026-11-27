@@ -1708,6 +1708,25 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn idempotency_lock_unlocks_with_inherited_descriptor() {
+        let runs = temp_runs_dir("metadata-lock-inherited");
+        let _temp = TempGuard(runs.clone());
+        let lock = acquire_idempotency_lock(&runs).unwrap();
+        // try_clone shares the open file description, just as a pre-exec fork
+        // does, without forking a multithreaded test process.
+        let inherited = lock.0.try_clone().unwrap();
+        drop(lock);
+        let path = idempotency_dir(&runs).join(".idempotency.lock");
+        let probe = open_no_follow(&path, true, true, false, false).unwrap();
+        probe
+            .try_lock()
+            .expect("metadata lock must be released while an inherited descriptor stays open");
+        drop(probe);
+        drop(inherited);
+    }
+
     #[tokio::test]
     async fn configured_lease_controls_adoption_and_wait_without_retiring_evidence() {
         use std::time::Duration;
