@@ -86,7 +86,31 @@ artifact (digest
 (Incus, not cleanup certification)`, on published revision
 `d76d469c579f51986ba6b60d01eae78d0e3991bb`. This is diagnostic evidence of the
 same name-keyed hazard seen with Docker and Podman, not a cleanup guarantee,
-and it provides no LXD evidence.
+and it is not live LXD daemon evidence; LXD documentation-level evidence is
+recorded below.
+
+Source-level inspection of Incus confirms the same constraint at the API
+boundary. In Incus v7.0.1 the `DELETE /1.0/instances/{name}` handler
+(`cmd/incusd/instance_delete.go`) accepts only `name` (path) and `project`
+(query): it resolves the target with `instance.LoadByProjectAndName(s,
+projectName, name)` and calls `inst.Delete(false, true)`. It reads no ETag or
+If-Match header and checks no immutable ID or ownership before deleting. The
+Incus Go client's `DeleteInstance(name)` likewise sends DELETE with an empty
+ETag; only `UpdateInstance(name, instance, ETag)` carries If-Match, and there
+is no delete-by-UUID method. The `etag` API extension (Incus v6.0.4
+`doc/api-extensions.md`) defines the ETag as the SHA-256 of user-modifiable
+content returned on GET and documents If-Match on PUT requests only, to avoid
+a GET-to-PUT race; it defines no conditional DELETE. All instance endpoints
+are addressed by `{name}`, and `volatile.uuid` is a config key rather than a
+supported lookup or delete address. LXD's default `etag` extension
+documentation uses the same PUT-only wording, which supplies documentation-level
+evidence for LXD (no live LXD daemon test was made). Even a hypothetical
+conditional delete is not shown to be identity-safe, because the ETag hashes
+user-modifiable content rather than binding `volatile.uuid`. There is
+therefore no atomic compare-and-delete: qcg adds neither deletion through a
+mutable name or label nor blind replay. This is source and documentation
+evidence scoped to Incus v6.0.4/v7.0.1 and the LXD default docs, not a new
+live-daemon run.
 
 Setup assumes Ubuntu's Incus packages, local socket,
 the initialized `default` storage pool, and API/`volatile.uuid` support. The
