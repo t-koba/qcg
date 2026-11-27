@@ -279,7 +279,7 @@ class QcgClient:
         if text is None:
             return None
         events: list[Any] = []
-        for line in text.splitlines():
+        for line in text.split("\n"):
             line = line.strip()
             if line:
                 events.append(json.loads(line))

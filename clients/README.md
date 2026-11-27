@@ -48,6 +48,9 @@ it, for example with `contextlib.closing(client.stream_run_events(run_id))`
 to release the response. TypeScript's async generator releases its reader
 when the consumer returns early; parse failures also run its cleanup.
 
+Python's NDJSON reader splits records only on LF and strips each line, so
+literal U+2028/U+2029 inside JSON strings remain intact.
+
 Run snapshots expose `queue_position_quality`: `exact`, `estimated`, or
 `unavailable`. Python returns the same fields in dictionaries. Transport
 markers `lagged`, `stream_error`, and `shutdown` do not advance a

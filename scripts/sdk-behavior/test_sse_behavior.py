@@ -261,6 +261,13 @@ def test_typed_readers() -> None:
     assert client.download_run_bundle("r1") == bytes([1, 2, 3])
     serve(200, b'{"a":1}\n{"b":2}\n')
     assert client.read_run_journal("r1") == [{"a": 1}, {"b": 2}]
+    journal = [
+        {"id": 1, "note": "line\u2028separator\u2029paragraph"},
+        {"id": 2, "note": "plain"},
+    ]
+    wire = "\n".join(json.dumps(record, ensure_ascii=False) for record in journal)
+    serve(200, wire.encode("utf-8"))
+    assert client.read_run_journal("r1") == journal
     serve(204, b"")
     assert client.delete_run("gone") is None
     serve(304, b"")
