@@ -162,18 +162,14 @@ const ARTIFACT_REQUEST_HEADERS: &[ApiHeader] = &[
         required: false,
     },
 ];
-const ARTIFACT_ETAG_DESCRIPTION: &str = "Strong validator naming the verified artifact SHA-256.";
-const ARTIFACT_ETAG_HEADERS: &[ApiHeader] = &[ApiHeader {
+const ARTIFACT_ETAG_HEADER: ApiHeader = ApiHeader {
     name: "ETag",
-    description: ARTIFACT_ETAG_DESCRIPTION,
+    description: "Strong validator naming the verified artifact SHA-256.",
     required: true,
-}];
+};
+const ARTIFACT_ETAG_HEADERS: &[ApiHeader] = &[ARTIFACT_ETAG_HEADER];
 const ARTIFACT_RESPONSE_HEADERS: &[ApiHeader] = &[
-    ApiHeader {
-        name: "ETag",
-        description: ARTIFACT_ETAG_DESCRIPTION,
-        required: true,
-    },
+    ARTIFACT_ETAG_HEADER,
     ApiHeader {
         name: "Accept-Ranges",
         description: "Supported range unit: bytes.",
