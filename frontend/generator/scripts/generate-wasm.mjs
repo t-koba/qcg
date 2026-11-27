@@ -29,14 +29,19 @@ const wasmFile = resolve(
 );
 const outDir = join(root, "frontend/generator/src/expr/pkg");
 
-function run(command, args, env) {
+function runStatus(command, args, env) {
   const result = spawnSync(command, args, {
     cwd: root,
     env,
     stdio: "inherit",
   });
   if (result.error) throw result.error;
-  if (result.status !== 0) process.exit(result.status ?? 1);
+  return result.status ?? 1;
+}
+
+function run(command, args, env) {
+  const status = runStatus(command, args, env);
+  if (status !== 0) process.exit(status);
 }
 
 const cargoEnv = { ...process.env, CARGO_ENCODED_RUSTFLAGS: rustflags, RUSTFLAGS: "" };
@@ -58,6 +63,14 @@ function buildWasm() {
   );
 }
 
+function bindgen() {
+  return runStatus(
+    "wasm-bindgen",
+    ["--target", "web", "--out-dir", outDir, "--out-name", "expr_wasm", wasmFile],
+    process.env,
+  );
+}
+
 function hasWasmMagic() {
   try {
     return readFileSync(wasmFile).subarray(0, 4).equals(wasmMagic);
@@ -66,12 +79,10 @@ function hasWasmMagic() {
   }
 }
 
-buildWasm();
-if (!hasWasmMagic()) {
+function rebuildArtifact() {
   // A cached or partially written artifact can look up to date to Cargo while
   // wasm-bindgen cannot parse it. Remove this package's outputs for that target
-  // so the same build reproduces the module from source, then fail with a clear
-  // error if it still is not valid.
+  // so the same build reproduces the module from source.
   console.error("invalid Wasm artifact after build; cleaning and rebuilding");
   run(
     "cargo",
@@ -79,14 +90,30 @@ if (!hasWasmMagic()) {
     cargoEnv,
   );
   buildWasm();
+}
+
+buildWasm();
+let rebuilt = false;
+if (!hasWasmMagic()) {
+  rebuildArtifact();
+  rebuilt = true;
   if (!hasWasmMagic()) {
     console.error(`cargo did not produce a valid Wasm module: ${wasmFile}`);
     process.exit(1);
   }
 }
 
-run(
-  "wasm-bindgen",
-  ["--target", "web", "--out-dir", outDir, "--out-name", "expr_wasm", wasmFile],
-  process.env,
-);
+let bindgenStatus = bindgen();
+if (bindgenStatus !== 0) {
+  // A truncated module keeps its magic bytes but still fails bindgen parsing.
+  if (rebuilt) {
+    console.error(`wasm-bindgen still failed after rebuilding: ${wasmFile}`);
+    process.exit(bindgenStatus);
+  }
+  rebuildArtifact();
+  bindgenStatus = bindgen();
+  if (bindgenStatus !== 0) {
+    console.error(`wasm-bindgen still failed after rebuilding: ${wasmFile}`);
+    process.exit(bindgenStatus);
+  }
+}
