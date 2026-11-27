@@ -23,7 +23,8 @@ Wrong-type message properties and primitive JSON are not coerced to strings.
 
 Redirects (TypeScript): manual same-protocol/cross-origin redirects are
 followed up to 5 hops with cycle detection; anything further fails with a
-clear redirect error instead of looping. Intermediate responses are
+clear redirect error instead of looping. A 303 rewrites the next request to
+GET except for HEAD; 301/302 rewrite POST to GET. Intermediate responses are
 released before following. Relative request URLs (default same-origin
 `/api/...`) resolve against the configured base URL, the document base
 in browsers, or a dummy origin in Node purely for URL resolution.

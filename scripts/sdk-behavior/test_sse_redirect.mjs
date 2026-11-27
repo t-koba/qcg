@@ -345,6 +345,36 @@ function redirectResponse(location) {
   check("G05-04 limit path releases all", cancelled.length === 6, JSON.stringify(cancelled));
 }
 
+// G05-05: a 303 rewrites to GET except for HEAD, matching the Python client
+// and the fetch redirect algorithm.
+{
+  const methods = [];
+  const mock = async (_url, init) => {
+    methods.push(init.method);
+    return methods.length === 1
+      ? new Response(null, { status: 303, headers: { location: "http://x.test/target" } })
+      : new Response(null, { status: 204 });
+  };
+  const client = new QcgClient({ baseUrl: "http://x.test", fetch: mock });
+  await client.request("HEAD", "/start");
+  check("G05-05 HEAD preserved on 303", methods.join(",") === "HEAD,HEAD", methods.join(","));
+}
+{
+  const methods = [];
+  const bodies = [];
+  const mock = async (_url, init) => {
+    methods.push(init.method);
+    bodies.push(init.body === undefined ? "" : String(init.body));
+    return methods.length === 1
+      ? new Response(null, { status: 303, headers: { location: "http://x.test/target" } })
+      : new Response(null, { status: 204 });
+  };
+  const client = new QcgClient({ baseUrl: "http://x.test", fetch: mock });
+  await client.request("POST", "/start", { body: { a: 1 } });
+  check("G05-05 POST becomes GET on 303", methods.join(",") === "POST,GET", methods.join(","));
+  check("G05-05 rewritten GET drops body", bodies[1] === "", JSON.stringify(bodies));
+}
+
 // G07-05: query options are honored and a positional query takes precedence.
 {
   const requests = [];

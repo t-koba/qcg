@@ -470,11 +470,11 @@ export class QcgClient {
         initHeaders.delete("authorization");
       }
       const nextInit: RequestInit = { ...init, headers: initHeaders };
-      // 303 always becomes GET (except HEAD); 301/302 POST becomes GET.
+      // A 303 rewrites to GET except for HEAD; 301/302 rewrite POST to GET.
+      const method = (init.method ?? "GET").toUpperCase();
       if (
-        response.status === 303 ||
-        ((response.status === 301 || response.status === 302) &&
-          (init.method ?? "GET") === "POST")
+        (response.status === 303 && method !== "HEAD") ||
+        ((response.status === 301 || response.status === 302) && method === "POST")
       ) {
         nextInit.method = "GET";
         nextInit.body = undefined;
@@ -1086,7 +1086,8 @@ Wrong-type message properties and primitive JSON are not coerced to strings.
 
 Redirects (TypeScript): manual same-protocol/cross-origin redirects are
 followed up to 5 hops with cycle detection; anything further fails with a
-clear redirect error instead of looping. Intermediate responses are
+clear redirect error instead of looping. A 303 rewrites the next request to
+GET except for HEAD; 301/302 rewrite POST to GET. Intermediate responses are
 released before following. Relative request URLs (default same-origin
 \`/api/...\`) resolve against the configured base URL, the document base
 in browsers, or a dummy origin in Node purely for URL resolution.

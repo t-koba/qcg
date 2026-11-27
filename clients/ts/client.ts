@@ -146,11 +146,11 @@ export class QcgClient {
         initHeaders.delete("authorization");
       }
       const nextInit: RequestInit = { ...init, headers: initHeaders };
-      // 303 always becomes GET (except HEAD); 301/302 POST becomes GET.
+      // A 303 rewrites to GET except for HEAD; 301/302 rewrite POST to GET.
+      const method = (init.method ?? "GET").toUpperCase();
       if (
-        response.status === 303 ||
-        ((response.status === 301 || response.status === 302) &&
-          (init.method ?? "GET") === "POST")
+        (response.status === 303 && method !== "HEAD") ||
+        ((response.status === 301 || response.status === 302) && method === "POST")
       ) {
         nextInit.method = "GET";
         nextInit.body = undefined;
