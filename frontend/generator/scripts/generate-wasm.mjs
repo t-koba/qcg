@@ -79,11 +79,11 @@ function hasWasmMagic() {
   }
 }
 
-function rebuildArtifact() {
+function rebuildArtifact(reason) {
   // A cached or partially written artifact can look up to date to Cargo while
   // wasm-bindgen cannot parse it. Remove this package's outputs for that target
   // so the same build reproduces the module from source.
-  console.error("invalid Wasm artifact after build; cleaning and rebuilding");
+  console.error(`${reason}; cleaning and rebuilding`);
   run(
     "cargo",
     ["clean", "-p", "expr-wasm", "--target", "wasm32-unknown-unknown", "--release"],
@@ -95,7 +95,7 @@ function rebuildArtifact() {
 buildWasm();
 let rebuilt = false;
 if (!hasWasmMagic()) {
-  rebuildArtifact();
+  rebuildArtifact("invalid Wasm artifact after build");
   rebuilt = true;
   if (!hasWasmMagic()) {
     console.error(`cargo did not produce a valid Wasm module: ${wasmFile}`);
@@ -110,7 +110,7 @@ if (bindgenStatus !== 0) {
     console.error(`wasm-bindgen still failed after rebuilding: ${wasmFile}`);
     process.exit(bindgenStatus);
   }
-  rebuildArtifact();
+  rebuildArtifact("wasm-bindgen failed on the built artifact");
   bindgenStatus = bindgen();
   if (bindgenStatus !== 0) {
     console.error(`wasm-bindgen still failed after rebuilding: ${wasmFile}`);
