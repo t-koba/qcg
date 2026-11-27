@@ -1871,6 +1871,14 @@ export type paths = {
                         "application/problem+json": components["schemas"]["ProblemDetails"];
                     };
                 };
+                "413": {
+                    "headers": {
+                        [name: string]: unknown;
+                    };
+                    "content": {
+                        "application/problem+json": components["schemas"]["ProblemDetails"];
+                    };
+                };
                 "429": components["responses"]["TooManyRequests"];
                 "500": {
                     "headers": {

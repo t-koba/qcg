@@ -11,6 +11,7 @@ pub const ERR_RATE_LIMITED: &[u16] = &[429];
 
 const ERR_INTERNAL: &[u16] = &[500];
 const ERR_RESOURCE: &[u16] = &[400, 404, 500];
+const ERR_RESOURCE_TOO_LARGE: &[u16] = &[400, 404, 413, 500];
 const ERR_INVALID: &[u16] = &[400, 500];
 const ERR_MCP_MUTATION: &[u16] = &[400, 403];
 const ERR_MCP_CALLBACK: &[u16] = &[400, 403, 500];
@@ -321,7 +322,7 @@ pub const API_ROUTES: &[ApiRoute] = &[
         request_schema: None,
         request_headers: NO_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
-        errors: ERR_RESOURCE,
+        errors: ERR_RESOURCE_TOO_LARGE,
     },
     ApiRoute {
         method: "get",
