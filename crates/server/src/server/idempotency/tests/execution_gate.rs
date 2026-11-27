@@ -167,14 +167,14 @@ async fn gate_process() {
         // Deliberately skip destructors: the OS releases locks, not directory entries.
         std::process::exit(0);
     }
-    if mode == "probe" {
+    if let Some(phase) = mode.strip_prefix("probe-") {
         // This process cannot replace, release or commit the expired same-key
         // claim: it cannot obtain the capability required by those APIs.
         let before = fs::read(pending(&runs)).unwrap();
         assert!(ExecutionGate::try_acquire(&runs, KEY).unwrap().is_none());
         // A distinct key can both claim and release: no metadata lock was
         // held while the same-key process was waiting at a barrier.
-        let other = "other-key".to_owned();
+        let other = format!("other-key-{phase}");
         let gate = ExecutionGate::try_acquire(&runs, &other).unwrap().unwrap();
         let (owner, generation) = match durable::claim_durable_pending_gated(
             &gate,
@@ -561,7 +561,7 @@ fn expired_owner_is_fenced_before_and_after_service_acceptance() {
         wait_file(runs, phase);
         // Expiry is not ownership: the gate-aware holder remains current
         // before and after acceptance, and the same-key retry must wait.
-        assert!(spawn(runs, "probe").success());
+        assert!(spawn(runs, &format!("probe-{phase}")).success());
         assert_eq!(fs::read(pending(runs)).unwrap(), aged);
         assert!(retry.0.try_wait().unwrap().is_none());
         fs::write(runs.join(format!("{phase}-go")), b"").unwrap();
