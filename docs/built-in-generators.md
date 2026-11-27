@@ -107,5 +107,5 @@ Run the real-provider two-generation equivalence check with:
 bash scripts/self-hosting-check.sh
 ```
 
-The script uses `OPENROUTER_API_KEY` when set, otherwise reads the
-OpenRouter key from the OpenCode authentication file without printing it.
+The script requires `OPENROUTER_API_KEY` to be set in the environment; it
+does not read credentials from other applications or print the key.
