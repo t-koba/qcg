@@ -1,6 +1,27 @@
 //! No open waiter survives the registry critical section. Thus an idle gate
 //! can be closed/unlinked under that registry without splitting its inode.
 use super::*;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static RETRY_WORKERS: AtomicUsize = AtomicUsize::new(0);
+
+/// Test-only join point for detached final-drop reclaim workers. A test that
+/// removes a temporary runs directory must first let any deferred worker
+/// finish; production callers never wait here.
+#[cfg(test)]
+pub(super) fn wait_for_retry_workers() {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while RETRY_WORKERS.load(Ordering::SeqCst) != 0 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "a deferred gate reclaim worker did not finish"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
 pub(crate) struct ExecutionGate {
     file: Option<Lock>,
     pub(super) runs_dir: Utf8PathBuf,
@@ -80,7 +101,9 @@ fn reclaim_after_drop(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(),
     }
     let runs = runs.clone();
     let path = path.to_owned();
-    if std::thread::Builder::new()
+    #[cfg(test)]
+    RETRY_WORKERS.fetch_add(1, Ordering::SeqCst);
+    let spawned = std::thread::Builder::new()
         .name("qcg-gate-reclaim".into())
         .spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
@@ -88,12 +111,15 @@ fn reclaim_after_drop(runs: &Utf8PathBuf, path: &camino::Utf8Path) -> Result<(),
                 std::thread::sleep(std::time::Duration::from_millis(1));
                 match reclaim_outcome(&runs, &path) {
                     Ok(ReclaimOutcome::RegistryBusy) => continue,
-                    Ok(_) | Err(_) => return,
+                    Ok(_) | Err(_) => break,
                 }
             }
-        })
-        .is_err()
-    {
+            #[cfg(test)]
+            RETRY_WORKERS.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        #[cfg(test)]
+        RETRY_WORKERS.fetch_sub(1, Ordering::SeqCst);
         // The resident sweep still reclaims deferred leftovers; do not block
         // the owner's thread just because a retry worker could not start.
         tracing::warn!("idempotency execution gate retry worker unavailable");

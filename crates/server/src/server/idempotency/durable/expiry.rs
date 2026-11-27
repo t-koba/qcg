@@ -656,6 +656,9 @@ mod tests {
         assert!(ExecutionGate::try_acquire(&runs, key).unwrap().is_none());
         drop(successor);
         assert!(!path.exists(), "normal completion reclaims promptly");
+        // The deferred final-drop worker may still be revisiting this runs
+        // directory; let it finish before removing the directory underneath it.
+        super::execution::wait_for_retry_workers();
         fs::remove_dir_all(runs).unwrap();
     }
 
