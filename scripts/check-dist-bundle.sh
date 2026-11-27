@@ -33,6 +33,8 @@ done
 
 if [ -z "$archive" ]; then
   archive="$(bash scripts/package-dist.sh --debug --out-dir "$tmp_root/dist" "${frontend_args[@]}" | tail -n 1)"
+  # Core verification runs before the UI exists; check packaging where it is built.
+  bash scripts/check-package-target-dir.sh
 elif [ ! -f "$archive" ]; then
   echo "archive not found: $archive" >&2
   exit 1

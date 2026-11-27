@@ -184,7 +184,6 @@ qcg_test_time "server no-default build" env CARGO_BUILD_WARNINGS=deny cargo test
 qcg_test_time "server no-default" env CARGO_BUILD_WARNINGS=deny cargo test -p server --no-default-features --locked
 bash scripts/check-fixtures.sh
 bash scripts/package-dist.sh --dry-run
-bash scripts/check-package-target-dir.sh
 if [[ "$(uname -s)" == Linux ]]; then
   # Feature-gated integration tests launch real stdio and streamable-HTTP
   # servers, complementing the in-process transport/unit tests on all OSes.
