@@ -72,6 +72,20 @@ fn wait_no_execution_locks(runs: &Utf8PathBuf) {
     }
 }
 
+/// All keys share one registry lock, and the retry polls that registry while
+/// this probe runs. A one-shot `try_acquire` can therefore report contention
+/// rather than a key that cannot progress; retry within a bound instead.
+fn acquire_gate_within(runs: &Utf8PathBuf, key: &str) -> ExecutionGate {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(gate) = ExecutionGate::try_acquire(runs, key).unwrap() {
+            return gate;
+        }
+        assert!(Instant::now() < deadline, "gate for {key} stayed contended");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn pending_for(runs: &Utf8PathBuf, key: &str) -> Utf8PathBuf {
     runs.join("idempotency").join(format!(
         "{}.pending.json",
@@ -171,11 +185,14 @@ async fn gate_process() {
         // This process cannot replace, release or commit the expired same-key
         // claim: it cannot obtain the capability required by those APIs.
         let before = fs::read(pending(&runs)).unwrap();
+        let other = format!("other-key-{phase}");
+        // Acquire the distinct key first: succeeding here proves the shared
+        // registry is available while the same-key owner still holds its gate,
+        // so the same-key refusal below is exclusion, not registry contention.
+        let gate = acquire_gate_within(&runs, &other);
         assert!(ExecutionGate::try_acquire(&runs, KEY).unwrap().is_none());
         // A distinct key can both claim and release: no metadata lock was
         // held while the same-key process was waiting at a barrier.
-        let other = format!("other-key-{phase}");
-        let gate = ExecutionGate::try_acquire(&runs, &other).unwrap().unwrap();
         let (owner, generation) = match durable::claim_durable_pending_gated(
             &gate,
             &other,
