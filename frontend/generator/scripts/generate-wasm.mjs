@@ -19,7 +19,11 @@ const rustflags = [
 // wasm-bindgen reads the release artifact directly; honor CARGO_TARGET_DIR
 // the same way cargo does so custom target directories keep working.
 const cargoTargetDir = process.env.CARGO_TARGET_DIR || join(root, "target");
-const wasmFile = join(
+// cargo resolves a relative CARGO_TARGET_DIR against its spawn cwd (root),
+// while this script can be run from frontend/generator; anchor it to root for
+// both the magic-header guard and wasm-bindgen.
+const wasmFile = resolve(
+  root,
   cargoTargetDir,
   "wasm32-unknown-unknown/release/expr_wasm.wasm",
 );
