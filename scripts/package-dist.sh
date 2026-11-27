@@ -115,6 +115,9 @@ source_binary="$(node scripts/product.mjs binary)"
 name="${product_id}-${os}-${arch}"
 staging="${out_dir}/${name}"
 bin_name="${product_id}"
+# cargo resolves CARGO_TARGET_DIR relative to this cwd; packaging must use the same directory.
+cargo_target_dir="${CARGO_TARGET_DIR:-target}"
+cargo_target_dir="${cargo_target_dir%/}"
 if [ "$os" = "windows" ]; then
   bin_name="${product_id}.exe"
   source_binary="${source_binary}.exe"
@@ -122,7 +125,7 @@ fi
 
 rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"
-cp "target/${target_profile}/${source_binary}" "$staging/bin/${bin_name}"
+cp "${cargo_target_dir}/${target_profile}/${source_binary}" "$staging/bin/${bin_name}"
 cp README.md "$staging/share/${product_id}/"
 cp PROJECT.md "$staging/share/${product_id}/"
 cp providers.toml "$staging/share/${product_id}/providers.toml"
