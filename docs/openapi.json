@@ -6032,7 +6032,7 @@
             "description": "Not modified",
             "headers": {
               "ETag": {
-                "description": "Weak validator for conditional GET requests.",
+                "description": "Strong validator naming the verified artifact SHA-256.",
                 "schema": {
                   "type": "string"
                 }

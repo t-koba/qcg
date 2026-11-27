@@ -161,10 +161,16 @@ const ARTIFACT_REQUEST_HEADERS: &[ApiHeader] = &[
         required: false,
     },
 ];
+const ARTIFACT_ETAG_DESCRIPTION: &str = "Strong validator naming the verified artifact SHA-256.";
+const ARTIFACT_ETAG_HEADERS: &[ApiHeader] = &[ApiHeader {
+    name: "ETag",
+    description: ARTIFACT_ETAG_DESCRIPTION,
+    required: true,
+}];
 const ARTIFACT_RESPONSE_HEADERS: &[ApiHeader] = &[
     ApiHeader {
         name: "ETag",
-        description: "Strong validator naming the verified artifact SHA-256.",
+        description: ARTIFACT_ETAG_DESCRIPTION,
         required: true,
     },
     ApiHeader {
@@ -183,7 +189,7 @@ const ARTIFACT_RESPONSES: &[ApiResponse] = &[
         status: 304,
         description: "Not modified",
         body: ResponseBody::Empty,
-        headers: ETAG_HEADERS,
+        headers: ARTIFACT_ETAG_HEADERS,
     },
     ApiResponse {
         status: 206,
