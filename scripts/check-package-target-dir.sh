@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
-# Regression: package-dist.sh must copy the binary cargo built under CARGO_TARGET_DIR.
-# Only `cargo build` is stubbed; metadata, SBOM and archive steps stay real.
+# Regression: package-dist.sh must copy the binary from the directory Cargo
+# actually built into, not from a path reconstructed from one env variable.
+# Cargo honors both CARGO_TARGET_DIR and the higher-precedence
+# CARGO_BUILD_TARGET_DIR. Only `cargo build` is stubbed; metadata, SBOM and
+# archive steps stay real, so packaging must follow Cargo's resolved directory.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.."
 
@@ -20,50 +23,64 @@ case "$(uname -s)" in
     ;;
 esac
 
-target_dir="$tmp_root/cargo-target"
-out_dir="$tmp_root/dist"
 stub_dir="$tmp_root/stub"
-fixture="qcg-target-dir-fixture-${tmp_root##*/}"
-mkdir -p "$stub_dir" "$target_dir/debug" "$out_dir" "$tmp_root/extract"
+mkdir -p "$stub_dir"
 
+# The stub writes a distinct fixture only where the build is told to place it.
 cat > "$stub_dir/cargo" <<EOF
 #!/usr/bin/env bash
 if [ "\${1:-}" = "build" ]; then
-  printf '%s\n' "$fixture" > "\$CARGO_TARGET_DIR/debug/$source_binary"
+  printf '%s\\n' "\$QCG_TEST_FIXTURE" > "\$QCG_TEST_TARGET_DIR/debug/$source_binary"
   exit 0
 fi
 exec "$real_cargo" "\$@"
 EOF
 chmod +x "$stub_dir/cargo"
 
-# Trailing slash is part of the environment cargo accepts; packaging must too.
-archive="$(
-  CARGO_TARGET_DIR="$target_dir/" \
-    PATH="$stub_dir:$PATH" \
-    bash scripts/package-dist.sh --frontend-built --debug --out-dir "$out_dir" | tail -n 1
-)"
+# check_case <label> <resolved target dir> <cargo env assignment...>
+check_case() {
+  local label="$1" target_dir="$2"
+  shift 2
+  local case_out="$tmp_root/dist-$label"
+  local case_extract="$tmp_root/extract-$label"
+  local fixture="qcg-target-dir-fixture-${label}-${tmp_root##*/}"
+  mkdir -p "$target_dir/debug" "$case_out" "$case_extract"
 
-case "$archive" in
-  *.tar.gz)
-    tar -C "$tmp_root/extract" -xzf "$archive"
-    ;;
-  *.zip)
-    unzip -q "$archive" -d "$tmp_root/extract"
-    ;;
-  *)
-    echo "unsupported archive: $archive" >&2
+  local archive
+  archive="$(
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+      "$@" \
+      QCG_TEST_TARGET_DIR="$target_dir" \
+      QCG_TEST_FIXTURE="$fixture" \
+      PATH="$stub_dir:$PATH" \
+      bash scripts/package-dist.sh --frontend-built --debug --out-dir "$case_out" | tail -n 1
+  )"
+
+  case "$archive" in
+    *.tar.gz) tar -C "$case_extract" -xzf "$archive" ;;
+    *.zip) unzip -q "$archive" -d "$case_extract" ;;
+    *) echo "unsupported archive: $archive" >&2; exit 1 ;;
+  esac
+
+  local packaged_binary
+  packaged_binary="$(find "$case_extract" -type f -name "$bin_name" | head -n 1)"
+  if [ -z "$packaged_binary" ]; then
+    echo "packaged binary was not found ($label)" >&2
     exit 1
-    ;;
-esac
+  fi
+  if ! cmp -s "$packaged_binary" "$target_dir/debug/$source_binary"; then
+    echo "packaged binary differs from the binary Cargo built ($label)" >&2
+    exit 1
+  fi
+}
 
-packaged_binary="$(find "$tmp_root/extract" -type f -name "$bin_name" | head -n 1)"
-if [ -z "$packaged_binary" ]; then
-  echo "packaged binary was not found" >&2
-  exit 1
-fi
-if ! cmp -s "$packaged_binary" "$target_dir/debug/$source_binary"; then
-  echo "packaged binary differs from the binary built in CARGO_TARGET_DIR" >&2
-  exit 1
-fi
+# Trailing slash is valid for CARGO_TARGET_DIR; packaging must still honor it.
+check_case cargo-target-dir "$tmp_root/cargo-target/" \
+  "CARGO_TARGET_DIR=$tmp_root/cargo-target/"
 
-echo "package-dist CARGO_TARGET_DIR check ok"
+# With CARGO_TARGET_DIR unset, Cargo uses CARGO_BUILD_TARGET_DIR; packaging
+# must follow Cargo's resolved directory rather than assume the default target/.
+check_case cargo-build-target-dir "$tmp_root/cargo-build-target" \
+  "CARGO_BUILD_TARGET_DIR=$tmp_root/cargo-build-target"
+
+echo "package-dist effective target dir check ok"

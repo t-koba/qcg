@@ -115,8 +115,13 @@ source_binary="$(node scripts/product.mjs binary)"
 name="${product_id}-${os}-${arch}"
 staging="${out_dir}/${name}"
 bin_name="${product_id}"
-# cargo resolves CARGO_TARGET_DIR relative to this cwd; packaging must use the same directory.
-cargo_target_dir="${CARGO_TARGET_DIR:-target}"
+# Ask Cargo which target directory it actually used. It honors both
+# CARGO_TARGET_DIR and the higher-precedence CARGO_BUILD_TARGET_DIR, so
+# reconstructing the path from one variable can package a stale binary.
+cargo_target_dir="$(
+  cargo metadata --no-deps --locked --offline --format-version 1 \
+    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).target_directory))'
+)"
 cargo_target_dir="${cargo_target_dir%/}"
 if [ "$os" = "windows" ]; then
   bin_name="${product_id}.exe"
