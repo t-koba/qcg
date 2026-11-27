@@ -57,7 +57,7 @@ The source application lives in `frontend/generator`. Vite builds directly to
 control and is built before distribution packaging:
 
 ```bash
-npm --prefix frontend/generator ci
+npm --prefix frontend/generator ci --ignore-scripts
 npm --prefix frontend/generator run generate:api
 npm --prefix frontend/generator run generate:wasm
 npm --prefix frontend/generator run check
