@@ -5756,6 +5756,16 @@
             },
             "description": "Resource not found"
           },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
+          },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"
           },
@@ -5846,6 +5856,16 @@
               }
             },
             "description": "Resource not found"
+          },
+          "413": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProblemDetails"
+                }
+              }
+            },
+            "description": "Payload too large"
           },
           "429": {
             "$ref": "#/components/responses/TooManyRequests"

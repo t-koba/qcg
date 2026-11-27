@@ -450,7 +450,7 @@ pub const API_ROUTES: &[ApiRoute] = &[
         request_schema: None,
         request_headers: IF_NONE_MATCH_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
-        errors: ERR_RESOURCE,
+        errors: ERR_RESOURCE_TOO_LARGE,
     },
     ApiRoute {
         method: "post",
@@ -578,7 +578,7 @@ pub const API_ROUTES: &[ApiRoute] = &[
         request_schema: None,
         request_headers: IF_NONE_MATCH_HEADERS,
         query_parameters: NO_QUERY_PARAMETERS,
-        errors: ERR_RESOURCE,
+        errors: ERR_RESOURCE_TOO_LARGE,
     },
     ApiRoute {
         method: "get",
