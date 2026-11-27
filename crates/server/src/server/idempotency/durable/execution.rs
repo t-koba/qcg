@@ -189,7 +189,16 @@ mod tests {
                 }
             })
         };
+        let drop_started = std::time::Instant::now();
         drop(gate);
+        let drop_elapsed = drop_started.elapsed();
+        // A busy registry must be handed off, not retried on this worker.
+        // The old inline retry held the worker for about a second; keep this
+        // bound well below that budget but above a normal spawn.
+        assert!(
+            drop_elapsed < std::time::Duration::from_millis(200),
+            "final reclamation must return promptly under contention: {drop_elapsed:?}"
+        );
         // The registry is still held: read progress before releasing it, so a
         // regression to inline sleeping on this worker cannot pass by awaiting
         // a ticker that eventually finishes.
