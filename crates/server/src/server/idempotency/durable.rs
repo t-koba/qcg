@@ -71,8 +71,19 @@ fn test_gate(runs_dir: &Utf8PathBuf, key: &str) -> Result<ExecutionGate, String>
         std::thread::sleep(IdempotencyTiming::DEFAULT.peer_poll);
     }
 }
+/// Unlock before close: a concurrent fork inherits the open description, so
+/// close alone can leave peers blocked until that child execs or exits. The
+/// critical section ends when this guard drops, in the owning process only.
+struct IdempotencyLock(File);
+impl Drop for IdempotencyLock {
+    fn drop(&mut self) {
+        if let Err(error) = self.0.unlock() {
+            tracing::warn!(%error, "idempotency lock unlock failed");
+        }
+    }
+}
 /// Metadata lock makes owner/generation checks and conditional mutations indivisible.
-fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<File, String> {
+fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<IdempotencyLock, String> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     let lock_path = idempotency_dir(runs_dir).join(".idempotency.lock");
@@ -81,7 +92,7 @@ fn acquire_idempotency_lock(runs_dir: &Utf8PathBuf) -> Result<File, String> {
     lock_file
         .lock()
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
-    Ok(lock_file)
+    Ok(IdempotencyLock(lock_file))
 }
 /// No-follow leaf opens relative to pinned immediate parents on Unix/Windows.
 /// Ancestors of that parent, including the configured store, must stay trusted.
@@ -413,7 +424,7 @@ fn rename_verified(src: &camino::Utf8Path, dst: &camino::Utf8Path) -> io::Result
 fn acquire_maintenance_lock(
     runs_dir: &Utf8PathBuf,
     stop: &tokio_util::sync::CancellationToken,
-) -> Result<File, String> {
+) -> Result<IdempotencyLock, String> {
     std::fs::create_dir_all(idempotency_dir(runs_dir).as_std_path())
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     let lock_path = idempotency_dir(runs_dir).join(".idempotency.lock");
@@ -421,7 +432,7 @@ fn acquire_maintenance_lock(
         .map_err(|error| format!("failed to persist idempotency record: {error}"))?;
     loop {
         match lock_file.try_lock() {
-            Ok(()) => return Ok(lock_file),
+            Ok(()) => return Ok(IdempotencyLock(lock_file)),
             Err(std::fs::TryLockError::WouldBlock) if !stop.is_cancelled() => {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
