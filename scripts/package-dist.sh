@@ -96,9 +96,20 @@ remap_flags="--remap-path-prefix=${build_root}=."
 if [ -n "${HOME:-}" ]; then
   remap_flags="${remap_flags} --remap-path-prefix=${HOME}=/build"
 fi
+# Force the built-in host target at build time. A custom target JSON's filename
+# stem becomes Cargo's artifact directory name, so deriving target identity from
+# that path alone would let a foreign spec named after the host be packaged as
+# native. An explicit CLI --target overrides CARGO_BUILD_TARGET and any
+# .cargo/config.toml build.target, so only the built-in host spec is selected.
+host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
+if [ -z "$host_triple" ]; then
+  echo "could not determine Rust host triple; refusing to package without it" >&2
+  exit 1
+fi
 build_json="$(
   RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${remap_flags}" \
     cargo build -p "$(node scripts/product.mjs package)" --locked --profile "$profile" \
+    --target "$host_triple" \
     --message-format=json-render-diagnostics
 )"
 
@@ -149,14 +160,11 @@ process.stdin.on("data", (chunk) => { input += chunk; }).on("end", () => {
 require_path "$executable"
 
 # Archive naming and the .exe suffix come from the host, so a foreign Cargo
-# target would be mislabeled. Derive the effective target from the logical
-# executable path Cargo reported; resolving symlinks could hide a foreign
-# build behind a cache directory named after the host triple.
-host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
-if [ -z "$host_triple" ]; then
-  echo "could not determine Rust host triple; refusing to package without it" >&2
-  exit 1
-fi
+# target would be mislabeled. The build above forced the built-in host target;
+# this is a defense-in-depth confirmation of the reported executable layout.
+# Derive the effective target from the logical path Cargo reported; resolving
+# symlinks could hide a foreign build behind a cache directory named after the
+# host triple.
 target_directory="$(cargo metadata --no-deps --format-version 1 --offline | node -e 'let input="";process.stdin.on("data",(chunk)=>{input+=chunk;}).on("end",()=>{try{const metadata=JSON.parse(input);if(typeof metadata.target_directory==="string"){process.stdout.write(metadata.target_directory);}}catch{process.exit(1);}});')"
 if [ -z "$target_directory" ] || [ ! -d "$target_directory" ]; then
   echo "could not determine Cargo target directory; refusing to package without it" >&2

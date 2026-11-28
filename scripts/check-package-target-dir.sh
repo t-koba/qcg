@@ -25,6 +25,12 @@ case "$(uname -s)" in
     ;;
 esac
 
+host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
+if [ -z "$host_triple" ]; then
+  echo "could not determine Rust host triple" >&2
+  exit 1
+fi
+
 stub_dir="$tmp_root/stub"
 mkdir -p "$stub_dir"
 
@@ -32,6 +38,19 @@ mkdir -p "$stub_dir"
 cat > "$stub_dir/cargo" <<'EOF'
 #!/usr/bin/env bash
 if [ "${1:-}" = "build" ]; then
+  # Packaging must force the built-in host target with an explicit CLI
+  # --target, so a custom target JSON named after the host cannot select a
+  # foreign spec through CARGO_BUILD_TARGET or .cargo/config.toml.
+  forced_target=""
+  previous_arg=""
+  for build_arg in "$@"; do
+    if [ "$previous_arg" = "--target" ]; then forced_target="$build_arg"; fi
+    previous_arg="$build_arg"
+  done
+  if [ "$forced_target" != "$QCG_TEST_HOST_TRIPLE" ]; then
+    echo "cargo build did not force host target: expected --target $QCG_TEST_HOST_TRIPLE, saw '$forced_target'" >&2
+    exit 1
+  fi
   mkdir -p "$(dirname "$QCG_TEST_ARTIFACT_PATH")"
   printf '%s\n' "$QCG_TEST_FIXTURE" > "$QCG_TEST_ARTIFACT_PATH"
   artifact_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$QCG_TEST_ARTIFACT_PATH")"
@@ -64,6 +83,7 @@ check_case() {
     env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
       "$@" \
       QCG_TEST_REAL_CARGO="$real_cargo" \
+      QCG_TEST_HOST_TRIPLE="$host_triple" \
       QCG_TEST_ARTIFACT_PATH="$artifact_path" \
       QCG_TEST_FIXTURE="$fixture" \
       PATH="$stub_dir:$PATH" \
@@ -107,6 +127,7 @@ check_fail_case() {
   if env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
       "$@" \
       QCG_TEST_REAL_CARGO="$real_cargo" \
+      QCG_TEST_HOST_TRIPLE="$host_triple" \
       QCG_TEST_ARTIFACT_PATH="$artifact_path" \
       QCG_TEST_FIXTURE="$fixture" \
       QCG_TEST_RECORD_COUNT="$record_count" \
@@ -141,11 +162,6 @@ check_case cargo-build-target-dir "$target_dir/debug/$source_binary" \
 # A host-triple build puts the fresh binary under <target>/<triple>/debug/
 # while an old binary can remain at <target>/debug/. Packaging must take the
 # executable Cargo reported, never the stale one.
-host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
-if [ -z "$host_triple" ]; then
-  echo "could not determine Rust host triple" >&2
-  exit 1
-fi
 target_dir="$tmp_root/cargo-build-target-host"
 fresh_binary="$target_dir/$host_triple/debug/$source_binary"
 stale_binary="$target_dir/debug/$source_binary"
@@ -170,6 +186,7 @@ check_foreign_case() {
   if env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
       "$@" \
       QCG_TEST_REAL_CARGO="$real_cargo" \
+      QCG_TEST_HOST_TRIPLE="$host_triple" \
       QCG_TEST_ARTIFACT_PATH="$artifact_path" \
       QCG_TEST_FIXTURE="$fixture" \
       PATH="$stub_dir:$PATH" \
@@ -220,3 +237,4 @@ check_fail_case ambiguous-artifact-record 2 \
 
 echo "package-dist effective target dir check ok"
 echo "package-dist foreign Cargo target check ok"
+echo "package-dist built-in host target check ok"
