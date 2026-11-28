@@ -149,8 +149,9 @@ process.stdin.on("data", (chunk) => { input += chunk; }).on("end", () => {
 require_path "$executable"
 
 # Archive naming and the .exe suffix come from the host, so a foreign Cargo
-# target would be mislabeled. Derive the effective target from the executable
-# Cargo reported and refuse before writing anything to staging.
+# target would be mislabeled. Derive the effective target from the logical
+# executable path Cargo reported; resolving symlinks could hide a foreign
+# build behind a cache directory named after the host triple.
 host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
 if [ -z "$host_triple" ]; then
   echo "could not determine Rust host triple; refusing to package without it" >&2
@@ -161,29 +162,31 @@ if [ -z "$target_directory" ] || [ ! -d "$target_directory" ]; then
   echo "could not determine Cargo target directory; refusing to package without it" >&2
   exit 1
 fi
-canonical_target="$(cd "$target_directory" && pwd -P)"
-canonical_exec_dir="$(cd "$(dirname "$executable")" && pwd -P)"
 if [ "$profile" = "dev" ]; then
   profile_dir="debug"
 else
   profile_dir="release"
 fi
-if [ "$(basename "$canonical_exec_dir")" != "$profile_dir" ]; then
-  echo "unexpected executable layout for profile $profile; refusing to package without it" >&2
-  exit 1
-fi
-above="$(dirname "$canonical_exec_dir")"
-if [ "$above" != "$canonical_target" ]; then
-  if [ "$(dirname "$above")" != "$canonical_target" ]; then
-    echo "unexpected executable layout under Cargo target directory; refusing to package without it" >&2
-    exit 1
-  fi
-  effective_target="$(basename "$above")"
-  if [ "$effective_target" != "$host_triple" ]; then
-    echo "refusing to package foreign Cargo target: ${effective_target} (host target: ${host_triple})" >&2
-    exit 1
-  fi
-fi
+node -e '
+const path = require("path");
+const [executable, target_directory, profile_dir, host_triple] = process.argv.slice(1);
+const execDir = path.dirname(executable);
+const rel = path.relative(target_directory, execDir);
+const parts = rel.split(path.sep).filter((s) => s.length > 0);
+let effective;
+if (parts.length === 1 && parts[0] === profile_dir) {
+  effective = host_triple;
+} else if (parts.length === 2 && parts[1] === profile_dir && parts[0] !== ".." && parts[0] !== ".") {
+  effective = parts[0];
+} else {
+  console.error("unexpected executable layout under Cargo target directory; refusing to package without it");
+  process.exit(1);
+}
+if (effective !== host_triple) {
+  console.error(`refusing to package foreign Cargo target: ${effective} (host target: ${host_triple})`);
+  process.exit(1);
+}
+' "$executable" "$target_directory" "$profile_dir" "$host_triple"
 
 rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"

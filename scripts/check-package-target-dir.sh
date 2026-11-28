@@ -201,6 +201,15 @@ check_foreign_case cargo-build-target-foreign "$foreign_env_root/$foreign_target
   "CARGO_BUILD_TARGET=$foreign_target" \
   "CARGO_TARGET_DIR=$foreign_env_root"
 
+# A symlinked foreign cache resolves physically into the host triple directory.
+# A guard that canonicalizes paths would accept it and archive a mislabeled
+# foreign binary, so the logical Cargo path must still be refused.
+link_root="$tmp_root/symlink-foreign-target"
+mkdir -p "$link_root/$host_triple/debug"
+ln -s "$host_triple" "$link_root/$foreign_target"
+check_foreign_case cargo-target-dir-symlink-foreign "$link_root/$foreign_target/debug/$source_binary" \
+  "CARGO_TARGET_DIR=$link_root"
+
 # Missing output (zero records) must fail closed.
 check_fail_case no-artifact-record 0 \
   "CARGO_TARGET_DIR=$tmp_root/fail-target-none"
