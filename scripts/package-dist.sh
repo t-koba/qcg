@@ -148,6 +148,43 @@ process.stdin.on("data", (chunk) => { input += chunk; }).on("end", () => {
 )"
 require_path "$executable"
 
+# Archive naming and the .exe suffix come from the host, so a foreign Cargo
+# target would be mislabeled. Derive the effective target from the executable
+# Cargo reported and refuse before writing anything to staging.
+host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
+if [ -z "$host_triple" ]; then
+  echo "could not determine Rust host triple; refusing to package without it" >&2
+  exit 1
+fi
+target_directory="$(cargo metadata --no-deps --format-version 1 --offline | node -e 'let input="";process.stdin.on("data",(chunk)=>{input+=chunk;}).on("end",()=>{try{const metadata=JSON.parse(input);if(typeof metadata.target_directory==="string"){process.stdout.write(metadata.target_directory);}}catch{process.exit(1);}});')"
+if [ -z "$target_directory" ] || [ ! -d "$target_directory" ]; then
+  echo "could not determine Cargo target directory; refusing to package without it" >&2
+  exit 1
+fi
+canonical_target="$(cd "$target_directory" && pwd -P)"
+canonical_exec_dir="$(cd "$(dirname "$executable")" && pwd -P)"
+if [ "$profile" = "dev" ]; then
+  profile_dir="debug"
+else
+  profile_dir="release"
+fi
+if [ "$(basename "$canonical_exec_dir")" != "$profile_dir" ]; then
+  echo "unexpected executable layout for profile $profile; refusing to package without it" >&2
+  exit 1
+fi
+above="$(dirname "$canonical_exec_dir")"
+if [ "$above" != "$canonical_target" ]; then
+  if [ "$(dirname "$above")" != "$canonical_target" ]; then
+    echo "unexpected executable layout under Cargo target directory; refusing to package without it" >&2
+    exit 1
+  fi
+  effective_target="$(basename "$above")"
+  if [ "$effective_target" != "$host_triple" ]; then
+    echo "refusing to package foreign Cargo target: ${effective_target} (host target: ${host_triple})" >&2
+    exit 1
+  fi
+fi
+
 rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"
 cp "$executable" "$staging/bin/${bin_name}"
