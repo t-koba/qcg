@@ -35,7 +35,12 @@ if [ "${1:-}" = "build" ]; then
   mkdir -p "$(dirname "$QCG_TEST_ARTIFACT_PATH")"
   printf '%s\n' "$QCG_TEST_FIXTURE" > "$QCG_TEST_ARTIFACT_PATH"
   artifact_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$QCG_TEST_ARTIFACT_PATH")"
-  printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"qcg"},"profile":{"test":false},"executable":%s}\n' "$artifact_json"
+  record_count="${QCG_TEST_RECORD_COUNT:-1}"
+  i=0
+  while [ "$i" -lt "$record_count" ]; do
+    printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"qcg"},"profile":{"test":false},"executable":%s}\n' "$artifact_json"
+    i=$((i + 1))
+  done
   exit 0
 fi
 exec "$QCG_TEST_REAL_CARGO" "$@"
@@ -87,6 +92,41 @@ check_case() {
   fi
 }
 
+# check_fail_case <label> <record count> <cargo env assignment...>
+# A zero- or two-record build must fail closed with the exact guard message and
+# leave no archive; otherwise a future weakening of the guard goes unnoticed.
+check_fail_case() {
+  local label="$1" record_count="$2"
+  shift 2
+  local case_out="$tmp_root/dist-$label"
+  local artifact_path="$tmp_root/fail-artifact-$label/debug/$source_binary"
+  local fixture="qcg-target-dir-fixture-${label}-${tmp_root##*/}"
+  local log="$tmp_root/log-$label"
+  mkdir -p "$(dirname "$artifact_path")" "$case_out"
+
+  if env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
+      "$@" \
+      QCG_TEST_REAL_CARGO="$real_cargo" \
+      QCG_TEST_ARTIFACT_PATH="$artifact_path" \
+      QCG_TEST_FIXTURE="$fixture" \
+      QCG_TEST_RECORD_COUNT="$record_count" \
+      PATH="$stub_dir:$PATH" \
+      bash scripts/package-dist.sh --frontend-built --debug --out-dir "$case_out" \
+        >"$log" 2>&1; then
+    echo "packaging unexpectedly succeeded with $record_count matching records ($label)" >&2
+    exit 1
+  fi
+  if ! grep -q "expected exactly one compiler-artifact record for qcg, found $record_count" "$log"; then
+    echo "packaging failed for an unexpected reason ($label)" >&2
+    cat "$log" >&2
+    exit 1
+  fi
+  if find "$case_out" -type f \( -name '*.tar.gz' -o -name '*.zip' \) | grep -q .; then
+    echo "packaging left an archive with $record_count matching records ($label)" >&2
+    exit 1
+  fi
+}
+
 # Trailing slash is valid for CARGO_TARGET_DIR; packaging must still honor it.
 target_dir="$tmp_root/cargo-target/"
 check_case cargo-target-dir "$target_dir/debug/$source_binary" \
@@ -116,5 +156,13 @@ check_case cargo-build-target-host "$fresh_binary" \
   "CARGO_BUILD_TARGET=$host_triple" \
   "CARGO_TARGET_DIR=$target_dir"
 unexpected_binary=""
+
+# Missing output (zero records) must fail closed.
+check_fail_case no-artifact-record 0 \
+  "CARGO_TARGET_DIR=$tmp_root/fail-target-none"
+
+# Ambiguous output (two records) must fail closed.
+check_fail_case ambiguous-artifact-record 2 \
+  "CARGO_TARGET_DIR=$tmp_root/fail-target-two"
 
 echo "package-dist effective target dir check ok"
