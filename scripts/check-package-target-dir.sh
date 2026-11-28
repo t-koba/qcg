@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
-# Regression: package-dist.sh must copy the binary from the directory Cargo
-# actually built into, not from a path reconstructed from one env variable.
-# Cargo honors both CARGO_TARGET_DIR and the higher-precedence
-# CARGO_BUILD_TARGET_DIR. Only `cargo build` is stubbed; metadata, SBOM and
-# archive steps stay real, so packaging must follow Cargo's resolved directory.
+# Regression: package-dist.sh must archive the binary Cargo actually built,
+# selected from Cargo's compiler-artifact record, rather than from a path
+# reconstructed from one env variable. Cargo honors CARGO_TARGET_DIR, the
+# higher-precedence CARGO_BUILD_TARGET_DIR, and CARGO_BUILD_TARGET (which adds
+# the target triple). Only `cargo build` is stubbed; metadata, SBOM and archive
+# steps stay real, so packaging must follow Cargo's reported executable.
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.."
 
@@ -12,45 +13,53 @@ trap 'rm -rf "$tmp_root"' EXIT
 
 real_cargo="$(command -v cargo)"
 product_id="$(node scripts/product.mjs name)"
-source_binary="$(node scripts/product.mjs binary)"
+binary_name="$(node scripts/product.mjs binary)"
 case "$(uname -s)" in
   MINGW*|MSYS*|CYGWIN*)
     bin_name="${product_id}.exe"
-    source_binary="${source_binary}.exe"
+    source_binary="${binary_name}.exe"
     ;;
   *)
     bin_name="$product_id"
+    source_binary="$binary_name"
     ;;
 esac
 
 stub_dir="$tmp_root/stub"
 mkdir -p "$stub_dir"
 
-# The stub writes a distinct fixture only where the build is told to place it.
-cat > "$stub_dir/cargo" <<EOF
+# The stub writes a distinct fixture only to the artifact path it reports.
+cat > "$stub_dir/cargo" <<'EOF'
 #!/usr/bin/env bash
-if [ "\${1:-}" = "build" ]; then
-  printf '%s\\n' "\$QCG_TEST_FIXTURE" > "\$QCG_TEST_TARGET_DIR/debug/$source_binary"
+if [ "${1:-}" = "build" ]; then
+  mkdir -p "$(dirname "$QCG_TEST_ARTIFACT_PATH")"
+  printf '%s\n' "$QCG_TEST_FIXTURE" > "$QCG_TEST_ARTIFACT_PATH"
+  artifact_json="$(node -e 'process.stdout.write(JSON.stringify(process.argv[1]))' "$QCG_TEST_ARTIFACT_PATH")"
+  printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"qcg"},"profile":{"test":false},"executable":%s}\n' "$artifact_json"
   exit 0
 fi
-exec "$real_cargo" "\$@"
+exec "$QCG_TEST_REAL_CARGO" "$@"
 EOF
 chmod +x "$stub_dir/cargo"
 
-# check_case <label> <resolved target dir> <cargo env assignment...>
+# Optional stale path set by a case; the archive must not contain that content.
+unexpected_binary=""
+
+# check_case <label> <artifact path> <cargo env assignment...>
 check_case() {
-  local label="$1" target_dir="$2"
+  local label="$1" artifact_path="$2"
   shift 2
   local case_out="$tmp_root/dist-$label"
   local case_extract="$tmp_root/extract-$label"
   local fixture="qcg-target-dir-fixture-${label}-${tmp_root##*/}"
-  mkdir -p "$target_dir/debug" "$case_out" "$case_extract"
+  mkdir -p "$(dirname "$artifact_path")" "$case_out" "$case_extract"
 
   local archive
   archive="$(
-    env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR \
+    env -u CARGO_TARGET_DIR -u CARGO_BUILD_TARGET_DIR -u CARGO_BUILD_TARGET \
       "$@" \
-      QCG_TEST_TARGET_DIR="$target_dir" \
+      QCG_TEST_REAL_CARGO="$real_cargo" \
+      QCG_TEST_ARTIFACT_PATH="$artifact_path" \
       QCG_TEST_FIXTURE="$fixture" \
       PATH="$stub_dir:$PATH" \
       bash scripts/package-dist.sh --frontend-built --debug --out-dir "$case_out" | tail -n 1
@@ -68,19 +77,44 @@ check_case() {
     echo "packaged binary was not found ($label)" >&2
     exit 1
   fi
-  if ! cmp -s "$packaged_binary" "$target_dir/debug/$source_binary"; then
-    echo "packaged binary differs from the binary Cargo built ($label)" >&2
+  if ! cmp -s "$packaged_binary" "$artifact_path"; then
+    echo "packaged binary differs from the executable Cargo reported ($label)" >&2
+    exit 1
+  fi
+  if [ -n "$unexpected_binary" ] && cmp -s "$packaged_binary" "$unexpected_binary"; then
+    echo "packaged binary is the stale binary ($label)" >&2
     exit 1
   fi
 }
 
 # Trailing slash is valid for CARGO_TARGET_DIR; packaging must still honor it.
-check_case cargo-target-dir "$tmp_root/cargo-target/" \
-  "CARGO_TARGET_DIR=$tmp_root/cargo-target/"
+target_dir="$tmp_root/cargo-target/"
+check_case cargo-target-dir "$target_dir/debug/$source_binary" \
+  "CARGO_TARGET_DIR=$target_dir"
 
 # With CARGO_TARGET_DIR unset, Cargo uses CARGO_BUILD_TARGET_DIR; packaging
 # must follow Cargo's resolved directory rather than assume the default target/.
-check_case cargo-build-target-dir "$tmp_root/cargo-build-target" \
-  "CARGO_BUILD_TARGET_DIR=$tmp_root/cargo-build-target"
+target_dir="$tmp_root/cargo-build-target"
+check_case cargo-build-target-dir "$target_dir/debug/$source_binary" \
+  "CARGO_BUILD_TARGET_DIR=$target_dir"
+
+# A host-triple build puts the fresh binary under <target>/<triple>/debug/
+# while an old binary can remain at <target>/debug/. Packaging must take the
+# executable Cargo reported, never the stale one.
+host_triple="$(rustc -vV | awk '/^host:/{print $2}')"
+if [ -z "$host_triple" ]; then
+  echo "could not determine Rust host triple" >&2
+  exit 1
+fi
+target_dir="$tmp_root/cargo-build-target-host"
+fresh_binary="$target_dir/$host_triple/debug/$source_binary"
+stale_binary="$target_dir/debug/$source_binary"
+mkdir -p "$(dirname "$stale_binary")"
+printf '%s\n' "qcg-stale-binary-${tmp_root##*/}" > "$stale_binary"
+unexpected_binary="$stale_binary"
+check_case cargo-build-target-host "$fresh_binary" \
+  "CARGO_BUILD_TARGET=$host_triple" \
+  "CARGO_TARGET_DIR=$target_dir"
+unexpected_binary=""
 
 echo "package-dist effective target dir check ok"

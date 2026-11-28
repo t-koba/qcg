@@ -2,7 +2,6 @@
 set -euo pipefail
 
 profile="release"
-target_profile="release"
 dry_run="false"
 frontend_built="false"
 dependencies_installed="false"
@@ -18,7 +17,6 @@ while [ "$#" -gt 0 ]; do
       ;;
     --debug)
       profile="dev"
-      target_profile="debug"
       ;;
     --dry-run)
       dry_run="true"
@@ -98,8 +96,11 @@ remap_flags="--remap-path-prefix=${build_root}=."
 if [ -n "${HOME:-}" ]; then
   remap_flags="${remap_flags} --remap-path-prefix=${HOME}=/build"
 fi
-RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${remap_flags}" \
-  cargo build -p "$(node scripts/product.mjs package)" --locked --profile "$profile"
+build_json="$(
+  RUSTFLAGS="${RUSTFLAGS:+${RUSTFLAGS} }${remap_flags}" \
+    cargo build -p "$(node scripts/product.mjs package)" --locked --profile "$profile" \
+    --message-format=json-render-diagnostics
+)"
 
 case "$(uname -s)" in
   Darwin) os="macos" ;;
@@ -111,26 +112,45 @@ arch="$(uname -m)"
 # Single rename place for distribution product id. Binary name and share dir
 # follow this value; pass a different id to rebrand without code changes.
 product_id="$(node scripts/product.mjs name)"
-source_binary="$(node scripts/product.mjs binary)"
+binary_name="$(node scripts/product.mjs binary)"
 name="${product_id}-${os}-${arch}"
 staging="${out_dir}/${name}"
 bin_name="${product_id}"
-# Ask Cargo which target directory it actually used. It honors both
-# CARGO_TARGET_DIR and the higher-precedence CARGO_BUILD_TARGET_DIR, so
-# reconstructing the path from one variable can package a stale binary.
-cargo_target_dir="$(
-  cargo metadata --no-deps --locked --offline --format-version 1 \
-    | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).target_directory))'
-)"
-cargo_target_dir="${cargo_target_dir%/}"
 if [ "$os" = "windows" ]; then
   bin_name="${product_id}.exe"
-  source_binary="${source_binary}.exe"
 fi
+# Use the executable Cargo reported for the binary it just built. Reconstructing
+# the path from a target directory can archive a stale binary when Cargo places
+# the fresh one under a target triple or a different resolved directory.
+executable="$(
+  printf '%s\n' "$build_json" | node -e '
+let input = "";
+process.stdin.on("data", (chunk) => { input += chunk; }).on("end", () => {
+  const binary = process.argv[1];
+  const records = input.split("\n").map((line) => {
+    if (!line.trim()) return null;
+    try { return JSON.parse(line); } catch { return null; }
+  }).filter((record) => record !== null);
+  const matches = records.filter((record) =>
+    record.reason === "compiler-artifact" &&
+    record.target && record.target.name === binary &&
+    Array.isArray(record.target.kind) && record.target.kind.includes("bin") &&
+    record.profile && record.profile.test === false &&
+    typeof record.executable === "string" && record.executable.length > 0
+  );
+  if (matches.length !== 1) {
+    console.error(`expected exactly one compiler-artifact record for ${binary}, found ${matches.length}`);
+    process.exit(1);
+  }
+  process.stdout.write(matches[0].executable);
+});
+' "$binary_name"
+)"
+require_path "$executable"
 
 rm -rf "$staging"
 mkdir -p "$staging/bin" "$staging/share/${product_id}"
-cp "${cargo_target_dir}/${target_profile}/${source_binary}" "$staging/bin/${bin_name}"
+cp "$executable" "$staging/bin/${bin_name}"
 cp README.md "$staging/share/${product_id}/"
 cp PROJECT.md "$staging/share/${product_id}/"
 cp providers.toml "$staging/share/${product_id}/providers.toml"
